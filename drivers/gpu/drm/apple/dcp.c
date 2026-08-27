@@ -49,12 +49,13 @@
 #include "av.h"
 #include "dcp.h"
 #include "dcp-internal.h"
+#include "dcp-lifecycle.h"
 #include "iomfb.h"
 #include "parser.h"
 #include "trace.h"
 
 #define APPLE_DCP_COPROC_CPU_CONTROL	 0x44
-#define APPLE_DCP_COPROC_CPU_CONTROL_RUN BIT(4)
+#define APPLE_DCP_COPROC_CPU_STATUS	 0x48
 
 #define DCP_BOOT_TIMEOUT msecs_to_jiffies(1000)
 
@@ -2197,7 +2198,7 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 {
 	struct device_node *panel_np;
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
-	u32 cpu_ctrl;
+	u32 cpu_ctrl, cpu_status;
 	int ret;
 
 	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(42));
@@ -2208,6 +2209,22 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	if (IS_ERR(dcp->coproc_reg))
 		return PTR_ERR(dcp->coproc_reg);
 
+	/*
+	 * ASCWrap v6 can be handed to Linux with a live firmware-owned RTKit
+	 * session.  The cold-start path below has no protocol for adopting its
+	 * endpoint map or IOMFB shared memory, so touching PIODMA/DART state or
+	 * sending a new RTKit INIT would corrupt the inherited display session.
+	 */
+	if (dcp->hw.reject_running_coprocessor) {
+		cpu_ctrl = readl_relaxed(dcp->coproc_reg +
+					 APPLE_DCP_COPROC_CPU_CONTROL);
+		cpu_status = readl_relaxed(dcp->coproc_reg +
+					   APPLE_DCP_COPROC_CPU_STATUS);
+		if (apple_dcp_coprocessor_is_active(cpu_ctrl, cpu_status))
+			return dev_err_probe(dev, -EBUSY,
+				"refusing cold start of running firmware-owned DCP (control=%#x status=%#x)\n",
+				cpu_ctrl, cpu_status);
+	}
 	if (dcp->index || dcp->dptx_phy || dcp->dptx_die)
 		dev_info(dev, "DCP index:%u dptx target phy: %u dptx die: %u\n",
 			 dcp->index, dcp->dptx_phy, dcp->dptx_die);
@@ -2610,6 +2627,11 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t8112 = {
 	.num_dptx_ports = 2,
 };
 
+static const struct apple_dcp_hw_data apple_dcp_hw_t8140 = {
+	.num_dptx_ports = 0,
+	.reject_running_coprocessor = true,
+};
+
 static const struct apple_dcp_hw_data apple_dcp_hw_dcp = {
 	.num_dptx_ports = 0,
 };
@@ -2621,6 +2643,7 @@ static const struct apple_dcp_hw_data apple_dcp_hw_dcpext = {
 static const struct of_device_id of_match[] = {
 	{ .compatible = "apple,t6020-dcp", .data = &apple_dcp_hw_t6020,  },
 	{ .compatible = "apple,t8112-dcp", .data = &apple_dcp_hw_t8112,  },
+	{ .compatible = "apple,t8140-dcp", .data = &apple_dcp_hw_t8140,  },
 	{ .compatible = "apple,dcp",       .data = &apple_dcp_hw_dcp,    },
 	{ .compatible = "apple,dcpext",    .data = &apple_dcp_hw_dcpext, },
 	{}
