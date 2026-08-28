@@ -1416,13 +1416,13 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 
 	for_each_oldnew_plane_in_state(state, plane, old_state, new_state, plane_idx) {
 		struct apple_plane_state *apple_state = to_apple_plane_state(new_state);
-		struct apple_plane *apl_plane = to_apple_plane(plane);
+		struct apple_plane *apple_plane = to_apple_plane(plane);
 
 		/* skip planes not for this crtc */
 		if (old_state->crtc != crtc && new_state->crtc != crtc)
 			continue;
 
-		l = apl_plane->iomfb_surf;
+		l = apple_plane->iomfb_surface;
 		req->swap.swap_enabled |= BIT(l);
 
 		if (old_state->fb && new_state->fb != old_state->fb) {

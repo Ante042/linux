@@ -21,9 +21,10 @@
 #include "iomfb_h17p.h"
 #include "iomfb_v12_3.h"
 #include "iomfb_v13_3.h"
+#include "iomfb-surface.h"
 #include "epic/dpavservep.h"
 
-#define DCP_MAX_PLANES 4
+#define DCP_MAX_PLANES APPLE_DCP_MAX_SURFACES
 #define DCP_MAX_TYPEC_ROUTES 4
 
 struct apple_dcp;
@@ -173,9 +174,9 @@ struct apple_dcp {
 	bool crashed;
 	u32 crash_count;
 
-	DECLARE_BITMAP(iomfb_surfaces, DCP_MAX_PLANES);
 	/* Ignore inherited application-endpoint traffic while quiescing RTKit. */
 	bool adopting_session;
+	struct apple_dcp_surface_order iomfb_surfaces;
 
 	/************* IOMFB **************************************************
 	 * everything below is mostly used inside IOMFB but it could make     *

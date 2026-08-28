@@ -1665,11 +1665,12 @@ bool dcp_fw_compat_is_12_x(struct platform_device *pdev)
 	return dcp->fw_compat == DCP_FIRMWARE_V_12_3;
 }
 
-unsigned long* dcp_get_iomfb_surfaces(struct platform_device *pdev)
+const u32 *dcp_get_iomfb_surfaces(struct platform_device *pdev, u32 *count)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 
-	return dcp->iomfb_surfaces;
+	*count = dcp->iomfb_surfaces.count;
+	return dcp->iomfb_surfaces.id;
 }
 
 int dcp_start(struct platform_device *pdev)
@@ -2431,9 +2432,11 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	enum dcp_firmware_version fw_compat;
 	struct device *dev = &pdev->dev;
 	struct apple_dcp *dcp;
-	int ret, surf, num_surfs;
-	u32 surf_en;
+	int num_surfaces;
+	u32 surface_enabled, i, count;
+	u32 surface_ids[DCP_MAX_PLANES];
 	u32 mux_index;
+	int ret;
 
 	fw_compat = dcp_check_firmware_version(dev);
 	if (fw_compat == DCP_FIRMWARE_UNKNOWN)
@@ -2473,6 +2476,46 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	mutex_init(&dcp->hpd_mutex);
 	mutex_init(&dcp->tb_lock);
 
+	if (fw_compat != DCP_FIRMWARE_H17P) {
+		/* Legacy device trees encode one enable flag per surface. */
+		count = 0;
+		i = 0;
+		if (!of_property_present(dev->of_node, "apple,iomfb-surfaces") ||
+		    !of_property_count_u32_elems(dev->of_node, "apple,iomfb-surfaces")) {
+			surface_ids[count++] = 0;
+			surface_ids[count++] = 1;
+		} else {
+			of_property_for_each_u32(dev->of_node, "apple,iomfb-surfaces", surface_enabled) {
+				if (i >= DCP_MAX_PLANES)
+					return -EINVAL;
+				if (surface_enabled)
+					surface_ids[count++] = i;
+				i++;
+			}
+		}
+		ret = apple_dcp_surface_order_init(&dcp->iomfb_surfaces, surface_ids, count);
+	} else if (!of_property_present(dev->of_node, "apple,iomfb-surfaces")) {
+		ret = apple_dcp_surface_order_init(&dcp->iomfb_surfaces, NULL, 0);
+	} else {
+		num_surfaces = of_property_count_u32_elems(dev->of_node,
+							  "apple,iomfb-surfaces");
+		if (num_surfaces <= 0 || num_surfaces > DCP_MAX_PLANES)
+			return dev_err_probe(dev,
+				num_surfaces < 0 ? num_surfaces : -EINVAL,
+				"invalid apple,iomfb-surfaces length %d\n",
+				num_surfaces);
+		ret = of_property_read_u32_array(dev->of_node,
+						 "apple,iomfb-surfaces",
+						 surface_ids, num_surfaces);
+		if (!ret)
+			ret = apple_dcp_surface_order_init(&dcp->iomfb_surfaces,
+							   surface_ids,
+							   num_surfaces);
+	}
+	if (ret)
+		return dev_err_probe(dev, ret,
+				     "invalid apple,iomfb-surfaces order\n");
+
 	platform_set_drvdata(pdev, dcp);
 
 	dcp->phy = devm_phy_optional_get(dev, "dp-phy");
@@ -2482,31 +2525,6 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	}
 	dcp->fixed_phy = dcp->phy;
 
-	bitmap_zero(dcp->iomfb_surfaces, DCP_MAX_PLANES);
-	if (!of_property_present(dev->of_node, "apple,iomfb-surfaces"))
-		num_surfs = 0;
-	else
-		num_surfs = of_property_count_elems_of_size(dev->of_node,
-						    "apple,iomfb-surfaces",
-						    sizeof(u32));
-
-	if (num_surfs == 0 || num_surfs == -ENODATA) {
-		set_bit(0, dcp->iomfb_surfaces);
-		set_bit(1, dcp->iomfb_surfaces);
-	} else if (num_surfs < 0) {
-		return num_surfs;
-	} else if (num_surfs > DCP_MAX_PLANES) {
-		dev_err(dev, "Number of iomfb-surfaces (%d) exceeds DCP_MAX_PLANES\n",
-			num_surfs);
-		return -EINVAL;
-	}
-
-	surf = 0;
-	of_property_for_each_u32(dev->of_node, "apple,iomfb-surfaces", surf_en) {
-		if (surf_en)
-			set_bit(surf, dcp->iomfb_surfaces);
-		surf++;
-	}
 
 	if (dcp->phy) {
 		int ret;
