@@ -9,6 +9,7 @@
 #include <linux/ioport.h>
 #include <linux/list.h>
 #include <linux/mutex.h>
+#include <linux/spinlock.h>
 #include <linux/mux/consumer.h>
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
@@ -99,6 +100,8 @@ struct dcp_mem_descriptor {
 	dma_addr_t dva;
 	struct sg_table map;
 	u64 reg;
+	/* live iommu mappings installed by dcpep_cb_map_piodma() */
+	bool piodma_mapped;
 };
 
 /* Limit on call stack depth (arbitrary). Some nesting is required */
@@ -127,7 +130,14 @@ struct dcp_channel {
 struct dcp_fb_reference {
 	struct list_head head;
 	struct drm_framebuffer *fb;
+	/*
+	 * Id of the swap that unbinds @fb, i.e. the one that puts its
+	 * replacement on screen.  Only meaningful once @armed is set: the
+	 * firmware assigns the id in the swap_start reply, which happens after
+	 * the atomic commit that displaced @fb has already queued this entry.
+	 */
 	u32 swap_id;
+	bool armed;
 };
 
 #define MAX_NOTCH_HEIGHT 160
@@ -156,6 +166,12 @@ struct dcp_panel {
 struct apple_dcp_hw_data {
 	u32 num_dptx_ports;
 	bool adopt_running_coprocessor;
+	/*
+	 * Attach to an existing RTKit session instead of restarting it.  This
+	 * requires the endpoint map to be recovered before the DCP services are
+	 * started; no current platform enables it.
+	 */
+	bool adopt_live_session;
 };
 
 /* TODO: move IOMFB members to its own struct */
@@ -167,6 +183,8 @@ struct apple_dcp {
 	struct iommu_domain *disp_iommu_dom;
 	/* the display-subsystem device, whose DMA domain the pipe scans out of */
 	struct device *disp_dev;
+	/* which of the nine cumulative A031 notify-client states to send next */
+	unsigned int a031_step;
 	struct apple_rtkit *rtk;
 	struct apple_crtc *crtc;
 	struct apple_connector *connector;
@@ -241,6 +259,8 @@ struct apple_dcp {
 
 	/* swap id of the last completed swap */
 	u32 last_swap_id;
+	/* last_swap_id is only meaningful after the first swap completes */
+	bool have_swap_complete;
 	ktime_t swap_start;
 	u64 swap_submit_timestamp;
 
@@ -297,6 +317,12 @@ struct apple_dcp {
 	 * on the next successfully completed swap.
 	 */
 	struct list_head swapped_out_fbs;
+	/*
+	 * swapped_out_fbs is appended to from the DRM atomic commit thread
+	 * (dcp_flush -> .atomic_flush) and armed/drained from the RTKit
+	 * workqueue that runs the DCP callbacks.  Two different threads.
+	 */
+	spinlock_t swapped_out_lock;
 
 	struct dcp_brightness brightness;
 	/* Workqueue for updating the initial brightness */
