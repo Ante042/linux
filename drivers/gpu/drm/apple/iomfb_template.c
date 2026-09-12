@@ -360,7 +360,7 @@ static void dcp_ack_dfb_surface(struct apple_dcp *dcp)
 	dcp_ack(dcp, DCP_CONTEXT_CB);
 }
 
-static void dcp_fill_dfb_surface(u8 *s)
+static void dcp_fill_dfb_surface(struct apple_dcp *dcp, u8 *s)
 {
 	s[0x002] = 0x01;
 	s[0x00b] = 'A';
@@ -375,6 +375,18 @@ static void dcp_fill_dfb_surface(u8 *s)
 	s[0x035] = 0x04;	/* IOSurface.surface_id; macOS writes 4, we wrote 3 */
 	s[0x051] = 0x01;
 	s[0x149] = 0x01;
+
+	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G) {
+		/* H17G 25G76 A472: b3a8 surface and the native default surface ID.
+		 * The word at0x29 remains opaque; these are its observed bytes,
+		 * not a size inferred from panel geometry. No addresses are copied.
+		 */
+		memcpy(s + 0x00b, "8a3b", 4);
+		s[0x02a] = 0;
+		s[0x02b] = 0x4d;
+		s[0x02c] = 1;
+		s[0x035] = 2;
+	}
 }
 
 /*
@@ -411,7 +423,7 @@ static bool iomfbep_cb_create_dfb_surface(struct apple_dcp *dcp, int tag,
 		return true;
 	}
 
-	dcp_fill_dfb_surface(req->surface);
+	dcp_fill_dfb_surface(dcp, req->surface);
 
 	dcp_register_dfb_surface(dcp, false, req, complete_dfb_surface, NULL);
 	kfree(req);
@@ -797,7 +809,7 @@ static struct DCP_FW_NAME(dcp_map_reg_resp) dcpep_cb_map_reg(struct apple_dcp *d
 	 * hardware.  Answer it the way macOS does; these apertures are reached
 	 * physically, so dva == addr.
 	 */
-	if (req->index == DCP_H17P_DISP0_REG_INDEX) {
+	if (dcp->hw.legacy_pmc_binding && req->index == DCP_H17P_DISP0_REG_INDEX) {
 		dev_info(dcp->dev, "map_reg[5]: disp0 window %#llx len %#llx\n",
 			 (u64)DCP_H17P_DISP0_REG_BASE,
 			 (u64)DCP_H17P_DISP0_REG_SIZE);
@@ -1031,7 +1043,7 @@ static void boot_4b(struct apple_dcp *dcp, void *out, void *cookie)
 	 * macOS 25G83 sends 0 here, not 1: the traced A000 payload is
 	 * "00 aa aa aa", one meaningful byte followed by poison.
 	 */
-	u32 arg = 0;
+	u32 arg = dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G;
 
 	dcp_late_init_signal(dcp, false, &arg, boot_5, NULL);
 #else
@@ -1075,27 +1087,23 @@ static void boot_1_11(struct apple_dcp *dcp, void *out, void *cookie)
 
 static void boot_1_10(struct apple_dcp *dcp, void *out, void *cookie)
 {
-	/*
-	 * The firmware only builds a default framebuffer when it has non-zero
-	 * geometry (its create_default_fb_surface is gated on "h && w"), so
-	 * withholding A104 keeps the pipe inert and lets a real DRM modeset
-	 * drive the first swap instead.  macOS always pushes it, but macOS has
-	 * an inherited scanout to keep alive and we do not.
+	struct dcp_dfb_dimensions_h17p dim;
+
+	/* A445 returns the dimensions that native macOS passes to A104.
+	 * The H17G capture is2560x1664; the H17P capture is2408x1506.
 	 */
-	if (0) {
-		boot_1_11(dcp, NULL, NULL);
+	memcpy(&dim, out, sizeof(dim));
+	if (!dim.width || !dim.height || dim.width > 16384 || dim.height > 16384) {
+		struct dcp_channel *ch = &dcp->ch_cb;
+
+		dev_err(dcp->dev, "invalid default framebuffer dimensions %ux%u\n",
+			dim.width, dim.height);
+		*(u8 *)ch->output[ch->depth - 1] = false;
+		dcp_ack(dcp, DCP_CONTEXT_CB);
 		return;
 	}
-
-	/*
-	 * The panel's native size, which is what macOS pushes here: the traced
-	 * A104 payload is 68 09 00 00 e2 05 00 00 = 2408 x 1506.  The firmware
-	 * has already told us the same numbers in D582.
-	 */
-	struct dcp_dfb_dimensions_h17p dim = {
-		.width = 2408,
-		.height = 1506,
-	};
+	dev_info(dcp->dev, "default framebuffer dimensions %ux%u\n",
+		 dim.width, dim.height);
 
 	dcp_set_dfb_dimensions(dcp, false, &dim, boot_1_11, NULL);
 }

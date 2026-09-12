@@ -204,10 +204,15 @@ enum dcpep_method {
 void dcp_stall_check(struct work_struct *work);
 
 #define IOMFB_METHOD(tag, name) [name] = { #name, { tag[0], tag[1], tag[2], tag[3] } }
+#define IOMFB_METHOD_H17(tag, h17g, name) [name] = { #name, \
+	{ tag[0], tag[1], tag[2], tag[3] }, \
+	{ h17g[0], h17g[1], h17g[2], h17g[3] } }
 
 struct dcp_method_entry {
 	const char *name;
 	char tag[4];
+	/* H17G shares the H17P transport but changes selected method IDs. */
+	char tag_h17g[4];
 };
 
 #define IOMFB_MAX_CB (1000)

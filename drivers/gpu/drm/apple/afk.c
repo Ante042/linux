@@ -104,7 +104,9 @@ int afk_start(struct apple_dcp_afkep *ep)
 	int ret;
 
 	reinit_completion(&ep->started);
-	apple_rtkit_start_ep(ep->dcp->rtk, ep->endpoint);
+	ret = dcp_start_rtkit_endpoint(ep->dcp, ep->endpoint);
+	if (ret)
+		return ret;
 	afk_send(ep, FIELD_PREP(RBEP_TYPE, RBEP_INIT));
 
 	ret = wait_for_completion_timeout(&ep->started, msecs_to_jiffies(1000));
@@ -152,7 +154,7 @@ static void afk_init_rxtx(struct apple_dcp_afkep *ep, u64 message,
 	u32 base = FIELD_GET(INITRB_OFFSET, message) << BLOCK_SHIFT;
 	u32 size = FIELD_GET(INITRB_SIZE, message) << BLOCK_SHIFT;
 	u16 tag = FIELD_GET(INITRB_TAG, message);
-	u32 bufsz, hdrsz, end;
+	u32 bufsz, hdrsz, end, block;
 
 	if (tag != ep->bfr_tag) {
 		dev_err(ep->dcp->dev, "AFK[ep:%02x]: expected tag 0x%x but got 0x%x\n",
@@ -166,7 +168,7 @@ static void afk_init_rxtx(struct apple_dcp_afkep *ep, u64 message,
 		return;
 	}
 
-	if (base >= ep->bfr_size) {
+	if (!ep->bfr || size < sizeof(__le32) || base >= ep->bfr_size) {
 		dev_err(ep->dcp->dev,
 			"AFK[ep:%02x]: requested base 0x%x >= max size 0x%lx\n",
 			ep->endpoint, base, ep->bfr_size);
@@ -182,16 +184,19 @@ static void afk_init_rxtx(struct apple_dcp_afkep *ep, u64 message,
 	}
 
 	bfr->hdr = ep->bfr + base;
-	bufsz = le32_to_cpu(*(__le32 *)bfr->hdr);	/* first word of block 0 */
+	dma_rmb();
+	bufsz = le32_to_cpu(READ_ONCE(*(__le32 *)bfr->hdr));
 	hdrsz = size - bufsz;
+	block = hdrsz / AFK_RB_BLOCKS;
 	if (bufsz >= size || hdrsz % AFK_RB_BLOCKS ||
-	    hdrsz / AFK_RB_BLOCKS < AFK_RB_BLOCK_MIN) {
+	    block < AFK_RB_BLOCK_MIN || !is_power_of_2(block) ||
+	    !IS_ALIGNED(bufsz, block) || bufsz < 2 * block) {
 		dev_err(ep->dcp->dev,
 			"AFK[ep:%02x]: ring bufsz %#x with size %#x gives no valid header (base %#x, msg %#llx)\n",
 			ep->endpoint, bufsz, size, base, message);
 		return;
 	}
-	bfr->block = hdrsz / AFK_RB_BLOCKS;
+	bfr->block = block;
 
 	bfr->buf = (u8 *)bfr->hdr + hdrsz;
 	bfr->bufsz = bufsz;
