@@ -54,6 +54,11 @@ static const struct mfd_cell apple_smc_devs[] = {
 	MFD_CELL_OF("macsmc-rtc", NULL, NULL, 0, 0, "apple,smc-rtc"),
 };
 
+/* Initial T8152 support is read-only telemetry. Firmware retains fan control. */
+static const struct mfd_cell apple_smc_telemetry_devs[] = {
+	MFD_CELL_OF("macsmc-hwmon", NULL, NULL, 0, 0, "apple,smc-hwmon"),
+};
+
 static int apple_smc_cmd_locked(struct apple_smc *smc, u64 cmd, u64 arg,
 				  u64 size, u64 wsize, u32 *ret_data)
 {
@@ -469,6 +474,15 @@ static int apple_smc_probe(struct platform_device *pdev)
 		return dev_err_probe(smc->dev, ret, "Failed to get key count");
 	smc->key_count = be32_to_cpu(count);
 
+	/* T8152's key-read interface is qualified; notifications, GPIO and power
+	 * functions are not. The board DT exposes temperature and fan inputs only.
+	 */
+	if (of_device_is_compatible(dev->of_node, "apple,t8152-smc"))
+		return devm_mfd_add_devices(smc->dev, PLATFORM_DEVID_NONE,
+					    apple_smc_telemetry_devs,
+					    ARRAY_SIZE(apple_smc_telemetry_devs),
+					    NULL, 0, NULL);
+
 	/* Enable notifications */
 	apple_smc_write_flag(smc, SMC_KEY(NTAP), true);
 	ret = devm_add_action_or_reset(dev, apple_smc_disable_notifications, smc);
@@ -486,6 +500,7 @@ static int apple_smc_probe(struct platform_device *pdev)
 }
 
 static const struct of_device_id apple_smc_of_match[] = {
+	{ .compatible = "apple,t8152-smc" },
 	{ .compatible = "apple,t8103-smc" },
 	{ .compatible = "apple,smc" },
 	{},
