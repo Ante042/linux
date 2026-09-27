@@ -140,7 +140,22 @@ static const struct apple_soc_cpufreq_info soc_t8152_info = {
 	.ps1_shift = APPLE_DVFS_CMD_PS1_SHIFT,
 };
 
+/* T6050 bring-up candidate: commanded frequency only, pending HW validation. */
+static const struct apple_soc_cpufreq_info soc_t6050_info = {
+	.has_ps2 = false,
+	.verify_completion = true,
+	.transition_timeout = 2000,
+	.max_pstate = 31,
+	.cur_pstate_mask = 0,
+	.ps1_mask = APPLE_DVFS_CMD_PS1,
+	.ps1_shift = APPLE_DVFS_CMD_PS1_SHIFT,
+};
+
 static const struct of_device_id apple_soc_cpufreq_of_match[] __maybe_unused = {
+	{
+		.compatible = "apple,t6050-cluster-cpufreq",
+		.data = &soc_t6050_info,
+	},
 	{
 		.compatible = "apple,t8152-cluster-cpufreq",
 		.data = &soc_t8152_info,
