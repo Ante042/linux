@@ -18,12 +18,24 @@
 #include <linux/device.h>
 #include <linux/io.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
+#include <linux/slab.h>
+#include <linux/sizes.h>
 #include <linux/of.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/types.h>
 
 #define APPLE_SART_MAX_ENTRIES 16
+
+/* One-operation sptm2mmio batch, shared with x1n1 src/sptm.c. */
+struct sart_x1n1_batch {
+	u32 count, flags;
+	s32 status;
+	u32 done;
+	u32 op, op_flags;
+	u64 arg[6], ret;
+};
 
 /* SARTv0 registers */
 #define APPLE_SART0_CONFIG(idx)       (0x00 + 4 * (idx))
@@ -81,7 +93,102 @@ struct apple_sart {
 
 	unsigned long protected_entries;
 	unsigned long used_entries;
+	bool x1n1, x1n1_active;
+	struct mutex x1n1_lock;
+	struct sart_x1n1_batch *batch;
+	struct {
+		phys_addr_t paddr;
+		size_t size;
+	} regions[APPLE_SART_MAX_ENTRIES];
 };
+
+/* Caller holds x1n1_lock. SPTM re-dispatch changes SP_EL1, so retain the
+ * kernel SP in a GPR exactly as the qualified DART transport does.
+ */
+static int sart_x1n1_call(struct apple_sart *sart, u32 op,
+			 u64 a0, u64 a1, u64 a2, u64 a3)
+{
+	struct sart_x1n1_batch *b = sart->batch;
+	unsigned long flags;
+	u64 pa = virt_to_phys(b);
+	void __iomem *db = sart->regs + 0x1000;
+
+	static_assert(sizeof(*b) == 80);
+	memset(b, 0, sizeof(*b));
+	b->count = 1;
+	b->op = op;
+	b->arg[0] = a0;
+	b->arg[1] = a1;
+	b->arg[2] = a2;
+	b->arg[3] = a3;
+	wmb();
+	local_irq_save(flags);
+	asm volatile("mov x9, sp\n"
+		     "str %x[pa], [%[db]]\n"
+		     "mov sp, x9\n"
+		     : : [pa] "r" (pa), [db] "r" (db) : "x9", "memory");
+	local_irq_restore(flags);
+	rmb();
+	return b->status || b->done != 1 || b->ret ? -EIO : 0;
+}
+
+static int sart_x1n1_region(struct apple_sart *sart, phys_addr_t paddr,
+			    size_t size, bool map)
+{
+	int i, ret;
+
+	if (!size || (paddr | size) & (SZ_16K - 1))
+		return -EINVAL;
+	mutex_lock(&sart->x1n1_lock);
+	if (!sart->x1n1_active) {
+		ret = sart_x1n1_call(sart, 1, 1, 0, 0, 0);
+		if (ret)
+			goto out;
+		sart->x1n1_active = true;
+	}
+	for (i = 0; i < APPLE_SART_MAX_ENTRIES; i++) {
+		if (map ? !sart->regions[i].size :
+		    (sart->regions[i].paddr == paddr && sart->regions[i].size == size))
+			break;
+	}
+	if (i == APPLE_SART_MAX_ENTRIES) {
+		ret = map ? -EBUSY : -ENOENT;
+		goto out;
+	}
+	/* Inputs are guest CPU physical addresses. The HV validates/translates
+	 * them to host backing pages; never pass an arbitrary host PA here.
+	 * perm=1 permits device writes; guard=1 holds the firmware power canary.
+	 */
+	ret = sart_x1n1_call(sart, map ? 2 : 3, paddr, size, map, map);
+	if (!ret) {
+		sart->regions[i].paddr = map ? paddr : 0;
+		sart->regions[i].size = map ? size : 0;
+	}
+out:
+	mutex_unlock(&sart->x1n1_lock);
+	return ret;
+}
+
+static void sart_x1n1_selftest(struct apple_sart *sart)
+{
+	void *page = (void *)__get_free_page(GFP_KERNEL | __GFP_ZERO);
+	phys_addr_t pa;
+	int ret;
+
+	if (!page)
+		return;
+	pa = virt_to_phys(page);
+	ret = sart_x1n1_region(sart, pa, PAGE_SIZE, true);
+	dev_info(sart->dev, "x1n1 selftest: map %pa size %#lx status %d\n",
+		 &pa, PAGE_SIZE, ret);
+	if (!ret) {
+		ret = sart_x1n1_region(sart, pa, PAGE_SIZE, false);
+		dev_info(sart->dev, "x1n1 selftest: unmap status %d\n", ret);
+		if (ret)
+			return; /* Do not free memory while a DMA grant might remain. */
+	}
+	free_page((unsigned long)page);
+}
 
 static void sart0_get_entry(struct apple_sart *sart, int index, u8 *flags,
 	phys_addr_t *paddr, size_t *size)
@@ -193,6 +300,21 @@ static int apple_sart_probe(struct platform_device *pdev)
 	sart->regs = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(sart->regs))
 		return PTR_ERR(sart->regs);
+	if (of_device_is_compatible(dev->of_node, "apple,sart-x1n1")) {
+		if (readq(sart->regs) != 0x78316e31 || readq(sart->regs + 8) != 1 ||
+		    !(readq(sart->regs + 0x18) & BIT(1)))
+			return -ENODEV;
+		sart->batch = devm_kzalloc(dev, PAGE_SIZE, GFP_KERNEL);
+		if (!sart->batch)
+			return -ENOMEM;
+		mutex_init(&sart->x1n1_lock);
+		sart->x1n1 = true;
+		platform_set_drvdata(pdev, sart);
+		dev_info(dev, "x1n1 SART via sptm2mmio\n");
+		if (of_property_read_bool(dev->of_node, "apple,x1n1-selftest"))
+			sart_x1n1_selftest(sart);
+		return 0;
+	}
 
 	for (i = 0; i < APPLE_SART_MAX_ENTRIES; ++i) {
 		u8 flags;
@@ -268,6 +390,9 @@ int apple_sart_add_allowed_region(struct apple_sart *sart, phys_addr_t paddr,
 {
 	int i, ret;
 
+	if (sart->x1n1)
+		return sart_x1n1_region(sart, paddr, size, true);
+
 	for (i = 0; i < APPLE_SART_MAX_ENTRIES; ++i) {
 		if (test_bit(i, &sart->protected_entries))
 			continue;
@@ -301,6 +426,9 @@ int apple_sart_remove_allowed_region(struct apple_sart *sart, phys_addr_t paddr,
 				     size_t size)
 {
 	int i;
+
+	if (sart->x1n1)
+		return sart_x1n1_region(sart, paddr, size, false);
 
 	dev_dbg(sart->dev,
 		"will remove [paddr: %pa, size: 0x%zx] from allowed regions\n",
@@ -338,6 +466,14 @@ static void apple_sart_shutdown(struct platform_device *pdev)
 	struct apple_sart *sart = dev_get_drvdata(&pdev->dev);
 	int i;
 
+	if (sart->x1n1) {
+		for (i = 0; i < APPLE_SART_MAX_ENTRIES; i++)
+			if (sart->regions[i].size)
+				sart_x1n1_region(sart, sart->regions[i].paddr,
+						 sart->regions[i].size, false);
+		return;
+	}
+
 	for (i = 0; i < APPLE_SART_MAX_ENTRIES; ++i) {
 		if (test_bit(i, &sart->protected_entries))
 			continue;
@@ -347,6 +483,7 @@ static void apple_sart_shutdown(struct platform_device *pdev)
 }
 
 static const struct of_device_id apple_sart_of_match[] = {
+	{ .compatible = "apple,sart-x1n1" },
 	{
 		.compatible = "apple,t6000-sart",
 		.data = &sart_ops_v3,
