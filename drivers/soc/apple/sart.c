@@ -16,6 +16,7 @@
 #include <linux/bits.h>
 #include <linux/bitfield.h>
 #include <linux/device.h>
+#include <linux/dma-direct.h>
 #include <linux/io.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -155,11 +156,12 @@ static int sart_x1n1_region(struct apple_sart *sart, phys_addr_t paddr,
 		ret = map ? -EBUSY : -ENOENT;
 		goto out;
 	}
-	/* Inputs are guest CPU physical addresses. The HV validates/translates
-	 * them to host backing pages; never pass an arbitrary host PA here.
+	/* Consumers supply DMA bus addresses. Reverse the DT dma-ranges offset
+	 * before the HV validates/translates the guest IPA to its backing page.
 	 * perm=1 permits device writes; guard=1 holds the firmware power canary.
 	 */
-	ret = sart_x1n1_call(sart, map ? 2 : 3, paddr, size, map, map);
+	ret = sart_x1n1_call(sart, map ? 2 : 3,
+			     dma_to_phys(sart->dev, paddr), size, map, map);
 	if (!ret) {
 		sart->regions[i].paddr = map ? paddr : 0;
 		sart->regions[i].size = map ? size : 0;
@@ -178,11 +180,11 @@ static void sart_x1n1_selftest(struct apple_sart *sart)
 	if (!page)
 		return;
 	pa = virt_to_phys(page);
-	ret = sart_x1n1_region(sart, pa, PAGE_SIZE, true);
+	ret = sart_x1n1_region(sart, phys_to_dma(sart->dev, pa), PAGE_SIZE, true);
 	dev_info(sart->dev, "x1n1 selftest: map %pa size %#lx status %d\n",
 		 &pa, PAGE_SIZE, ret);
 	if (!ret) {
-		ret = sart_x1n1_region(sart, pa, PAGE_SIZE, false);
+		ret = sart_x1n1_region(sart, phys_to_dma(sart->dev, pa), PAGE_SIZE, false);
 		dev_info(sart->dev, "x1n1 selftest: unmap status %d\n", ret);
 		if (ret)
 			return; /* Do not free memory while a DMA grant might remain. */

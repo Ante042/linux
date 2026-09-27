@@ -16,6 +16,8 @@
 #include <linux/blk-mq.h>
 #include <linux/device.h>
 #include <linux/dma-mapping.h>
+#include <linux/dma-direct.h>
+#include <linux/sizes.h>
 #include <linux/dmapool.h>
 #include <linux/interrupt.h>
 #include <linux/io-64-nonatomic-lo-hi.h>
@@ -175,6 +177,7 @@ struct apple_nvme_iod {
 };
 
 struct apple_nvme_hw {
+	bool sptm_resident;
 	bool has_lsq_nvmmu;
 	bool has_linear_sq_ctrl;
 	bool has_prp_null_ctrl;
@@ -182,6 +185,18 @@ struct apple_nvme_hw {
 	bool has_separate_nvmmu;
 	bool needs_ioq_registers;
 	u32 max_queue_depth;
+};
+
+struct apple_nvme_sptm_op {
+	u32 op, flags;
+	u64 arg[6];
+	s64 ret;
+};
+struct apple_nvme_sptm_batch {
+	u32 count, flags;
+	s32 status;
+	u32 done;
+	struct apple_nvme_sptm_op ops[6];
 };
 
 struct apple_nvme {
@@ -200,6 +215,8 @@ struct apple_nvme {
 	struct apple_rtkit *rtk;
 	struct reset_control *reset;
 	bool owns_rtkit;
+	void __iomem *sptm_regs;
+	struct apple_nvme_sptm_batch *sptm_batch;
 
 	struct dma_pool *prp_page_pool;
 	struct dma_pool *prp_small_pool;
@@ -226,6 +243,69 @@ struct apple_nvme {
 	struct delayed_work flush_dwork;
 	struct blk_crypto_profile crypto_profile;
 };
+
+/* Serialized by anv->lock during I/O; reset configures queues before use.
+ * All operations in a batch share one guest exit/entry. Payloads stay in
+ * their original DMA buffers: this transport copies only small descriptors.
+ */
+static int apple_nvme_sptm_exec(struct apple_nvme *anv, unsigned int count)
+{
+	struct apple_nvme_sptm_batch *b = anv->sptm_batch;
+	unsigned long flags;
+	u64 pa = virt_to_phys(b);
+	void __iomem *db = anv->sptm_regs + 0x1010;
+
+	b->count = count;
+	b->done = 0;
+	b->status = 0;
+	wmb();
+	local_irq_save(flags);
+	asm volatile("mov x9, sp\nstr %x[pa], [%[db]]\nmov sp, x9\n"
+		     : : [pa] "r" (pa), [db] "r" (db) : "x9", "memory");
+	local_irq_restore(flags);
+	rmb();
+	return b->status || b->done != count ? -EIO : 0;
+}
+
+static int apple_nvme_sptm_admin(struct apple_nvme *anv)
+{
+	struct apple_nvme_sptm_op *op = anv->sptm_batch->ops;
+	memset(anv->sptm_batch, 0, sizeof(*anv->sptm_batch));
+	op[0].op = 3; op[0].arg[0] = 253; op[0].arg[1] = 2;
+	op[1].op = 0;
+	op[2].op = 4;
+	op[2].arg[0] = dma_to_phys(anv->dev, anv->adminq.sq_dma_addr);
+	op[2].arg[1] = APPLE_NVME_AQ_DEPTH - 1;
+	op[2].arg[2] = dma_to_phys(anv->dev, anv->adminq.cq_dma_addr);
+	op[2].arg[3] = APPLE_NVME_AQ_DEPTH - 1;
+	op[3].op = 5;
+	op[3].arg[0] = op[3].arg[1] = anv->hw->max_queue_depth - 1;
+	op[4].op = 7;
+	op[4].arg[0] = dma_to_phys(anv->dev, anv->ioq.cq_dma_addr);
+	op[5].op = 6;
+	op[5].arg[0] = dma_to_phys(anv->dev, anv->ioq.sq_dma_addr);
+	return apple_nvme_sptm_exec(anv, 6);
+}
+
+static int apple_nvme_sptm_request(struct apple_nvme_queue *q, unsigned int tag,
+				   unsigned int bytes, bool map)
+{
+	struct apple_nvme *anv = q->is_adminq ?
+		container_of(q, struct apple_nvme, adminq) :
+		container_of(q, struct apple_nvme, ioq);
+	struct apple_nvme_sptm_op *op = anv->sptm_batch->ops;
+
+	memset(anv->sptm_batch, 0, sizeof(*anv->sptm_batch));
+	op->op = map ? 1 : 2;
+	op->arg[0] = q->is_adminq ? 0 : 1;
+	op->arg[1] = tag;
+	if (map) {
+		op->arg[2] = dma_to_phys(anv->dev, q->tcb_dma_addr) +
+			     tag * sizeof(*q->tcbs);
+		op->arg[3] = bytes;
+	}
+	return apple_nvme_sptm_exec(anv, 1);
+}
 
 static inline void apple_nvme_writeq(struct apple_nvme *anv, u64 value,
 				     void __iomem *addr)
@@ -372,7 +452,8 @@ static int apple_nvme_sart_dma_setup(void *cookie,
 	if (!bfr->buffer)
 		return -ENOMEM;
 
-	ret = apple_sart_add_allowed_region(anv->sart, bfr->iova, bfr->size);
+	ret = apple_sart_add_allowed_region(anv->sart, bfr->iova,
+		anv->hw->sptm_resident ? ALIGN(bfr->size, SZ_16K) : bfr->size);
 	if (ret) {
 		dma_free_coherent(anv->dev, bfr->size, bfr->buffer, bfr->iova);
 		bfr->buffer = NULL;
@@ -392,7 +473,12 @@ static void apple_nvme_sart_dma_destroy(void *cookie,
 		return;
 	}
 
-	apple_sart_remove_allowed_region(anv->sart, bfr->iova, bfr->size);
+	if (apple_sart_remove_allowed_region(anv->sart, bfr->iova,
+		anv->hw->sptm_resident ? ALIGN(bfr->size, SZ_16K) : bfr->size) &&
+	    anv->hw->sptm_resident) {
+		dev_err(anv->dev, "retaining RTKit buffer after failed SART unmap\n");
+		return;
+	}
 	dma_free_coherent(anv->dev, bfr->size, bfr->buffer, bfr->iova);
 }
 
@@ -406,6 +492,11 @@ static void apple_nvmmu_inval(struct apple_nvme_queue *q, unsigned int tag)
 {
 	struct apple_nvme *anv = queue_to_apple_nvme(q);
 
+	if (anv->hw->sptm_resident) {
+		if (apple_nvme_sptm_request(q, tag, 0, false))
+			panic("ANS SPTM failed to release DMA references for tag %u", tag);
+		return;
+	}
 	writel(tag, anv->mmio_nvmmu + APPLE_NVMMU_TCB_INVAL);
 	if (readl(anv->mmio_nvmmu + APPLE_NVMMU_TCB_STAT))
 		dev_warn_ratelimited(anv->dev,
@@ -474,6 +565,12 @@ static void apple_nvme_submit_cmd_t8103(struct apple_nvme_queue *q,
 		memcpy(tcb->_aes_unk + 16, key + 16, 48);
 	}
 	memcpy(&q->sqes[tag], cmd, sizeof(*cmd));
+	if (anv->hw->sptm_resident && q->is_adminq)
+		dev_dbg(anv->dev, "SPTM admin submit op=%#x tag=%u prp=%#llx/%#llx cdw10=%#x cdw11=%#x bytes=%u\n",
+			 cmd->common.opcode, tag, le64_to_cpu(cmd->common.dptr.prp1),
+			 le64_to_cpu(cmd->common.dptr.prp2), le32_to_cpu(cmd->common.cdw10),
+			 le32_to_cpu(cmd->common.cdw11), blk_rq_payload_bytes(req));
+
 
 	if (!q->is_adminq) {
 		dma_addr_t sqe_dma = q->sq_dma_addr + tag * sizeof(*cmd);
@@ -501,6 +598,13 @@ static void apple_nvme_submit_cmd_t8103(struct apple_nvme_queue *q,
 	 * and the final CQ update.
 	 */
 	spin_lock_irq(&anv->lock);
+	if (anv->hw->sptm_resident &&
+	    apple_nvme_sptm_request(q, tag, blk_rq_payload_bytes(req), true)) {
+		spin_unlock_irq(&anv->lock);
+		nvme_req(req)->status = NVME_SC_INTERNAL;
+		blk_mq_complete_request(req);
+		return;
+	}
 	writel(tag, q->sq_db);
 	spin_unlock_irq(&anv->lock);
 }
@@ -792,6 +896,9 @@ static inline void apple_nvme_handle_cqe(struct apple_nvme_queue *q,
 	if (anv->hw->has_lsq_nvmmu)
 		apple_nvmmu_inval(q, command_id);
 
+	if (anv->hw->sptm_resident && q->is_adminq)
+		dev_dbg(anv->dev, "SPTM admin completion cid=%u status=%#x result=%#x\n",
+			 command_id, le16_to_cpu(cqe->status), le32_to_cpu(cqe->result.u32));
 	req = nvme_find_rq(apple_nvme_queue_tagset(anv, q), command_id);
 	if (unlikely(!req)) {
 		dev_warn(anv->dev, "invalid id %d completed", command_id);
@@ -1333,6 +1440,11 @@ static void apple_nvme_reset_work(struct work_struct *work)
 	 */
 	if (!(readl(anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL) &
 		APPLE_ANS_COPROC_CPU_CONTROL_RUN)) {
+		if (anv->hw->sptm_resident) {
+			dev_err(anv->dev, "resident ANS firmware is not running\n");
+			ret = -EIO;
+			goto out;
+		}
 
 		ret = reset_control_assert(anv->reset);
 		if (ret)
@@ -1384,6 +1496,15 @@ rtkit_ready:
 	anv->ctrl.max_segments = NVME_MAX_SEGS;
 
 	dma_set_max_seg_size(anv->dev, 0xffffffff);
+	if (anv->hw->sptm_resident) {
+		anv->ctrl.max_hw_sectors = min_t(u32, anv->ctrl.max_hw_sectors, 2048);
+		ret = apple_nvme_sptm_admin(anv);
+		if (ret)
+			goto out;
+		dev_info(anv->dev, "SPTM admin queue configured through one batch\n");
+		goto queues_configured;
+	}
+
 
 	if (anv->hw->has_lsq_nvmmu) {
 		/*
@@ -1455,6 +1576,7 @@ rtkit_ready:
 				  anv->mmio_nvmmu + APPLE_NVMMU_IOSQ_TCB_BASE);
 	}
 
+queues_configured:
 	anv->ctrl.sqsize =
 		anv->hw->max_queue_depth - 1; /* 0's based queue depth */
 	anv->ctrl.cap = readq(anv->mmio_nvme + NVME_REG_CAP);
@@ -1493,7 +1615,7 @@ rtkit_ready:
 	dev_dbg(anv->dev, "I/O SQ created\n");
 
 	apple_nvme_init_queue(&anv->ioq);
-	if (anv->hw->needs_ioq_registers) {
+	if (anv->hw->needs_ioq_registers && !anv->hw->sptm_resident) {
 		apple_nvme_writeq(anv, anv->ioq.cq_dma_addr,
 				  anv->mmio_nvme + APPLE_ANS_IOCQ_REGISTER);
 		apple_nvme_writeq(anv, anv->ioq.sq_dma_addr,
@@ -1657,15 +1779,60 @@ static int apple_nvme_alloc_tagsets(struct apple_nvme *anv)
 	return 0;
 }
 
+struct apple_nvme_sart_buffer {
+	struct device *dev;
+	struct apple_sart *sart;
+	void *buffer;
+	dma_addr_t dma;
+	size_t size;
+};
+
+static void apple_nvme_sart_buffer_release(void *data)
+{
+	struct apple_nvme_sart_buffer *b = data;
+
+	if (apple_sart_remove_allowed_region(b->sart, b->dma, b->size)) {
+		dev_err(b->dev, "retaining queue buffer after failed SART unmap\n");
+		return;
+	}
+	dma_free_coherent(b->dev, b->size, b->buffer, b->dma);
+}
+
+static void *apple_nvme_queue_buffer_alloc(struct apple_nvme *anv,
+					  size_t size, dma_addr_t *dma)
+{
+	struct apple_nvme_sart_buffer *b;
+
+	if (!anv->hw->sptm_resident)
+		return dmam_alloc_coherent(anv->dev, size, dma, GFP_KERNEL);
+	b = devm_kzalloc(anv->dev, sizeof(*b), GFP_KERNEL);
+	if (!b)
+		return NULL;
+	b->dev = anv->dev;
+	b->sart = anv->sart;
+	b->size = ALIGN(size, SZ_16K);
+	b->buffer = dma_alloc_coherent(b->dev, b->size, &b->dma, GFP_KERNEL);
+	if (!b->buffer)
+		return NULL;
+	if (apple_sart_add_allowed_region(b->sart, b->dma, b->size)) {
+		dma_free_coherent(b->dev, b->size, b->buffer, b->dma);
+		return NULL;
+	}
+	if (devm_add_action_or_reset(b->dev, apple_nvme_sart_buffer_release, b))
+		return NULL;
+	*dma = b->dma;
+	return b->buffer;
+}
+
 static int apple_nvme_queue_alloc(struct apple_nvme *anv,
 				  struct apple_nvme_queue *q)
 {
 	unsigned int depth = apple_nvme_queue_depth(q);
 	size_t iosq_size;
 
-	q->cqes = dmam_alloc_coherent(anv->dev,
+	q->cqes = apple_nvme_queue_buffer_alloc(anv,
 				      depth * sizeof(struct nvme_completion),
-				      &q->cq_dma_addr, GFP_KERNEL);
+				      &q->cq_dma_addr);
 	if (!q->cqes)
 		return -ENOMEM;
 
@@ -1674,8 +1841,7 @@ static int apple_nvme_queue_alloc(struct apple_nvme *anv,
 	else
 		iosq_size = depth << APPLE_NVME_IOSQES;
 
-	q->sqes = dmam_alloc_coherent(anv->dev, iosq_size,
-				      &q->sq_dma_addr, GFP_KERNEL);
+	q->sqes = apple_nvme_queue_buffer_alloc(anv, iosq_size, &q->sq_dma_addr);
 	if (!q->sqes)
 		return -ENOMEM;
 
@@ -1684,10 +1850,10 @@ static int apple_nvme_queue_alloc(struct apple_nvme *anv,
 		 * We need the maximum queue depth here because the NVMMU only
 		 * has a single depth configuration shared between both queues.
 		 */
-		q->tcbs = dmam_alloc_coherent(anv->dev,
+		q->tcbs = apple_nvme_queue_buffer_alloc(anv,
 			anv->hw->max_queue_depth *
 				sizeof(struct apple_nvmmu_tcb),
-			&q->tcb_dma_addr, GFP_KERNEL);
+			&q->tcb_dma_addr);
 		if (!q->tcbs)
 			return -ENOMEM;
 	}
@@ -1823,6 +1989,24 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 		goto put_dev;
 	}
 
+	if (anv->hw->sptm_resident) {
+		anv->sptm_regs = devm_platform_ioremap_resource_byname(pdev, "sptm");
+		if (IS_ERR(anv->sptm_regs)) {
+			ret = PTR_ERR(anv->sptm_regs);
+			goto put_dev;
+		}
+		if (readq(anv->sptm_regs) != 0x78316e31 ||
+		    !(readq(anv->sptm_regs + 0x18) & BIT(3))) {
+			ret = -ENODEV;
+			goto put_dev;
+		}
+		anv->sptm_batch = devm_kzalloc(dev, sizeof(*anv->sptm_batch), GFP_KERNEL);
+		if (!anv->sptm_batch) {
+			ret = -ENOMEM;
+			goto put_dev;
+		}
+	}
+
 	anv->mmio_coproc = devm_platform_ioremap_resource_byname(pdev, "ans");
 	if (IS_ERR(anv->mmio_coproc)) {
 		ret = PTR_ERR(anv->mmio_coproc);
@@ -1863,7 +2047,9 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 		goto put_dev;
 	}
 
-	anv->reset = devm_reset_control_array_get_exclusive(anv->dev);
+	anv->reset = anv->hw->sptm_resident ?
+		devm_reset_control_array_get_optional_exclusive(anv->dev) :
+		devm_reset_control_array_get_exclusive(anv->dev);
 	if (IS_ERR(anv->reset)) {
 		ret = dev_err_probe(dev, PTR_ERR(anv->reset),
 				    "Failed to get reset control");
@@ -2115,7 +2301,17 @@ static const struct apple_nvme_hw apple_nvme_t8132_hw = {
 	.max_queue_depth = 64,
 };
 
+static const struct apple_nvme_hw apple_nvme_t6050_sptm_hw = {
+	.sptm_resident = true,
+	.has_lsq_nvmmu = true,
+	.has_linear_sq_ctrl = false,
+	.has_separate_nvmmu = true,
+	.needs_ioq_registers = true,
+	.max_queue_depth = 64,
+};
+
 static const struct of_device_id apple_nvme_of_match[] = {
+	{ .compatible = "apple,t6050-nvme-sptm", .data = &apple_nvme_t6050_sptm_hw },
 	{ .compatible = "apple,t8015-nvme-ans2", .data = &apple_nvme_t8015_hw },
 	{ .compatible = "apple,t8103-nvme-ans2", .data = &apple_nvme_t8103_hw },
 	{ .compatible = "apple,t8132-nvme-ans2", .data = &apple_nvme_t8132_hw },
