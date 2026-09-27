@@ -14,6 +14,7 @@
 #include <linux/timex.h>
 
 #include <clocksource/arm_arch_timer.h>
+#include <asm/apple-idle.h>
 
 #define USECS_TO_CYCLES(time_usecs)			\
 	xloops_to_cycles((time_usecs) * 0x10C7UL)
@@ -42,6 +43,14 @@ void __delay(unsigned long cycles)
 {
 	cycles_t start = __delay_cycles();
 
+	/*
+	 * T6050 secondaries also lose registers across WFIT. Delays can run
+	 * with live kernel SIMD state, so idle's FPSIMD ownership flush is
+	 * not sufficient here. Use the counter loop on affected machines.
+	 */
+	if (apple_wfi_needs_save())
+		goto spin;
+
 	if (alternative_has_cap_unlikely(ARM64_HAS_WFXT)) {
 		u64 end = start + cycles;
 
@@ -60,6 +69,7 @@ void __delay(unsigned long cycles)
 			wfe();
 	}
 
+spin:
 	while ((__delay_cycles() - start) < cycles)
 		cpu_relax();
 }

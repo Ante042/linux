@@ -88,3 +88,5 @@ endif
 
 # for cleaning
 subdir- += vdso vdso32
+
+obj-$(CONFIG_ARCH_APPLE)	+= idle-apple.o
