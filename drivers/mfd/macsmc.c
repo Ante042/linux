@@ -412,6 +412,48 @@ static void apple_smc_disable_notifications(void *data)
 	apple_smc_write_flag(smc, SMC_KEY(NTAP), false);
 }
 
+/* One-shot, DT-opt-in inventory; never writes a key or calls a function key. */
+static int apple_smc_t6050_discover_temperatures(struct apple_smc *smc)
+{
+	unsigned int i, found = 0;
+
+	/* A corrupt count must not turn bring-up into an unbounded firmware walk. */
+	if (smc->key_count > 8192)
+		return -E2BIG;
+
+	for (i = 0; i < smc->key_count; i++) {
+		struct apple_smc_key_info info;
+		smc_key key;
+		u8 value[8] = {};
+		int ret;
+
+		ret = apple_smc_get_key_by_index(smc, i, &key);
+		if (ret < 0)
+			return ret;
+		if ((key >> 24) != 'T')
+			continue;
+		ret = apple_smc_get_key_info(smc, key, &info);
+		if (ret < 0)
+			return ret;
+		if (!(info.flags & APPLE_SMC_READABLE) ||
+		    (info.flags & APPLE_SMC_FUNCTION) ||
+		    !info.size || info.size > sizeof(value))
+			continue;
+		ret = apple_smc_read(smc, key, value, info.size);
+		if (ret < 0)
+			return ret;
+		if (ret != info.size)
+			return -EIO;
+		dev_info(smc->dev,
+			 "T6050_SMC_TEMP: key=%08x type=%08x flags=%02x size=%u raw=%*phN\n",
+			 key, info.type_code, info.flags, info.size, info.size, value);
+		found++;
+	}
+	dev_info(smc->dev, "T6050_SMC_DISCOVERY: keys=%u temperatures=%u key_writes=0\n",
+		 smc->key_count, found);
+	return 0;
+}
+
 static int apple_smc_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -473,6 +515,14 @@ static int apple_smc_probe(struct platform_device *pdev)
 	if (ret < 0)
 		return dev_err_probe(smc->dev, ret, "Failed to get key count");
 	smc->key_count = be32_to_cpu(count);
+
+	if (of_device_is_compatible(dev->of_node, "apple,t6050-smc") &&
+	    of_property_read_bool(dev->of_node, "apple,t6050-temperature-discovery")) {
+		ret = apple_smc_t6050_discover_temperatures(smc);
+		if (ret)
+			return dev_err_probe(dev, ret, "SMC temperature discovery failed");
+	}
+
 
 	/* T8152's key-read interface is qualified; notifications, GPIO and power
 	 * functions are not. The board DT exposes temperature and fan inputs only.
