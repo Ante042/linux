@@ -21,3 +21,14 @@ config ARM64_RELOC_TEST
 	tristate "Relocation testing module"
 
 source "drivers/hwtracing/coresight/Kconfig"
+
+config AURORA_EL1_SYSREG_PROBE
+	bool "Aurora bounded EL1 sysreg read diagnostic"
+	depends on ARCH_APPLE && DEBUG_KERNEL
+	default n
+	help
+	  Build a read-only, fixed-register diagnostic for the experimental
+	  x1n1 SPTM hypervisor. The aurora_el1_sysregs=1 boot parameter is
+	  also required. Only use with the matching opt-in HV probe handler.
+	  Undefined reads recover only at explicitly generated probe PCs.
+	  No candidate system register is written. Say N for normal kernels.

@@ -43,6 +43,7 @@
 #include <asm/kprobes.h>
 #include <asm/text-patching.h>
 #include <asm/traps.h>
+#include <asm/aurora-el1-sysregs.h>
 #include <asm/smp.h>
 #include <asm/stack_pointer.h>
 #include <asm/stacktrace.h>
@@ -479,6 +480,9 @@ void do_el1_undef(struct pt_regs *regs, unsigned long esr)
 
 	if (aarch64_insn_read((void *)regs->pc, &insn))
 		goto out_err;
+
+	if (aurora_el1_sysreg_undef(regs, esr, insn))
+		return;
 
 	if (try_emulate_el1_ssbs(regs, insn))
 		return;

@@ -90,3 +90,5 @@ endif
 subdir- += vdso vdso32
 
 obj-$(CONFIG_ARCH_APPLE)	+= idle-apple.o
+
+obj-$(CONFIG_AURORA_EL1_SYSREG_PROBE) += aurora-el1-sysregs.o aurora-el1-sysregs-asm.o
