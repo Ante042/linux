@@ -477,7 +477,8 @@ static int apple_smc_probe(struct platform_device *pdev)
 	/* T8152's key-read interface is qualified; notifications, GPIO and power
 	 * functions are not. The board DT exposes temperature and fan inputs only.
 	 */
-	if (of_device_is_compatible(dev->of_node, "apple,t8152-smc"))
+	if (of_device_is_compatible(dev->of_node, "apple,t8152-smc") ||
+	    of_device_is_compatible(dev->of_node, "apple,t6050-smc"))
 		return devm_mfd_add_devices(smc->dev, PLATFORM_DEVID_NONE,
 					    apple_smc_telemetry_devs,
 					    ARRAY_SIZE(apple_smc_telemetry_devs),
@@ -501,6 +502,7 @@ static int apple_smc_probe(struct platform_device *pdev)
 
 static const struct of_device_id apple_smc_of_match[] = {
 	{ .compatible = "apple,t8152-smc" },
+	{ .compatible = "apple,t6050-smc" },
 	{ .compatible = "apple,t8103-smc" },
 	{ .compatible = "apple,smc" },
 	{},
