@@ -68,6 +68,7 @@ struct tb_cm {
 	struct list_head tunnel_list;
 	struct list_head dp_resources;
 	bool hotplug_active;
+	bool stopping;
 	struct delayed_work remove_work;
 	struct tb_bandwidth_group groups[MAX_GROUPS];
 };
@@ -3016,7 +3017,19 @@ static void tb_stop(struct tb *tb)
 	struct tb_tunnel *tunnel;
 	struct tb_tunnel *n;
 
+	/* Exclude hotplug, runtime PM and removal while the lock is dropped. */
+	tcm->stopping = true;
+	tcm->hotplug_active = false;
 	cancel_delayed_work(&tcm->remove_work);
+	list_for_each_entry(tunnel, &tcm->tunnel_list, list) {
+		if (tb_tunnel_is_dp(tunnel))
+			tb_dp_tunnel_cancel_dprx(tunnel);
+	}
+	/* 7.2 callbacks take tb->lock; drain before releasing any router ports. */
+	mutex_unlock(&tb->lock);
+	flush_workqueue(tb->wq);
+	mutex_lock(&tb->lock);
+
 	/* tunnels are only present after everything has been initialized */
 	list_for_each_entry_safe(tunnel, n, &tcm->tunnel_list, list) {
 		/*
@@ -3026,8 +3039,6 @@ static void tb_stop(struct tb *tb)
 		 */
 		if (tb_tunnel_is_dma(tunnel) ||
 		    (tb_tunnel_is_dp(tunnel) && !tb_tunnel_is_active(tunnel)))
-			tb_tunnel_deactivate(tunnel);
-		else if (tb_tunnel_is_dp(tunnel) && !tb_tunnel_is_active(tunnel))
 			tb_tunnel_deactivate(tunnel);
 		/* the host side of a DP tunnel goes away with us */
 		else if (tb_tunnel_is_dp(tunnel)) {
@@ -3391,6 +3402,10 @@ static int tb_runtime_suspend(struct tb *tb)
 	struct tb_cm *tcm = tb_priv(tb);
 
 	mutex_lock(&tb->lock);
+	if (tcm->stopping) {
+		mutex_unlock(&tb->lock);
+		return -ESHUTDOWN;
+	}
 	/*
 	 * The below call only releases DP resources to allow exiting and
 	 * re-entering redrive mode.
@@ -3410,7 +3425,7 @@ static void tb_remove_work(struct work_struct *work)
 	struct tb *tb = tcm_to_tb(tcm);
 
 	mutex_lock(&tb->lock);
-	if (tb->root_switch) {
+	if (tb->root_switch && !tcm->stopping) {
 		tb_free_unplugged_children(tb->root_switch);
 		tb_free_unplugged_xdomains(tb->root_switch);
 	}
@@ -3423,6 +3438,10 @@ static int tb_runtime_resume(struct tb *tb)
 	struct tb_tunnel *tunnel, *n;
 
 	mutex_lock(&tb->lock);
+	if (tcm->stopping) {
+		mutex_unlock(&tb->lock);
+		return -ESHUTDOWN;
+	}
 	tb_switch_resume(tb->root_switch, true);
 	tb_free_invalid_tunnels(tb);
 	tb_restore_children(tb->root_switch);
