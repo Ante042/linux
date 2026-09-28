@@ -271,12 +271,14 @@ dchid_get_interface(struct dockchannel_hid *dchid, int index, const char *name)
 			iface->power_method == DCHID_POWER_METHOD_2;
 	}
 	/*
-	 * J813's MTP firmware owns the touch reset line. Its Windows bring-up
+	 * M5 MTP uses the v2 touch power transaction. J813 bring-up
 	 * uses the v2 Will/Has power messages, including the 50 ms ON delay,
 	 * without a GPIO_REQUEST or an external AFE GPIO operation.
 	 */
 	if (iface->power_method == DCHID_POWER_METHOD_2 &&
-	    !strcmp(name, "multi-touch") && of_machine_is_compatible("apple,j813"))
+	    !strcmp(name, "multi-touch") &&
+	    (of_machine_is_compatible("apple,j813") ||
+	     of_machine_is_compatible("apple,j714s")))
 		iface->inherited_power_method_2 = true;
 
 	if (iface->power_method == DCHID_POWER_METHOD_2 &&

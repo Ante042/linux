@@ -89,6 +89,7 @@ struct x1n1_batch {
 
 #define DART_X1N1_MAX_STREAMS	256
 #define DART_X1N1_APERTURE_END	(SZ_4G - 1)
+#define DART_X1N1_NATIVE_APERTURE_END GENMASK_ULL(41, 0)
 
 /* One batch buffer per DART, sized to hold a full unmap/map of the aperture in
  * per-block chunks; kept in the linear map so its guest PA is stable. A page
@@ -1089,7 +1090,7 @@ static int apple_dart_x1n1_probe(struct platform_device *pdev)
 		if (of_property_read_u64_array(dev->of_node, "apple,dma-range", range, 2) ||
 		    !range[1] || (range[0] | range[1]) & (DART_X1N1_PAGE_SIZE - 1) ||
 		    check_add_overflow(range[0], range[1] - 1, &end) ||
-		    end > DART_X1N1_APERTURE_END)
+		    end > DART_X1N1_NATIVE_APERTURE_END)
 			return dev_err_probe(dev, -EINVAL, "bad DMA range\n");
 		dart->dma_min = range[0];
 		dart->dma_max = end;
@@ -1099,6 +1100,11 @@ static int apple_dart_x1n1_probe(struct platform_device *pdev)
 					 &dart->iova_force) ||
 		    (dart->iova_force && dart->iova_force != BIT_ULL(40)))
 			return dev_err_probe(dev, -EINVAL, "unsupported IOVA force mask\n");
+		/* A native DVA aperture already contains its high address bits.
+		 * Hidden force bits are only valid for the low-address device view.
+		 */
+		if (dart->iova_force && dart->dma_max >= dart->iova_force)
+			return dev_err_probe(dev, -EINVAL, "IOVA force overlaps DMA aperture\n");
 	}
 
 	dart->num_streams = DART_X1N1_MAX_STREAMS;
