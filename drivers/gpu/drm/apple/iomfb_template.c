@@ -67,6 +67,7 @@ static_assert(offsetof(struct dcp_surface, has_compr_info) == 0x1ed);
 struct dcp_wait_cookie {
 	struct kref refcount;
 	struct completion done;
+	int status;
 };
 
 static void release_wait_cookie(struct kref *ref)
@@ -1385,6 +1386,18 @@ dcpep_cb_set_frame_sync_props_h17p(struct apple_dcp *dcp,
 				   struct dcp_set_frame_sync_props_req_h17p *req)
 {
 	struct dcp_set_frame_sync_props_resp_h17p resp = {};
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0)
+	unsigned int i;
+
+	/* 26A428 UPPipeAP_H17GSCD::set_frame_sync_props publishes the sixteen
+	 * supplied property words, then clears each consumed change flag.
+	 * Preserve their values, including brightness caps and scale factors.
+	 */
+	memcpy(&resp, req, sizeof(resp));
+	for (i = 0x40; i < sizeof(resp); i++)
+		if (resp.unk[i] & 1)
+			resp.unk[i] = 0;
+#else
 	static const u16 identity_at[] = { 0x24, 0x28, 0x2c };
 	unsigned int i;
 
@@ -1393,6 +1406,7 @@ dcpep_cb_set_frame_sync_props_h17p(struct apple_dcp *dcp,
 
 		memcpy(&resp.unk[identity_at[i]], &v, sizeof(v));
 	}
+#endif
 
 	return resp;
 }
@@ -1573,7 +1587,12 @@ static void dcp_on_set_power_state(struct apple_dcp *dcp, void *out, void *cooki
 static void dcp_on_set_parameter(struct apple_dcp *dcp, void *out, void *cookie)
 {
 	struct dcp_set_parameter_dcp param = {
+		/* 26A428 moved adaptive sync from parameter 14 to 15. */
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0)
+		.param = 15,
+#else
 		.param = IOMFBPARAM_ADAPTIVE_SYNC,
+#endif
 		.value = { 0 },
 #if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
 		.count = 3,
@@ -2056,6 +2075,12 @@ static void complete_set_digital_out_mode(struct apple_dcp *dcp, void *data,
 	struct dcp_wait_cookie *wait = cookie;
 
 	if (wait) {
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0)
+		if (data && *(u32 *)data) {
+			dev_err(dcp->dev, "timing mode rejected: %#x\n", *(u32 *)data);
+			wait->status = -EIO;
+		}
+#endif
 		complete(&wait->done);
 		kref_put(&wait->refcount, release_wait_cookie);
 	}
@@ -2065,6 +2090,17 @@ static void complete_set_digital_out_mode(struct apple_dcp *dcp, void *data,
 static void dcp_on_set_adaptive_sync(struct apple_dcp *dcp, void *out,
 				     void *cookie)
 {
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0)
+	if (*(u32 *)out) {
+		struct dcp_wait_cookie *wait = cookie;
+
+		dev_err(dcp->dev, "adaptive-sync parameters rejected: %#x\n", *(u32 *)out);
+		wait->status = -EOPNOTSUPP;
+		complete(&wait->done);
+		kref_put(&wait->refcount, release_wait_cookie);
+		return;
+	}
+#endif
 	dcp_set_digital_out_mode(dcp, false, &dcp->mode,
 				 complete_set_digital_out_mode, cookie);
 }
@@ -2073,7 +2109,12 @@ static void dcp_set_adaptive_sync(struct apple_dcp *dcp, u32 min_vrr,
 				  void *cookie)
 {
 	struct dcp_set_parameter_dcp param = {
+		/* 26A428 moved adaptive sync from parameter 14 to 15. */
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0)
+		.param = 15,
+#else
 		.param = IOMFBPARAM_ADAPTIVE_SYNC,
+#endif
 		.value = {
 			min_vrr, /* minRR, 16.16 fixed-point Hz */
 			0,       /* mediaTargetRate */
@@ -2212,7 +2253,12 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 			"set_digital_out_mode finished with %d to spare\n",
 			jiffies_to_msecs(ret));
 	}
+	ret = cookie->status;
 	kref_put(&cookie->refcount, release_wait_cookie);
+	if (ret) {
+		dcp->valid_mode = false;
+		return ret;
+	}
 	dcp->valid_mode = true;
 	dcp->vrr_enabled = mode->vrr && crtc_state->vrr_enabled;
 
