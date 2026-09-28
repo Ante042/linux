@@ -413,3 +413,115 @@ complete ATC power gating. External sink training remains unverified.
 
 The source-including model test lives at
 ``tools/testing/selftests/drivers/phy/apple-t6050/``.
+
+Firmware27 HDMI control signals
+------------------------------
+
+J714s describes the HDMI bridge and connector supply using ``pcIO`` SMC
+commands. The ``apple,smc-pcio-gpio`` child of the SMC exposes explicit
+board output templates, rather than assuming the legacy ``gPxx`` keys.
+Its GPIO index is the template's position in ``apple,output-commands``;
+it is not a decoded PMU pad number. Native pKW8 copies the eight-byte
+template and replaces its low16 bits with the requested value. The driver
+uses that byte order and preserves all remaining template fields. It
+propagates SMC failures and does not claim electrical readback support.
+
+The HDMI HPD signal is AOP GPIO14. Its native interrupt descriptor selects
+group5, distinct from wake-only group4. The pinctrl driver's optional
+``apple,irq-group-base`` permits listing only host-owned parent interrupts;
+startup, acknowledgement and chained dispatch use their hardware indices.
+The J714s candidate lists group5/AIC573, without registering firmware-owned
+interrupt groups. The older group0-based description remains the default.
+
+The actual serializer and GPIO IRQ callbacks have sanitizer and ARM64 tests
+in ``tools/testing/selftests/drivers/gpio/apple-hdmi-controls.py``. On J714s,
+both native power commands were acknowledged and GPIO14 delivered an HPD
+rising edge through group5. DCP then selected HBR3 and four lanes and
+published its IOAVVideoInterface. These results qualify the control path;
+they do not establish external scanout or an optical display result.
+
+Firmware27 display identity callback
+-----------------------------------
+
+D133 is ``vi_is_displayX1`` (no input, four-byte output), not a generic
+success acknowledgement. Native macOS asks firmware A375 for a display's
+product identity, then recognizes vendor ``APP`` (or an empty vendor) and
+product0xae42/0xae43 only when the query succeeds. The driver performs that
+nested RPC, checks the native predicate, and acknowledges the original
+callback channel after its reply. It does not substitute a constant answer
+or depend on EDID having already reached DRM's later mode enumeration.
+
+The native A375 request is24 bytes: vendor[10], vendor-ID32, buffer length32,
+product-ID32, and two null flags. The reply is20 bytes: vendor[10], vendor-ID32,
+product-ID32, one success byte and padding. Unaligned fields use the packed
+wire layout. The test ``apple-dcp-display-identity-v27.py`` covers these
+layouts, identity matching, and deferred acknowledgement on normal and
+out-of-band callback/async channels.
+
+Firmware-owned nested RPC streams
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+An AP query made while servicing a firmware-originated asynchronous request
+must reuse that stream. Native ``link_get_stream_by_thread_id_gated`` finds
+the callback thread's existing stream; ``rpc_caller_gated`` then sends a
+nested request without the new-call bit. This produces context1 for normal
+firmware-owned traffic and context5 for its out-of-band counterpart.
+The previous AP-only context chooser sent D133's A375 query as context2;
+the firmware waited for the nested exchange and the new command stalled.
+
+Executing the captured native stream initializer confirms TX offsets
+0x20000/0x28000 and RX offsets0x40000/0x48000 for these streams. Context1
+shares the context3 stack, and context5 shares the context7 stack. A375's
+reply unwinds its nested frame before the original D133 acknowledgement.
+``dcp_push_nested`` takes the original callback context explicitly; unrelated
+AP commands do not select its stream. Existing ``dcp_push`` callers keep
+their previous AP-stream selection. ``apple-dcp-nested-stream.py`` tests
+actual push/ACK implementation, native offsets, deferred identity replies,
+and unchanged ordinary/out-of-band AP behavior.
+
+The nested exchange is hardware-qualified on J714s: A375 returned Samsung
+vendor ``SAM`` and product0x774c while handling a context3 D133 request.
+Firmware then advanced to its external-pipeline accounting callbacks.
+
+External pipeline accounting
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Firmware27 D130 adds/removes external pipeline and Apple-display counts.
+Its eight-byte request packs the plug bit at byte0, the Apple-display bit
+at byte1, and the unaligned 32-bit pipe count at byte2. D131 returns the
+three shared counters (pipes, Apple displays, suppression references); its
+16-byte input includes three pointer-null flags after the initial values.
+D132 increments or decrements suppression references using bit0 of its
+four-byte request. These counters are shared across DCPs, as in native
+UnifiedPipeline2, and updates/snapshots are protected against concurrent
+RTKit workers. Internal panels do not contribute to the external pipe
+count. The source test covers the captured Samsung request, multiple
+controllers, balanced plug/suppression events and concurrent updates.
+
+On J714s these callbacks allowed firmware to export32 HDMI modes, including
+3840x2160 at120 Hz. GNOME selected4K60 alongside the internal120 Hz panel;
+the user saw the login background briefly. A later HPD drop exposed a
+missing D569 metadata callback and prevented recovery, so this observation
+does not establish sustained HDMI operation.
+
+D569 is the native IORegistry boolean-property setter (64-byte name,
+one-byte boolean and padding; four-byte reply). It updates per-DCP host
+metadata such as ``IOMFBHotplugKeysChangedKey`` during unplug. Names are
+terminated at byte63 and values use bit0, matching native marshalling.
+The driver stores/replaces these properties and reports allocation failure
+rather than leaving the firmware waiting. No power or modeset operation is
+implied by this metadata update. Its test covers replacement, controller
+isolation, name truncation and failure replies.
+
+With D569 implemented, repeated hardware HPD drops/reconnects completed
+unplug/plug and mode export without the earlier stalled command. HDMI
+3840x2160@120 (DSC enabled) and internal3024x1964@120 ran together at2x
+scaling; the user confirmed clean sustained external output. A five-second
+DPMS cycle restored both120Hz modes and internal brightness. This does not
+establish full system sleep or4K240: firmware currently filters the latter
+against an820MHz video-clock limit.
+
+Boolean metadata has a bind-managed cleanup action registered before the
+RTKit resources, so its entries are freed after the RTKit worker stops.
+The cleanup path passed sanitizer and ARM64 QEMU tests; the optical/DPMS
+hardware run used the preceding build with identical callback behavior.

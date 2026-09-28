@@ -17,6 +17,19 @@ properties:
     enum:
       - apple,smc-gpio
       - apple,smc-low-gpio
+      - apple,smc-pcio-gpio
+
+  apple,output-commands:
+    $ref: /schemas/types.yaml#/definitions/uint64-array
+    minItems: 1
+    maxItems: 64
+    description: |
+      Board-specific pcIO output command templates in GPIO index order.
+      Each template is the eight-byte argument from the native pKW8
+      platform function. Its low 16 bits must be zero and are replaced
+      with the requested logical output value. Remaining fields are
+      opaque PMU command data. This interface supports outputs only;
+      electrical state readback is not available.
 
   gpio-controller: true
 
@@ -27,5 +40,17 @@ required:
   - compatible
   - gpio-controller
   - '#gpio-cells'
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          const: apple,smc-pcio-gpio
+    then:
+      required:
+        - apple,output-commands
+    else:
+      properties:
+        apple,output-commands: false
 
 additionalProperties: false

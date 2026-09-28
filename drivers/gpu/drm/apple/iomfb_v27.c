@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /* Copyright The Asahi Linux Contributors */
 
+#include <linux/unaligned.h>
+#include <linux/spinlock.h>
+
 #include "dcp-link.h"
 #include "iomfb_v27.h"
 #include "iomfb_v12_3.h"
@@ -345,6 +348,10 @@ static bool trampoline_tiling_state_v27(struct apple_dcp *dcp, int tag,
 	return true;
 }
 
+#include "iomfb-display-identity-v27.inc"
+#include "iomfb-external-counts-v27.inc"
+#include "iomfb-boolean-properties-v27.inc"
+
 static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[0] = dcpep_cb_d000_h17p, /* native did_boot callback */
 	[1] = trampoline_true,
@@ -377,6 +384,10 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[127] = trampoline_prop_chunk, /* setDCPAVPropChunk */
 	[128] = trampoline_prop_end, /* setDCPAVPropEnd */
 	[129] = trampoline_allocate_bandwidth, /* allocate_bandwidth */
+	[130] = trampoline_update_external_counts_v27,
+	[131] = trampoline_get_external_counts_v27,
+	[132] = trampoline_apply_suppression_v27,
+	[133] = trampoline_display_identity_v27, /* vi_is_displayX1 */
 	[201] = trampoline_map_piodma, /* map_buf */
 	[202] = trampoline_unmap_piodma, /* unmap_buf */
 	[206] = iomfbep_cb_match_pmu_service_2, /* match_pmu_service */
@@ -403,6 +414,7 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[563] = trampoline_true,
 	[565] = trampoline_true,
 	[567] = trampoline_true,
+	[569] = trampoline_set_boolean_property_v27,
 	[572] = trampoline_zero, /* powerUpDART */
 	[574] = iomfbep_cb_video_range_h17p,
 	[575] = trampoline_hotplug_h17p,
@@ -463,6 +475,10 @@ static const struct {
 	[127] = { 0x1008, 0x4 },
 	[128] = { 0x40, 0x4 },
 	[129] = { 0x1c, 0x14 },
+	[130] = { 0x8, 0x0 },
+	[131] = { 0x10, 0xc },
+	[132] = { 0x4, 0x0 },
+	[133] = { 0x0, 0x4 },
 	[201] = { 0xc, 0x10 },
 	[202] = { 0x18, 0x0 },
 	[206] = { 0x0, 0x4 },
@@ -488,6 +504,7 @@ static const struct {
 	[563] = { 0x4c, 0x4 },
 	[565] = { 0x48, 0x4 },
 	[567] = { 0x80, 0x4 },
+	[569] = { 0x44, 0x4 },
 	[572] = { 0x4, 0x4 },
 	[574] = { 0x4, 0x8 },
 	[575] = { 0x58, 0x4c },

@@ -81,6 +81,7 @@ int dcp_tunnel_dpin_activate(struct apple_dcp *dcp, bool active);
 
 int iomfb_start_rtkit(struct apple_dcp *dcp);
 void iomfb_shutdown(struct apple_dcp *dcp);
+void iomfb_boolean_properties_cleanup_v27(void *data);
 /* rtkit message handler for IOMFB messages */
 void iomfb_recv_msg(struct apple_dcp *dcp, u64 message);
 

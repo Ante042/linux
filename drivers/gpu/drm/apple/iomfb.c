@@ -129,6 +129,10 @@ static int dcp_tx_offset(enum dcp_context_id id)
 	case DCP_CONTEXT_OOBCB:
 	case DCP_CONTEXT_OOBCMD:
 		return 0x08000;
+	case DCP_CONTEXT_ASYNC_CB:
+		return 0x20000;
+	case DCP_CONTEXT_OOBASYNC_CB:
+		return 0x28000;
 	default:
 		return -EINVAL;
 	}
@@ -137,8 +141,10 @@ static int dcp_tx_offset(enum dcp_context_id id)
 static int dcp_channel_offset(enum dcp_context_id id)
 {
 	switch (id) {
+	case DCP_CONTEXT_ASYNC_CB:
 	case DCP_CONTEXT_ASYNC:
 		return 0x40000;
+	case DCP_CONTEXT_OOBASYNC_CB:
 	case DCP_CONTEXT_OOBASYNC:
 		return 0x48000;
 	case DCP_CONTEXT_CB:
@@ -214,8 +220,10 @@ static struct dcp_channel *dcp_get_channel(struct apple_dcp *dcp,
 		return &dcp->ch_oobcb;
 	case DCP_CONTEXT_OOBCMD:
 		return &dcp->ch_oobcmd;
+	case DCP_CONTEXT_ASYNC_CB:
 	case DCP_CONTEXT_ASYNC:
 		return &dcp->ch_async;
+	case DCP_CONTEXT_OOBASYNC_CB:
 	case DCP_CONTEXT_OOBASYNC:
 		return &dcp->ch_oobasync;
 	default:
@@ -249,9 +257,10 @@ static u8 dcp_pop_depth(u8 *depth)
 }
 
 /* Call a DCP function given by a tag */
-void dcp_push(struct apple_dcp *dcp, bool oob, const struct dcp_method_entry *call,
-		     u32 in_len, u32 out_len, void *data, dcp_callback_t cb,
-		     void *cookie)
+static void dcp_push_context(struct apple_dcp *dcp, enum dcp_context_id context,
+			     const struct dcp_method_entry *call,
+			     u32 in_len, u32 out_len, void *data,
+			     dcp_callback_t cb, void *cookie)
 {
 	struct dcp_method_entry resolved = *call;
 
@@ -260,7 +269,6 @@ void dcp_push(struct apple_dcp *dcp, bool oob, const struct dcp_method_entry *ca
 		memcpy(resolved.tag, call->tag_h17g, sizeof(resolved.tag));
 	call = &resolved;
 
-	enum dcp_context_id context = dcp_call_context(dcp, oob);
 	struct dcp_channel *ch = dcp_get_channel(dcp, context);
 
 	struct dcp_packet_header header = {
@@ -312,6 +320,41 @@ void dcp_push(struct apple_dcp *dcp, bool oob, const struct dcp_method_entry *ca
 
 	dcp_send_message(dcp, IOMFB_ENDPOINT,
 			 dcpep_msg(context, data_len, offset));
+}
+
+/* Automatic selection for an AP-initiated RPC stream. */
+void dcp_push(struct apple_dcp *dcp, bool oob, const struct dcp_method_entry *call,
+	     u32 in_len, u32 out_len, void *data, dcp_callback_t cb, void *cookie)
+{
+	dcp_push_context(dcp, dcp_call_context(dcp, oob), call,
+			 in_len, out_len, data, cb, cookie);
+}
+
+/* Native rpc_caller reuses the callback thread's stream, including its
+ * firmware-owned half. A new context2 command can deadlock a firmware
+ * callback waiting for the AP to finish a nested query on context1. */
+int dcp_push_nested(struct apple_dcp *dcp, enum dcp_context_id origin,
+		    const struct dcp_method_entry *call, u32 in_len, u32 out_len,
+		    void *data, dcp_callback_t cb, void *cookie)
+{
+	enum dcp_context_id context;
+
+	switch (origin) {
+	case DCP_CONTEXT_CB:
+	case DCP_CONTEXT_OOBCB:
+		context = origin;
+		break;
+	case DCP_CONTEXT_ASYNC:
+		context = DCP_CONTEXT_ASYNC_CB;
+		break;
+	case DCP_CONTEXT_OOBASYNC:
+		context = DCP_CONTEXT_OOBASYNC_CB;
+		break;
+	default:
+		return -EINVAL;
+	}
+	dcp_push_context(dcp, context, call, in_len, out_len, data, cb, cookie);
+	return 0;
 }
 
 /* Parse a callback tag "D123" into the ID 123. Returns -EINVAL on failure. */

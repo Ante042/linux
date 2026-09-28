@@ -21,6 +21,9 @@ enum dcp_context_id {
 	/* Callback */
 	DCP_CONTEXT_CB = 0,
 
+	/* Nested RPC on a firmware-initiated stream */
+	DCP_CONTEXT_ASYNC_CB = 1,
+
 	/* Command */
 	DCP_CONTEXT_CMD = 2,
 
@@ -29,6 +32,9 @@ enum dcp_context_id {
 
 	/* Out-of-band callback */
 	DCP_CONTEXT_OOBCB = 4,
+
+	/* Nested RPC on an out-of-band firmware-initiated stream */
+	DCP_CONTEXT_OOBASYNC_CB = 5,
 
 	/* Out-of-band command */
 	DCP_CONTEXT_OOBCMD = 6,

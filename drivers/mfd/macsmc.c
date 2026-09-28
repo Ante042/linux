@@ -48,6 +48,7 @@ static const struct mfd_cell apple_smc_devs[] = {
 	MFD_CELL_NAME("macsmc-input"),
 	MFD_CELL_NAME("macsmc-power"),
 	MFD_CELL_OF("macsmc-gpio", NULL, NULL, 0, 0, "apple,smc-gpio"),
+	MFD_CELL_OF("macsmc-pcio-gpio", NULL, NULL, 0, 0, "apple,smc-pcio-gpio"),
 	MFD_CELL_OF("macsmc-low-gpio", NULL, NULL, 0, 0, "apple,smc-low-gpio"),
 	MFD_CELL_OF("macsmc-hwmon", NULL, NULL, 0, 0, "apple,smc-hwmon"),
 	MFD_CELL_OF("macsmc-reboot", NULL, NULL, 0, 0, "apple,smc-reboot"),
@@ -57,6 +58,12 @@ static const struct mfd_cell apple_smc_devs[] = {
 /* Initial T8152 support is read-only telemetry. Firmware retains fan control. */
 static const struct mfd_cell apple_smc_telemetry_devs[] = {
 	MFD_CELL_OF("macsmc-hwmon", NULL, NULL, 0, 0, "apple,smc-hwmon"),
+};
+
+/* T6050 additionally describes native pcIO outputs explicitly in its DT. */
+static const struct mfd_cell apple_smc_t6050_devs[] = {
+	MFD_CELL_OF("macsmc-hwmon", NULL, NULL, 0, 0, "apple,smc-hwmon"),
+	MFD_CELL_OF("macsmc-pcio-gpio", NULL, NULL, 0, 0, "apple,smc-pcio-gpio"),
 };
 
 static int apple_smc_cmd_locked(struct apple_smc *smc, u64 cmd, u64 arg,
@@ -216,7 +223,9 @@ int apple_smc_get_key_info(struct apple_smc *smc, smc_key key, struct apple_smc_
 	u8 key_info[6];
 	int ret;
 
-	ret = apple_smc_cmd(smc, SMC_MSG_GET_KEY_INFO, key, 0, 0, NULL);
+	/* Key metadata occupies the same shared buffer as other SMC replies. */
+	guard(mutex)(&smc->mutex);
+	ret = apple_smc_cmd_locked(smc, SMC_MSG_GET_KEY_INFO, key, 0, 0, NULL);
 	if (ret >= 0 && info) {
 		memcpy_fromio(key_info, smc->shmem.iomem, sizeof(key_info));
 		info->size = key_info[0];
@@ -527,8 +536,13 @@ static int apple_smc_probe(struct platform_device *pdev)
 	/* T8152's key-read interface is qualified; notifications, GPIO and power
 	 * functions are not. The board DT exposes temperature and fan inputs only.
 	 */
-	if (of_device_is_compatible(dev->of_node, "apple,t8152-smc") ||
-	    of_device_is_compatible(dev->of_node, "apple,t6050-smc"))
+	if (of_device_is_compatible(dev->of_node, "apple,t6050-smc"))
+		return devm_mfd_add_devices(smc->dev, PLATFORM_DEVID_NONE,
+					    apple_smc_t6050_devs,
+					    ARRAY_SIZE(apple_smc_t6050_devs),
+					    NULL, 0, NULL);
+
+	if (of_device_is_compatible(dev->of_node, "apple,t8152-smc"))
 		return devm_mfd_add_devices(smc->dev, PLATFORM_DEVID_NONE,
 					    apple_smc_telemetry_devs,
 					    ARRAY_SIZE(apple_smc_telemetry_devs),

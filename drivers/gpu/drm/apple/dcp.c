@@ -2659,6 +2659,13 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	bool loader_quiesced;
 	int ret;
 
+	INIT_LIST_HEAD(&dcp->iomfb_boolean_properties);
+	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0) {
+		ret = devm_add_action_or_reset(dev, iomfb_boolean_properties_cleanup_v27, dcp);
+		if (ret)
+			return ret;
+	}
+
 	/*
 	 * The coprocessor scans out through the display-subsystem device's
 	 * IOMMU stream, not through piodma's, so buffers it asks us to map for

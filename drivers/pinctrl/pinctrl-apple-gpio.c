@@ -30,6 +30,13 @@
 #include "core.h"
 #include "pinmux.h"
 
+struct apple_gpio_pinctrl;
+
+struct apple_gpio_irq_group {
+	struct apple_gpio_pinctrl *pctl;
+	u8 index;
+};
+
 struct apple_gpio_pinctrl {
 	struct device *dev;
 	struct pinctrl_dev *pctldev;
@@ -39,7 +46,8 @@ struct apple_gpio_pinctrl {
 
 	struct pinctrl_desc pinctrl_desc;
 	struct gpio_chip gpio_chip;
-	u8 irqgrps[];
+	u8 irq_group_base;
+	struct apple_gpio_irq_group irqgrps[];
 };
 
 #define REG_GPIO(x)          (4 * (x))
@@ -313,7 +321,7 @@ static unsigned int apple_gpio_irq_startup(struct irq_data *data)
 	struct apple_gpio_pinctrl *pctl = gpiochip_get_data(chip);
 
 	apple_gpio_set_reg(pctl, data->hwirq, REG_GPIOx_GRP,
-			   FIELD_PREP(REG_GPIOx_GRP, 0));
+			   FIELD_PREP(REG_GPIOx_GRP, pctl->irq_group_base));
 
 	apple_gpio_direction_input(chip, data->hwirq);
 	apple_gpio_irq_unmask(data);
@@ -342,18 +350,17 @@ static int apple_gpio_irq_set_type(struct irq_data *data, unsigned int type)
 static void apple_gpio_irq_handler(struct irq_desc *desc)
 {
 	struct irq_chip *chip = irq_desc_get_chip(desc);
-	u8 *grpp = irq_desc_get_handler_data(desc);
-	struct apple_gpio_pinctrl *pctl;
+	struct apple_gpio_irq_group *group = irq_desc_get_handler_data(desc);
+	struct apple_gpio_pinctrl *pctl = group->pctl;
 	unsigned int pinh, pinl;
 	unsigned long pending;
 	struct gpio_chip *gc;
 
-	pctl = container_of(grpp - *grpp, typeof(*pctl), irqgrps[0]);
 	gc = &pctl->gpio_chip;
 
 	chained_irq_enter(chip, desc);
 	for (pinh = 0; pinh < gc->ngpio; pinh += 32) {
-		pending = readl_relaxed(pctl->base + REG_IRQ(*grpp, pinh));
+		pending = readl_relaxed(pctl->base + REG_IRQ(group->index, pinh));
 		for_each_set_bit(pinl, &pending, 32)
 			generic_handle_domain_irq(gc->irq.domain, pinh + pinl);
 	}
@@ -412,7 +419,8 @@ static int apple_gpio_register(struct apple_gpio_pinctrl *pctl)
 				goto out_free_irq_data;
 
 			girq->parents[i] = ret;
-			pctl->irqgrps[i] = i;
+			pctl->irqgrps[i].pctl = pctl;
+			pctl->irqgrps[i].index = pctl->irq_group_base + i;
 			irq_data[i] = &pctl->irqgrps[i];
 		}
 
@@ -441,7 +449,7 @@ static int apple_gpio_pinctrl_probe(struct platform_device *pdev)
 	static const char *pinmux_functions[] = {
 		"gpio", "periph1", "periph2", "periph3"
 	};
-	unsigned int i, nirqs = 0;
+	unsigned int i, nirqs = 0, irq_group_base = 0;
 	int res;
 
 	if (of_property_read_bool(pdev->dev.of_node, "interrupt-controller")) {
@@ -450,11 +458,21 @@ static int apple_gpio_pinctrl_probe(struct platform_device *pdev)
 			nirqs = res;
 	}
 
+	if (of_property_present(pdev->dev.of_node, "apple,irq-group-base")) {
+		res = of_property_read_u32(pdev->dev.of_node, "apple,irq-group-base",
+					  &irq_group_base);
+		if (res)
+			return res;
+	}
+	if (irq_group_base > 6 || nirqs > 7 - irq_group_base)
+		return dev_err_probe(&pdev->dev, -EINVAL, "invalid host IRQ groups\n");
+
 	pctl = devm_kzalloc(&pdev->dev, struct_size(pctl, irqgrps, nirqs),
 			    GFP_KERNEL);
 	if (!pctl)
 		return -ENOMEM;
 	pctl->dev = &pdev->dev;
+	pctl->irq_group_base = irq_group_base;
 	pctl->gpio_chip.irq.num_parents = nirqs;
 	dev_set_drvdata(&pdev->dev, pctl);
 

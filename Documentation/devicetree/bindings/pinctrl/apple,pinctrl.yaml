@@ -63,6 +63,16 @@ properties:
     minItems: 1
     maxItems: 7
 
+  apple,irq-group-base:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    minimum: 0
+    maximum: 6
+    default: 0
+    description: |
+      Hardware index of the first interrupt group listed in interrupts.
+      On GPIO controllers shared with a coprocessor, lower groups may be
+      owned by that firmware. Only contiguous host-owned groups are listed.
+
   interrupt-controller: true
 
   '#interrupt-cells':

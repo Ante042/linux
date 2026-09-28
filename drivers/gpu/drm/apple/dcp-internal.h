@@ -231,6 +231,7 @@ struct apple_dcp {
 	/* Ignore inherited application-endpoint traffic while quiescing RTKit. */
 	bool adopting_session;
 	struct apple_dcp_surface_order iomfb_surfaces;
+	struct list_head iomfb_boolean_properties;
 
 	/************* IOMFB **************************************************
 	 * everything below is mostly used inside IOMFB but it could make     *
