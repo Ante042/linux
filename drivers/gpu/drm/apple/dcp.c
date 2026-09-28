@@ -388,6 +388,37 @@ static int dcp_dpxbar_link(struct mux_control *mux, bool up)
 	return ret;
 }
 
+int dcp_direct_crossbar_link(struct apple_dcp *dcp, bool up)
+{
+	typeof(&apple_t6050_dp_link_config) get_config;
+	typeof(&apple_dpxbar_link_configure) configure;
+	unsigned int pclk;
+	bool uhbr;
+	int ret;
+
+	if (dcp->dptx_tunnel || !dcp->phy || !dcp->xbar)
+		return 0;
+	get_config = symbol_get(apple_t6050_dp_link_config);
+	if (!get_config)
+		return 0;
+	ret = get_config(dcp->phy, &pclk, &uhbr);
+	symbol_put(apple_t6050_dp_link_config);
+	if (ret == -EOPNOTSUPP)
+		return 0;
+	if (!up && ret == -ENOLINK)
+		ret = 0;
+	if (ret)
+		return ret;
+	if (!up)
+		return dcp_dpxbar_link(dcp->xbar, false);
+	configure = symbol_get(apple_dpxbar_link_configure);
+	if (!configure)
+		return -ENODEV;
+	ret = configure(dcp->xbar, pclk, uhbr);
+	symbol_put(apple_dpxbar_link_configure);
+	return ret ? ret : dcp_dpxbar_link(dcp->xbar, true);
+}
+
 /* DP IN adapter handshake through the thunderbolt glue; tb_lock held. */
 static int dcp_tunnel_dpin_locked(struct apple_dcp *dcp, bool active)
 {

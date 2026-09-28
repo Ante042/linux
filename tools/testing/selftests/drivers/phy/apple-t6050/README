@@ -1,0 +1,14 @@
+This opt-in test module includes the real fixed T6050 DP driver source.
+It substitutes PM-domain operations and explicit poll acknowledgements,
+using allocated memory instead of any hardware MMIO. It tests two cycles,
+four link rates, drive requests, invalid settings and timeout stopping.
+It deliberately logs a timeout for the missing-acknowledgement test.
+It does not test physical link training, analog behavior or optical output.
+
+Build against a configured ARM64 kernel:
+  make -C <linux-source> O=<kernel-build> ARCH=arm64 LLVM=1 M=$PWD modules
+
+In a QEMU Linux guest with the matching kernel, load apple-tunable.ko then
+apple-t6050-driver-test.ko. Require AURORA_T6050_INTEGRATED_TEST_PASS in the
+kernel log; module insertion failure is a test failure. Never use this
+module's model acknowledgements as evidence about physical hardware.

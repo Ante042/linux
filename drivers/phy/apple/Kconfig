@@ -1,4 +1,14 @@
 # SPDX-License-Identifier: GPL-2.0 OR BSD-2-Clause
+config PHY_APPLE_T6050_DP
+	tristate "Apple T6050 fixed DisplayPort PHY"
+	depends on (ARCH_APPLE || COMPILE_TEST) && OF && PM
+	select GENERIC_PHY
+	select APPLE_TUNABLE
+	help
+	  Support the fixed four-lane DisplayPort PHY used by the T6050 HDMI
+	  bridge, including analog power sequencing and DP1.x link training.
+	  USB and dynamically assigned Type-C PHYs use separate drivers.
+
 config PHY_APPLE_ATC
 	tristate "Apple Type-C PHY"
 	depends on (ARM64 && ARCH_APPLE) || (COMPILE_TEST && !GENERIC_ATOMIC64)

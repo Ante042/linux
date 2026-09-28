@@ -357,3 +357,59 @@ PHYs and failed PHY operations::
 The complete module loaded and these callback tests passed as ARM64 code
 in a QEMU guest. Actual firmware link-training callbacks have not yet been
 exercised on hardware; this is not external scanout qualification.
+
+
+Fixed T6050 DisplayPort PHY
+--------------------------
+
+``PHY_APPLE_T6050_DP`` provides the normal-orientation, four-lane DP PHY
+used by the HDMI bridge path. It does not select USB or dynamic Type-C
+modes. The register sequences follow the captured macOS27 T6050 path;
+board tunables remain device-tree data. RBR, HBR, HBR2 and HBR3 are
+supported. Spread spectrum and UHBR are not enabled by this driver.
+
+Three named power domains (``usb-aon``, ``common``, ``wrapper``) are required.
+The first two enable access; the wrapper is resumed partway through native
+reset, and is suspended at the corresponding native shutdown step. A
+single automatically attached domain would enable the wrapper too early.
+The domain topology must describe ATC leaf domains, without handing shared
+SoC fabric power-off ownership to a lone PHY. The T8142 crossbar can hold
+its own named AON/common references for control-page access.
+
+The PHY node uses ``apple,t6050-dp-phy``, ``#phy-cells = <0>``, and named
+resources ``core``, ``reset``, ``fabric``, ``axi2af``, ``lioa``,
+``common-cfg``. The core resource spans native bank2 through bank34;
+remaining resources correspond to native banks39 through43. Its nine
+``apple,tunable-*`` properties are offset/mask/value triples using the
+same format as the existing Apple tunable helper. They are all required:
+``axi2af``, ``fabric``, ``common-cfg``, ``lioa``, ``lane0-rx-clock``,
+``lane1-rx-clock``, ``lane0-rx-eq``, ``lane1-rx-eq``, ``auspll``.
+Optional 16-entry ``apple,dp-training-table-{rbr,hbr,hbr2,hbr3}`` overrides
+fall back to a shared ``apple,dp-training-table`` and then the native
+built-in DP1.x table. Voltage and pre-emphasis select index voltage*4+pre;
+invalid combinations are rejected before MMIO.
+
+The direct PHY main clock is native logical PCLK0, which the crossbar maps
+to physical PCLK1. The four additional logical clocks are tunnel clocks.
+DCP's link-change callbacks take the direct crossbar down before a rate
+change, then configure the actual clock/coding and bring it up after the
+PHY is ready. Older PHYs and the existing USB4 tunnel path retain their
+previous callbacks. Errors from activation and deactivation reach firmware.
+
+A failed hardware acknowledgement stops the sequence and marks that PHY
+instance faulted; further operations fail until a fresh reset. The driver
+does not fabricate readiness or retry partially completed sequences.
+
+Validation status: the actual driver source passed an ARM64 QEMU model
+covering two complete power-domain cycles, four rates, DP drive requests,
+invalid settings and a missing acknowledgement. QEMU supplies modeled
+hardware acknowledgements explicitly; this does not establish physical
+link training or external video. On J714s with firmware27, a separate real generic-PHY consumer completed
+two cycles of power/AUX setup, all four link rates, and four-lane drive
+settings, then suspended the wrapper domain. All hardware polls passed.
+AON/common references were released; those domains remained on while
+waiting for the unbound crossbar consumer, so this is not evidence of
+complete ATC power gating. External sink training remains unverified.
+
+The source-including model test lives at
+``tools/testing/selftests/drivers/phy/apple-t6050/``.

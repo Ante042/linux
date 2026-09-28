@@ -657,11 +657,15 @@ dptxport_call_activate(struct apple_epic_service *service,
 	 * change for a tunnel (dptx->atcphy must stay in USB4/TBT mode the
 	 * whole connection, see dcp_tunnel_set_rate()). The DP IN adapter is
 	 * only woken (DPTX_INACTIVE=0) here, via dcp_tunnel_dpin_activate();
-	 * waking it earlier hangs the machine. Activate always replies
-	 * success to DCP.
+	 * waking it earlier hangs the machine. Report PHY activation failures
+	 * to DCP instead of acknowledging a transmitter that is not ready.
 	 */
-	if (dptx->atcphy && !dcp->phy_managed_by_typec)
-		phy_set_mode_ext(dptx->atcphy, PHY_MODE_DP, dcp->index);
+	if (dptx->atcphy && !dcp->phy_managed_by_typec) {
+		int ret = phy_set_mode_ext(dptx->atcphy, PHY_MODE_DP, dcp->index);
+
+		if (ret)
+			return ret;
+	}
 	if (dcp->dptx_tunnel)
 		dcp_tunnel_dpin_activate(dcp, true);
 
@@ -679,12 +683,19 @@ dptxport_call_deactivate(struct apple_epic_service *service,
 {
 	struct dptx_port *dptx = service->cookie;
 	struct apple_dcp *dcp = service->ep->dcp;
+	int ret;
 
 	dev_info(dcp->dev, "DPTXPort: DEACTIVATE\n");
+	ret = dcp_direct_crossbar_link(dcp, false);
+	if (ret)
+		return ret;
 	if (dcp->dptx_tunnel)
 		dcp_tunnel_dpin_activate(dcp, false);
-	if (dptx->atcphy && !dcp->phy_managed_by_typec)
-		phy_set_mode_ext(dptx->atcphy, PHY_MODE_INVALID, 0);
+	if (dptx->atcphy && !dcp->phy_managed_by_typec) {
+		ret = phy_set_mode_ext(dptx->atcphy, PHY_MODE_INVALID, 0);
+		if (ret)
+			return ret;
+	}
 
 	memcpy(reply, data, min(reply_size, data_size));
 	if (reply_size >= 4)
@@ -707,7 +718,11 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 				     min(data_size, (size_t)64), true);
 
 	switch (idx) {
-	case DPTX_APCALL_WILL_CHANGE_LINKG_CONFIG:
+	case DPTX_APCALL_WILL_CHANGE_LINKG_CONFIG: {
+		int ret = dcp_direct_crossbar_link(service->ep->dcp, false);
+
+		if (ret)
+			return ret;
 		/*
 		 * Ported from aurora-silicon/linux#8: a re-link on an
 		 * established tunnel takes the crossbar connection down
@@ -716,11 +731,14 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 		if (service->ep->dcp->dptx_tunnel && dptx->link_rate)
 			dcp_tunnel_crossbar_down(service->ep->dcp);
 		return dptxport_call_will_change_link_config(service);
+	}
 	case DPTX_APCALL_DID_CHANGE_LINK_CONFIG: {
 		int ret = dptxport_call_did_change_link_config(service);
 
 		if (!ret && service->ep->dcp->dptx_tunnel && dptx->link_rate)
 			dcp_tunnel_crossbar_up(service->ep->dcp);
+		if (!ret && dptx->link_rate)
+			ret = dcp_direct_crossbar_link(service->ep->dcp, true);
 		return ret;
 	}
 	case DPTX_APCALL_GET_MAX_LINK_RATE:

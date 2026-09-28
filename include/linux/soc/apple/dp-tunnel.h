@@ -35,6 +35,9 @@ int apple_dcp_tb_dp_tunnel(struct device_node *connector_np, unsigned int dpin,
  */
 int apple_atc_dp_tunnel_rate(struct phy *phy, u8 rate);
 
+/* Fixed T6050 DP: obtain the live main-link clock for the physical crossbar. */
+int apple_t6050_dp_link_config(struct phy *phy, unsigned int *pclk, bool *uhbr);
+
 /*
  * Display crossbar: take the connection of an already selected output down or
  * bring it back up (clock gates and enables) around a link reconfiguration.

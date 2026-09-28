@@ -24,6 +24,8 @@
 #include <linux/of.h>
 #include <linux/of_device.h>
 #include <linux/platform_device.h>
+#include <linux/pm_domain.h>
+#include <linux/pm_runtime.h>
 #include <linux/soc/apple/dp-tunnel.h>
 
 /*
@@ -762,6 +764,39 @@ int apple_dpxbar_link_down(struct mux_control *mux)
 }
 EXPORT_SYMBOL_GPL(apple_dpxbar_link_down);
 
+static void apple_dpxbar_domain_release(void *data)
+{
+	struct device *pd = data;
+
+	pm_runtime_put_sync_suspend(pd);
+	dev_pm_domain_detach(pd, true);
+}
+
+static int apple_dpxbar_domains(struct device *dev)
+{
+	static const char * const names[] = { "usb-aon", "common" };
+	int ret;
+
+	/* Older handoff-only trees have no Linux-managed domains. */
+	if (!of_property_present(dev->of_node, "power-domain-names"))
+		return 0;
+	for (unsigned int i = 0; i < ARRAY_SIZE(names); i++) {
+		struct device *pd = dev_pm_domain_attach_by_name(dev, names[i]);
+
+		if (IS_ERR_OR_NULL(pd))
+			return pd ? PTR_ERR(pd) : -ENODEV;
+		ret = pm_runtime_resume_and_get(pd);
+		if (ret < 0) {
+			dev_pm_domain_detach(pd, true);
+			return ret;
+		}
+		ret = devm_add_action_or_reset(dev, apple_dpxbar_domain_release, pd);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
 static int apple_dpxbar_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -771,6 +806,11 @@ static int apple_dpxbar_probe(struct platform_device *pdev)
 	int ret;
 
 	hw = of_device_get_match_data(dev);
+	if (hw->ops == &apple_dpxbar_t8142_ops) {
+		ret = apple_dpxbar_domains(dev);
+		if (ret)
+			return dev_err_probe(dev, ret, "cannot power crossbar controls\n");
+	}
 	mux_chip = devm_mux_chip_alloc(dev, hw->n_mux, sizeof(*dpxbar));
 	if (IS_ERR(mux_chip))
 		return PTR_ERR(mux_chip);
