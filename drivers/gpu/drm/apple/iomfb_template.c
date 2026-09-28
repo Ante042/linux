@@ -64,7 +64,20 @@ DCP_THUNK_OUT(iomfb_a358_vi_set_temperature_hint, iomfbep_a358_vi_set_temperatur
 IOMFB_THUNK_INOUT(set_matrix);
 IOMFB_THUNK_INOUT(get_color_remap_mode);
 IOMFB_THUNK_INOUT(last_client_close);
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0)
+static void iomfb_abort_swaps_dcp(struct apple_dcp *dcp, bool oob,
+				struct iomfb_abort_swaps_dcp_req *data,
+				dcp_callback_t cb, void *cookie)
+{
+	/* 26A428 A479 serializes the client handle, not an IOUserClient. */
+	u64 client = data->client.addr;
+
+	dcp_push(dcp, oob, &dcp_methods[iomfbep_abort_swaps_dcp],
+		 sizeof(client), sizeof(u32), &client, cb, cookie);
+}
+#else
 IOMFB_THUNK_INOUT(abort_swaps_dcp);
+#endif
 
 DCP_THUNK_INOUT(dcp_swap_submit, dcpep_swap_submit,
 		struct DCP_FW_NAME(dcp_swap_submit_req),
@@ -1363,6 +1376,7 @@ static void dcp_h17p_fix_swap_surfaces(struct apple_dcp *dcp)
 	 * empty rectangles, and rejects the swap with
 	 * "verify_scaling: error: null rectangle: src:0x0+0,0 dst:0x0+0,0".
 	 */
+#if DCP_FW_VER < DCP_FW_VERSION(27, 0, 0)
 	{
 		u8 *r = (u8 *)req;
 		size_t n = sizeof(*req);
@@ -1384,6 +1398,7 @@ static void dcp_h17p_fix_swap_surfaces(struct apple_dcp *dcp)
 		memmove(r + off - 2, r + off, n - off);
 		memset(r + n - 2, 0, 2);
 	}
+#endif
 }
 #else
 static void dcp_h17p_fix_swap_surfaces(struct apple_dcp *dcp) { }

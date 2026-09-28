@@ -1895,6 +1895,9 @@ static void _dcp_poweroff(struct apple_dcp *dcp)
 	case DCP_FIRMWARE_H17P:
 		iomfb_poweroff_h17p(dcp);
 		break;
+	case DCP_FIRMWARE_V_27_0:
+		iomfb_poweroff_v27(dcp);
+		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
 		break;
@@ -1960,6 +1963,9 @@ static void __maybe_unused dcp_sleep(struct apple_dcp *dcp)
 	case DCP_FIRMWARE_H17P:
 		iomfb_sleep_h17p(dcp);
 		break;
+	case DCP_FIRMWARE_V_27_0:
+		iomfb_sleep_v27(dcp);
+		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
 		break;
@@ -2003,6 +2009,9 @@ void dcp_poweron(struct platform_device *pdev)
 		break;
 	case DCP_FIRMWARE_H17P:
 		iomfb_poweron_h17p(dcp);
+		break;
+	case DCP_FIRMWARE_V_27_0:
+		iomfb_poweron_v27(dcp);
 		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
@@ -2376,6 +2385,14 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 	char fw_str[DCP_FW_VERSION_STR_LEN];
 	int ret;
 
+	if (hw->firmware_compat == DCP_FIRMWARE_V_27_0) {
+		ret = dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);
+		if (ret < 0 || strcmp(compat_str, "27.0.0")) {
+			dev_err(dev, "T6050 requires an explicit 27.0.0 firmware ABI profile\n");
+			return DCP_FIRMWARE_UNKNOWN;
+		}
+		return DCP_FIRMWARE_V_27_0;
+	}
 	if (hw->firmware_compat != DCP_FIRMWARE_UNKNOWN)
 		return hw->firmware_compat;
 
@@ -2548,7 +2565,7 @@ static int dcp_restart_inherited_session(struct apple_dcp *dcp)
 {
 	int ret;
 
-	if (dcp->fw_compat != DCP_FIRMWARE_H17P)
+	if (dcp->fw_compat < DCP_FIRMWARE_H17P)
 		return apple_rtkit_quiesce(dcp->rtk);
 
 	/*
@@ -2566,60 +2583,6 @@ static int dcp_restart_inherited_session(struct apple_dcp *dcp)
 	dev_info(dcp->dev, "inherited DCP acknowledged IOP OFF\n");
 	return dcp_asc_restart(dcp);
 }
-
-/*
- * Reset the display coprocessor's ASC core.
- *
- * Once Linux has driven a DCP session the firmware stops answering the
- * management endpoint: it will not re-HELLO on INIT (it is already ON) and it
- * will not acknowledge a power-state change either, so neither apple_rtkit_wake
- * nor apple_rtkit_quiesce can recover it and the module could previously only
- * be reloaded by rebooting the machine.
- *
- * CPU_CONTROL.RUN is a raw register in the ASC wrapper and needs no cooperation
- * from the firmware, so clearing it stops the core no matter how wedged it is.
- * The firmware image itself is left alone -- iBoot mapped it into the DCP's own
- * DART and nothing here touches those mappings -- so setting RUN again restarts
- * it from its reset vector and it comes back with a fresh HELLO.
- */
-static int dcp_asc_restart(struct apple_dcp *dcp)
-{
-	u32 ctrl, status;
-	int i;
-
-	ctrl = readl_relaxed(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
-	writel_relaxed(ctrl & ~APPLE_DCP_COPROC_CPU_CONTROL_RUN,
-		       dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
-
-	/*
-	 * T8140 clears CPU_STATUS.RUNNING when the core halts but never sets
-	 * the STOPPED bit (status goes 0x6d -> 0x48), so gate on RUNNING going
-	 * away rather than on STOPPED appearing.
-	 */
-	for (i = 0; i < 500; i++) {
-		status = readl_relaxed(dcp->coproc_reg +
-				       APPLE_DCP_COPROC_CPU_STATUS);
-		if (!(status & APPLE_DCP_COPROC_CPU_STATUS_RUNNING) ||
-		    (status & APPLE_DCP_COPROC_CPU_STATUS_STOPPED))
-			break;
-		usleep_range(100, 200);
-	}
-	if (status & APPLE_DCP_COPROC_CPU_STATUS_RUNNING) {
-		dev_err(dcp->dev, "DCP ASC did not stop (status %#x)\n", status);
-		return -ETIMEDOUT;
-	}
-
-	dev_info(dcp->dev, "DCP ASC stopped (status %#x), restarting it\n",
-		 status);
-	usleep_range(1000, 2000);
-	writel_relaxed(ctrl | APPLE_DCP_COPROC_CPU_CONTROL_RUN,
-		       dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
-	return 0;
-}
-
-
-
-
 
 static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 {
@@ -2744,6 +2707,24 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 		return ret;
 	}
 
+	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0) {
+		int count = of_property_count_u32_elems(dev->of_node, "apple,clock-ids");
+
+		ret = devm_clk_bulk_get_all(dev, &dcp->firmware_clocks);
+		if (ret < 0)
+			return dev_err_probe(dev, ret, "failed to acquire firmware clocks\n");
+		if (!ret || count != ret)
+			return dev_err_probe(dev, -EINVAL, "firmware clock IDs must match clocks\n");
+		dcp->num_firmware_clocks = count;
+		dcp->firmware_clock_ids = devm_kcalloc(dev, count, sizeof(u32), GFP_KERNEL);
+		if (!dcp->firmware_clock_ids)
+			return -ENOMEM;
+		ret = of_property_read_u32_array(dev->of_node, "apple,clock-ids",
+						dcp->firmware_clock_ids, count);
+		if (ret)
+			return ret;
+	}
+
 	dcp->clk = devm_clk_get(dev, NULL);
 	if (IS_ERR(dcp->clk))
 		return dev_err_probe(dev, PTR_ERR(dcp->clk),
@@ -2766,7 +2747,7 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 		(struct list_head)LIST_HEAD_INIT(dcp->swapped_out_fbs);
 	spin_lock_init(&dcp->swapped_out_lock);
 
-	if (dcp->fw_compat == DCP_FIRMWARE_H17P && !dcp->hw.adopt_live_session)
+	if (dcp->fw_compat >= DCP_FIRMWARE_H17P && !dcp->hw.adopt_live_session)
 		dcp_enable_pmc_domain(dcp);
 
 	if (start_mode == APPLE_DCP_COPROCESSOR_ADOPT_AND_RESTART &&
@@ -2855,7 +2836,7 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 
 		ret = dcp_restart_inherited_session(dcp);
 		dcp->adopting_session = false;
-		if (ret && dcp->fw_compat == DCP_FIRMWARE_H17P)
+		if (ret && dcp->fw_compat >= DCP_FIRMWARE_H17P)
 			return ret;
 		if (!ret)
 			ret = apple_rtkit_wake(dcp->rtk);
@@ -3013,7 +2994,7 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	mutex_init(&dcp->hpd_mutex);
 	mutex_init(&dcp->tb_lock);
 
-	if (fw_compat != DCP_FIRMWARE_H17P) {
+	if (fw_compat < DCP_FIRMWARE_H17P) {
 		/* Legacy device trees encode one enable flag per surface. */
 		count = 0;
 		i = 0;
@@ -3252,6 +3233,17 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t8142 = {
 	.firmware_compat = DCP_FIRMWARE_H17P,
 };
 
+/* Native 26A428 T605X uses DCPLink with the 27.0 method/callback ABI.
+ * The loader must preserve the firmware mappings and running ASC generation.
+ */
+static const struct apple_dcp_hw_data apple_dcp_hw_t6050 = {
+	.num_dptx_ports = 0,
+	.iomfb_method_profile = DCP_IOMFB_METHODS_H17G,
+	.adopt_running_coprocessor = true,
+	.adopt_live_session = true,
+	.firmware_compat = DCP_FIRMWARE_V_27_0,
+};
+
 static const struct apple_dcp_hw_data apple_dcp_hw_dcp = {
 	.num_dptx_ports = 0,
 };
@@ -3264,6 +3256,7 @@ static const struct of_device_id of_match[] = {
 	{ .compatible = "apple,t6020-dcp", .data = &apple_dcp_hw_t6020,  },
 	{ .compatible = "apple,t8112-dcp", .data = &apple_dcp_hw_t8112,  },
 	{ .compatible = "apple,t8140-dcp", .data = &apple_dcp_hw_t8140,  },
+	{ .compatible = "apple,t6050-dcp", .data = &apple_dcp_hw_t6050, },
 	{ .compatible = "apple,t8142-dcp", .data = &apple_dcp_hw_t8142,  },
 	{ .compatible = "apple,dcp",       .data = &apple_dcp_hw_dcp,    },
 	{ .compatible = "apple,dcpext",    .data = &apple_dcp_hw_dcpext, },

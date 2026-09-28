@@ -577,26 +577,10 @@ static void dcpep_handle_cb(struct apple_dcp *dcp, enum dcp_context_id context,
 		return;
 	}
 
-	if (tag < 0 || tag >= IOMFB_MAX_CB || !dcp->cb_handlers ||
-	    !dcp->cb_handlers[tag]) {
-		dev_warn(dev, "received unknown callback %c%c%c%c\n",
-			 hdr->tag[3], hdr->tag[2], hdr->tag[1], hdr->tag[0]);
-		/*
-		 * Leaving a callback unanswered wedges the coprocessor: it
-		 * waits for the ack forever and the outer call never returns.
-		 * On H17P answer it with a zeroed output instead, so the
-		 * warning above names the tag we still have to implement
-		 * rather than costing a reboot to discover one tag at a time.
-		 */
-		if (dcp->fw_compat == DCP_FIRMWARE_H17P) {
-			if (hdr->out_len)
-				memset(out, 0, hdr->out_len);
-			depth = dcp_push_depth(&ch->depth);
-			ch->output[depth] = out;
-			ch->end[depth] = offset +
-					 ALIGN(length, DCP_PACKET_ALIGNMENT);
-			dcp_ack(dcp, context);
-		}
+	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
+	    !iomfb_v27_callback_size_valid(tag, hdr->in_len, hdr->out_len)) {
+		dev_err(dev, "firmware27 callback D%03d has incompatible lengths %u/%u\n",
+			tag, hdr->in_len, hdr->out_len);
 		return;
 	}
 
@@ -822,6 +806,9 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 	case DCP_FIRMWARE_H17P:
 		ret = iomfb_modeset_h17p(dcp, crtc_state);
 		break;
+	case DCP_FIRMWARE_V_27_0:
+		ret = iomfb_modeset_v27(dcp, crtc_state);
+		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n",
 			  dcp->fw_compat);
@@ -895,6 +882,9 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_state *state)
 	case DCP_FIRMWARE_H17P:
 		iomfb_flush_h17p(dcp, crtc, state);
 		break;
+	case DCP_FIRMWARE_V_27_0:
+		iomfb_flush_v27(dcp, crtc, state);
+		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
 		break;
@@ -912,6 +902,9 @@ static void iomfb_start(struct apple_dcp *dcp)
 		break;
 	case DCP_FIRMWARE_H17P:
 		iomfb_start_h17p(dcp);
+		break;
+	case DCP_FIRMWARE_V_27_0:
+		iomfb_start_v27(dcp);
 		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
@@ -936,7 +929,7 @@ void iomfb_recv_msg(struct apple_dcp *dcp, u64 message)
 		 * of the same InitComplete word (macOS 25G83 sends e.g.
 		 * 0x004045bc9ef40101).  The transport below it is unchanged.
 		 */
-		if (dcp->fw_compat == DCP_FIRMWARE_H17P)
+		if (dcp->fw_compat >= DCP_FIRMWARE_H17P)
 			dev_info(dcp->dev,
 				 "IOMFB: init complete %#llx (version %llu)\n",
 				 message,
@@ -995,6 +988,9 @@ void iomfb_shutdown(struct apple_dcp *dcp)
 		break;
 	case DCP_FIRMWARE_H17P:
 		iomfb_shutdown_h17p(dcp);
+		break;
+	case DCP_FIRMWARE_V_27_0:
+		iomfb_shutdown_v27(dcp);
 		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);

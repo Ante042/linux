@@ -20,6 +20,7 @@
 #include "dptxep.h"
 #include "iomfb.h"
 #include "iomfb_h17p.h"
+#include "iomfb_v27.h"
 #include "iomfb_v12_3.h"
 #include "iomfb_v13_3.h"
 #include "iomfb-surface.h"
@@ -70,6 +71,7 @@ enum dcp_firmware_version {
 	DCP_FIRMWARE_V_12_3,
 	DCP_FIRMWARE_V_13_5,
 	DCP_FIRMWARE_H17P,
+	DCP_FIRMWARE_V_27_0,
 };
 
 enum {
@@ -233,6 +235,9 @@ struct apple_dcp {
 	/* clock rate request by dcp in */
 	struct clk *clk;
 	struct clk *clk_194;
+	struct clk_bulk_data *firmware_clocks;
+	u32 *firmware_clock_ids;
+	unsigned int num_firmware_clocks;
 
 	/* DCP shared memory */
 	void *shmem;
@@ -275,6 +280,7 @@ struct apple_dcp {
 		struct dcp_swap_submit_req_v12_3 v12_3;
 		struct dcp_swap_submit_req_v13_3 v13_3;
 		struct dcp_swap_submit_req_h17p h17p;
+		struct dcp_swap_submit_req_v27 v27;
 	} swap;
 
 	/* swap id of the last completed swap */

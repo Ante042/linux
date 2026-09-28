@@ -72,7 +72,12 @@ struct DCP_FW_NAME(dcp_swap) {
 	 * dcp_surface_h17p = 0x22c, SWAP_SURFACES = 4 and no surf2 block leaves
 	 * exactly 0x122 here.  0x278 makes dcp_swap 0x6e0 and forces a
 	 * non-integer surface size, so it cannot be right. */
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0)
+	/* 26A428 copies exactly 0x6e0 bytes of IOMFBSwapRec in A408. */
+	u8 h17p_tail[0x230];
+#else
 	u8 h17p_tail[0xda];
+#endif
 #endif
 } __packed;
 
@@ -123,6 +128,9 @@ struct DCP_FW_NAME(dcp_swap_submit_req) {
 #if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
 	u8 unkU32Ptr_null;
 	u8 unkU32out_null;
+#endif
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0)
+	u8 padding[2];
 #endif
 #if DCP_FW_VER < DCP_FW_VERSION(26, 0, 0)
 	u8 padding[1];

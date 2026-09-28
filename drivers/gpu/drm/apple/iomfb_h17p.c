@@ -6,6 +6,7 @@
 #include "iomfb_v12_3.h"
 #include "iomfb_v13_3.h"
 #include "version_utils.h"
+#include "dcp-internal.h"
 
 struct dcp_h17p_hotplug_request {
 	__le64 connected;
