@@ -42,6 +42,13 @@ int apple_atc_dp_tunnel_rate(struct phy *phy, u8 rate);
  * enable set and link_up() re-asserts it. The caller keeps the output
  * selected (holds the mux) around both.
  */
+/*
+ * T8142/T6050: selection only establishes the route. Before link_up(), set
+ * the PHY's actual pixel clock (1..4) and link coding; no clock is assumed.
+ * Configure only while down. Re-selecting or releasing the mux invalidates
+ * this configuration. Older generations return -EOPNOTSUPP.
+ */
+int apple_dpxbar_link_configure(struct mux_control *mux, unsigned int pclk, bool uhbr);
 int apple_dpxbar_link_down(struct mux_control *mux);
 int apple_dpxbar_link_up(struct mux_control *mux);
 

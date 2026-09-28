@@ -284,3 +284,49 @@ and external0 DCP. A read-only driver-state snapshot confirms both external
 DPTX ports enabled with units0/1 and initialized service cookies; the earlier
 port0 initialization timeout is gone. HDMI and USB-C routing, incoming DPTX
 link-training callbacks, and external scanout remain unqualified.
+
+T8142 physical crossbar
+----------------------
+
+The T6050 ATC crossbar advertises the T8142 register interface. Its five
+outputs are DPPHY and DPIN0..3. The initial driver covers the eight external
+DCP source states (two ports per DCP), with even states only on DPPHY,
+matching native connection validation. AUX source roles have a different
+selector-to-clock-bit mapping and are not exposed by this initial path.
+
+With ``apple,t8142-display-crossbar``, mux selection programs only the
+route. While holding that selection, the consumer must configure its PHY
+or tunnel clock and call ``apple_dpxbar_link_configure(mux, pclk, uhbr)``
+with the actual PCLK1..4 and coding before ``apple_dpxbar_link_up()``.
+There is no implicit clock or link-rate choice. A link configuration change
+requires link-down first. Releasing or changing the selection invalidates
+its clock configuration; reselecting the same source does not. Other
+outputs retain their route and clock gates. The coding bit is shared per
+PCLK, so conflicting simultaneous users are rejected before register writes.
+Older crossbar generations retain their existing selection semantics.
+
+The native T8142 path requires neither the older cycle-slip delay nor the
+old register0xc00 tunable. Link-down preserves the selector and output
+permission bit while disabling source and pixel-clock gates and restoring
+reset gates. Native readback checks use the T8142 status register layout.
+The source-based regression test exercises this sequence and output isolation::
+
+  python3 tools/testing/selftests/drivers/gpu/apple-dpxbar-t8142.py
+
+Control-page access also requires the ATC provider's common power gates.
+On T6050, native TypeCPhy power-on enables provider clock indices0 and1;
+ADT identifies these for HDMI's ATC3 as589 (ATC3_USB_AON_V) and62
+(ATC3_COMMON). Reading the crossbar before these were enabled produced an
+asynchronous fabric SError on hardware. Enabling them allowed all32 tested
+control/status registers to be read without exceptions. The host setup
+entry ``sptm_hv_guest_atc_xbar_setup`` resolves the ADT resources, enables
+those two clocks and maps one control page, without touching PHY lanes or
+pixel-clock clients. Physical PHY configuration and DCP consumer integration
+are still separate work; a successful mux test is not external scanout proof.
+
+On J714s, an isolated Linux test programmed and read back all36 supported
+source/output selector combinations, confirmed the other register fields
+and gates were unchanged, and restored the original selector registers.
+The test required the crossbar source gates to be off and never enabled
+PHY lanes or pixel clocks. Link-up/down clock behavior and optical output
+remain unverified on hardware.
