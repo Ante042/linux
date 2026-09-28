@@ -129,3 +129,25 @@ windows only; all endpoint/interrupt results above are from hardware.
 Interface registration is not association, packet transfer, Bluetooth radio
 qualification or native performance equivalence. Production data-ring startup,
 firmware27 connection details and sustained traffic are still in progress.
+
+Native macOS 27 scan qualification
+---------------------------------
+
+J714s uses the native 14-byte scan header followed by the channel-list TLV260
+and five-byte options TLV357. Channels use the ACI band encoding and respect
+cfg80211's requested/allowed list. Native default dwell fields are 40/40/110
+milliseconds; the inherited 110/110/0 values caused Alpha to enter execution
+stage3 on the first scan even after the required TLVs were added.
+
+With the corrected native request, hardware completed 38 channels and reported
+36 beacons, including the requested home network. Alpha remained at execution
+stage2 after completion. This establishes scanning, not association or packet
+traffic. J813 retains its existing firmware-specific scan path.
+
+Evidence: ``hardware-linux-n1-scan-dwell-1-guest.log``; kernel
+``Image-n1-scan-dwell`` SHA256:
+``bf1fcb4998ed820629fd937b7dea1aeeb1570b27c5d120216ca0b6cc9eb67ce7``.
+The native ABI references are ACIScanAdapter::buildScanRequestNewApi at
+0x1809bf400 and IO80211ScanRequest defaults at0x1807b46d4 in the captured
+DriverKit cache. Firmware payload/calibration and network details remain
+private local artifacts.
