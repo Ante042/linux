@@ -65,3 +65,5 @@ obj-$(CONFIG_ARM64) += pci-thunder-pem.o
 obj-$(CONFIG_ARM64) += pci-xgene.o
 endif
 endif
+
+obj-$(CONFIG_PCIE_APPLE_X1N1) += apple-x1n1/

@@ -3,6 +3,16 @@
 menu "PCI controller drivers"
 	depends on PCI
 
+config PCIE_APPLE_X1N1
+	tristate "Apple x1n1 preinitialized PCIe host"
+	depends on ARM64 && OF && PCI_MSI
+	select PCI_HOST_COMMON
+	select IRQ_MSI_LIB
+	help
+	  PCI host for controllers initialized by x1n1, with direct ECAM/BAR
+	  mappings and native hierarchical AIC MSI interrupts. The firmware
+	  must configure power, DART/RID routing and the MSI capture registers.
+
 config PCI_HOST_COMMON
 	tristate
 	select PCI_ECAM

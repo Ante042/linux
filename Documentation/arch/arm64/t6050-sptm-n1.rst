@@ -9,9 +9,9 @@ uploaded the personalized J714s N1 FTAB through the Control PCI function on
 2026-09-27. The ROM returned response 1, advanced from stage 0 to stage 4,
 and wrote MSI data 0xa5a0 into the diagnostic DMA mailbox. This verifies actual
 PCIe device reads and writes through the SPTM-managed DART, beyond API-only
-map/unmap tests. Native interrupt delivery and operational Wi-Fi are separate,
-unfinished steps; the inherited polled firmware prototype is not a qualified
-full-performance networking implementation.
+map/unmap tests. This initial result used a diagnostic MSI DMA mailbox. The later native-MSI
+and runtime qualification is described below; radio operation and throughput
+remain unqualified.
 
 The test uses a preinitialized native T6050 PCIe controller, explicit bus1
 RID 0x100/0x101/0x102 to SID1/2/3 routing, and direct ECAM/BAR stage-2 windows.
@@ -72,3 +72,60 @@ Kernel ``Image-n1-force`` SHA256:
 ``02df14333ad13e8f44d76332eadb159b0437501df6d11b3a39cbc677db3f73b8``.
 Stage2 bundle ``candidate-n1-dart-permissions``; target DT
 ``t6050-n1-guard-enabled.dtb``. Firmware/calibration stays private.
+
+Native MSI, reset and runtime qualification
+------------------------------------------
+
+The preinitialized ``apple,x1n1-pcie`` host now exposes hierarchical native
+MSI using the AIC parent. T6050 port0 captures address0xfffff000 and maps
+32 local vectors onto AIC1824..1855. Linux allocates aligned vector ranges;
+per-function positions are not hardcoded. Its DART advertises the capture
+page as IOMMU_RESV_MSI, so the MSI address remains untranslated.
+
+The optional J714s port resources support the native firmware transition:
+endpoint bus mastering stops and pending transactions drain; the endpoint
+enters D3hot; bridge decode/bus numbers are cleared before PME broadcast;
+PME acknowledgement/L2 precede GPIO PERST and refclk-gating disable. The
+native DART power transition retains tables/mappings, and port reset restores
+RID/MSI routes before link training and PCI state restoration. Errors leave
+bridge decode disabled. The cycle is restricted to the preboot personality
+with no enumerated sibling functions. It does not reset an active Wi-Fi bus.
+
+Guest resources passed alongside ECAM are port0 at0x62800000+0x8000,
+PHY at0x62808000+0x4000, interrupt routing at0x6280c000+0x4000, and the
+PERST pad at0x62810140+4. The host provides target-derived four-cell tunable
+entries (offset, width, mask, value), and the kernel executes the reviewed
+native port sequence. The corresponding physical resources remain owned by
+this preinitialized controller; initial PHY/SMC setup still occurs in x1n1's
+hardware setup workflow.
+
+The IRQ conversion removes recurring Wi-Fi/Bluetooth traffic polling.
+Control reserves4 MSI vectors, Alpha16, Beta2. Alpha's vectors must exist
+before its IPC handshake. They remain allocated through runtime, with a
+synchronized callback handoff to the Wi-Fi worker. Beta owns its own vectors.
+Finite bootstrap/command response polls remain.
+
+Each function has its own IOMMU domain on this machine. Buffers therefore
+retain the consuming function's DMA device and matching lifetime: Control
+owns secondary FTAB and Control IPC; each memory-swap working copy belongs
+to its recipient; Alpha owns its window, context, messages and firmware log.
+Allocating all buffers through Control prevented Alpha from starting.
+
+Hardware ``hardware-linux-n1-runtime-3-guest.log`` establishes:
+
+* Native Control MSI reception, ROM success1/stage4.
+* Port cycle completed with endpoint identity106b:1901 and boot stage1.
+* Control reached OS stage2, completed IPC and CCHI hello.
+* Alpha completed its IPC handshake and registered ``wlan0``.
+* Beta completed IPC and registered ``hci0``.
+
+Kernel ``Image-n1-early-alpha-irq`` SHA256:
+``8a43716a91eb395ced1226c78c94d460647ace6712ee49002d97da3d22500720``.
+Stage2 ``candidate-n1-port-cycle`` and target DT
+``t6050-n1-cycle-enabled.dtb``. Full kernel builds and IRQ cleanup failure
+checks passed. Focused QEMU tests validate the additional stage-2 resource
+windows only; all endpoint/interrupt results above are from hardware.
+
+Interface registration is not association, packet transfer, Bluetooth radio
+qualification or native performance equivalence. Production data-ring startup,
+firmware27 connection details and sustained traffic are still in progress.

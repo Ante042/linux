@@ -85,7 +85,8 @@ struct centauri_wifi {
 	struct net_device *netdev;
 	struct work_struct scan_work;
 	struct work_struct connect_work;
-	struct delayed_work link_work;
+	struct work_struct link_work;
+	bool irq_ready;
 	struct cfg80211_scan_request *scan_request;
 	struct mutex lock;
 	/* The logger has its own coherent allocation. Reads/acknowledgements
@@ -1091,29 +1092,42 @@ static void connect_worker(struct work_struct *work)
 		netif_carrier_on(wifi->netdev);
 		if (wifi->data_probe_done & BIT(5))
 			netif_wake_queue(wifi->netdev);
-		schedule_delayed_work(&wifi->link_work, msecs_to_jiffies(20));
+		schedule_work(&wifi->link_work);
 	}
+}
+
+irqreturn_t centauri_alpha_irq(int irq, void *data)
+{
+	struct centauri *c = data;
+	struct centauri_wifi *wifi = smp_load_acquire(&c->wifi);
+
+	/* During bootstrap only the stable Control owner exists. Publication
+	 * and removal synchronize with these same IRQs before freeing Wi-Fi.
+	 */
+	if (wifi && smp_load_acquire(&wifi->irq_ready) &&
+	    !READ_ONCE(wifi->stopping))
+		schedule_work(&wifi->link_work);
+	return IRQ_HANDLED;
 }
 
 static void link_worker(struct work_struct *work)
 {
-	struct centauri_wifi *wifi = container_of(to_delayed_work(work), struct centauri_wifi, link_work);
-	bool disconnected;
+	struct centauri_wifi *wifi = container_of(work, struct centauri_wifi, link_work);
+	bool disconnected, was_connected;
 
 	mutex_lock(&wifi->lock);
+	was_connected = wifi->connected;
 	drain(wifi);
 	disconnected = wifi->disconnect_event || READ_ONCE(wifi->stopping) ||
 		readl(wifi->a.bar + 8) != 2;
 	if (disconnected)
 		wifi->connected = false;
 	mutex_unlock(&wifi->lock);
-	if (disconnected) {
+	if (disconnected && was_connected) {
 		netif_stop_queue(wifi->netdev);
 		skb_queue_purge(&wifi->data_tx_queue);
 		netif_carrier_off(wifi->netdev);
 		cfg80211_disconnected(wifi->netdev, WLAN_REASON_UNSPECIFIED, NULL, 0, false, GFP_KERNEL);
-	} else {
-		schedule_delayed_work(&wifi->link_work, msecs_to_jiffies(20));
 	}
 }
 
@@ -1136,7 +1150,7 @@ static int wifi_disconnect(struct wiphy *wiphy, struct net_device *netdev, u16 r
 	connected = wifi->connected;
 	wifi->connected = false;
 	mutex_unlock(&wifi->lock);
-	cancel_delayed_work_sync(&wifi->link_work);
+	cancel_work_sync(&wifi->link_work);
 	netif_stop_queue(netdev);
 	skb_queue_purge(&wifi->data_tx_queue);
 	netif_carrier_off(netdev);
@@ -1219,7 +1233,7 @@ static netdev_tx_t net_transmit(struct sk_buff *skb, struct net_device *netdev)
 	skb_queue_tail(&wifi->data_tx_queue, skb);
 	if (skb_queue_len(&wifi->data_tx_queue) >= DATA_TX_QUEUE_LIMIT)
 		netif_stop_queue(netdev);
-	mod_delayed_work(system_wq, &wifi->link_work, 0);
+	schedule_work(&wifi->link_work);
 	return NETDEV_TX_OK;
 }
 
@@ -2163,14 +2177,14 @@ int centauri_wifi_register(struct centauri *c)
 	wifi = kzalloc(sizeof(*wifi), GFP_KERNEL);
 	if (!wifi)
 		return -ENOMEM;
-	c->wifi = wifi;
 	wifi->control = c;
 	mutex_init(&wifi->lock);
 	mutex_init(&wifi->fwlog_lock);
 	skb_queue_head_init(&wifi->data_tx_queue);
 	INIT_WORK(&wifi->scan_work, scan_worker);
 	INIT_WORK(&wifi->connect_work, connect_worker);
-	INIT_DELAYED_WORK(&wifi->link_work, link_worker);
+	INIT_WORK(&wifi->link_work, link_worker);
+	smp_store_release(&c->wifi, wifi);
 	ret = centauri_alpha_resources(c, &wifi->a);
 	if (ret)
 		goto failed;
@@ -2235,6 +2249,8 @@ int centauri_wifi_register(struct centauri *c)
 	}
 	dev_info(&c->pdev->dev, "cfg80211 interface %s ready for scan tests; packet data unavailable\n",
 		 wifi->netdev->name);
+	smp_store_release(&wifi->irq_ready, true);
+	schedule_work(&wifi->link_work);
 	wifi->passphrase_file = debugfs_create_file("passphrase", 0200, c->debug, wifi, &passphrase_ops);
 	wifi->data_probe_file = debugfs_create_file("data_probe", 0200, c->debug, wifi, &data_probe_ops);
 	wifi->data_status_file = debugfs_create_file("data_status", 0400, c->debug, wifi, &data_status_ops);
@@ -2269,6 +2285,12 @@ void centauri_wifi_unregister(struct centauri *c)
 	if (!wifi)
 		return;
 	WRITE_ONCE(wifi->stopping, true);
+	smp_store_release(&c->wifi, NULL);
+	/* A handler that observed the old pointer must finish before any work
+	 * item or Wi-Fi storage can be freed. Later IRQs observe NULL.
+	 */
+	for (unsigned int i = 0; i < c->alpha_irqs.count; i++)
+		synchronize_irq(pci_irq_vector(c->alpha_irqs.pdev, i));
 	if (wifi->netdev && wifi->netdev->reg_state == NETREG_REGISTERED)
 		netif_tx_disable(wifi->netdev);
 	debugfs_remove(wifi->passphrase_file);
@@ -2290,7 +2312,7 @@ void centauri_wifi_unregister(struct centauri *c)
 	debugfs_remove(wifi->fwlog_ack_file);
 	cancel_work_sync(&wifi->scan_work);
 	cancel_work_sync(&wifi->connect_work);
-	cancel_delayed_work_sync(&wifi->link_work);
+	cancel_work_sync(&wifi->link_work);
 	skb_queue_purge(&wifi->data_tx_queue);
 	if (wifi->scan_request) {
 		struct cfg80211_scan_info info = { .aborted = true };
@@ -2308,5 +2330,4 @@ void centauri_wifi_unregister(struct centauri *c)
 		free_netdev(wifi->netdev);
 	memzero_explicit(wifi, sizeof(*wifi));
 	kfree(wifi);
-	c->wifi = NULL;
 }

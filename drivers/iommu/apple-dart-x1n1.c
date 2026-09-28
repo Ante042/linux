@@ -27,6 +27,7 @@
  * knows) and #iommu-cells = <1> (the stream id).
  */
 
+#include <linux/apple-dart-x1n1.h>
 #include <linux/bitmap.h>
 #include <linux/dma-mapping.h>
 #include <linux/err.h>
@@ -42,6 +43,8 @@
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/xarray.h>
+
+#include "dma-iommu.h"
 
 /* sptm2mmio register/doorbell map, shared with x1n1 src/sptm.c. */
 #define X1N1_MMIO_MAGIC		0x000
@@ -976,7 +979,34 @@ static bool apple_dart_x1n1_capable(struct device *dev, enum iommu_cap cap)
 	return cap == IOMMU_CAP_CACHE_COHERENCY;
 }
 
+/* PCIe captures the MSI doorbell before DART translation. Advertise the
+ * identity MSI page to the DMA layer so it never tries to map this non-RAM
+ * address through the SPTM transport. Other devices retain normal reservations.
+ * This follows apple-dart.c's hardware MSI reservation (Asahi contributors).
+ */
+static void apple_dart_x1n1_get_resv_regions(struct device *dev,
+                                           struct list_head *head)
+{
+	if (dev_is_pci(dev)) {
+		struct pci_host_bridge *bridge = pci_find_host_bridge(to_pci_dev(dev)->bus);
+		struct device_node *np = bridge->dev.parent->of_node;
+		struct iommu_resv_region *region;
+		u64 address;
+
+		if (of_device_is_compatible(np, "apple,x1n1-pcie") &&
+		    !of_property_read_u64(np, "apple,msi-address", &address)) {
+			region = iommu_alloc_resv_region(address & PAGE_MASK, PAGE_SIZE,
+				IOMMU_WRITE | IOMMU_NOEXEC | IOMMU_MMIO,
+				IOMMU_RESV_MSI, GFP_KERNEL);
+			if (region)
+				list_add_tail(&region->list, head);
+		}
+	}
+	iommu_dma_get_resv_regions(dev, head);
+}
+
 static const struct iommu_ops apple_dart_x1n1_ops = {
+	.get_resv_regions = apple_dart_x1n1_get_resv_regions,
 	.capable		= apple_dart_x1n1_capable,
 	.domain_alloc_paging	= apple_dart_x1n1_domain_alloc_paging,
 	.probe_device		= apple_dart_x1n1_probe_device,
@@ -993,6 +1023,38 @@ static const struct iommu_ops apple_dart_x1n1_ops = {
 		.free			= apple_dart_x1n1_domain_free,
 	},
 };
+
+/* Used only after the PCI host has stopped every endpoint on this DART.
+ * Native POWERDOWN/POWERUP retains the SPTM-owned tables and live mappings. */
+int apple_dart_x1n1_set_power(struct device *dev, bool on)
+{
+	struct apple_dart_x1n1_master *master;
+	struct apple_dart_x1n1 *dart;
+	unsigned long flags;
+	int ret;
+
+	if (!dev->iommu || !dev->iommu->iommu_dev ||
+	    dev->iommu->iommu_dev->ops != &apple_dart_x1n1_ops)
+		return -ENODEV;
+	master = dev_iommu_priv_get(dev);
+	if (!master)
+		return -ENODEV;
+	dart = master->dart;
+	mutex_lock(&dart->init_lock);
+	if (!dart->inited) {
+		ret = -EINVAL;
+		goto out;
+	}
+	spin_lock_irqsave(&dart->batch_lock, flags);
+	dart->batch->count = 1;
+	dart->batch->op[0] = (struct x1n1_op){ .op = on ? 7 : 8 };
+	ret = x1n1_ring(dart, X1N1_MMIO_DART_DB + 8 * dart->dart_id);
+	spin_unlock_irqrestore(&dart->batch_lock, flags);
+out:
+	mutex_unlock(&dart->init_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_dart_x1n1_set_power);
 
 static int apple_dart_x1n1_probe(struct platform_device *pdev)
 {

@@ -16,6 +16,7 @@
 
 struct cen_buffer {
 	struct list_head list;
+	struct device *owner;
 	void *cpu;
 	dma_addr_t dma;
 	size_t size;
@@ -30,6 +31,7 @@ struct cen_context {
 struct centauri_ipc {
 	struct list_head buffers;
 	struct pci_dev *function[3];
+	bool enabled[3];
 	void __iomem *bar[3];
 	struct cen_context control, alpha;
 	struct cen_buffer *secondary, *window, *cchi_rx, *cchi_tx, *debug_rx;
@@ -37,15 +39,22 @@ struct centauri_ipc {
 	u16 cchi_head, cchi_tail;
 };
 
-static struct cen_buffer *buffer_alloc(struct centauri *c, size_t size)
+/* Each PCI function can have its own DART domain. Keep the DMA owner with
+ * every allocation: an address allocated for Control is not an Alpha/Beta
+ * mapping, even when all functions share the same physical PCI endpoint.
+ */
+static struct cen_buffer *buffer_alloc(struct centauri *c, unsigned int function,
+                                      size_t size)
 {
 	struct cen_buffer *buffer = kzalloc(sizeof(*buffer), GFP_KERNEL);
 
 	if (!buffer)
 		return NULL;
+	buffer->owner = get_device(&c->ipc->function[function]->dev);
 	buffer->size = PAGE_ALIGN(size);
-	buffer->cpu = dma_alloc_coherent(&c->pdev->dev, buffer->size, &buffer->dma, GFP_KERNEL);
+	buffer->cpu = dma_alloc_coherent(buffer->owner, buffer->size, &buffer->dma, GFP_KERNEL);
 	if (!buffer->cpu) {
+		put_device(buffer->owner);
 		kfree(buffer);
 		return NULL;
 	}
@@ -139,7 +148,7 @@ static int secondary_init(struct centauri *c)
 			return -EINVAL;
 		required = max_t(u32, required, end);
 	}
-	c->ipc->secondary = buffer_alloc(c, required);
+	c->ipc->secondary = buffer_alloc(c, 0, required);
 	if (!c->ipc->secondary)
 		return -ENOMEM;
 	memcpy(c->ipc->secondary->cpu, seed, length);
@@ -153,14 +162,14 @@ static int secondary_init(struct centauri *c)
 }
 
 static int context_init(struct centauri *c, struct cen_context *ctx,
-			u16 tr, u16 cr, dma_addr_t scratch, size_t scratch_size)
+			unsigned int function, u16 tr, u16 cr, dma_addr_t scratch, size_t scratch_size)
 {
 	u8 *header;
 	dma_addr_t dma;
 	int i;
 
-	ctx->buffer = buffer_alloc(c, SZ_32K);
-	ctx->messages = buffer_alloc(c, SZ_16K);
+	ctx->buffer = buffer_alloc(c, function, SZ_32K);
+	ctx->messages = buffer_alloc(c, function, SZ_16K);
 	if (!ctx->buffer || !ctx->messages)
 		return -ENOMEM;
 	ctx->tr_count = tr;
@@ -198,13 +207,20 @@ static int handshake(void __iomem *bar, struct cen_context *ctx,
 
 	writel(1, bar + control);
 	ret = readl_poll_timeout(bar + status, value, value == 1, 100, 2000000);
-	if (ret)
+	if (ret) {
+		pr_err("centauri: IPC init timeout status@%#x=%#x control@%#x=%#x context=%pad\n",
+		       status, value, control, readl(bar + control), &ctx->buffer->dma);
 		return ret;
+	}
 	writel(lower_32_bits(ctx->buffer->dma), bar + address);
 	writel(upper_32_bits(ctx->buffer->dma), bar + address + 4);
 	dma_wmb();
 	writel(2, bar + control);
-	return readl_poll_timeout(bar + status, value, value == 2, 100, 2000000);
+	ret = readl_poll_timeout(bar + status, value, value == 2, 100, 2000000);
+	if (ret)
+		pr_err("centauri: IPC run timeout status@%#x=%#x control@%#x=%#x context=%pad\n",
+		       status, value, control, readl(bar + control), &ctx->buffer->dma);
+	return ret;
 }
 
 static int message(struct cen_context *ctx, void __iomem *doorbell,
@@ -256,9 +272,9 @@ static int cchi_init(struct centauri *c)
 	u16 tail;
 	int i, ret;
 
-	ipc->cchi_rx = buffer_alloc(c, SZ_32K);
-	ipc->cchi_tx = buffer_alloc(c, SZ_32K);
-	ipc->debug_rx = buffer_alloc(c, SZ_16K);
+	ipc->cchi_rx = buffer_alloc(c, 0, SZ_32K);
+	ipc->cchi_tx = buffer_alloc(c, 0, SZ_32K);
+	ipc->debug_rx = buffer_alloc(c, 0, SZ_16K);
 	if (!ipc->cchi_rx || !ipc->cchi_tx || !ipc->debug_rx)
 		return -ENOMEM;
 	ret = message(&ipc->control, c->bar + 0x9000, config, sizeof(config));
@@ -311,7 +327,7 @@ static int memswap_handoff(struct centauri *c, unsigned int function, const char
 	ret = ftab_entry(secondary->cpu, secondary->size, tag, &offset, &size, false);
 	if (ret)
 		return ret;
-	working = buffer_alloc(c, size);
+	working = buffer_alloc(c, function, size);
 	if (!working)
 		return -ENOMEM;
 	dma_rmb();
@@ -327,8 +343,7 @@ static int memswap_handoff(struct centauri *c, unsigned int function, const char
 static int enumerate_functions(struct centauri *c)
 {
 	struct centauri_ipc *ipc = c->ipc;
-	u16 control;
-	int i, cap;
+	int i, ret;
 
 	pci_lock_rescan_remove();
 	/* The ROM personality was single-function; boot exposes Alpha and Beta. */
@@ -346,19 +361,25 @@ static int enumerate_functions(struct centauri *c)
 		ipc->bar[i] = pci_iomap(ipc->function[i], 0, 0);
 		if (!ipc->bar[i])
 			return -ENOMEM;
-		cap = pci_find_capability(ipc->function[i], PCI_CAP_ID_MSI);
-		if (!cap)
-			return -ENODEV;
-		pci_read_config_word(ipc->function[i], cap + PCI_MSI_FLAGS, &control);
-		if (!(control & PCI_MSI_FLAGS_64BIT))
-			return -EOPNOTSUPP;
-		pci_write_config_dword(ipc->function[i], cap + PCI_MSI_ADDRESS_LO,
-			lower_32_bits(c->msi_dma + 0x400 * i));
-		pci_write_config_dword(ipc->function[i], cap + PCI_MSI_ADDRESS_HI,
-			upper_32_bits(c->msi_dma + 0x400 * i));
-		pci_write_config_word(ipc->function[i], cap + PCI_MSI_DATA_64, 0xa5a0 + 0x100 * i);
-		pci_write_config_word(ipc->function[i], cap + PCI_MSI_FLAGS,
-			(control & ~PCI_MSI_FLAGS_QSIZE) | (5 << 4) | PCI_MSI_FLAGS_ENABLE);
+		if (i) {
+			ret = pci_enable_device_mem(ipc->function[i]);
+			if (ret)
+				return ret;
+			ipc->enabled[i] = true;
+		}
+		ret = dma_set_mask_and_coherent(&ipc->function[i]->dev, DMA_BIT_MASK(40));
+		if (ret)
+			return ret;
+		if (i == 1) {
+			/* Firmware publishes Alpha bootstrap changes through MSI before
+			 * the host installs its ACIPC context. Keep these vectors stable
+			 * through the later Wi-Fi handler handoff.
+			 */
+			ret = centauri_request_irqs(&c->alpha_irqs, ipc->function[i],
+						    16, centauri_alpha_irq, c);
+			if (ret)
+				return ret;
+		}
 		pci_set_master(ipc->function[i]);
 	}
 	return 0;
@@ -383,7 +404,7 @@ int centauri_start_ipc(struct centauri *c)
 	ret = secondary_init(c);
 	if (ret)
 		goto failed;
-	ret = context_init(c, &ipc->control, 13, 1, 0, 0);
+	ret = context_init(c, &ipc->control, 0, 13, 1, 0, 0);
 	if (ret)
 		goto failed;
 	writel(lower_32_bits(c->descriptor_dma), c->bar + 0x8044);
@@ -417,12 +438,12 @@ int centauri_start_ipc(struct centauri *c)
 		ret = ret ?: -EIO;
 		goto failed;
 	}
-	ipc->window = buffer_alloc(c, SZ_16M);
+	ipc->window = buffer_alloc(c, 1, SZ_16M);
 	if (!ipc->window) {
 		ret = -ENOMEM;
 		goto failed;
 	}
-	ret = context_init(c, &ipc->alpha, 192, 234,
+	ret = context_init(c, &ipc->alpha, 1, 192, 234,
 		ipc->window->dma + CEN_ALPHA_SCRATCH_OFFSET, CEN_ALPHA_SCRATCH_SIZE);
 	if (ret)
 		goto failed;
@@ -433,10 +454,26 @@ int centauri_start_ipc(struct centauri *c)
 	if (ret)
 		goto failed;
 	dev_info(&c->pdev->dev, "Alpha Wi-Fi firmware running; IPC handshake complete\n");
-	return centauri_wifi_register(c);
+	ret = centauri_wifi_register(c);
+	if (ret)
+		return ret;
+	/* Beta was not ready during the initial rescan; retry its own driver only
+	 * after Control has handed over its memory and started the runtime image.
+	 */
+	ret = device_attach(&ipc->function[2]->dev);
+	if (ret < 0)
+		dev_warn(&c->pdev->dev, "Beta driver attachment failed: %d\n", ret);
+	return 0;
 failed:
 	dev_err(&c->pdev->dev, "IPC bootstrap failed: %d (Control stage=%#x)\n",
 		ret, readl(c->bar + 0x8000));
+	if (ipc->bar[1])
+		dev_err(&c->pdev->dev, "Alpha stage=%#x IPC=%#x window=%#x/%#x/%#x\n",
+			readl(ipc->bar[1] + 8), readl(ipc->bar[1] + 0xc),
+			readl(ipc->bar[1] + 0x18), readl(ipc->bar[1] + 0x1c), readl(ipc->bar[1] + 0x20));
+	if (ipc->bar[2])
+		dev_err(&c->pdev->dev, "Beta stage=%#x IPC=%#x\n",
+			readl(ipc->bar[2] + 0x18), readl(ipc->bar[2] + 0x1c));
 	/* Published DMA stays pinned until every function is stopped at removal. */
 	return ret;
 }
@@ -445,31 +482,30 @@ void centauri_free_ipc(struct centauri *c)
 {
 	struct centauri_ipc *ipc = c->ipc;
 	struct cen_buffer *buffer, *next;
-	int i, cap;
-	u16 control;
+	int i;
 
 	if (!ipc)
 		return;
+	if (ipc->function[2])
+		device_release_driver(&ipc->function[2]->dev);
 	centauri_wifi_unregister(c);
+	centauri_free_irqs(&c->alpha_irqs);
 	for (i = 0; i < 3; i++) {
 		if (!ipc->function[i])
 			continue;
-		cap = pci_find_capability(ipc->function[i], PCI_CAP_ID_MSI);
-		if (cap) {
-			pci_read_config_word(ipc->function[i], cap + PCI_MSI_FLAGS, &control);
-			pci_write_config_word(ipc->function[i], cap + PCI_MSI_FLAGS,
-				control & ~PCI_MSI_FLAGS_ENABLE);
-		}
 		pci_clear_master(ipc->function[i]);
 	}
 	list_for_each_entry_safe(buffer, next, &ipc->buffers, list) {
-		dma_free_coherent(&c->pdev->dev, buffer->size, buffer->cpu, buffer->dma);
+		dma_free_coherent(buffer->owner, buffer->size, buffer->cpu, buffer->dma);
+		put_device(buffer->owner);
 		list_del(&buffer->list);
 		kfree(buffer);
 	}
 	for (i = 0; i < 3; i++) {
 		if (ipc->bar[i])
 			pci_iounmap(ipc->function[i], ipc->bar[i]);
+		if (ipc->enabled[i])
+			pci_disable_device(ipc->function[i]);
 		pci_dev_put(ipc->function[i]);
 	}
 	kfree(ipc);
@@ -482,6 +518,7 @@ int centauri_alpha_resources(struct centauri *c, struct cen_alpha_resources *res
 
 	if (!ipc || !ipc->window || !ipc->alpha.buffer || !ipc->alpha.messages)
 		return -ENODEV;
+	resources->pdev = ipc->function[1];
 	resources->context = ipc->alpha.buffer->cpu;
 	resources->context_dma = ipc->alpha.buffer->dma;
 	resources->messages = ipc->alpha.messages->cpu;
@@ -505,7 +542,7 @@ int centauri_alpha_log_buffer(struct centauri *c, void **cpu, dma_addr_t *dma, s
 	if (!ipc || !ipc->window)
 		return -ENODEV;
 	if (!ipc->alpha_log)
-		ipc->alpha_log = buffer_alloc(c, SZ_4M);
+		ipc->alpha_log = buffer_alloc(c, 1, SZ_4M);
 	if (!ipc->alpha_log)
 		return -ENOMEM;
 	*cpu = ipc->alpha_log->cpu;

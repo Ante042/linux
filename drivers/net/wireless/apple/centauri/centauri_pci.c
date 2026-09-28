@@ -12,6 +12,7 @@
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/pci.h>
+#include <linux/pci-apple-x1n1.h>
 #include <linux/seq_file.h>
 #include <linux/sizes.h>
 #include <linux/unaligned.h>
@@ -19,6 +20,52 @@
 #include "centauri.h"
 
 static struct dentry *centauri_debug;
+
+/* Fixed counts follow the native Control/Alpha/Beta resource maps. PCI's MSI
+ * allocator owns the message addresses and data; never program a DMA mailbox.
+ */
+void centauri_free_irqs(struct centauri_irqs *irqs)
+{
+	if (!irqs->pdev)
+		return;
+	while (irqs->count)
+		free_irq(pci_irq_vector(irqs->pdev, --irqs->count), irqs->data);
+	pci_free_irq_vectors(irqs->pdev);
+	irqs->pdev = NULL;
+}
+
+int centauri_request_irqs(struct centauri_irqs *irqs, struct pci_dev *pdev,
+                         unsigned int count, irq_handler_t handler, void *data)
+{
+	int ret;
+
+	ret = pci_alloc_irq_vectors(pdev, count, count, PCI_IRQ_MSI);
+	if (ret < 0)
+		return ret;
+	irqs->pdev = pdev;
+	irqs->data = data;
+	for (irqs->count = 0; irqs->count < count; irqs->count++) {
+		ret = request_irq(pci_irq_vector(pdev, irqs->count), handler, 0,
+				  "centauri", data);
+		if (ret) {
+			centauri_free_irqs(irqs);
+			return ret;
+		}
+	}
+	return 0;
+}
+
+static irqreturn_t centauri_control_irq(int irq, void *data)
+{
+	struct centauri *c = data;
+
+	atomic_inc(&c->irq_count);
+	/* ROM and bounded Control bootstrap commands poll their response fields.
+	 * MSI delivery is counted independently, including boot-stage changes.
+	 */
+	return IRQ_HANDLED;
+}
+
 
 static int centauri_status_show(struct seq_file *s, void *unused)
 {
@@ -43,22 +90,24 @@ static void centauri_free_boot(struct centauri *c)
 	struct device *dev = &c->pdev->dev;
 
 	if (!c->link_ready && c->boot_attempted) {
+		/* No endpoint config access is safe after a failed port transition.
+		 * Disconnect handlers before devm frees c; leave PCI vectors and
+		 * published DMA pinned until the required reset/device removal.
+		 */
+		while (c->irqs.count)
+			free_irq(pci_irq_vector(c->pdev, --c->irqs.count), c);
 		dev_warn(dev, "retaining DMA buffers after failed link transition; reboot required\n");
 		return;
 	}
 	/* Stop device writes before any DMA storage is released. */
 	centauri_free_ipc(c);
-	if (c->msi_cap)
-		pci_write_config_word(c->pdev, c->msi_cap + PCI_MSI_FLAGS,
-				      c->msi_original & ~PCI_MSI_FLAGS_ENABLE);
 	pci_clear_master(c->pdev);
+	centauri_free_irqs(&c->irqs);
 	if (c->firmware)
 		dma_free_coherent(dev, c->firmware_size, c->firmware, c->firmware_dma);
 	if (c->descriptor)
 		dma_free_coherent(dev, SZ_16K, c->descriptor, c->descriptor_dma);
-	if (c->msi_page)
-		dma_free_coherent(dev, SZ_16K, c->msi_page, c->msi_dma);
-	c->firmware = c->descriptor = c->msi_page = NULL;
+	c->firmware = c->descriptor = NULL;
 }
 
 struct centauri_host_profile {
@@ -111,34 +160,20 @@ static int centauri_rom_boot(struct centauri *c)
 	c->firmware_size = PAGE_ALIGN(fw->size);
 	c->firmware = dma_alloc_coherent(dev, c->firmware_size, &c->firmware_dma, GFP_KERNEL);
 	c->descriptor = dma_alloc_coherent(dev, SZ_16K, &c->descriptor_dma, GFP_KERNEL);
-	c->msi_page = dma_alloc_coherent(dev, SZ_16K, &c->msi_dma, GFP_KERNEL);
-	if (!c->firmware || !c->descriptor || !c->msi_page) {
+	if (!c->firmware || !c->descriptor) {
 		ret = -ENOMEM;
 		goto free_buffers;
 	}
 	memset(c->firmware, 0, c->firmware_size);
 	memcpy(c->firmware, fw->data, fw->size);
 	memset(c->descriptor, 0, SZ_16K);
-	memset(c->msi_page, 0, SZ_16K);
 	/* Measured ROM scatter entry: u64 DMA, u32 length, u32 flags, u64 x2 zero. */
 	put_unaligned_le64(c->firmware_dma, c->descriptor);
 	put_unaligned_le32(ALIGN(fw->size, SZ_4K), c->descriptor + 8);
-	c->msi_cap = pci_find_capability(c->pdev, PCI_CAP_ID_MSI);
-	if (!c->msi_cap) {
-		ret = -ENODEV;
+	ret = centauri_request_irqs(&c->irqs, c->pdev, 4,
+				    centauri_control_irq, c);
+	if (ret)
 		goto free_buffers;
-	}
-	pci_read_config_word(c->pdev, c->msi_cap + PCI_MSI_FLAGS, &c->msi_original);
-	if (!(c->msi_original & PCI_MSI_FLAGS_64BIT)) {
-		ret = -EOPNOTSUPP;
-		goto free_buffers;
-	}
-	/* Poll the measured DMA-backed MSI mailbox until native IRQ support exists. */
-	pci_write_config_dword(c->pdev, c->msi_cap + PCI_MSI_ADDRESS_LO, lower_32_bits(c->msi_dma));
-	pci_write_config_dword(c->pdev, c->msi_cap + PCI_MSI_ADDRESS_HI, upper_32_bits(c->msi_dma));
-	pci_write_config_word(c->pdev, c->msi_cap + PCI_MSI_DATA_64, 0xa5a0);
-	pci_write_config_word(c->pdev, c->msi_cap + PCI_MSI_FLAGS,
-		(c->msi_original & ~PCI_MSI_FLAGS_QSIZE) | PCI_MSI_FLAGS_ENABLE);
 	pci_set_master(c->pdev);
 	writel(profile->platform_id, c->bar + 0x807c);
 	writel(0, c->bar + 0x803c);
@@ -156,13 +191,15 @@ static int centauri_rom_boot(struct centauri *c)
 	writel(1, c->bar + 0x9000);
 	ret = readl_poll_timeout(c->bar + 0x8040, c->image_response,
 				c->image_response != 0, 20000, 20000000);
+	if (!ret && c->image_response != 1)
+		ret = -EIO;
 	if (!ret)
 		ret = readl_poll_timeout(c->bar + 0x8000, stage, stage != 0, 20000, 20000000);
 	else
 		stage = readl(c->bar + 0x8000);
 	dma_rmb();
-	dev_info(dev, "ROM firmware result: response=%#x stage=%#x mailbox=%#x poll=%d\n",
-		 c->image_response, stage, READ_ONCE(*(u32 *)c->msi_page), ret);
+	dev_info(dev, "ROM firmware result: response=%#x stage=%#x irqs=%d poll=%d\n",
+		 c->image_response, stage, atomic_read(&c->irq_count), ret);
 	/* Keep DMA buffers owned until device removal, even on timeout. */
 	if (!ret && stage != 4)
 		ret = -EIO;
@@ -192,8 +229,11 @@ static ssize_t centauri_boot_write(struct file *file, const char __user *buffer,
 		ret = -EBUSY;
 	} else {
 		c->link_ready = false;
-		ret = centauri_j813_port_cycle(c->pdev);
+		ret = of_machine_is_compatible("apple,j714s") ?
+			apple_x1n1_pcie_cycle(c->pdev) :
+			centauri_j813_port_cycle(c->pdev);
 		if (!ret) {
+			pci_restore_msi_state(c->pdev);
 			c->link_ready = true;
 			dev_info(&c->pdev->dev, "post-reset execution stage=%#x\n",
 				 readl(c->bar + 0x8000));
@@ -216,10 +256,13 @@ static int centauri_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	void *page;
 	int ret;
 
+	if (PCI_FUNC(pdev->devfn) != 0)
+		return -ENODEV;
 	c = devm_kzalloc(&pdev->dev, sizeof(*c), GFP_KERNEL);
 	if (!c)
 		return -ENOMEM;
 	c->pdev = pdev;
+	atomic_set(&c->irq_count, 0);
 	c->link_ready = true;
 	mutex_init(&c->boot_lock);
 	c->stage_offset = id->driver_data;
@@ -266,8 +309,6 @@ static void centauri_remove(struct pci_dev *pdev)
 static const struct pci_device_id centauri_ids[] = {
 	{ PCI_DEVICE(PCI_VENDOR_ID_APPLE, 0x1900), .driver_data = 0x8000 },
 	{ PCI_DEVICE(PCI_VENDOR_ID_APPLE, 0x1901), .driver_data = 0x8000 },
-	{ PCI_DEVICE(PCI_VENDOR_ID_APPLE, 0x1902), .driver_data = 0x0008 },
-	{ PCI_DEVICE(PCI_VENDOR_ID_APPLE, 0x1903), .driver_data = 0x0018 },
 	{ }
 };
 MODULE_DEVICE_TABLE(pci, centauri_ids);

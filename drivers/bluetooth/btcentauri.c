@@ -13,6 +13,7 @@
 #include <linux/hex.h>
 #include <linux/dma-mapping.h>
 #include <linux/iopoll.h>
+#include <linux/interrupt.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
@@ -108,7 +109,9 @@ struct cen_bt {
 	u8 *arena;
 	dma_addr_t dma;
 	struct mutex lock;
-	struct delayed_work poll;
+	struct work_struct poll;
+	unsigned int irq_count;
+	bool irq_vectors;
 	struct sk_buff_head txq;
 	struct sk_buff_head acl_txq, le_txq;
 	u16 acl_tx_head, le_tx_head;
@@ -471,7 +474,7 @@ static int cen_transmit(struct cen_bt *bt, struct sk_buff_head *queue,
 
 static void cen_poll(struct work_struct *work)
 {
-	struct cen_bt *bt = container_of(to_delayed_work(work), struct cen_bt, poll);
+	struct cen_bt *bt = container_of(work, struct cen_bt, poll);
 	struct hci_dev *hdev = bt->hdev;
 	struct sk_buff *skb;
 	u16 tail;
@@ -574,12 +577,11 @@ static void cen_poll(struct work_struct *work)
 	     cen_transmit(bt, &bt->le_txq, 4, CEN_LE_SLOTS, CEN_LE_TX,
 			  CEN_LE_FOOTER, &bt->le_tx_head)))
 		goto protocol_error;
-	schedule_delayed_work(&bt->poll, msecs_to_jiffies(1));
 	goto unlock;
 protocol_error:
 	bt->running = false;
 	hdev->stat.err_rx++;
-	dev_err(&bt->pdev->dev, "Beta transport stopped (exec=%u ipc=%u); polling disabled\n",
+	dev_err(&bt->pdev->dev, "Beta transport stopped (exec=%u ipc=%u); interrupt processing stopped\n",
 		readl(bt->bar + 0x18), readl(bt->bar));
 unlock:
 	mutex_unlock(&bt->lock);
@@ -591,7 +593,7 @@ static int cen_hci_open(struct hci_dev *hdev)
 
 	mutex_lock(&bt->lock);
 	bt->running = true;
-	schedule_delayed_work(&bt->poll, 0);
+	schedule_work(&bt->poll);
 	mutex_unlock(&bt->lock);
 	return 0;
 }
@@ -604,7 +606,7 @@ static int cen_hci_close(struct hci_dev *hdev)
 	bt->running = false;
 	bt->hrb_status_pending = false;
 	mutex_unlock(&bt->lock);
-	cancel_delayed_work_sync(&bt->poll);
+	cancel_work_sync(&bt->poll);
 	skb_queue_purge(&bt->txq);
 	skb_queue_purge(&bt->acl_txq);
 	skb_queue_purge(&bt->le_txq);
@@ -772,7 +774,7 @@ static int cen_hci_send(struct hci_dev *hdev, struct sk_buff *skb)
 		ret = -ENOBUFS;
 	else {
 		skb_queue_tail(queue, skb);
-		mod_delayed_work(system_wq, &bt->poll, 0);
+		schedule_work(&bt->poll);
 	}
 	mutex_unlock(&bt->lock);
 	if (!ret)
@@ -784,9 +786,48 @@ out:
 	return ret;
 }
 
+static irqreturn_t cen_irq(int irq, void *data)
+{
+	struct cen_bt *bt = data;
+
+	if (READ_ONCE(bt->running))
+		schedule_work(&bt->poll);
+	return IRQ_HANDLED;
+}
+
+static void cen_free_irqs(struct cen_bt *bt)
+{
+	while (bt->irq_count)
+		free_irq(pci_irq_vector(bt->pdev, --bt->irq_count), bt);
+	if (bt->irq_vectors) {
+		pci_free_irq_vectors(bt->pdev);
+		bt->irq_vectors = false;
+	}
+}
+
+static int cen_request_irqs(struct cen_bt *bt)
+{
+	int ret = pci_alloc_irq_vectors(bt->pdev, 2, 2, PCI_IRQ_MSI);
+
+	if (ret < 0)
+		return ret;
+	bt->irq_vectors = true;
+	for (bt->irq_count = 0; bt->irq_count < 2; bt->irq_count++) {
+		ret = request_irq(pci_irq_vector(bt->pdev, bt->irq_count), cen_irq,
+				  0, "btcentauri", bt);
+		if (ret) {
+			cen_free_irqs(bt);
+			return ret;
+		}
+	}
+	return 0;
+}
+
 static void cen_stop(struct cen_bt *bt)
 {
 	pci_clear_master(bt->pdev);
+	cen_free_irqs(bt);
+	cancel_work_sync(&bt->poll);
 	kvfree(bt->capture);
 	bt->capture = NULL;
 	/* IPC control 0 caused a firmware abort in the initial hardware probe.
@@ -887,7 +928,8 @@ static int cen_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	struct hci_dev *hdev;
 	int ret;
 
-	if (!of_machine_is_compatible("apple,j813") || PCI_FUNC(pdev->devfn) != 2)
+	if ((!of_machine_is_compatible("apple,j813") &&
+	     !of_machine_is_compatible("apple,j714s")) || PCI_FUNC(pdev->devfn) != 2)
 		return -ENODEV;
 	bt = devm_kzalloc(&pdev->dev, sizeof(*bt), GFP_KERNEL);
 	if (!bt)
@@ -901,7 +943,7 @@ static int cen_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		return -EINVAL;
 	if (native_hrb && (!native_startup || !enable_acl))
 		return -EINVAL;
-	INIT_DELAYED_WORK(&bt->poll, cen_poll);
+	INIT_WORK(&bt->poll, cen_poll);
 	ret = pcim_enable_device(pdev);
 	if (ret)
 		return ret;
@@ -929,6 +971,9 @@ static int cen_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 			goto stop;
 		}
 	}
+	ret = cen_request_irqs(bt);
+	if (ret)
+		goto stop;
 	ret = cen_start(bt);
 	if (ret) {
 		dev_err(&pdev->dev, "Beta IPC initialization failed: %d\n", ret);
@@ -976,6 +1021,8 @@ static void cen_remove(struct pci_dev *pdev)
 	debugfs_remove_recursive(bt->debug);
 	hci_unregister_dev(bt->hdev);
 	cen_hci_close(bt->hdev);
+	cen_free_irqs(bt);
+	cancel_work_sync(&bt->poll);
 	hci_free_dev(bt->hdev);
 	cen_stop(bt);
 }
