@@ -29,6 +29,7 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_platform.h>
+#include <linux/of_reserved_mem.h>
 #include <linux/once.h>
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
@@ -339,6 +340,13 @@ static inline struct apple_nvme *ctrl_to_apple_nvme(struct nvme_ctrl *ctrl)
 
 static bool apple_nvme_can_adopt_rtkit(struct apple_nvme *anv)
 {
+	/* U-Boot's resident-SPTM handoff quiesces both RTKit sides before
+	 * releasing DMA buffers. CC.EN/CSTS.RDY survive that transition and
+	 * cannot identify a live mailbox session. The next owner must INIT.
+	 */
+	if (of_property_read_bool(anv->dev->of_node, "asahi,rtkit-quiesced"))
+		return false;
+
 	/* CPU_RUN and BOOT_STATUS survive an inactive firmware session. */
 	return anv->hw->needs_ioq_registers &&
 		(readl(anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL) &
@@ -1785,6 +1793,7 @@ struct apple_nvme_sart_buffer {
 	void *buffer;
 	dma_addr_t dma;
 	size_t size;
+	bool inherited;
 };
 
 static void apple_nvme_sart_buffer_release(void *data)
@@ -1795,11 +1804,57 @@ static void apple_nvme_sart_buffer_release(void *data)
 		dev_err(b->dev, "retaining queue buffer after failed SART unmap\n");
 		return;
 	}
-	dma_free_coherent(b->dev, b->size, b->buffer, b->dma);
+	if (!b->inherited)
+		dma_free_coherent(b->dev, b->size, b->buffer, b->dma);
+}
+
+/* SPTM pins queue addresses until the next machine boot. A previous owner
+ * supplies those same pages as reserved memory; never silently replace them.
+ * Firmware has been quiesced by that owner before Linux can clear the pages.
+ */
+static int apple_nvme_handoff_validate(struct apple_nvme *anv)
+{
+	static const char * const names[] = { "admin-sq", "admin-cq", "io-sq", "io-cq" };
+	struct device_node *np = anv->dev->of_node;
+	phys_addr_t addresses[ARRAY_SIZE(names)];
+	int i, j;
+
+	if (!anv->hw->sptm_resident || !of_property_present(np, "memory-region"))
+		return 0;
+	if (!of_property_read_bool(np, "asahi,rtkit-quiesced") ||
+	    !dev_is_dma_coherent(anv->dev) ||
+	    of_count_phandle_with_args(np, "memory-region", NULL) != ARRAY_SIZE(names) ||
+	    of_property_count_strings(np, "memory-region-names") != ARRAY_SIZE(names))
+		return -EINVAL;
+	for (i = 0; i < ARRAY_SIZE(names); i++) {
+		struct device_node *node;
+		struct reserved_mem *rmem;
+		int index = of_property_match_string(np, "memory-region-names", names[i]);
+
+		if (index < 0)
+			return index;
+		node = of_parse_phandle(np, "memory-region", index);
+		if (!node)
+			return -EINVAL;
+		rmem = of_reserved_mem_lookup(node);
+		if (!rmem || !of_property_read_bool(node, "no-map") ||
+		    !IS_ALIGNED(rmem->base, SZ_16K) || rmem->size != SZ_16K) {
+			of_node_put(node);
+			return -EINVAL;
+		}
+		addresses[i] = rmem->base;
+		of_node_put(node);
+		for (j = 0; j < i; j++)
+			if (addresses[j] == addresses[i])
+				return -EINVAL;
+	}
+	dev_info(anv->dev, "using four inherited SPTM queue pages\n");
+	return 0;
 }
 
 static void *apple_nvme_queue_buffer_alloc(struct apple_nvme *anv,
-					  size_t size, dma_addr_t *dma)
+					  size_t size, dma_addr_t *dma,
+					  const char *handoff_name)
 {
 	struct apple_nvme_sart_buffer *b;
 
@@ -1811,11 +1866,34 @@ static void *apple_nvme_queue_buffer_alloc(struct apple_nvme *anv,
 	b->dev = anv->dev;
 	b->sart = anv->sart;
 	b->size = ALIGN(size, SZ_16K);
-	b->buffer = dma_alloc_coherent(b->dev, b->size, &b->dma, GFP_KERNEL);
-	if (!b->buffer)
-		return NULL;
+	if (handoff_name && of_property_present(anv->dev->of_node, "memory-region")) {
+		struct device_node *np = anv->dev->of_node, *node;
+		struct reserved_mem *rmem;
+		int index = of_property_match_string(np, "memory-region-names", handoff_name);
+
+		if (index < 0)
+			return NULL;
+		node = of_parse_phandle(np, "memory-region", index);
+		if (!node)
+			return NULL;
+		rmem = of_reserved_mem_lookup(node);
+		of_node_put(node);
+		if (!rmem || b->size > rmem->size)
+			return NULL;
+		b->buffer = devm_memremap(b->dev, rmem->base, b->size, MEMREMAP_WB);
+		if (IS_ERR(b->buffer))
+			return NULL;
+		b->dma = phys_to_dma(b->dev, rmem->base);
+		b->inherited = true;
+		memset(b->buffer, 0, b->size);
+	} else {
+		b->buffer = dma_alloc_coherent(b->dev, b->size, &b->dma, GFP_KERNEL);
+		if (!b->buffer)
+			return NULL;
+	}
 	if (apple_sart_add_allowed_region(b->sart, b->dma, b->size)) {
-		dma_free_coherent(b->dev, b->size, b->buffer, b->dma);
+		if (!b->inherited)
+			dma_free_coherent(b->dev, b->size, b->buffer, b->dma);
 		return NULL;
 	}
 	if (devm_add_action_or_reset(b->dev, apple_nvme_sart_buffer_release, b))
@@ -1832,7 +1910,8 @@ static int apple_nvme_queue_alloc(struct apple_nvme *anv,
 
 	q->cqes = apple_nvme_queue_buffer_alloc(anv,
 				      depth * sizeof(struct nvme_completion),
-				      &q->cq_dma_addr);
+				      &q->cq_dma_addr,
+				      q == &anv->adminq ? "admin-cq" : "io-cq");
 	if (!q->cqes)
 		return -ENOMEM;
 
@@ -1841,7 +1920,8 @@ static int apple_nvme_queue_alloc(struct apple_nvme *anv,
 	else
 		iosq_size = depth << APPLE_NVME_IOSQES;
 
-	q->sqes = apple_nvme_queue_buffer_alloc(anv, iosq_size, &q->sq_dma_addr);
+	q->sqes = apple_nvme_queue_buffer_alloc(anv, iosq_size, &q->sq_dma_addr,
+					     q == &anv->adminq ? "admin-sq" : "io-sq");
 	if (!q->sqes)
 		return -ENOMEM;
 
@@ -1853,7 +1933,7 @@ static int apple_nvme_queue_alloc(struct apple_nvme *anv,
 		q->tcbs = apple_nvme_queue_buffer_alloc(anv,
 			anv->hw->max_queue_depth *
 				sizeof(struct apple_nvmmu_tcb),
-			&q->tcb_dma_addr);
+			&q->tcb_dma_addr, NULL);
 		if (!q->tcbs)
 			return -ENOMEM;
 	}
@@ -2060,6 +2140,11 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 	INIT_WORK(&anv->remove_work, apple_nvme_remove_dead_ctrl_work);
 	spin_lock_init(&anv->lock);
 
+	ret = apple_nvme_handoff_validate(anv);
+	if (ret) {
+		dev_err(dev, "invalid inherited SPTM queue memory: %d\n", ret);
+		goto put_dev;
+	}
 	ret = apple_nvme_queue_alloc(anv, &anv->adminq);
 	if (ret)
 		goto put_dev;

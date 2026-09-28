@@ -54,3 +54,39 @@ Evidence: hardware-linux-ans-durable-guest.log and
 hardware-linux-ans-durable-persist-guest.log under the workspace directory above.
 Kernel Image SHA256:
 019d9c370014fc726df4b39ef1f2218e36c0ca5e8bec3177e08b96c9945cc233.
+
+Bootloader handoff
+-----------------
+
+A bootloader that quiesces both RTKit AP and IOP before releasing its shared
+buffers sets the boolean ``asahi,rtkit-quiesced`` on the NVMe controller node.
+The next kernel must negotiate a fresh INIT session even when CC.EN and CSTS.RDY
+remain set. Those controller bits describe NVMe state, not RTKit mailbox state.
+Without this indication the existing live-session adoption path attempts a
+controller disable against a quiesced firmware session. A bootloader preserving
+an active mailbox session must not set this property.
+
+Queue ownership across U-Boot and Linux
+--------------------------------------
+
+Native SPTM retains the first registered ASQ/ACQ/IOSQ/IOCQ physical addresses
+for the whole boot. Disabling the controller or quiescing RTKit does not
+permit a later owner to replace those addresses. The firmware-27 admin
+validation at 0xfffffff0270c8aa4 compares the new ASQ with its saved value;
+a different address panics with VIOLATION_NVME_ILLEGAL_QUEUE_ADDRESS. The
+Neo SPTM implementation also caches these addresses and rejects replacements.
+
+A resident-SPTM U-Boot therefore allocates each queue in a separate 16 KiB
+page and describes the four pages with ``memory-region`` phandles on the
+NVMe device. ``memory-region-names`` is ``admin-sq``, ``admin-cq``, ``io-sq``,
+``io-cq``. Each reserved-memory node has ``no-map`` and a 16 KiB aligned,
+16 KiB sized ``reg``. U-Boot quiesces both RTKit sides before handing off,
+and supplies ``asahi,rtkit-quiesced``. Linux validates all four reservations
+and maps them cacheable on this DMA-coherent device; it never substitutes
+new pages for a malformed handoff. TCB scratch storage and payload DMA
+mappings retain their normal allocation paths. Queue depth and command
+batching are unchanged, and there are no additional per-I/O copies.
+
+This reservation describes firmware-owned memory, not a pool for arbitrary
+DMA allocations. The pages remain reserved even if the driver is removed,
+because their native SPTM registrations survive the driver lifetime.
