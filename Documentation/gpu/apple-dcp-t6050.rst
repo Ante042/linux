@@ -330,3 +330,30 @@ and gates were unchanged, and restored the original selector registers.
 The test required the crossbar source gates to be off and never enabled
 PHY lanes or pixel clocks. Link-up/down clock behavior and optical output
 remain unverified on hardware.
+
+Firmware27 transmitter drive settings
+------------------------------------
+
+The native DPTX proxy uses twelve-byte IODPDriveSettings records containing
+encoding type, voltage swing and pre-emphasis. For DP1.x, GET_MAX returns
+``{0, 3, 3}``. After the 64-byte DCPAVIPC header, SET takes the lane count
+at offset16 and records at offset32, and returns IOReturn at offset0.
+GET instead takes the count at offset0 and returns IOReturn at offset16;
+its records also start at offset32. These layouts are decoded from the
+27.0 native proxy handlers and its native ATC port implementation.
+
+The firmware27 handlers validate every requested lane and payload boundary,
+forward physical voltage/pre-emphasis requests through ``phy_configure``,
+and retain per-lane values only after that call succeeds. A missing direct
+PHY or a PHY error is returned to the caller. USB4 tunnels retain their
+logical drive-setting behavior. Older firmware keeps its existing handlers.
+
+The actual callback implementation has sanitizer tests, including four
+independent lanes, short buffers, aliased request/reply buffers, missing
+PHYs and failed PHY operations::
+
+  python3 tools/testing/selftests/drivers/gpu/apple-dcp-drive-v27.py
+
+The complete module loaded and these callback tests passed as ARM64 code
+in a QEMU guest. Actual firmware link-training callbacks have not yet been
+exercised on hardware; this is not external scanout qualification.

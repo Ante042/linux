@@ -78,6 +78,8 @@ struct dptxport_apcall_set_tiled {
 	__le32 retcode;
 };
 
+#include "dptx-drive-v27.inc"
+
 /*
  * Ported from aurora-silicon/linux#8: a Thunderbolt DP tunnel uses the same
  * plain CORE|ATC|DIE|CONNECTED target as a direct alt-mode PHY. CORE is the
@@ -266,6 +268,11 @@ dptxport_call_get_max_drive_settings(struct apple_epic_service *service,
 	reply->retcode = cpu_to_le32(0);
 	reply->max_drive_settings[0] = cpu_to_le32(0x3);
 	reply->max_drive_settings[1] = cpu_to_le32(0x3);
+	if (service->ep->dcp->fw_compat == DCP_FIRMWARE_V_27_0) {
+		/* Native IODPDriveSettings is { type0, max voltage3, max pre3 }. */
+		reply->max_drive_settings[0] = cpu_to_le32(0);
+		memcpy(reply->_unk1, &reply->max_drive_settings[1], sizeof(__le32));
+	}
 
 	return 0;
 }
@@ -760,9 +767,15 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 		memcpy(reply, data, min(reply_size, data_size));
 		return dptxport_call_set_tiled_display_hint(reply, reply_size);
 	case DPTX_APCALL_GET_DRIVE_SETTINGS:
+		if (service->ep->dcp->fw_compat == DCP_FIRMWARE_V_27_0)
+			return dptxport_call_drive_v27(service, false, data, data_size,
+						     reply, reply_size);
 		return dptxport_call_get_drive_settings(service, data, data_size,
 							reply, reply_size);
 	case DPTX_APCALL_SET_DRIVE_SETTINGS:
+		if (service->ep->dcp->fw_compat == DCP_FIRMWARE_V_27_0)
+			return dptxport_call_drive_v27(service, true, data, data_size,
+						     reply, reply_size);
 		return dptxport_call_set_drive_settings(service, data, data_size,
 							reply, reply_size);
         case DPTX_APCALL_ACTIVATE:
