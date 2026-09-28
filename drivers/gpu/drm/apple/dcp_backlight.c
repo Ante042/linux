@@ -86,7 +86,7 @@ static int dcp_get_brightness(struct backlight_device *bd)
 {
 	struct apple_dcp *dcp = bl_get_data(bd);
 
-	return dcp->brightness.nits;
+	return READ_ONCE(dcp->brightness.nits);
 }
 
 #define SCALE_FACTOR (1 << 10)
@@ -112,6 +112,10 @@ static u32 interpolate(int val, int min, int max, u32 *tbl, size_t tbl_size)
 static u32 calculate_dac(struct apple_dcp *dcp, int val)
 {
 	u32 dac;
+
+	/* Firmware27 consumes nits directly in its swap, not a DAC value. */
+	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0)
+		return val;
 
 	if (val <= MIN_BRIGHTNESS_PART1)
 		return 16 * brightness_part1[0];
@@ -238,7 +242,9 @@ int dcp_backlight_register(struct apple_dcp *dcp)
 		.brightness = dcp->brightness.nits,
 		.scale = BACKLIGHT_SCALE_LINEAR,
 	};
-	props.max_brightness = min(dcp->brightness.maximum, MAX_BRIGHTNESS_PART2 - 1);
+	props.max_brightness = dcp->fw_compat == DCP_FIRMWARE_V_27_0 ?
+		dcp->brightness.maximum :
+		min(dcp->brightness.maximum, MAX_BRIGHTNESS_PART2 - 1);
 
 	bl_dev = devm_backlight_device_register(dev, "apple-panel-bl", dev, dcp,
 						&dcp_backlight_ops, &props);

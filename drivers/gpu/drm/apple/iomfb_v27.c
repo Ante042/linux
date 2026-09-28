@@ -26,6 +26,9 @@ static_assert(sizeof(struct dcp_h17p_swap_info_request) == 0xe4);
 /* D590 swap_complete_ap_gated: 0x730 on the wire in 1919/1919 traced swaps. */
 static_assert(sizeof(struct dc_swap_complete_resp_v27) == 0x730);
 static_assert(offsetof(struct dc_swap_complete_resp_v27, swap_id) == 0);
+static_assert(offsetof(struct dcp_swap_v27, brightness_update) == 0x354);
+static_assert(offsetof(struct dcp_swap_v27, brightness_nits) == 0x35e);
+static_assert(sizeof(struct dcp_swap_v27) == 0x6e0);
 
 /* Native 26A428 T605X kernelcache RPC serializers. The method IDs are not
  * compatible with the 25G83 H17P or 25G76 H17G tables. See t6050-dcp.rst.
@@ -89,28 +92,14 @@ static bool trampoline_rt_bandwidth_h17p(struct apple_dcp *dcp, int tag,
 		.input = in,
 		.output = out,
 	};
-	/*
-	 * Take these from the macOS capture rather than from the DT resources.
-	 * macOS answers D003 with one stable record,
-	 *   0000820203000000 0080860203000000 00000000
-	 * -> scratch 0x302820000, doorbell 0x302868000 -- which is
-	 * DISP0_REG_BASE + 0x20000 and + 0x68000, both inside the 0xbc000
-	 * window we already hand out for map_reg index 5.  The DT lookup lands
-	 * 0x5a80000 higher, so the firmware was being pointed at the wrong
-	 * block for its bandwidth scratch and doorbell.
+	/* Native 26A428 UPPipeAP_H17GSCD::rt_bandwidth_setup_ap returns
+	 * the PMC descriptor's physical address and a zero clock request
+	 * (getPhysicalAddress; stp x0, xzr at 0xfffffe00097ac058).
+	 * Firmware consumes a physical address, even when Linux uses IPAs.
 	 */
-	u64 clock_request = DCP_H17P_DISP0_REG_BASE + 0x68000;
-	u64 scratch = DCP_H17P_DISP0_REG_BASE + 0x20000;
-
-	/* The T8142 DT contains the native PMC resources. The fallback above
-	 * is specific to the incomplete legacy T8140 binding.
-	 */
-	if (!dcp->hw.legacy_pmc_binding) {
-		scratch = dcp->disp_bw_scratch_res.start +
-			  dcp->disp_bw_scratch_offset;
-		clock_request = dcp->disp_bw_doorbell_res.start +
-				dcp->disp_bw_doorbell_offset;
-	}
+	u64 scratch = dcp->disp_firmware_base[dcp->disp_bw_scratch_index] +
+		      dcp->disp_bw_scratch_offset;
+	u64 clock_request = 0;
 
 	trace_iomfb_callback(dcp, tag, __func__);
 	if (apple_dcp_h17p_rt_bw_encode_reply(&view, scratch,
@@ -123,18 +112,21 @@ static bool trampoline_get_frequency_v27(struct apple_dcp *dcp, int tag,
 					void *out, void *in)
 {
 	const struct apple_dcp_h17p_clock_request *request = in;
-	u32 id = le32_to_cpu(request->clock_id);
-	unsigned int i;
+	u32 index = le32_to_cpu(request->clock_id);
 	u64 rate = 0;
 
-	for (i = 0; i < dcp->num_firmware_clocks; i++) {
-		if (dcp->firmware_clock_ids[i] == id) {
-			rate = clk_get_rate(dcp->firmware_clocks[i].clk);
-			break;
-		}
-	}
-	if (i == dcp->num_firmware_clocks)
-		dev_err(dcp->dev, "DCP requested undeclared firmware clock %u\n", id);
+	/* 26A428 ServiceRelay -> iOSSvcProx -> AppleARMIODevice interprets
+	 * this argument as an index into the provider's clock-ids property.
+	 * AppleARMIODevice resolves the global clock ID before forwarding
+	 * to AppleARMIO; it is not sent directly in this callback.
+	 */
+	if (index < dcp->num_firmware_clocks)
+		rate = clk_get_rate(dcp->firmware_clocks[index].clk);
+	else
+		dev_err(dcp->dev, "DCP requested undeclared provider clock index %u\n",
+			index);
+	dev_dbg(dcp->dev, "D408 service=%#x index=%u rate=%llu\n",
+		le32_to_cpu(request->service), index, rate);
 	*(__le64 *)out = cpu_to_le64(rate);
 	return true;
 }
@@ -233,6 +225,126 @@ static bool trampoline_get_data_prop_v27(struct apple_dcp *dcp, int tag,
 	return true;
 }
 
+/* 26A428 MemDescRelay serializers: D451 no longer returns a physical
+ * address. The two u64 outputs are mapped DVA and buffer capacity, followed
+ * by the descriptor ID at +0x10 (ab8a414..ab8a444, ab7e9bc..ab7e9ec).
+ */
+struct dcp_allocate_buffer_req_v27 {
+	__le32 options;
+	__le64 size;
+	__le32 alignment;
+	u8 dva_null;
+	u8 capacity_null;
+	u8 padding[2];
+} __packed;
+
+struct dcp_allocate_buffer_resp_v27 {
+	__le64 dva;
+	__le64 capacity;
+	__le32 mem_desc_id;
+} __packed;
+
+struct dcp_buffer_lifecycle_req_v27 {
+	__le32 mem_desc_id;
+	__le32 options;
+} __packed;
+
+static_assert(sizeof(struct dcp_allocate_buffer_req_v27) == 0x14);
+static_assert(sizeof(struct dcp_allocate_buffer_resp_v27) == 0x14);
+static_assert(offsetof(struct dcp_allocate_buffer_resp_v27, mem_desc_id) == 0x10);
+static_assert(sizeof(struct dcp_buffer_lifecycle_req_v27) == 8);
+
+static bool trampoline_allocate_buffer_v27(struct apple_dcp *dcp, int tag,
+					 void *out, void *in)
+{
+	const struct dcp_allocate_buffer_req_v27 *req = in;
+	struct dcp_allocate_buffer_resp_v27 *resp = out;
+	struct dcp_allocate_buffer_req allocation = {
+		.unk0 = le32_to_cpu(req->options),
+		.size = le64_to_cpu(req->size),
+		.unk2 = le32_to_cpu(req->alignment),
+	};
+	struct dcp_allocate_buffer_resp buffer;
+
+	if (!allocation.size || allocation.size > SIZE_MAX - SZ_16K ||
+	    allocation.unk2 > PAGE_SIZE)
+		return true;
+	buffer = dcpep_cb_allocate_buffer(dcp, &allocation);
+	if (!req->dva_null)
+		resp->dva = cpu_to_le64(buffer.dva);
+	if (!req->capacity_null)
+		resp->capacity = cpu_to_le64(ALIGN(buffer.dva_size, SZ_16K));
+	resp->mem_desc_id = cpu_to_le32(buffer.mem_desc_id);
+	dev_dbg(dcp->dev, "D451 allocation id=%u dva=%#llx capacity=%#llx\n",
+		buffer.mem_desc_id, buffer.dva, le64_to_cpu(resp->capacity));
+	return true;
+}
+
+static bool trampoline_buffer_lifecycle_v27(struct apple_dcp *dcp, int tag,
+					  void *out, void *in)
+{
+	const struct dcp_buffer_lifecycle_req_v27 *req = in;
+	__le32 *status = out;
+	u32 id = le32_to_cpu(req->mem_desc_id);
+
+	/* Native prepare/complete take an existing descriptor, not a physical
+	 * address to map. Coherent allocations remain DMA-mapped until D454;
+	 * no streaming cache maintenance or per-call IOMMU updates are needed.
+	 */
+	if (!id || id >= DCP_MAX_MAPPINGS ||
+	    !test_bit(id, dcp->memdesc_map) || !dcp->memdesc[id].buf) {
+		*status = cpu_to_le32(14); /* native kIOReturnNotReady -> link */
+		return true;
+	}
+	if (tag == 452)
+		dma_wmb();
+	else
+		dma_rmb();
+	*status = 0;
+	return true;
+}
+
+/* Native get_ideal_screen_space reads product/artwork-display-gamut:
+ * P3 -> 2, AdobeRGB -> 3, absent/unrecognized -> 1 (ab97428..ab975d0).
+ */
+static bool trampoline_ideal_screen_space_v27(struct apple_dcp *dcp, int tag,
+					    void *out, void *in)
+{
+	const char *gamut;
+	u32 space = 1;
+
+	if (!of_property_read_string(dcp->dev->of_node,
+				     "apple,artwork-display-gamut", &gamut)) {
+		if (!strcmp(gamut, "P3"))
+			space = 2;
+		else if (!strcmp(gamut, "AdobeRGB"))
+			space = 3;
+	}
+	*(__le32 *)out = cpu_to_le32(space);
+	return true;
+}
+
+/* Native D114 params 1 and 11 read tile membership/manager flags
+ * (97bd5c0 and 97bd488). Both are false for an untiled connector.
+ * Tiled connectors and other parameters require separate tiling
+ * manager state; retain the caller's value and return false if unsupported.
+ */
+static bool trampoline_tiling_state_v27(struct apple_dcp *dcp, int tag,
+				       void *out, void *in)
+{
+	const struct dcpep_get_tiling_state_req *req = in;
+	struct dcpep_get_tiling_state_resp *resp = out;
+
+	resp->value = req->value;
+	resp->ret = 0;
+	if (!req->value_null && (req->param == 1 || req->param == 11) &&
+	    dcp->connector && !dcp->connector->base.has_tile) {
+		resp->value = 0;
+		resp->ret = 1;
+	}
+	return true;
+}
+
 static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[0] = dcpep_cb_d000_h17p, /* native did_boot callback */
 	[1] = trampoline_true,
@@ -243,6 +355,7 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[101] = trampoline_zero,
 	[102] = trampoline_nop, /* set_number_property */
 	[104] = trampoline_nop, /* set_boolean_property */
+	[106] = trampoline_nop, /* remove host IORegistry metadata property */
 	[107] = trampoline_true, /* create_provider_service */
 	[108] = trampoline_true, /* create_product_service */
 	[109] = trampoline_true, /* create_PMU_service */
@@ -254,6 +367,7 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[117] = trampoline_zero, /* upload_trace_start */
 	[118] = trampoline_zero, /* upload_trace_chunk */
 	[119] = trampoline_zero, /* upload_trace_end */
+	[114] = trampoline_tiling_state_v27,
 	[120] = dcpep_cb_boot_1, /* start_hardware_boot */
 	[121] = trampoline_false, /* is_dark_boot */
 	[122] = trampoline_false, /* is_waking_from_hibernate */
@@ -267,6 +381,7 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[202] = trampoline_unmap_piodma, /* unmap_buf */
 	[206] = iomfbep_cb_match_pmu_service_2, /* match_pmu_service */
 	[207] = iomfbep_cb_match_backlight_service, /* match_backlight_service */
+	[204] = trampoline_ideal_screen_space_v27,
 	[208] = trampoline_nop, /* update_backlight_factor_prop */
 	[209] = trampoline_get_time, /* get_calendar_time_ms */
 	[300] = trampoline_pr_publish,
@@ -279,8 +394,9 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[413] = trampoline_true, /* setProperty */
 	[414] = trampoline_sr_set_property_int, /* setProperty */
 	[415] = trampoline_true, /* setProperty */
-	[451] = trampoline_allocate_buffer, /* allocate_buffer */
-	[452] = trampoline_map_physical, /* prepare */
+	[451] = trampoline_allocate_buffer_v27, /* allocate_buffer */
+	[452] = trampoline_buffer_lifecycle_v27, /* prepare */
+	[453] = trampoline_buffer_lifecycle_v27, /* complete */
 	[454] = trampoline_release_mem_desc, /* release_descriptor */
 	[552] = trampoline_true,
 	[561] = trampoline_true,
@@ -291,17 +407,14 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[574] = iomfbep_cb_video_range_h17p,
 	[575] = trampoline_hotplug_h17p,
 	[576] = trampoline_nop,
-	/*
-	 * We do not create a default framebuffer surface, so answering "yes"
-	 * makes the firmware go on to program the display engine for a surface
-	 * that does not exist: it then DMAs from a null base and the piodma
-	 * DART (412300000) faults continuously on SID 0, which starves the
-	 * system into an RCU stall.  Decline instead.
-	 */
 	[586] = iomfbep_cb_create_dfb_surface, /* create_default_fb_surface */
 	[587] = trampoline_nop, /* clear_default_surface */
 	[588] = trampoline_nop, /* swap_notify_gated */
 	[589] = trampoline_swap_info_h17p, /* swap_info_notify_dispatch */
+	/* Native D592 applies an AP-queued DFB geometry change only. Linux
+	 * handles D586 geometry synchronously and queues no deferred resize.
+	 */
+	[592] = trampoline_nop, /* resize_default_fb_surface_gated */
 	[594] = trampoline_swap_complete, /* swap_complete_ap_gated */
 	[596] = trampoline_swap_complete_intent_gated, /* swap_complete_intent_gated */
 	[597] = trampoline_abort_swap_ap_gated, /* abort_swap_ap_gated */
@@ -328,6 +441,7 @@ static const struct {
 	[101] = { 0x0, 0x4 },
 	[102] = { 0x44, 0x0 },
 	[104] = { 0x44, 0x0 },
+	[106] = { 0x40, 0x0 },
 	[107] = { 0x0, 0x4 },
 	[108] = { 0x0, 0x4 },
 	[109] = { 0x0, 0x4 },
@@ -339,6 +453,7 @@ static const struct {
 	[117] = { 0x14, 0x4 },
 	[118] = { 0x3e88, 0x4 },
 	[119] = { 0x4, 0x4 },
+	[114] = { 0x10, 0x8 },
 	[120] = { 0x0, 0x4 },
 	[121] = { 0x0, 0x4 },
 	[122] = { 0x0, 0x4 },
@@ -352,6 +467,7 @@ static const struct {
 	[202] = { 0x18, 0x0 },
 	[206] = { 0x0, 0x4 },
 	[207] = { 0x0, 0x4 },
+	[204] = { 0x0, 0x4 },
 	[208] = { 0x4, 0x0 },
 	[209] = { 0x0, 0x8 },
 	[400] = { 0x4c, 0xc04 },
@@ -365,6 +481,7 @@ static const struct {
 	[415] = { 0x4c, 0x4 },
 	[451] = { 0x14, 0x14 },
 	[452] = { 0x8, 0x4 },
+	[453] = { 0x8, 0x4 },
 	[454] = { 0x4, 0x4 },
 	[552] = { 0x1044, 0x4 },
 	[561] = { 0x1044, 0x4 },
@@ -379,6 +496,7 @@ static const struct {
 	[587] = { 0x0, 0x0 },
 	[588] = { 0x18, 0x0 },
 	[589] = { 0xe4, 0xe0 },
+	[592] = { 0x0, 0x0 },
 	[594] = { 0x730, 0x0 },
 	[596] = { 0x14, 0x0 },
 	[597] = { 0x4, 0x0 },

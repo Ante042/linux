@@ -556,8 +556,11 @@ static void dcpep_handle_cb(struct apple_dcp *dcp, enum dcp_context_id context,
 
 	if (tag < 0 || tag >= IOMFB_MAX_CB || !dcp->cb_handlers ||
 	    !dcp->cb_handlers[tag]) {
-		dev_warn(dev, "received unknown callback %c%c%c%c\n",
-			 hdr->tag[3], hdr->tag[2], hdr->tag[1], hdr->tag[0]);
+		dev_warn(dev, "received unknown callback %c%c%c%c in=%u out=%u data=%*ph\n",
+			 hdr->tag[3], hdr->tag[2], hdr->tag[1], hdr->tag[0],
+			 hdr->in_len, hdr->out_len,
+			 min_t(u32, min_t(u32, hdr->in_len,
+				length - sizeof(*hdr)), 32), in);
 		/*
 		 * Leaving a callback unanswered wedges the coprocessor: it
 		 * waits for the ack forever and the outer call never returns.

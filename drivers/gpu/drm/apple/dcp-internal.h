@@ -171,6 +171,8 @@ enum dcp_iomfb_method_profile {
 };
 
 struct apple_dcp_hw_data {
+	/* Firmware CPU access may cover less than the display DART aperture. */
+	u8 firmware_dma_bits;
 	u32 num_dptx_ports;
 	enum dcp_iomfb_method_profile iomfb_method_profile;
 	bool adopt_running_coprocessor;
@@ -180,6 +182,8 @@ struct apple_dcp_hw_data {
 	 * the bootloader already consumed endpoint discovery.
 	 */
 	bool adopt_live_session;
+	/* The inherited firmware can renegotiate without stopping its ASC. */
+	bool discover_live_session;
 	enum dcp_firmware_version firmware_compat;
 	/* T8140's legacy DT omits the native H17 PMC window. */
 	bool legacy_pmc_binding;

@@ -1074,6 +1074,11 @@ static bool live_discovery;
 module_param(live_discovery, bool, 0400);
 MODULE_PARM_DESC(live_discovery, "Negotiate RTKit on the inherited live DCP without an ASC reset");
 
+static bool dcp_discover_live_session(const struct apple_dcp *dcp)
+{
+	return dcp->hw.discover_live_session || live_discovery;
+}
+
 /* copied and simplified from drm_vblank.c */
 static void send_vblank_event(struct drm_device *dev,
 		struct drm_pending_vblank_event *e,
@@ -1208,7 +1213,8 @@ void dcp_set_dimensions(struct apple_dcp *dcp)
 
 bool dcp_has_panel(struct apple_dcp *dcp)
 {
-	return dcp->panel.width_mm > 0;
+	return dcp->fixed_connector_type == DRM_MODE_CONNECTOR_eDP ||
+	       dcp->panel.width_mm > 0;
 }
 
 int dcp_set_crc(struct drm_crtc *crtc, bool enabled)
@@ -1444,7 +1450,7 @@ int dcp_start_rtkit_endpoint(struct apple_dcp *dcp, u8 endpoint)
 {
 	u64 message;
 
-	if (!dcp->hw.adopt_live_session || live_discovery)
+	if (!dcp->hw.adopt_live_session || dcp_discover_live_session(dcp))
 		return apple_rtkit_start_ep(dcp->rtk, endpoint);
 	if (endpoint < 0x20 || endpoint >= 0x40)
 		return -EINVAL;
@@ -1469,6 +1475,7 @@ int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state *state)
 	struct platform_device *pdev = to_apple_crtc(crtc)->dcp;
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 	struct drm_crtc_state *crtc_state;
+	struct drm_crtc_state *old_crtc_state;
 	bool needs_modeset;
 
 	if (dcp->crashed) {
@@ -1479,6 +1486,12 @@ int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state *state)
 	}
 
 	crtc_state = drm_atomic_get_new_crtc_state(state, crtc);
+	old_crtc_state = drm_atomic_get_old_crtc_state(state, crtc);
+	/* DCP latches adaptive-sync parameters when selecting the timing mode.
+	 * A VRR-only property change must therefore run the modeset path too.
+	 */
+	if (old_crtc_state->vrr_enabled != crtc_state->vrr_enabled)
+		crtc_state->mode_changed = true;
 
 	needs_modeset = drm_atomic_crtc_needs_modeset(crtc_state) || !dcp->valid_mode;
 	if (!needs_modeset && (!dcp->connector || !dcp->connector->connected)) {
@@ -2642,7 +2655,11 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	 * an axi_rd_err NMI.  The bootloader's translations are left alone.
 	 */
 
-	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(42));
+	/* The firmware CPU and the display engines have different address
+	 * apertures. Keep scanout and PIODMA at their independent42bit masks.
+	 */
+	ret = dma_set_mask_and_coherent(dev,
+		DMA_BIT_MASK(dcp->hw.firmware_dma_bits ?: 42));
 	if (ret)
 		return ret;
 
@@ -2807,7 +2824,7 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	} else {
 		if (start_mode == APPLE_DCP_COPROCESSOR_QUIESCED_RESTART)
 			dev_info(dev, "restarting loader-quiesced DCP session\n");
-		if (dcp->hw.adopt_live_session && !live_discovery) {
+		if (dcp->hw.adopt_live_session && !dcp_discover_live_session(dcp)) {
 			dcp->adopting_session = true;
 			dcp->rtk = devm_apple_rtkit_init_adopted(dev, dcp,
 								 "mbox", 0,
@@ -2822,7 +2839,7 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 					     "Failed to initialize RTKit\n");
 	}
 
-	if (dcp->hw.adopt_live_session && live_discovery) {
+	if (dcp->hw.adopt_live_session && dcp_discover_live_session(dcp)) {
 		/* No CPU-control, power-domain or DART writes on this path. The
 		 * native trace receives HELLO in response to this standard INIT.
 		 * A timeout is evidence to retain; do not fall back to a reset.
@@ -3271,10 +3288,15 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t8142 = {
  * The loader must preserve the firmware mappings and running ASC generation.
  */
 static const struct apple_dcp_hw_data apple_dcp_hw_t6050 = {
+	/* 26A428 iBoot config0x02000c00 bounds the app's ordinary untyped
+	 * buffer ranges at2TiB, despite the DART's4TiB upper limit.
+	 */
+	.firmware_dma_bits = 41,
 	.num_dptx_ports = 0,
 	.iomfb_method_profile = DCP_IOMFB_METHODS_H17G,
 	.adopt_running_coprocessor = true,
 	.adopt_live_session = true,
+	.discover_live_session = true,
 	.firmware_compat = DCP_FIRMWARE_V_27_0,
 };
 

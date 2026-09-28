@@ -59,6 +59,14 @@ struct DCP_FW_NAME(dcp_swap) {
 	u32 swap_completed;
 
 	u32 bg_color;
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0)
+	u8 reserved_158[0x1fc];
+	/* 26A428 _kern_SwapSetBrightness, relative to IOMFBSwapRec. */
+	u8 brightness_update;
+	u8 reserved_355[9];
+	u64 brightness_nits; /* IEEE754 binary64, encoded without kernel FP */
+	u8 reserved_366[0x37a];
+#else
 	u8 unk_110[0x1b8];
 	u32 unk_2c8;
 	u8 unk_2cc[0x14];
@@ -81,10 +89,6 @@ struct DCP_FW_NAME(dcp_swap) {
 	 * dcp_surface_h17p = 0x22c, SWAP_SURFACES = 4 and no surf2 block leaves
 	 * exactly 0x122 here.  0x278 makes dcp_swap 0x6e0 and forces a
 	 * non-integer surface size, so it cannot be right. */
-#if DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0)
-	/* 26A428 copies exactly 0x6e0 bytes of IOMFBSwapRec in A408. */
-	u8 h17p_tail[0x230];
-#else
 	u8 h17p_tail[0xda];
 #endif
 #endif

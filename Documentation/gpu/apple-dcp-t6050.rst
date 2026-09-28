@@ -1,10 +1,11 @@
 T6050 display firmware 27.0 ABI
 ==============================
 
-This is an explicit firmware ABI port, not a hardware qualification. The
-T6050 node must name ``apple,t6050-dcp`` and carry
+This profile has driven the J714s internal panel on hardware at fixed
+3024x1964/120 Hz, including GNOME and its framebuffer-console handoff.
+The T6050 node must name ``apple,t6050-dcp`` and carry
 ``apple,firmware-compat = <27 0 0>``. The stable J714 guest DT is unchanged,
-so simpledrm remains the display driver until a separate DCP test DT is used.
+so the qualified display path currently uses a separate RAM-boot DCP DT.
 Do not advertise another 27.x release as compatible without comparing it.
 
 Reference
@@ -23,8 +24,7 @@ The saved live-27.0 ADT names DCP UUID
  d9384573025721074ec1a7190626a8bab36cf61f764055e8e05c7d5d98cb318f).
 The 2026-09-28 live ADT independently carries the same UUID (ADT SHA-256
 d3dbf5a4d89fe19dbf98e0c8db6749f8c51d1082ba7a4214688376512eceed20).
-This closes the live image identity check for that boot, not presentation
-qualification. The initial IOMFB version word still needs runtime checking. A manually supplied firmware-compat
+This establishes the live image identity used for the hardware tests. The initial IOMFB version word still needs runtime checking. A manually supplied firmware-compat
 property selects the ABI; it does not prove what iBoot loaded.
 
 The transport is imported from the Neo H17P series by DjDeveloperr and the
@@ -86,8 +86,8 @@ The 27.0 callback dispatcher checks native minimum wire lengths before
 calling typed handlers. Provider property replies use the matching device's
 raw property bytes, rather than Neo-specific panel power tables.
 
-Hardware integration still required
------------------------------------
+Hardware integration
+--------------------
 
 Saved J714s ADT resources, after parent-range translation:
 
@@ -126,7 +126,8 @@ D586, rather than reporting unconditional success. b3a8, w40a, BGRA, w30r
 and l10r are supported with compression 0, 2 or 3; other values are rejected
 explicitly. Its integer-only calculation reproduces native binary32 size
 rounding without using floating point in the kernel. Native arithmetic and
-layout checks pass; runtime query values/presentation are not tested.
+layout checks pass, and the resulting descriptor has been used during
+successful hardware initialization and scanout.
 
 The matching 26A428 Recovery image's IOMobileFramebuffer library resolves
 the previously opaque swap fields. Its _kern_SwapBegin clears the 0x6e0-byte
@@ -147,14 +148,55 @@ Executing its standalone debug setter against a private user buffer and
 comparing compiled structure offsets confirms this layout; it is not a
 hardware pageflip test.
 
-The current SPTM DART backend uses a low-4-GiB DMA aperture with optional
-bit-40 force, disables a SID during attachment, and attaches a fresh root.
-DCP's inherited mappings must instead survive attachment. Separate driver
-instances also request exclusive ownership of their MMIO resource, so they
-cannot all claim the same synthetic doorbell page without a shared-provider
-change or distinct emulated aliases. These integration requirements and
-panel/provider behavior must be resolved before enabling the profile. No J714 DCP pageflip, power transition,
-backlight, or external-output result is claimed by this port.
+The SPTM DART backend adopts the existing firmware roots through the native
+INIT/POWERUP protocol. DCP firmware CPU allocations use its native
+[1 TiB, 2 TiB) aperture, while scanout and PIODMA keep independent 42-bit
+apertures. Guest aliases cover only the ADT shared firmware segments and
+retained VRAM; private executable firmware is not mapped into Linux.
+
+The display-subsystem ``memory-region`` must describe the CPU aperture used
+by simpledrm. DCP's own ``memory-region`` separately describes the complete
+retained VRAM allocation. These can be different aliases of the same host
+memory; conflating them prevents native DRM from removing simpledrm.
+
+Timestamps, brightness and display power
+---------------------------------------
+
+The native 26A428 Mach time functions use AGTCNTVCTSS (S3_4_C15_C10_6).
+On this hardware it advances at 24 MHz while the Linux architectural timer
+advances at 1 GHz. The 27.0 swap timestamps therefore read the Apple counter
+directly; using architectural ticks stalls timestamped swaps. Hardware
+measurements gave 120.00 completed flips/second after this correction.
+
+``_kern_SwapSetBrightness`` stores a binary64 nits value at swap+0x35e and
+sets the update byte at +0x354. The old packed-DAC fields occupy different
+offsets and are not used on this profile. Integer encoding avoids kernel
+floating point. Runtime property20 is IOMFBBrightnessLevel in16.16 nits;
+property15 is overrideBacklight, unlike the older ABI. The panel's ordinary
+600-nit user limit is forwarded from the ADT's backlight node. The user has
+confirmed that both GNOME's slider and keyboard brightness controls change
+the panel visibly. Brightness feedback arrives as powerlog-service mNits
+reports on system endpoint channel3, using the compact EPIC header also
+found on H17P. The retained ring captured requests40/240/140 nits and matching
+40000/240000/140000 mNits reports. After enabling the compact decoder,
+Linux actual_brightness read back40/240/140 for the same sequence.
+
+D592 calls native ``resize_default_fb_surface_gated``. This applies a resize
+queued by the AP; Linux handles explicit D586 geometry synchronously and
+has no pending resize to apply. Its acknowledgement lets the normal power-
+off call return. Three five-second DPMS cycles completed the firmware power
+off/on sequence and restored successful scanout. This is display power
+control, not system suspend or deep sleep. Firmware feedback returned to
+the requested140nits after the latest cycle; optical off/on confirmation
+was not obtained.
+
+VRR range advertisement alone is not hardware qualification. DCP latches
+adaptive-sync parameters when reselecting the mode, so changing VRR_ENABLED
+must run the modeset path. The authored VRR implementation from aurora-silicon/linux@tb, commit
+38c14f610, is already in this branch. On the current27.0 candidate, paced
+flip intervals remain similar with VRR_ENABLED off/on; this does not yet
+qualify the toggle or a fixed-versus-variable panel refresh distinction.
+System sleep and external HDMI also remain under investigation.
 
 Firmware physical addresses in a guest
 -------------------------------------
@@ -164,13 +206,12 @@ The DCP coprocessor still sees host physical MMIO. An optional
 ``apple,firmware-physical-regs`` array supplies one u64 host base per
 ``disp-N`` resource, followed by the appended bandwidth scratch/doorbell
 resources in driver index order. Its length must equal the resource count.
-The disabled T6050 fixture supplies six entries; its last two both describe
+The T6050 test fixture supplies six entries; its last two both describe
 PMC at 0x286700000. Without the property, bases default to resource start,
 preserving native behavior.
 
 Register/BW replies use these firmware addresses. A firmware map_physical
 request is translated in reverse to the corresponding CPU resource before
-calling dma_map_resource. The HV/IOMMU resource-DMA path must also translate
-that IPA to host MMIO before forwarding to SPTM; its current RAM-only map
-translation is not sufficient. This source change does not implement that
-host-side operation or establish firmware DMA success.
+calling dma_map_resource. The HV/IOMMU resource-DMA path must preserve that distinction when forwarding
+to SPTM. Successful internal scanout does not qualify arbitrary additional
+MMIO ranges or external display pipelines.

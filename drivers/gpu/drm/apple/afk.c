@@ -558,7 +558,8 @@ static void afk_recv_handle(struct apple_dcp_afkep *ep, u32 channel, u32 type,
 	u8 *payload;
 	size_t payload_size;
 
-	if (ep->dcp->fw_compat == DCP_FIRMWARE_H17P) {
+	if (ep->dcp->fw_compat == DCP_FIRMWARE_H17P ||
+	    ep->dcp->fw_compat == DCP_FIRMWARE_V_27_0) {
 		const struct epic_sub_hdr_h17p *c =
 			(const struct epic_sub_hdr_h17p *)(data + sizeof(*ehdr));
 
@@ -575,6 +576,8 @@ static void afk_recv_handle(struct apple_dcp_afkep *ep, u32 channel, u32 type,
 		 * mNits/uAmps/iDAC backlight reports on channel 3.  Taking the
 		 * queue channel at face value binds "system" to 0 and makes
 		 * every later announce and report look like a duplicate.
+		 * The retained26A428 system endpoint uses this same layout:
+		 * channel1 announces system, channel3 publishes mNits/iDAC.
 		 */
 		channel = le16_to_cpup((__le16 *)(data + 2));
 

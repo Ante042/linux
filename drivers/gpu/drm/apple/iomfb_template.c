@@ -424,14 +424,6 @@ static void dcp_fill_dfb_surface(struct apple_dcp *dcp, u8 *s)
 }
 #endif
 
-/*
- * A471 (update_dfb) is never sent.  It hands the firmware a default-framebuffer
- * surface descriptor, and on H17P it makes the coprocessor take an AXI read
- * error and NMI immediately (axi_rd_err -> "panic(app): app NMI").  Scanout does
- * not need it: the swap carries its own surface, whose DVA comes from the DRM
- * GEM object on the display-subsystem device and is therefore already mapped in
- * the stream the pipe reads.  Just acknowledge the callback.
- */
 static void complete_dfb_surface(struct apple_dcp *dcp, void *out, void *cookie)
 {
 #if DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0)
@@ -561,10 +553,19 @@ static bool iomfbep_cb_match_backlight_service(struct apple_dcp *dcp, int tag, v
 static void iomfb_cb_pr_publish(struct apple_dcp *dcp, struct iomfb_property *prop)
 {
 	switch (prop->id) {
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0)
+	/* Native26A428 runtime-property table: IOMFBBrightnessLevel. */
+	case 20:
+#else
 	case IOMFB_PROPERTY_NITS:
+#endif
 	{
 		if (dcp_has_panel(dcp)) {
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0)
+			dcp->brightness.nits = prop->value >> 16;
+#else
 			dcp->brightness.nits = prop->value / dcp->brightness.scale;
+#endif
 			/* notify backlight device of the initial brightness */
 			if (!dcp->brightness.bl_dev && dcp->brightness.maximum > 0)
 				schedule_work(&dcp->bl_register_wq);
@@ -751,8 +752,19 @@ dcpep_cb_allocate_buffer(struct apple_dcp *dcp,
 	memdesc->buf = dma_alloc_coherent(dcp->dev, size,
 					  &memdesc->dva, GFP_KERNEL);
 
-	dma_get_sgtable(dcp->dev, &memdesc->map, memdesc->buf, memdesc->dva,
-			size);
+	if (!memdesc->buf) {
+		clear_bit(id, dcp->memdesc_map);
+		memdesc->size = 0;
+		return (struct dcp_allocate_buffer_resp){};
+	}
+	if (dma_get_sgtable(dcp->dev, &memdesc->map, memdesc->buf,
+			   memdesc->dva, size)) {
+		dma_free_coherent(dcp->dev, size, memdesc->buf, memdesc->dva);
+		memdesc->buf = NULL;
+		memdesc->size = 0;
+		clear_bit(id, dcp->memdesc_map);
+		return (struct dcp_allocate_buffer_resp){};
+	}
 	resp.dva = memdesc->dva;
 
 	/*
@@ -1694,9 +1706,14 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 	 * brightness.
 	 */
 	if (dcp_has_panel(dcp)) {
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0)
+		swap->swap.brightness_update = 1;
+		swap->swap.brightness_nits = 0;
+#else
 		swap->swap.bl_unk = 1;
 		swap->swap.bl_value = 0;
 		swap->swap.bl_power = 0;
+#endif
 	}
 
 	/* Null all surfaces */
@@ -1961,6 +1978,21 @@ TRAMPOLINE_INOUT(trampoline_get_tiling_state, dcpep_cb_get_tiling_state,
 		 struct dcpep_get_tiling_state_req, struct dcpep_get_tiling_state_resp);
 TRAMPOLINE_OUT(trampoline_create_backlight_service, dcpep_cb_create_backlight_service, u8);
 
+static u64 dcp_swap_time(void)
+{
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0)
+	/* 26A428 mach_continuous_time uses AGTCNTVCTSS. On T6050 the
+	 * architectural counter runs at 1 GHz while this firmware clock
+	 * runs at 24 MHz. Sending architectural ticks schedules swaps far
+	 * into the future. Read the native counter directly, including when
+	 * the guest has architectural-counter redirection disabled.
+	 */
+	return read_sysreg_s(sys_reg(3, 4, 15, 10, 6));
+#else
+	return arch_timer_read_counter();
+#endif
+}
+
 /*
  * Callback for swap requests. If a swap failed, we'll never get a swap
  * complete event so we need to fake a vblank event early to avoid a hang.
@@ -1976,7 +2008,7 @@ static void dcp_swapped(struct apple_dcp *dcp, void *data, void *cookie)
 		return;
 	}
 	dcp->swap_start = ktime_get();
-	dcp->swap_submit_timestamp = arch_timer_read_counter();
+	dcp->swap_submit_timestamp = dcp_swap_time();
 
 	dcp_release_swapped_out_fbs(dcp);
 }
@@ -2124,7 +2156,7 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	 * already running at its native 2408x1506, so skip the modeset and let
 	 * that timing stand.
 	 */
-	if (!dcp_send_modeset) {
+	if (DCP_FW_VER < DCP_FW_VERSION(27, 0, 0) && !dcp_send_modeset) {
 		dev_info(dcp->dev, "inheriting the bootloader's display mode\n");
 		complete_set_digital_out_mode(dcp, NULL, cookie);
 	} else
@@ -2295,11 +2327,11 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 
 	if (has_surface && (dcp->use_timestamps || dcp->vrr_enabled)) {
 		u64 submit_timestamp = dcp->swap_submit_timestamp;
-		u64 timestamp = arch_timer_read_counter();
+		u64 timestamp = dcp_swap_time();
 
 		/*
-		 * IOMobileFramebuffer uses Mach continuous-time values here. On
-		 * Apple Silicon that is the ARM architectural counter. Empirical
+		 * IOMobileFramebuffer uses Mach continuous-time values here;
+		 * dcp_swap_time() selects its firmware timebase. Empirical
 		 * testing shows that using the current submission time together
 		 * with the previous accepted swap makes DCP follow swap pacing.
 		 */
@@ -2320,9 +2352,23 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 
 	/* update brightness if changed */
 	if (dcp_has_panel(dcp) && dcp->brightness.update) {
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0)
+		u32 nits = dcp->brightness.dac;
+
+		/* The native API takes double nits, not the legacy packed DAC. */
+		req->swap.brightness_update = 1;
+		if (nits) {
+			unsigned int exponent = ilog2(nits);
+
+			req->swap.brightness_nits =
+				((u64)(exponent + 1023) << 52) |
+				((u64)(nits ^ (1U << exponent)) << (52 - exponent));
+		}
+#else
 		req->swap.bl_unk = 1;
 		req->swap.bl_value = dcp->brightness.dac;
 		req->swap.bl_power = 0x40;
+#endif
 		dcp->brightness.update = false;
 	}
 
