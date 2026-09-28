@@ -116,9 +116,17 @@ then clamps it to the inherited PurpleGfxMem region. In particular, the
 word at 0x29 is allocation size, not an opaque panel constant. For b3a8,
 native compression mode 2 normalizes to w40a with 8-byte elements; other
 modes use 4-byte and 1-byte planes. Compression modes 2 and 3 have distinct
-tile-allocation formulae. The driver still contains the donor's unqualified
-default-surface constants: wiring native query results and inherited region
-size is required before a presentation test.
+tile-allocation formulae. The 27.0 driver caches A036/A037 replies from the existing boot chain and
+uses D586's width/height. It requires a ``memory-region`` named
+``framebuffer`` for the inherited allocation limit. The empty IOSurface
+constructor initializes 1-byte elements of size 1x1 and no plane geometry;
+setPixelFormat and allocate_carveout only change its format/allocation.
+The driver matches that initial descriptor and returns the A483 boolean to
+D586, rather than reporting unconditional success. b3a8, w40a, BGRA, w30r
+and l10r are supported with compression 0, 2 or 3; other values are rejected
+explicitly. Its integer-only calculation reproduces native binary32 size
+rounding without using floating point in the kernel. Native arithmetic and
+layout checks pass; runtime query values/presentation are not tested.
 
 The native AP swap entry copies both flag words from its caller; the A408
 serializer only copies the record. This establishes layout, not that Neo's

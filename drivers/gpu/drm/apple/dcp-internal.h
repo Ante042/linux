@@ -238,6 +238,9 @@ struct apple_dcp {
 	struct clk_bulk_data *firmware_clocks;
 	u32 *firmware_clock_ids;
 	unsigned int num_firmware_clocks;
+	u32 dfb_format, dfb_compression;
+	u64 dfb_region_size;
+	bool dfb_format_valid, dfb_compression_valid;
 
 	/* DCP shared memory */
 	void *shmem;

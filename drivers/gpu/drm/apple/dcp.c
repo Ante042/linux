@@ -2709,6 +2709,25 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 
 	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0) {
 		int count = of_property_count_u32_elems(dev->of_node, "apple,clock-ids");
+		int index = of_property_match_string(dev->of_node, "memory-region-names",
+						    "framebuffer");
+		struct device_node *fb;
+		struct resource res;
+
+		/* D586 mirrors native allocation inside PurpleGfxMem. The loader
+		 * supplies the inherited region; do not assume another panel's size.
+		 */
+		if (index < 0)
+			return dev_err_probe(dev, -EINVAL, "missing framebuffer memory-region\n");
+		fb = of_parse_phandle(dev->of_node, "memory-region", index);
+		if (!fb)
+			return -EINVAL;
+		ret = of_address_to_resource(fb, 0, &res);
+		of_node_put(fb);
+		if (ret)
+			return ret;
+		dcp->dfb_region_size = resource_size(&res);
+
 
 		ret = devm_clk_bulk_get_all(dev, &dcp->firmware_clocks);
 		if (ret < 0)

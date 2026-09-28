@@ -34,6 +34,7 @@
 #include "dcp-internal.h"
 #include "iomfb.h"
 #include "iomfb_internal.h"
+#include "iomfb-dfb.h"
 #include "parser.h"
 #include "trace.h"
 #include "version_utils.h"
@@ -376,15 +377,16 @@ DCP_THUNK_INOUT(dcp_register_dfb_surface, dcpep_register_dfb_surface,
 
 /* Fill the common SurfaceContents fields, matching the traced macOS bytes. */
 
-static void dcp_ack_dfb_surface(struct apple_dcp *dcp)
+static void dcp_ack_dfb_surface(struct apple_dcp *dcp, bool success)
 {
 	struct dcp_channel *ch = &dcp->ch_cb;
 	u8 *succ = ch->output[ch->depth - 1];
 
-	*succ = true;
+	*succ = success;
 	dcp_ack(dcp, DCP_CONTEXT_CB);
 }
 
+#if DCP_FW_VER < DCP_FW_VERSION(27, 0, 0)
 static void dcp_fill_dfb_surface(struct apple_dcp *dcp, u8 *s)
 {
 	s[0x002] = 0x01;
@@ -413,6 +415,7 @@ static void dcp_fill_dfb_surface(struct apple_dcp *dcp, u8 *s)
 		s[0x035] = 2;
 	}
 }
+#endif
 
 /*
  * A471 (update_dfb) is never sent.  It hands the firmware a default-framebuffer
@@ -424,7 +427,12 @@ static void dcp_fill_dfb_surface(struct apple_dcp *dcp, u8 *s)
  */
 static void complete_dfb_surface(struct apple_dcp *dcp, void *out, void *cookie)
 {
-	dcp_ack_dfb_surface(dcp);
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0)
+	/* update_dfb() returns bool, which native forwards to D586. */
+	dcp_ack_dfb_surface(dcp, *(u8 *)out & 1);
+#else
+	dcp_ack_dfb_surface(dcp, true);
+#endif
 }
 
 static bool iomfbep_cb_create_dfb_surface(struct apple_dcp *dcp, int tag,
@@ -448,7 +456,44 @@ static bool iomfbep_cb_create_dfb_surface(struct apple_dcp *dcp, int tag,
 		return true;
 	}
 
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0)
+	{
+		struct dcp_dfb_dimensions_h17p dim;
+		struct dcp_surface *surface = (void *)req->surface;
+		u32 format, allocation;
+		int ret = -EINVAL;
+
+		memcpy(&dim, in, sizeof(dim));
+		if (dcp->dfb_format_valid && dcp->dfb_compression_valid)
+			ret = apple_dcp_dfb_allocation(dim.width, dim.height,
+				dcp->dfb_format, dcp->dfb_compression,
+				dcp->dfb_region_size, &format, &allocation);
+		if (ret) {
+			dev_err(dcp->dev, "unsupported DFB layout %ux%u format=%#x compression=%u (%d)\n",
+				dim.width, dim.height, dcp->dfb_format,
+				dcp->dfb_compression, ret);
+			*(u8 *)out = false;
+			kfree(req);
+			return true;
+		}
+		/* IOSurface::init() with no geometry: element dimensions default
+		 * to1; plane count/stride/width/height remain0. setPixelFormat()
+		 * and allocate_carveout() only set format and allocation size.
+		 * hidePointers() turns the two metadata pointers into presence1.
+		 */
+		surface->is_premultiplied = 1;
+		surface->format = format;
+		surface->pix_size = 1;
+		surface->pel_w = 1;
+		surface->pel_h = 1;
+		surface->buf_size = allocation;
+		surface->surface_id = DCP_SWAP_SURFACE_ID_BASE - 1;
+		surface->has_comp = 1;
+		surface->has_planes = 1;
+	}
+#else
 	dcp_fill_dfb_surface(dcp, req->surface);
+#endif
 
 	dcp_register_dfb_surface(dcp, false, req, complete_dfb_surface, NULL);
 	kfree(req);
@@ -1144,12 +1189,24 @@ static void boot_1_8(struct apple_dcp *dcp, void *out, void *cookie)
 {
 	struct dcp_dfb_layout_req_h17p req = {};
 
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0)
+	/* A036 returns format at0 and success at0x28. */
+	dcp->dfb_format_valid = *((u8 *)out + 0x28) & 1;
+	memcpy(&dcp->dfb_format, out, sizeof(dcp->dfb_format));
+#endif
+
 	dcp_get_dfb_layout(dcp, false, &req, boot_1_9, NULL);
 }
 
 static void boot_1_7(struct apple_dcp *dcp, void *out, void *cookie)
 {
 	struct dcp_dfb_info_h17p info = {};
+
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0)
+	/* A037 returns compression at0 and success at4. */
+	dcp->dfb_compression_valid = *((u8 *)out + 4) & 1;
+	memcpy(&dcp->dfb_compression, out, sizeof(dcp->dfb_compression));
+#endif
 
 	dcp_get_dfb_info(dcp, false, &info, boot_1_8, NULL);
 }
