@@ -130,23 +130,74 @@ struct apple_dart_x1n1 {
 	spinlock_t batch_lock;		/* protects batch + doorbell */
 };
 
-struct apple_dart_x1n1_master {
+/* Match the native DART driver's capacity for shared display DMA domains. */
+#define X1N1_MAX_DARTS 8
+
+struct x1n1_stream_map {
 	struct apple_dart_x1n1 *dart;
 	DECLARE_BITMAP(sids, DART_X1N1_MAX_STREAMS);
 };
 
+struct apple_dart_x1n1_master {
+	unsigned int num_darts;
+	struct x1n1_stream_map streams[X1N1_MAX_DARTS];
+};
+
 struct apple_dart_x1n1_domain {
 	struct iommu_domain domain;
-	struct apple_dart_x1n1 *dart;
-	DECLARE_BITMAP(sids, DART_X1N1_MAX_STREAMS);
-	struct mutex lock;		/* protects sids / dart binding */
-	/* level-2 leaf tables already attached, keyed by (sid << 40 | block),
-	 * block = dva >> 25. Installing a level-2 table twice is fatal in SPTM,
-	 * so each 32 MiB window is attached at most once. */
+	unsigned int num_darts;
+	struct x1n1_stream_map streams[X1N1_MAX_DARTS];
+	struct mutex lock; /* serialises domain attachments */
+	/* Mapping calls may run concurrently on distinct ranges. An attachment
+	 * must replay a stable mapping set before publishing its new streams.
+	 */
+	rwlock_t streams_lock;
+	/* Key: dart-id:8, sid:8, block:40. SPTM tables cannot be attached twice. */
 	struct xarray l2_attached;
 	bool has_retained;
-	struct xarray mappings; /* tagged (guest-PFN, protection), indexed by IOVA page */
+	/* One canonical mapping set and IOVA allocator for every DART. */
+	struct xarray mappings;
 };
+
+static struct x1n1_stream_map *
+x1n1_find_stream(struct apple_dart_x1n1_domain *dom, struct apple_dart_x1n1 *dart)
+{
+	if (dom)
+		for (unsigned int i = 0; i < dom->num_darts; i++)
+			if (dom->streams[i].dart == dart)
+				return &dom->streams[i];
+	return NULL;
+}
+
+/* Domain topology is fixed before the first attachment. Later devices can
+ * add SIDs on these DARTs, but cannot change an active allocator's aperture.
+ */
+static int x1n1_domain_configure(struct apple_dart_x1n1_domain *dom,
+			       const struct apple_dart_x1n1_master *master)
+{
+	u64 start = 0, end = DART_X1N1_NATIVE_APERTURE_END;
+
+	if (!master || !master->num_darts)
+		return -ENODEV;
+	if (dom->num_darts) {
+		for (unsigned int i = 0; i < master->num_darts; i++)
+			if (!x1n1_find_stream(dom, master->streams[i].dart))
+				return -EINVAL;
+		return 0;
+	}
+	for (unsigned int i = 0; i < master->num_darts; i++) {
+		start = max(start, master->streams[i].dart->dma_min);
+		end = min(end, master->streams[i].dart->dma_max);
+	}
+	if (start > end)
+		return -EINVAL;
+	for (unsigned int i = 0; i < master->num_darts; i++)
+		dom->streams[i].dart = master->streams[i].dart;
+	dom->domain.geometry.aperture_start = start;
+	dom->domain.geometry.aperture_end = end;
+	dom->num_darts = master->num_darts;
+	return 0;
+}
 
 static struct apple_dart_x1n1_domain *to_x1n1_domain(struct iommu_domain *dom)
 {
@@ -307,11 +358,15 @@ static bool x1n1_retained_overlap(struct apple_dart_x1n1_domain *dom, u64 dva,
 
 	if (!dom->has_retained)
 		return false;
-	for_each_set_bit(sid, dom->sids, dom->dart->num_streams) {
-		struct x1n1_retained_sid *r = dom->dart->retained[sid];
+	for (unsigned int i = 0; i < dom->num_darts; i++) {
+		struct x1n1_stream_map *stream = &dom->streams[i];
 
-		if (r && x1n1_retained_lookup(r, dva, size))
-			return true;
+		for_each_set_bit(sid, stream->sids, stream->dart->num_streams) {
+			struct x1n1_retained_sid *r = stream->dart->retained[sid];
+
+			if (r && x1n1_retained_lookup(r, dva, size))
+				return true;
+		}
 	}
 	return false;
 }
@@ -324,20 +379,25 @@ static phys_addr_t x1n1_retained_translate(struct apple_dart_x1n1_domain *dom,
 
 	if (!dom->has_retained)
 		return 0;
-	/* One domain may serve several streams: an inherited mapping is only
-	 * unambiguous when every stream resolves it to the same guest address. */
-	for_each_set_bit(sid, dom->sids, dom->dart->num_streams) {
-		struct x1n1_retained_sid *r = dom->dart->retained[sid];
-		const struct x1n1_retained_run *run =
-			r ? x1n1_retained_lookup(r, dva, 1) : NULL;
-		u64 pa;
+	/* Firmware may retain different mappings on different display engines.
+	 * Only a unanimous translation is meaningful for their shared domain.
+	 */
+	for (unsigned int i = 0; i < dom->num_darts; i++) {
+		struct x1n1_stream_map *stream = &dom->streams[i];
 
-		if (!run || dva < run->dva || run->ipa == U64_MAX)
-			return 0;
-		pa = run->ipa + dva - run->dva;
-		if (result && result != pa)
-			return 0;
-		result = pa;
+		for_each_set_bit(sid, stream->sids, stream->dart->num_streams) {
+			struct x1n1_retained_sid *r = stream->dart->retained[sid];
+			const struct x1n1_retained_run *run =
+				r ? x1n1_retained_lookup(r, dva, 1) : NULL;
+			u64 pa;
+
+			if (!run || dva < run->dva || run->ipa == U64_MAX)
+				return 0;
+			pa = run->ipa + dva - run->dva;
+			if (result && result != pa)
+				return 0;
+			result = pa;
+		}
 	}
 	return result;
 }
@@ -481,10 +541,12 @@ static void x1n1_forget_mapping(struct apple_dart_x1n1_domain *dom,
 }
 
 static int x1n1_prepare_leaf(struct apple_dart_x1n1_domain *dom,
+			   struct x1n1_stream_map *stream,
 			   unsigned int sid, u64 iova)
 {
-	struct apple_dart_x1n1 *dart = dom->dart;
-	unsigned long key = ((unsigned long)sid << 40) |
+	struct apple_dart_x1n1 *dart = stream->dart;
+	unsigned long key = ((unsigned long)dart->dart_id << 48) |
+			    ((unsigned long)sid << 40) |
 			    (iova >> DART_X1N1_BLOCK_SHIFT);
 	int ret;
 
@@ -547,9 +609,9 @@ static bool x1n1_next_mapping(struct apple_dart_x1n1_domain *dom,
 }
 
 static int x1n1_undo_replay(struct apple_dart_x1n1_domain *dom,
-			     unsigned int sid, u64 mapped_end)
+			     struct x1n1_stream_map *stream, unsigned int sid, u64 mapped_end)
 {
-	struct apple_dart_x1n1 *dart = dom->dart;
+	struct apple_dart_x1n1 *dart = stream->dart;
 	unsigned long cursor = 0;
 	struct x1n1_op op;
 
@@ -569,9 +631,10 @@ static int x1n1_undo_replay(struct apple_dart_x1n1_domain *dom,
 
 /* New SID is disabled throughout replay. On failure, keep it disabled and
  * remove the successful replay prefix. Existing SIDs/maps stay untouched. */
-static int x1n1_replay_sid(struct apple_dart_x1n1_domain *dom, unsigned int sid)
+static int x1n1_replay_sid(struct apple_dart_x1n1_domain *dom,
+			   struct x1n1_stream_map *stream, unsigned int sid)
 {
-	struct apple_dart_x1n1 *dart = dom->dart;
+	struct apple_dart_x1n1 *dart = stream->dart;
 	unsigned long cursor = 0;
 	struct x1n1_op op;
 	u64 mapped_end = 0;
@@ -581,7 +644,7 @@ static int x1n1_replay_sid(struct apple_dart_x1n1_domain *dom, unsigned int sid)
 	while (x1n1_next_mapping(dom, &cursor, &op, sid)) {
 		if (dart->retained[sid] && x1n1_retained_lookup(dart->retained[sid], op.arg[1], op.arg[3]))
 			return -EBUSY;
-		ret = x1n1_prepare_leaf(dom, sid, op.arg[1]);
+		ret = x1n1_prepare_leaf(dom, stream, sid, op.arg[1]);
 		if (ret)
 			return ret;
 	}
@@ -605,7 +668,7 @@ static int x1n1_replay_sid(struct apple_dart_x1n1_domain *dom, unsigned int sid)
 			return 0;
 	}
 undo:
-	x1n1_undo_replay(dom, sid, mapped_end);
+	x1n1_undo_replay(dom, stream, sid, mapped_end);
 	return ret;
 }
 
@@ -615,22 +678,20 @@ static int apple_dart_x1n1_attach_dev(struct iommu_domain *domain,
 {
 	struct apple_dart_x1n1_master *master = dev_iommu_priv_get(dev);
 	struct apple_dart_x1n1_domain *dom = to_x1n1_domain(domain);
-	struct apple_dart_x1n1 *dart;
+	struct apple_dart_x1n1_domain *prior = NULL;
+	unsigned long added[X1N1_MAX_DARTS][BITS_TO_LONGS(DART_X1N1_MAX_STREAMS)] = {};
+	unsigned long moved[X1N1_MAX_DARTS][BITS_TO_LONGS(DART_X1N1_MAX_STREAMS)] = {};
 	unsigned long flags;
 	unsigned int sid;
-	DECLARE_BITMAP(added_sids, DART_X1N1_MAX_STREAMS);
-	struct apple_dart_x1n1_domain *prior = NULL;
-	DECLARE_BITMAP(moved_sids, DART_X1N1_MAX_STREAMS);
 	int ret;
 
-	if (!master)
+	if (!master || !master->num_darts)
 		return -ENODEV;
-	dart = master->dart;
-
-	ret = apple_dart_x1n1_ensure_init(dart);
-	if (ret)
-		return ret;
-
+	for (unsigned int i = 0; i < master->num_darts; i++) {
+		ret = apple_dart_x1n1_ensure_init(master->streams[i].dart);
+		if (ret)
+			return ret;
+	}
 	if (old && old != domain && old->owner == &apple_dart_x1n1_ops &&
 	    old->ops == apple_dart_x1n1_ops.default_domain_ops)
 		prior = to_x1n1_domain(old);
@@ -642,120 +703,108 @@ static int apple_dart_x1n1_attach_dev(struct iommu_domain *domain,
 		if (prior)
 			mutex_lock_nested(&prior->lock, SINGLE_DEPTH_NESTING);
 	}
-	if (dom->dart && dom->dart != dart) {
-		if (prior)
-			mutex_unlock(&prior->lock);
-		mutex_unlock(&dom->lock);
-		return -EINVAL;
-	}
-	dom->dart = dart;
-	domain->geometry.aperture_start = dart->dma_min;
-	domain->geometry.aperture_end = dart->dma_max;
+	ret = x1n1_domain_configure(dom, master);
+	if (ret)
+		goto unlock_mutex;
 
-	/* A new stream must see all existing mappings before it can DMA. */
-	spin_lock_irqsave(&dart->batch_lock, flags);
-	ret = 0;
-	bitmap_zero(added_sids, DART_X1N1_MAX_STREAMS);
-	bitmap_zero(moved_sids, DART_X1N1_MAX_STREAMS);
-	for_each_set_bit(sid, master->sids, dart->num_streams) {
-		if (test_bit(sid, dom->sids))
-			continue;
-		if (dart->retained[sid] && prior && prior->dart == dart &&
-		    test_bit(sid, prior->sids)) {
-			set_bit(sid, moved_sids);
-			ret = x1n1_undo_replay(prior, sid, U64_MAX);
+	local_irq_save(flags);
+	if (prior && (unsigned long)prior < (unsigned long)dom) {
+		write_lock(&prior->streams_lock);
+		write_lock_nested(&dom->streams_lock, SINGLE_DEPTH_NESTING);
+	} else {
+		write_lock(&dom->streams_lock);
+		if (prior)
+			write_lock_nested(&prior->streams_lock, SINGLE_DEPTH_NESTING);
+	}
+	for (unsigned int i = 0; i < master->num_darts && !ret; i++) {
+		struct apple_dart_x1n1 *dart = master->streams[i].dart;
+		struct x1n1_stream_map *stream = x1n1_find_stream(dom, dart);
+		struct x1n1_stream_map *before = x1n1_find_stream(prior, dart);
+
+		spin_lock(&dart->batch_lock);
+		for_each_set_bit(sid, master->streams[i].sids, dart->num_streams) {
+			if (test_bit(sid, stream->sids))
+				continue;
+			if (dart->retained[sid] && before && test_bit(sid, before->sids)) {
+				set_bit(sid, moved[i]);
+				ret = x1n1_undo_replay(prior, before, sid, U64_MAX);
+				if (ret)
+					break;
+			}
+			dart->batch->count = dart->retained[sid] ? 1 : 2;
+			dart->batch->op[0] = (struct x1n1_op){
+				.op = dart->retained[sid] ? X1N1_DART_RETAINED_INFO :
+							  X1N1_DART_DISABLE,
+				.arg = { sid },
+			};
+			if (!dart->retained[sid])
+				dart->batch->op[1] = (struct x1n1_op){
+					.op = X1N1_DART_ATTACH,
+					.arg = { sid, dart->dma_min, 1 },
+				};
+			ret = x1n1_ring(dart, X1N1_MMIO_DART_DB + 8 * dart->dart_id);
 			if (ret)
 				break;
-		}
-		if (dart->retained[sid]) {
+			ret = x1n1_replay_sid(dom, stream, sid);
+			if (ret)
+				break;
+			/* Include this SID in unwind even when ENABLE's completion fails. */
+			set_bit(sid, added[i]);
 			dart->batch->count = 1;
 			dart->batch->op[0] = (struct x1n1_op){
-				.op = X1N1_DART_RETAINED_INFO,
+				.op = dart->retained[sid] ? X1N1_DART_RETAINED_INFO :
+							  X1N1_DART_ENABLE,
 				.arg = { sid },
 			};
-		} else {
-			dart->batch->count = 2;
-			dart->batch->op[0] = (struct x1n1_op){
-				.op = dart->retained[sid] ?
-					      X1N1_DART_RETAINED_INFO :
-					      X1N1_DART_DISABLE,
-				.arg = { sid },
-			};
-			dart->batch->op[1] = (struct x1n1_op){
-				.op = X1N1_DART_ATTACH,
-				.arg = { sid, dart->dma_min, 1 },
-			};
+			ret = x1n1_ring(dart, X1N1_MMIO_DART_DB + 8 * dart->dart_id);
+			if (ret)
+				break;
+			dom->has_retained |= !!dart->retained[sid];
+			set_bit(sid, stream->sids);
 		}
-		ret = x1n1_ring(dart, X1N1_MMIO_DART_DB + 8 * dart->dart_id);
-		if (ret)
-			break;
-		ret = x1n1_replay_sid(dom, sid);
-		if (ret)
-			break;
-		dart->batch->count = 1;
-		dart->batch->op[0] = (struct x1n1_op){
-			.op = dart->retained[sid] ? X1N1_DART_RETAINED_INFO :
-						    X1N1_DART_ENABLE,
-			.arg = { sid },
-		};
-		ret = x1n1_ring(dart, X1N1_MMIO_DART_DB + 8 * dart->dart_id);
-		if (ret) {
-			/* A failed completion may still have enabled the SID. */
-			dart->batch->count = 1;
-			dart->batch->op[0] = (struct x1n1_op){
-				.op = dart->retained[sid] ?
-					      X1N1_DART_RETAINED_INFO :
-					      X1N1_DART_DISABLE,
-				.arg = { sid },
-			};
-			if (x1n1_ring(dart,
-				      X1N1_MMIO_DART_DB + 8 * dart->dart_id))
-				dev_err(dart->dev,
-					"failed to disable new SID %u after enable error\n",
-					sid);
-			x1n1_undo_replay(dom, sid, U64_MAX);
-			break;
-		}
-		dom->has_retained |= !!dart->retained[sid];
-		set_bit(sid, dom->sids);
-		set_bit(sid, added_sids);
+		spin_unlock(&dart->batch_lock);
 	}
-	if (ret) {
-		/* A master can contain multiple SIDs. Undo those added by this
-		 * failed attachment without disturbing streams already in use. */
-		for_each_set_bit(sid, added_sids, dart->num_streams) {
-			dart->batch->count = 1;
-			dart->batch->op[0] = (struct x1n1_op){
-				.op = dart->retained[sid] ?
-					      X1N1_DART_RETAINED_INFO :
-					      X1N1_DART_DISABLE,
-				.arg = { sid },
-			};
-			if (x1n1_ring(dart,
-				      X1N1_MMIO_DART_DB + 8 * dart->dart_id))
-				dev_err(dart->dev,
-					"failed to disable new SID %u after attachment error\n",
-					sid);
-			x1n1_undo_replay(dom, sid, U64_MAX);
-			clear_bit(sid, dom->sids);
-		}
-	}
-	for_each_set_bit(sid, moved_sids, dart->num_streams) {
-		if (ret) {
-			if (x1n1_replay_sid(prior, sid))
-				dev_err(dart->dev,
-					"failed to restore previous domain SID %u\n",
-					sid);
-		} else {
-			clear_bit(sid, prior->sids);
-		}
-	}
-	spin_unlock_irqrestore(&dart->batch_lock, flags);
 
+	/* Attach is one transaction across all of the master's DARTs. */
+	for (unsigned int i = 0; i < master->num_darts; i++) {
+		struct apple_dart_x1n1 *dart = master->streams[i].dart;
+		struct x1n1_stream_map *stream = x1n1_find_stream(dom, dart);
+		struct x1n1_stream_map *before = x1n1_find_stream(prior, dart);
+
+		spin_lock(&dart->batch_lock);
+		if (ret) {
+			for_each_set_bit(sid, added[i], dart->num_streams) {
+				dart->batch->count = 1;
+				dart->batch->op[0] = (struct x1n1_op){
+					.op = dart->retained[sid] ? X1N1_DART_RETAINED_INFO :
+								  X1N1_DART_DISABLE,
+					.arg = { sid },
+				};
+				if (x1n1_ring(dart, X1N1_MMIO_DART_DB + 8 * dart->dart_id))
+					dev_err(dart->dev, "failed to disable SID %u during attach unwind\n", sid);
+				x1n1_undo_replay(dom, stream, sid, U64_MAX);
+				clear_bit(sid, stream->sids);
+			}
+		}
+		for_each_set_bit(sid, moved[i], dart->num_streams) {
+			if (ret) {
+				if (x1n1_replay_sid(prior, before, sid))
+					dev_err(dart->dev, "failed to restore previous domain SID %u\n", sid);
+			} else {
+				clear_bit(sid, before->sids);
+			}
+		}
+		spin_unlock(&dart->batch_lock);
+	}
+	if (prior)
+		write_unlock(&prior->streams_lock);
+	write_unlock(&dom->streams_lock);
+	local_irq_restore(flags);
+unlock_mutex:
 	if (prior)
 		mutex_unlock(&prior->lock);
 	mutex_unlock(&dom->lock);
-	return ret ? -EIO : 0;
+	return ret;
 }
 
 struct x1n1_map_progress {
@@ -767,10 +816,11 @@ struct x1n1_map_progress {
 /* Track only fully installed stream cohorts. The batch may split one cohort
  * without reducing batching; keep its progress across doorbells. */
 static int x1n1_flush_maps(struct apple_dart_x1n1_domain *dom,
+			 struct x1n1_stream_map *stream,
 			 struct x1n1_map_progress *progress)
 {
-	struct apple_dart_x1n1 *dart = dom->dart;
-	unsigned int total_streams = bitmap_weight(dom->sids, dart->num_streams);
+	struct apple_dart_x1n1 *dart = stream->dart;
+	unsigned int total_streams = bitmap_weight(stream->sids, dart->num_streams);
 	int ret = x1n1_ring(dart, X1N1_MMIO_DART_DB + 8 * dart->dart_id);
 
 	for (u32 i = 0; i < min(dart->batch->done, dart->batch->count); i++) {
@@ -778,7 +828,6 @@ static int x1n1_flush_maps(struct apple_dart_x1n1_domain *dom,
 
 		progress->partial = *op;
 		if (++progress->streams == total_streams) {
-			x1n1_record_mapping(dom, op->arg[1], op->arg[2], op->arg[3], op->arg[4]);
 			progress->mapped += op->arg[3];
 			progress->streams = 0;
 		}
@@ -787,7 +836,7 @@ static int x1n1_flush_maps(struct apple_dart_x1n1_domain *dom,
 		unsigned int sid;
 		u32 n = 0;
 
-		for_each_set_bit(sid, dom->sids, dart->num_streams) {
+		for_each_set_bit(sid, stream->sids, dart->num_streams) {
 			if (n == progress->streams)
 				break;
 			dart->batch->op[n++] = (struct x1n1_op){
@@ -802,13 +851,13 @@ static int x1n1_flush_maps(struct apple_dart_x1n1_domain *dom,
 	return ret;
 }
 
-static int apple_dart_x1n1_map_pages(struct iommu_domain *domain,
+static int x1n1_map_streams(struct apple_dart_x1n1_domain *dom,
+			     struct x1n1_stream_map *stream,
 				     unsigned long iova, phys_addr_t paddr,
 				     size_t pgsize, size_t pgcount, int prot,
 				     gfp_t gfp, size_t *mapped)
 {
-	struct apple_dart_x1n1_domain *dom = to_x1n1_domain(domain);
-	struct apple_dart_x1n1 *dart = dom->dart;
+	struct apple_dart_x1n1 *dart = stream->dart;
 	struct x1n1_map_progress progress = {};
 	size_t total;
 	unsigned long flags;
@@ -816,7 +865,7 @@ static int apple_dart_x1n1_map_pages(struct iommu_domain *domain,
 	int ret;
 
 	*mapped = 0;
-	if (!dart || bitmap_empty(dom->sids, dart->num_streams))
+	if (!dart || bitmap_empty(stream->sids, dart->num_streams))
 		return -ENODEV;
 	if (pgsize != DART_X1N1_PAGE_SIZE || !pgcount ||
 	    check_mul_overflow(pgsize, pgcount, &total) ||
@@ -826,11 +875,6 @@ static int apple_dart_x1n1_map_pages(struct iommu_domain *domain,
 	    total - 1 > dart->dma_max - iova ||
 	    iova + total > DART_X1N1_NATIVE_APERTURE_END)
 		return -EINVAL;
-	if (x1n1_retained_overlap(dom, iova, total))
-		return -EBUSY;
-	ret = x1n1_reserve_mappings(dom, iova, total, gfp);
-	if (ret)
-		return ret;
 	spin_lock_irqsave(&dart->batch_lock, flags);
 	/* Install all leaf tables before accumulating the mapping batch. */
 	for (size_t pos = 0; pos < total;) {
@@ -839,8 +883,8 @@ static int apple_dart_x1n1_map_pages(struct iommu_domain *domain,
 				    DART_X1N1_BLOCK_SIZE - (cur & (DART_X1N1_BLOCK_SIZE - 1)));
 		unsigned int sid;
 
-		for_each_set_bit(sid, dom->sids, dart->num_streams) {
-			ret = x1n1_prepare_leaf(dom, sid, cur);
+		for_each_set_bit(sid, stream->sids, dart->num_streams) {
+			ret = x1n1_prepare_leaf(dom, stream, sid, cur);
 			if (ret)
 				goto out;
 		}
@@ -852,14 +896,14 @@ static int apple_dart_x1n1_map_pages(struct iommu_domain *domain,
 				    DART_X1N1_BLOCK_SIZE - (cur & (DART_X1N1_BLOCK_SIZE - 1)));
 		unsigned int sid;
 
-		for_each_set_bit(sid, dom->sids, dart->num_streams) {
+		for_each_set_bit(sid, stream->sids, dart->num_streams) {
 			dart->batch->op[n++] = (struct x1n1_op){
 				.op = X1N1_DART_MAP,
 				.arg = { sid, cur, paddr + pos, chunk, prot },
 			};
 			if (n == X1N1_BATCH_MAX_OPS) {
 				dart->batch->count = n;
-				ret = x1n1_flush_maps(dom, &progress);
+				ret = x1n1_flush_maps(dom, stream, &progress);
 				if (ret)
 					goto out;
 				n = 0;
@@ -869,22 +913,19 @@ static int apple_dart_x1n1_map_pages(struct iommu_domain *domain,
 	}
 	if (n) {
 		dart->batch->count = n;
-		ret = x1n1_flush_maps(dom, &progress);
+		ret = x1n1_flush_maps(dom, stream, &progress);
 	}
 out:
 	spin_unlock_irqrestore(&dart->batch_lock, flags);
 	*mapped = progress.mapped;
-	/* Remove unused reservations after a partial failure; committed mappings
-	 * remain available both to caller unwind and a later stream attachment. */
-	if (ret)
-		x1n1_release_reservations(dom, iova + progress.mapped, total - progress.mapped);
 	return ret ? -EIO : 0;
 }
 
 static int x1n1_restore_partial_unmap(struct apple_dart_x1n1_domain *dom,
+			 struct x1n1_stream_map *stream,
 				    const struct x1n1_op *partial, unsigned int streams)
 {
-	struct apple_dart_x1n1 *dart = dom->dart;
+	struct apple_dart_x1n1 *dart = stream->dart;
 	unsigned long cursor = partial->arg[1] >> DART_X1N1_PAGE_SHIFT;
 	u64 end = partial->arg[1] + partial->arg[2];
 	struct x1n1_op op;
@@ -894,7 +935,7 @@ static int x1n1_restore_partial_unmap(struct apple_dart_x1n1_domain *dom,
 		unsigned int sid, count = 0;
 
 		op.arg[3] = min_t(u64, op.arg[3], end - op.arg[1]);
-		for_each_set_bit(sid, dom->sids, dart->num_streams) {
+		for_each_set_bit(sid, stream->sids, dart->num_streams) {
 			if (count++ == streams)
 				break;
 			op.arg[0] = sid;
@@ -914,10 +955,11 @@ static int x1n1_restore_partial_unmap(struct apple_dart_x1n1_domain *dom,
 }
 
 static int x1n1_flush_unmaps(struct apple_dart_x1n1_domain *dom,
+			 struct x1n1_stream_map *stream,
 			   struct x1n1_map_progress *progress)
 {
-	struct apple_dart_x1n1 *dart = dom->dart;
-	unsigned int total_streams = bitmap_weight(dom->sids, dart->num_streams);
+	struct apple_dart_x1n1 *dart = stream->dart;
+	unsigned int total_streams = bitmap_weight(stream->sids, dart->num_streams);
 	int ret = x1n1_ring(dart, X1N1_MMIO_DART_DB + 8 * dart->dart_id);
 
 	for (u32 i = 0; i < min(dart->batch->done, dart->batch->count); i++) {
@@ -925,14 +967,130 @@ static int x1n1_flush_unmaps(struct apple_dart_x1n1_domain *dom,
 
 		progress->partial = *op;
 		if (++progress->streams == total_streams) {
-			x1n1_forget_mapping(dom, op->arg[1], op->arg[2]);
 			progress->mapped += op->arg[2];
 			progress->streams = 0;
 		}
 	}
 	if (ret && progress->streams &&
-	    x1n1_restore_partial_unmap(dom, &progress->partial, progress->streams))
+	    x1n1_restore_partial_unmap(dom, stream, &progress->partial, progress->streams))
 		dev_err(dart->dev, "failed to restore partial DART unmap\n");
+	return ret;
+}
+
+static size_t x1n1_unmap_streams(struct apple_dart_x1n1_domain *dom,
+				  struct x1n1_stream_map *stream,
+					  unsigned long iova, size_t pgsize,
+					  size_t pgcount,
+					  struct iommu_iotlb_gather *gather)
+{
+	struct apple_dart_x1n1 *dart = stream->dart;
+	struct x1n1_map_progress progress = {};
+	size_t total;
+	unsigned long flags;
+	u32 n = 0;
+
+	if (!dart || bitmap_empty(stream->sids, dart->num_streams) ||
+	    pgsize != DART_X1N1_PAGE_SIZE || !pgcount ||
+	    check_mul_overflow(pgsize, pgcount, &total) ||
+	    (iova & (DART_X1N1_PAGE_SIZE - 1)) ||
+	    iova < dart->dma_min || iova > dart->dma_max ||
+	    total - 1 > dart->dma_max - iova)
+		return 0;
+	spin_lock_irqsave(&dart->batch_lock, flags);
+	for (size_t pos = 0; pos < total;) {
+		u64 cur = iova + pos;
+		size_t chunk = min_t(size_t, total - pos,
+				    DART_X1N1_BLOCK_SIZE - (cur & (DART_X1N1_BLOCK_SIZE - 1)));
+		unsigned int sid;
+
+		for_each_set_bit(sid, stream->sids, dart->num_streams) {
+			dart->batch->op[n++] = (struct x1n1_op){
+				.op = X1N1_DART_UNMAP, .arg = { sid, cur, chunk },
+			};
+			if (n == X1N1_BATCH_MAX_OPS) {
+				dart->batch->count = n;
+				if (x1n1_flush_unmaps(dom, stream, &progress))
+					goto out;
+				n = 0;
+			}
+		}
+		pos += chunk;
+	}
+	if (n) {
+		dart->batch->count = n;
+		x1n1_flush_unmaps(dom, stream, &progress);
+	}
+out:
+	spin_unlock_irqrestore(&dart->batch_lock, flags);
+	return progress.mapped;
+}
+
+/* A buffer has one IOVA and one software mapping, regardless of how many
+ * display engines can scan it out. Forward whole batches to each DART; do
+ * not split them into per-page or per-stream transactions.
+ */
+static int apple_dart_x1n1_map_pages(struct iommu_domain *domain,
+				     unsigned long iova, phys_addr_t paddr,
+				     size_t pgsize, size_t pgcount, int prot,
+				     gfp_t gfp, size_t *mapped)
+{
+	struct apple_dart_x1n1_domain *dom = to_x1n1_domain(domain);
+	size_t done[X1N1_MAX_DARTS] = {}, total;
+	unsigned long flags;
+	unsigned int active = 0;
+	int ret;
+
+	*mapped = 0;
+	if (!dom->num_darts)
+		return -ENODEV;
+	if (pgsize != DART_X1N1_PAGE_SIZE || !pgcount ||
+	    check_mul_overflow(pgsize, pgcount, &total) ||
+	    (iova | paddr) & (DART_X1N1_PAGE_SIZE - 1) || !paddr ||
+	    total - 1 > U64_MAX - paddr ||
+	    prot & ~((1U << X1N1_MAP_PROT_BITS) - 1) ||
+	    iova < domain->geometry.aperture_start ||
+	    iova > domain->geometry.aperture_end ||
+	    total - 1 > domain->geometry.aperture_end - iova ||
+	    iova + total > DART_X1N1_NATIVE_APERTURE_END)
+		return -EINVAL;
+	ret = x1n1_reserve_mappings(dom, iova, total, gfp);
+	if (ret)
+		return ret;
+	read_lock_irqsave(&dom->streams_lock, flags);
+	if (x1n1_retained_overlap(dom, iova, total)) {
+		ret = -EBUSY;
+		goto out;
+	}
+	for (unsigned int i = 0; i < dom->num_darts; i++) {
+		struct x1n1_stream_map *stream = &dom->streams[i];
+
+		if (bitmap_empty(stream->sids, stream->dart->num_streams))
+			continue;
+		active++;
+		ret = x1n1_map_streams(dom, stream, iova, paddr, pgsize, pgcount,
+				     prot, gfp, &done[i]);
+		if (ret)
+			break;
+	}
+	if (!active)
+		ret = -ENODEV;
+	if (!ret) {
+		x1n1_record_mapping(dom, iova, paddr, total, prot);
+		*mapped = total;
+	} else {
+		/* A later DART failed. Undo the successful prefixes on every
+		 * engine before letting the DMA layer reuse this IOVA.
+		 */
+		for (unsigned int i = 0; i < dom->num_darts; i++)
+			if (done[i] && x1n1_unmap_streams(dom, &dom->streams[i], iova,
+					pgsize, done[i] / pgsize, NULL) != done[i])
+				dev_err(dom->streams[i].dart->dev,
+					"failed to unwind multi-DART mapping\n");
+	}
+out:
+	read_unlock_irqrestore(&dom->streams_lock, flags);
+	if (ret)
+		x1n1_release_reservations(dom, iova, total);
 	return ret;
 }
 
@@ -942,48 +1100,59 @@ static size_t apple_dart_x1n1_unmap_pages(struct iommu_domain *domain,
 					  struct iommu_iotlb_gather *gather)
 {
 	struct apple_dart_x1n1_domain *dom = to_x1n1_domain(domain);
-	struct apple_dart_x1n1 *dart = dom->dart;
-	struct x1n1_map_progress progress = {};
-	size_t total;
+	size_t done[X1N1_MAX_DARTS] = {}, total, common;
 	unsigned long flags;
-	u32 n = 0;
+	unsigned int active = 0;
 
-	if (!dart || bitmap_empty(dom->sids, dart->num_streams) ||
-	    pgsize != DART_X1N1_PAGE_SIZE || !pgcount ||
+	if (!dom->num_darts || pgsize != DART_X1N1_PAGE_SIZE || !pgcount ||
 	    check_mul_overflow(pgsize, pgcount, &total) ||
 	    (iova & (DART_X1N1_PAGE_SIZE - 1)) ||
-	    iova < dart->dma_min || iova > dart->dma_max ||
-	    total - 1 > dart->dma_max - iova)
+	    iova < domain->geometry.aperture_start ||
+	    iova > domain->geometry.aperture_end ||
+	    total - 1 > domain->geometry.aperture_end - iova)
 		return 0;
-	if (x1n1_retained_overlap(dom, iova, total))
-		return 0;
-	spin_lock_irqsave(&dart->batch_lock, flags);
-	for (size_t pos = 0; pos < total;) {
-		u64 cur = iova + pos;
-		size_t chunk = min_t(size_t, total - pos,
-				    DART_X1N1_BLOCK_SIZE - (cur & (DART_X1N1_BLOCK_SIZE - 1)));
-		unsigned int sid;
+	read_lock_irqsave(&dom->streams_lock, flags);
+	if (x1n1_retained_overlap(dom, iova, total)) {
+		common = 0;
+		goto out;
+	}
+	for (unsigned int i = 0; i < dom->num_darts; i++) {
+		struct x1n1_stream_map *stream = &dom->streams[i];
 
-		for_each_set_bit(sid, dom->sids, dart->num_streams) {
-			dart->batch->op[n++] = (struct x1n1_op){
-				.op = X1N1_DART_UNMAP, .arg = { sid, cur, chunk },
-			};
-			if (n == X1N1_BATCH_MAX_OPS) {
-				dart->batch->count = n;
-				if (x1n1_flush_unmaps(dom, &progress))
-					goto out;
-				n = 0;
-			}
-		}
-		pos += chunk;
+		if (bitmap_empty(stream->sids, stream->dart->num_streams))
+			continue;
+		active++;
+		done[i] = x1n1_unmap_streams(dom, stream, iova, pgsize, pgcount, gather);
+		if (done[i] != total)
+			break;
 	}
-	if (n) {
-		dart->batch->count = n;
-		x1n1_flush_unmaps(dom, &progress);
+	common = active ? total : 0;
+	for (unsigned int i = 0; i < dom->num_darts; i++)
+		if (!bitmap_empty(dom->streams[i].sids, dom->streams[i].dart->num_streams))
+			common = min(common, done[i]);
+	/* Preserve the canonical mapping until all engines have agreed. On
+	 * failure restore the suffix removed from earlier engines, retaining
+	 * their existing leaf tables and full-sized transport batches.
+	 */
+	for (unsigned int i = 0; i < dom->num_darts; i++) {
+		struct x1n1_stream_map *stream = &dom->streams[i];
+		struct apple_dart_x1n1 *dart = stream->dart;
+		struct x1n1_op suffix = {
+			.arg = { 0, iova + common, done[i] - common },
+		};
+
+		if (done[i] <= common)
+			continue;
+		spin_lock(&dart->batch_lock);
+		if (x1n1_restore_partial_unmap(dom, stream, &suffix,
+					     bitmap_weight(stream->sids, dart->num_streams)))
+			dev_err(dart->dev, "failed to restore multi-DART unmap suffix\n");
+		spin_unlock(&dart->batch_lock);
 	}
+	x1n1_forget_mapping(dom, iova, common);
 out:
-	spin_unlock_irqrestore(&dart->batch_lock, flags);
-	return progress.mapped;
+	read_unlock_irqrestore(&dom->streams_lock, flags);
+	return common;
 }
 
 static void apple_dart_x1n1_iotlb_sync(struct iommu_domain *domain,
@@ -1010,14 +1179,17 @@ static void apple_dart_x1n1_domain_free(struct iommu_domain *domain)
 {
 	struct apple_dart_x1n1_domain *dom = to_x1n1_domain(domain);
 
-	if (dom->has_retained && dom->dart) {
-		unsigned int sid;
-		unsigned long flags;
+	if (dom->has_retained) {
+		for (unsigned int i = 0; i < dom->num_darts; i++) {
+			struct x1n1_stream_map *stream = &dom->streams[i];
+			unsigned int sid;
+			unsigned long flags;
 
-		spin_lock_irqsave(&dom->dart->batch_lock, flags);
-		for_each_set_bit(sid, dom->sids, dom->dart->num_streams)
-			x1n1_undo_replay(dom, sid, U64_MAX);
-		spin_unlock_irqrestore(&dom->dart->batch_lock, flags);
+			spin_lock_irqsave(&stream->dart->batch_lock, flags);
+			for_each_set_bit(sid, stream->sids, stream->dart->num_streams)
+				x1n1_undo_replay(dom, stream, sid, U64_MAX);
+			spin_unlock_irqrestore(&stream->dart->batch_lock, flags);
+		}
 	}
 	xa_destroy(&dom->l2_attached);
 	xa_destroy(&dom->mappings);
@@ -1028,29 +1200,25 @@ static struct iommu_domain *
 apple_dart_x1n1_domain_alloc_paging(struct device *dev)
 {
 	struct apple_dart_x1n1_domain *dom;
+	int ret;
 
 	dom = kzalloc(sizeof(*dom), GFP_KERNEL);
 	if (!dom)
 		return NULL;
-
 	mutex_init(&dom->lock);
+	rwlock_init(&dom->streams_lock);
 	xa_init(&dom->l2_attached);
 	xa_init(&dom->mappings);
 	dom->domain.pgsize_bitmap = DART_X1N1_PAGE_SIZE;
-	dom->domain.geometry.aperture_start = 0;
 	dom->domain.geometry.aperture_end = DART_X1N1_APERTURE_END;
 	dom->domain.geometry.force_aperture = true;
-
-	if (dev) {
-		struct apple_dart_x1n1_master *master = dev_iommu_priv_get(dev);
-
-		if (master) {
-			dom->dart = master->dart;
-			dom->domain.geometry.aperture_start = master->dart->dma_min;
-			dom->domain.geometry.aperture_end = master->dart->dma_max;
+	if (dev && dev_iommu_priv_get(dev)) {
+		ret = x1n1_domain_configure(dom, dev_iommu_priv_get(dev));
+		if (ret) {
+			kfree(dom);
+			return ERR_PTR(ret);
 		}
 	}
-
 	return &dom->domain;
 }
 
@@ -1058,13 +1226,12 @@ static struct iommu_device *apple_dart_x1n1_probe_device(struct device *dev)
 {
 	struct apple_dart_x1n1_master *master = dev_iommu_priv_get(dev);
 
-	if (!dev_iommu_fwspec_get(dev) || !master)
+	if (!dev_iommu_fwspec_get(dev) || !master || !master->num_darts)
 		return ERR_PTR(-ENODEV);
-
-	device_link_add(dev, master->dart->dev,
-			DL_FLAG_PM_RUNTIME | DL_FLAG_AUTOREMOVE_SUPPLIER);
-
-	return &master->dart->iommu;
+	for (unsigned int i = 0; i < master->num_darts; i++)
+		device_link_add(dev, master->streams[i].dart->dev,
+				DL_FLAG_PM_RUNTIME | DL_FLAG_AUTOREMOVE_SUPPLIER);
+	return &master->streams[0].dart->iommu;
 }
 
 static void apple_dart_x1n1_release_device(struct device *dev)
@@ -1094,22 +1261,25 @@ static int apple_dart_x1n1_of_xlate(struct device *dev,
 	if (!dart)
 		return -ENODEV;
 
+	if (sid >= dart->num_streams)
+		return -EINVAL;
 	if (!master) {
 		master = kzalloc(sizeof(*master), GFP_KERNEL);
 		if (!master)
 			return -ENOMEM;
-		master->dart = dart;
 		dev_iommu_priv_set(dev, master);
-	} else if (master->dart != dart) {
-		/* This driver forwards per (dart-id, sid); a device spanning
-		 * two paravirt DARTs is not modelled. */
-		return -EINVAL;
 	}
-
-	if (sid >= dart->num_streams)
+	for (unsigned int i = 0; i < master->num_darts; i++) {
+		if (master->streams[i].dart == dart) {
+			set_bit(sid, master->streams[i].sids);
+			return 0;
+		}
+	}
+	if (master->num_darts == X1N1_MAX_DARTS)
 		return -EINVAL;
-
-	set_bit(sid, master->sids);
+	master->streams[master->num_darts].dart = dart;
+	set_bit(sid, master->streams[master->num_darts].sids);
+	master->num_darts++;
 	return 0;
 }
 
@@ -1125,10 +1295,40 @@ static void apple_dart_x1n1_release_group(void *data)
 	unsigned int sid;
 
 	mutex_lock(&apple_dart_x1n1_groups_lock);
-	for_each_set_bit(sid, group_master->sids, group_master->dart->num_streams)
-		group_master->dart->sid2group[sid] = NULL;
+	for (unsigned int i = 0; i < group_master->num_darts; i++) {
+		struct x1n1_stream_map *stream = &group_master->streams[i];
+
+		for_each_set_bit(sid, stream->sids, stream->dart->num_streams)
+			stream->dart->sid2group[sid] = NULL;
+	}
 	mutex_unlock(&apple_dart_x1n1_groups_lock);
 	kfree(group_master);
+}
+
+static int x1n1_merge_master(struct apple_dart_x1n1_master *dst,
+			     const struct apple_dart_x1n1_master *src)
+{
+	struct apple_dart_x1n1_master merged = *dst;
+
+	for (unsigned int i = 0; i < src->num_darts; i++) {
+		const struct x1n1_stream_map *from = &src->streams[i];
+		unsigned int j;
+
+		for (j = 0; j < merged.num_darts; j++)
+			if (merged.streams[j].dart == from->dart)
+				break;
+		if (j == merged.num_darts) {
+			if (j == X1N1_MAX_DARTS)
+				return -EINVAL;
+			merged.streams[j] = *from;
+			merged.num_darts++;
+		} else {
+			bitmap_or(merged.streams[j].sids, merged.streams[j].sids,
+				  from->sids, from->dart->num_streams);
+		}
+	}
+	*dst = merged;
+	return 0;
 }
 
 static struct iommu_group *apple_dart_x1n1_device_group(struct device *dev)
@@ -1139,20 +1339,22 @@ static struct iommu_group *apple_dart_x1n1_device_group(struct device *dev)
 	struct iommu_group *result = ERR_PTR(-EINVAL);
 	unsigned int sid;
 
-	if (!master || bitmap_empty(master->sids, master->dart->num_streams))
+	if (!master || !master->num_darts)
 		return result;
-
 	mutex_lock(&apple_dart_x1n1_groups_lock);
-	for_each_set_bit(sid, master->sids, master->dart->num_streams) {
-		struct iommu_group *existing = master->dart->sid2group[sid];
+	for (unsigned int i = 0; i < master->num_darts; i++) {
+		struct x1n1_stream_map *stream = &master->streams[i];
 
-		if (!existing)
-			continue;
-		if (group && existing != group)
-			goto out;
-		group = existing;
+		for_each_set_bit(sid, stream->sids, stream->dart->num_streams) {
+			struct iommu_group *existing = stream->dart->sid2group[sid];
+
+			if (!existing)
+				continue;
+			if (group && existing != group)
+				goto out;
+			group = existing;
+		}
 	}
-
 	if (group) {
 		group = iommu_group_ref_get(group);
 	} else {
@@ -1171,13 +1373,7 @@ static struct iommu_group *apple_dart_x1n1_device_group(struct device *dev)
 		result = ERR_PTR(-ENOMEM);
 		goto out;
 	}
-
-	/* A PCI topology group may already contain another function. */
 	group_master = iommu_group_get_iommudata(group);
-	if (group_master && group_master->dart != master->dart) {
-		put_group = group;
-		goto out;
-	}
 	if (!group_master) {
 		group_master = kmemdup(master, sizeof(*master), GFP_KERNEL);
 		if (!group_master) {
@@ -1187,13 +1383,16 @@ static struct iommu_group *apple_dart_x1n1_device_group(struct device *dev)
 		}
 		iommu_group_set_iommudata(group, group_master,
 					 apple_dart_x1n1_release_group);
-	} else {
-		bitmap_or(group_master->sids, group_master->sids, master->sids,
-			  master->dart->num_streams);
+	} else if (x1n1_merge_master(group_master, master)) {
+		put_group = group;
+		goto out;
 	}
+	for (unsigned int i = 0; i < master->num_darts; i++) {
+		struct x1n1_stream_map *stream = &master->streams[i];
 
-	for_each_set_bit(sid, master->sids, master->dart->num_streams)
-		master->dart->sid2group[sid] = group;
+		for_each_set_bit(sid, stream->sids, stream->dart->num_streams)
+			stream->dart->sid2group[sid] = group;
+	}
 	result = group;
 out:
 	mutex_unlock(&apple_dart_x1n1_groups_lock);
@@ -1219,11 +1418,13 @@ static void apple_dart_x1n1_get_resv_regions(struct device *dev,
 	struct apple_dart_x1n1_master *master = dev_iommu_priv_get(dev);
 	unsigned int sid;
 
-	if (master) {
+	for (unsigned int i = 0; master && i < master->num_darts; i++) {
+		struct x1n1_stream_map *stream = &master->streams[i];
+
 		/* SPTM converts both start and exclusive end with a strict 42-bit
 		 * address check (26A428: 270d63d8/270d640c). A range ending at
 		 * 4 TiB is rejected, so keep its final granule out of allocation. */
-		if (master->dart->dma_max == DART_X1N1_NATIVE_APERTURE_END) {
+		if (stream->dart->dma_max == DART_X1N1_NATIVE_APERTURE_END) {
 			struct iommu_resv_region *region =
 				iommu_alloc_resv_region(
 					DART_X1N1_NATIVE_APERTURE_END + 1 -
@@ -1234,9 +1435,9 @@ static void apple_dart_x1n1_get_resv_regions(struct device *dev,
 			if (region)
 				list_add_tail(&region->list, head);
 		}
-		for_each_set_bit(sid, master->sids, master->dart->num_streams) {
+		for_each_set_bit(sid, stream->sids, stream->dart->num_streams) {
 			struct x1n1_retained_sid *r =
-				master->dart->retained[sid];
+				stream->dart->retained[sid];
 			if (!r)
 				continue;
 			for (unsigned int i = 0; i < r->count; i++) {
@@ -1300,9 +1501,9 @@ int apple_dart_x1n1_set_power(struct device *dev, bool on)
 	    dev->iommu->iommu_dev->ops != &apple_dart_x1n1_ops)
 		return -ENODEV;
 	master = dev_iommu_priv_get(dev);
-	if (!master)
+	if (!master || master->num_darts != 1)
 		return -ENODEV;
-	dart = master->dart;
+	dart = master->streams[0].dart;
 	mutex_lock(&dart->init_lock);
 	if (!dart->inited) {
 		ret = -EINVAL;
