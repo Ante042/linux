@@ -402,13 +402,19 @@ static void centauri_remove(struct pci_dev *pdev)
 	 * only trylock on that path and observes this before requeueing.
 	 */
 	WRITE_ONCE(c->removing, true);
-	debugfs_remove_recursive(c->debug);
 	cancel_delayed_work_sync(&c->boot_work);
 	mutex_lock(&c->boot_lock);
 	centauri_wifi_unregister(c);
 	centauri_free_boot(c);
 	c->boot_phase = CEN_BOOT_STOPPED;
 	mutex_unlock(&c->boot_lock);
+	/* Wi-Fi owns the child dentries and removes them before freeing its
+	 * storage. Removing the parent first leaves stale child pointers for
+	 * that teardown. Drop boot_lock before draining the parent files: an
+	 * in-flight rom_boot writer may be waiting for that mutex.
+	 */
+	debugfs_remove_recursive(c->debug);
+	c->debug = NULL;
 }
 
 static const struct pci_device_id centauri_ids[] = {
