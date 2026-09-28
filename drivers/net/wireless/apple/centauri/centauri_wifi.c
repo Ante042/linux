@@ -8,6 +8,7 @@
 #include <linux/ieee80211.h>
 #include <linux/iopoll.h>
 #include <linux/module.h>
+#include <linux/of.h>
 #include <linux/seq_file.h>
 #include <linux/unaligned.h>
 #include <linux/workqueue.h>
@@ -101,6 +102,7 @@ struct centauri_wifi {
 	u32 reply_command, channels_seen, scans_done, beacons_seen;
 	bool reply_valid, registered, configured;
 	bool stopping;
+	u8 scan_sequence;
 	bool connecting, connected, connect_event, disconnect_event;
 	bool associated, pmk_seen, pmk_matches;
 	u8 expected_pmk[32];
@@ -800,6 +802,100 @@ static int radio_start(struct centauri_wifi *wifi)
 	return 0;
 }
 
+/* Current macOS27 buildScanRequestNewApi (1809bf400) always appends the
+ * channel-list TLV260 and five-byte options TLV357 to its14-byte header.
+ * Each channel is {number, ACI band, 0, 0}; the native bound is59 entries.
+ */
+#define CEN_SCAN_CHANNELS_MAX 59
+static int scan_native27(struct centauri_wifi *wifi)
+{
+	struct cfg80211_scan_request *request = wifi->scan_request;
+	u8 scan[14 + 5 + 4 * CEN_SCAN_CHANNELS_MAX + 9 + 4 + 2 + 32];
+	unsigned int next = 0;
+
+	if (!request || !request->n_channels || request->n_ssids > 1)
+		return -EINVAL;
+	while (next < request->n_channels) {
+		u8 channels[1 + 4 * CEN_SCAN_CHANNELS_MAX] = {};
+		u8 options[5] = { 0, 0, 1, 0, 0 };
+		unsigned int count = 0;
+		u32 done = wifi->scans_done;
+		size_t size = 14;
+		unsigned long deadline;
+		int ret;
+
+		memset(scan, 0, sizeof(scan));
+		scan[0] = (++wifi->scan_sequence) & 0x1f;
+		scan[3] = 0x80;
+		scan[5] = 2;
+		scan[7] = 0x10;
+		/* Native scan defaults: active min/max 40 ms, passive 110 ms. */
+		put_unaligned_le16(40, scan + 8);
+		put_unaligned_le16(40, scan + 10);
+		put_unaligned_le16(110, scan + 12);
+		while (next < request->n_channels && count < CEN_SCAN_CHANNELS_MAX) {
+			struct ieee80211_channel *channel = request->channels[next++];
+			unsigned int number;
+
+			if (channel->flags & IEEE80211_CHAN_DISABLED)
+				continue;
+			if (channel->band != NL80211_BAND_2GHZ &&
+			    channel->band != NL80211_BAND_5GHZ)
+				return -EOPNOTSUPP;
+			number = ieee80211_frequency_to_channel(channel->center_freq);
+			if (!number || number > 255)
+				return -EINVAL;
+			channels[1 + 4 * count] = number;
+			channels[2 + 4 * count] = channel->band == NL80211_BAND_5GHZ;
+			count++;
+		}
+		if (!count)
+			continue;
+		channels[0] = count;
+		put_unaligned_le16(260, scan + size);
+		put_unaligned_le16(1 + 4 * count, scan + size + 2);
+		memcpy(scan + size + 4, channels, 1 + 4 * count);
+		size += 5 + 4 * count;
+		put_unaligned_le16(357, scan + size);
+		put_unaligned_le16(sizeof(options), scan + size + 2);
+		memcpy(scan + size + 4, options, sizeof(options));
+		size += 4 + sizeof(options);
+		if (request->n_ssids) {
+			const struct cfg80211_ssid *ssid = &request->ssids[0];
+
+			if (ssid->ssid_len > 32)
+				return -EINVAL;
+			/* Native single-SSID TLV258 uses5 for a directed SSID;
+			 * the zero-length wildcard form uses4 (bfc40..bfc5c).
+			 */
+			scan[2] = !!ssid->ssid_len;
+			put_unaligned_le16(258, scan + size);
+			put_unaligned_le16(2 + ssid->ssid_len, scan + size + 2);
+			scan[size + 4] = ssid->ssid_len ? 5 : 4;
+			scan[size + 5] = ssid->ssid_len;
+			memcpy(scan + size + 6, ssid->ssid, ssid->ssid_len);
+			size += 6 + ssid->ssid_len;
+		}
+		ret = command(wifi, 65551, scan, size);
+		if (ret)
+			return ret;
+		deadline = jiffies + msecs_to_jiffies(max(8000U, count * 220 + 2000));
+		do {
+			drain(wifi);
+			if (READ_ONCE(wifi->stopping) || readl(wifi->a.bar + 8) != 2)
+				return -EIO;
+			if (wifi->scans_done != done)
+				break;
+			usleep_range(1000, 2000);
+		} while (time_before(jiffies, deadline));
+		if (wifi->scans_done == done) {
+			command(wifi, 65537, NULL, 0);
+			return -ETIMEDOUT;
+		}
+	}
+	return 0;
+}
+
 static void scan_worker(struct work_struct *work)
 {
 	struct centauri_wifi *wifi = container_of(work, struct centauri_wifi, scan_work);
@@ -810,6 +906,10 @@ static void scan_worker(struct work_struct *work)
 	int ret = 0;
 
 	mutex_lock(&wifi->lock);
+	if (of_machine_is_compatible("apple,j714s")) {
+		ret = scan_native27(wifi);
+		goto completed;
+	}
 	for (chunk = 0; chunk < 3 && !ret; chunk++) {
 		u32 channels = wifi->channels_seen, done = wifi->scans_done;
 		bool stopped = false;
@@ -839,6 +939,7 @@ static void scan_worker(struct work_struct *work)
 		if (!ret && wifi->scans_done == done)
 			ret = -ETIMEDOUT;
 	}
+completed:
 	info.aborted = !!ret;
 	request = wifi->scan_request;
 	wifi->scan_request = NULL;
