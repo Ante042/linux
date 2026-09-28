@@ -2177,7 +2177,10 @@ static int apple_nvme_probe(struct platform_device *pdev)
 		goto out_uninit_ctrl;
 	}
 
-	if (flush_interval) {
+	/* A resident guest must not report a successful flush before firmware
+	 * has completed it. The legacy deferred-flush policy acknowledges some
+	 * requests early and cannot provide the required fsync durability. */
+	if (flush_interval && !anv->hw->sptm_resident) {
 		anv->flush_interval = msecs_to_jiffies(flush_interval);
 		anv->flush_ns = NULL;
 		anv->last_flush = jiffies - anv->flush_interval;

@@ -11,9 +11,9 @@ payload data. CREATE_CQ/SQ reference their PRP1 queue page even with no
 block-layer payload. Completion invalidation must release SPTM DMA references
 before buffers may be reused.
 
-DMA ranges translate the guest RAM IPA window to its actual physical backing.
-SART receives DMA addresses and converts them back to guest physical before
-submitting its own transport. Queue and RTKit grants are16KiB aligned.
+The qualified full-RAM host uses identity guest IPA and native physical
+addresses, with empty identity dma-ranges. The older diagnostic offset layout
+is also supported by the transport. Queue and RTKit grants are16KiB aligned.
 The firmware must already be running; this profile does not own its reset.
 The obsolete linear-SQ control register is not written on T6050.
 
@@ -29,5 +29,28 @@ Hardware qualification on J714s, macOS27.0 firmware26A428:
 
 Full logs and pinned binaries are retained in the workspace directory
 work/j714-mpidr-20260927. This is an initial resident profile; ordinary ANS
-profiles and their wrapped-key crypto support are retained. No SSD writes or
-filesystem changes were used for qualification.
+profiles and their wrapped-key crypto support are retained.
+
+Write and flush qualification
+-----------------------------
+
+The resident profile disables the legacy deferred-flush policy. A successful
+flush now requires completion of the corresponding hardware NVMe FLUSH;
+acknowledging a request early and scheduling it later cannot establish the
+requested fdatasync durability. Other profiles retain their existing policy.
+
+On 2026-09-27, Linux with all18 CPUs and59.436GiB of guest RAM created a new
+1GiB test file on the existing ALARM_ROOT ext4 filesystem, using O_DIRECT and
+fdatasync. It verified the entire offset-dependent pattern, overwrote alternating
+1MiB ranges, synced and verified again, and unmounted the filesystem. After a
+hardware reboot, a read-only/no-journal-replay mount verified every byte of the
+final pattern. Existing user files and boot files were not overwritten.
+
+The initial1GiB pattern generation, write and fdatasync took0.198547 seconds
+(5157.46MiB/s). This is a bounded sample, not sustained throughput or a native
+comparison. Reboot persistence passed; sudden power-loss behavior was not tested.
+Earlier timings with deferred flush enabled do not measure durable write speed.
+Evidence: hardware-linux-ans-durable-guest.log and
+hardware-linux-ans-durable-persist-guest.log under the workspace directory above.
+Kernel Image SHA256:
+019d9c370014fc726df4b39ef1f2218e36c0ca5e8bec3177e08b96c9945cc233.
