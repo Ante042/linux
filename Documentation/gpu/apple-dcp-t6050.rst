@@ -141,3 +141,22 @@ cannot all claim the same synthetic doorbell page without a shared-provider
 change or distinct emulated aliases. These integration requirements and
 panel/provider behavior must be resolved before enabling the profile. No J714 DCP pageflip, power transition,
 backlight, or external-output result is claimed by this port.
+
+Firmware physical addresses in a guest
+-------------------------------------
+
+``reg`` describes Linux CPU resources and therefore contains guest IPAs.
+The DCP coprocessor still sees host physical MMIO. An optional
+``apple,firmware-physical-regs`` array supplies one u64 host base per
+``disp-N`` resource, followed by the appended bandwidth scratch/doorbell
+resources in driver index order. Its length must equal the resource count.
+The disabled T6050 fixture supplies six entries; its last two both describe
+PMC at 0x286700000. Without the property, bases default to resource start,
+preserving native behavior.
+
+Register/BW replies use these firmware addresses. A firmware map_physical
+request is translated in reverse to the corresponding CPU resource before
+calling dma_map_resource. The HV/IOMMU resource-DMA path must also translate
+that IPA to host MMIO before forwarding to SPTM; its current RAM-only map
+translation is not sufficient. This source change does not implement that
+host-side operation or establish firmware DMA success.

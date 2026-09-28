@@ -2331,6 +2331,21 @@ static int dcp_get_disp_regs(struct apple_dcp *dcp)
 	}
 
 	dcp->nr_disp_registers = count;
+	for (i = 0; i < count; i++)
+		dcp->disp_firmware_base[i] = dcp->disp_registers[i]->start;
+	/* A guest resource is an IPA. A live coprocessor still sees host
+	 * physical MMIO addresses, so its register callbacks need both views.
+	 */
+	if (of_property_present(dcp->dev->of_node, "apple,firmware-physical-regs")) {
+		if (of_property_count_u64_elems(dcp->dev->of_node,
+				"apple,firmware-physical-regs") != count)
+			return -EINVAL;
+		ret = of_property_read_u64_array(dcp->dev->of_node,
+				"apple,firmware-physical-regs",
+				dcp->disp_firmware_base, count);
+		if (ret)
+			return ret;
+	}
 	return 0;
 }
 

@@ -811,18 +811,30 @@ static u8 dcpep_cb_release_mem_desc(struct apple_dcp *dcp, u32 *mem_desc_id)
 	return 1;
 }
 
-/* Validate that the specified region is a display register */
-static bool is_disp_register(struct apple_dcp *dcp, u64 start, u64 end)
+/* Translate a firmware-visible MMIO address back to the guest CPU resource.
+ * Both views are identical on bare metal; the hypervisor supplies the map
+ * when Linux resources are translated IPAs.
+ */
+static bool dcp_firmware_reg_to_resource(struct apple_dcp *dcp, u64 address,
+					u64 size, phys_addr_t *resource)
 {
-	int i;
+	unsigned int i;
 
-	for (i = 0; i < dcp->nr_disp_registers; ++i) {
+	if (!size)
+		return false;
+	for (i = 0; i < dcp->nr_disp_registers; i++) {
 		struct resource *r = dcp->disp_registers[i];
+		u64 base = dcp->disp_firmware_base[i];
+		u64 offset;
 
-		if ((start >= r->start) && (end <= r->end))
+		if (address < base)
+			continue;
+		offset = address - base;
+		if (offset < resource_size(r) && size <= resource_size(r) - offset) {
+			*resource = r->start + offset;
 			return true;
+		}
 	}
-
 	return false;
 }
 
@@ -837,9 +849,10 @@ dcpep_cb_map_physical(struct apple_dcp *dcp, struct dcp_map_physical_req *req)
 {
 	int size = ALIGN(req->size, 4096);
 	dma_addr_t dva;
+	phys_addr_t resource;
 	u32 id;
 
-	if (!is_disp_register(dcp, req->paddr, req->paddr + size - 1)) {
+	if (!dcp_firmware_reg_to_resource(dcp, req->paddr, size, &resource)) {
 		dev_err(dcp->dev, "refusing to map phys address %llx size %llx\n",
 			req->paddr, req->size);
 		return (struct dcp_map_physical_resp){};
@@ -848,9 +861,9 @@ dcpep_cb_map_physical(struct apple_dcp *dcp, struct dcp_map_physical_req *req)
 	id = find_first_zero_bit(dcp->memdesc_map, DCP_MAX_MAPPINGS);
 	set_bit(id, dcp->memdesc_map);
 	dcp->memdesc[id].size = size;
-	dcp->memdesc[id].reg = req->paddr;
+	dcp->memdesc[id].reg = resource;
 
-	dva = dma_map_resource(dcp->dev, req->paddr, size, DMA_BIDIRECTIONAL, 0);
+	dva = dma_map_resource(dcp->dev, resource, size, DMA_BIDIRECTIONAL, 0);
 	WARN_ON(dva == DMA_MAPPING_ERROR);
 
 	return (struct dcp_map_physical_resp){
@@ -906,7 +919,7 @@ static struct DCP_FW_NAME(dcp_map_reg_resp) dcpep_cb_map_reg(struct apple_dcp *d
 		 * dma_map_resource() them instead fails and hands the firmware
 		 * DMA_MAPPING_ERROR as a device address.
 		 */
-		dma_addr_t dva = rsrc->start;
+		dma_addr_t dva = dcp->disp_firmware_base[req->index];
 #elif DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
 		dma_addr_t dva = dma_map_resource(dcp->dev, rsrc->start, resource_size(rsrc),
 						  DMA_BIDIRECTIONAL, 0);
@@ -920,7 +933,7 @@ static struct DCP_FW_NAME(dcp_map_reg_resp) dcpep_cb_map_reg(struct apple_dcp *d
 #endif
 
 		return (struct DCP_FW_NAME(dcp_map_reg_resp)){
-			.addr = rsrc->start,
+			.addr = dcp->disp_firmware_base[req->index],
 			.length = resource_size(rsrc),
 #if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
 			.dva = dva,
@@ -1308,12 +1321,12 @@ static struct dcp_rt_bandwidth dcpep_cb_rt_bandwidth(struct apple_dcp *dcp)
 	if (dcp->disp_bw_scratch_index) {
 		u32 offset = dcp->disp_bw_scratch_offset;
 		u32 index = dcp->disp_bw_scratch_index;
-		rt_bw.reg_scratch = dcp->disp_registers[index]->start + offset;
+		rt_bw.reg_scratch = dcp->disp_firmware_base[index] + offset;
 	}
 
 	if (dcp->disp_bw_doorbell_index) {
 		u32 index = dcp->disp_bw_doorbell_index;
-		rt_bw.reg_doorbell = dcp->disp_registers[index]->start;
+		rt_bw.reg_doorbell = dcp->disp_firmware_base[index];
 		rt_bw.doorbell_bit = REG_DOORBELL_BIT(dcp->index);
 		/*
 		 * This is most certainly not padding. t8103-dcp crashes without
