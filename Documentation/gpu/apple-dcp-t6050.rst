@@ -21,9 +21,10 @@ The saved live-27.0 ADT names DCP UUID
 64863924-B56B-3E32-87FE-038677F52709. Those UUID bytes occur at offset
 205332 in the decompressed 26A428 t605x DCP bundle (SHA-256
  d9384573025721074ec1a7190626a8bab36cf61f764055e8e05c7d5d98cb318f).
-This identifies the saved boot's firmware, not the current live boot. Before
-enabling the candidate, capture the live DCP UUID and initial IOMFB version
-word and compare them to the reference. A manually supplied firmware-compat
+The 2026-09-28 live ADT independently carries the same UUID (ADT SHA-256
+d3dbf5a4d89fe19dbf98e0c8db6749f8c51d1082ba7a4214688376512eceed20).
+This closes the live image identity check for that boot, not presentation
+qualification. The initial IOMFB version word still needs runtime checking. A manually supplied firmware-compat
 property selects the ABI; it does not prove what iBoot loaded.
 
 The transport is imported from the Neo H17P series by DjDeveloperr and the
@@ -66,6 +67,14 @@ the reply is 0x0c. The old 26.x request was 0xe9c bytes and required a
 two-byte tail relocation; applying that relocation to 27.0 corrupts its
 already aligned IOVAs. The 27.0 profile does not perform it.
 
+A408 and A483 both call ``SurfaceContents::from`` at 0xfffffe000abb6a64.
+It writes tearing at byte 1, premultiplied at byte 2, plane count at 3 and
+pixel format at 0xb. Thus the Neo per-surface two-byte relocation must also
+be skipped for 27.0. These offsets, allocation size at 0x29, and the three
+pointer-presence fields at 0x51/0x149/0x1ed have compile-time assertions.
+``hidePointers`` writes 1 to a non-NULL metadata pointer; these are presence
+markers, not copied host pointers.
+
 The native swap_submit_with_tags routine confirms swap ID at 0x98, source
 rectangles at 0xac, destination rectangles at 0x10c, and enabled surfaces at
 0x14c. The D594 deserializer requires 0x730 input bytes, retaining the 26.x
@@ -87,8 +96,11 @@ Saved J714s ADT resources, after parent-range translation:
 * Display DART: 0x48a300000, id 18, scanout SID 0, PIODMA SID 16.
 * Both DARTs include a secondary aperture at 0x2803f0000 and vm-base
   0x10000000000. Existing firmware mappings must survive guest attachment.
-* Display reg[4] resolves to 0x286700000, size 0x114000. PMC bandwidth
-  resources must be derived from the T6050 PMGR descriptions.
+* Display reg[4] resolves to 0x286700000, size 0x114000. Native T6050
+  ``getBWRMemoryOffset`` returns 0x20000 + agent * 0x4000. The live ADT's
+  DISP_INT request 0x96 has agent index 0. PMGR group 0x22 selects map
+  0x81 plus 0x700000; map 0x81 is ADT PMGR reg[8], 0x286000000.
+  The resulting DISP_INT bandwidth scratch is 0x286720000, size 8.
 * Display clock IDs are 361 and 458 in this ADT. The 27.0 driver requires
   ``apple,clock-ids`` in the same order as ``clocks`` and resolves callbacks
   against those handles. It does not reuse Neo's IDs 154 and 194.
@@ -97,8 +109,27 @@ The guest needs explicit ASC/mailbox/interrupt access, SPTM DART mediation
 for these identities, and native panel properties. Do not clear or reset
 firmware-owned display tables merely to make a probe succeed.
 
-The default-surface descriptor values and swap flag policy inherited from
-the 26.x driver are not yet qualified on J714. Native 27.0 surface
-serialization and panel/PMC property behavior need validation before this
-profile is made the default. No J714 DCP pageflip, power transition,
+The native default-surface constructor sets the format returned by A036
+(after pixel-definition normalization); A037 supplies compression mode. It
+computes allocation size from callback width/height and per-plane layout,
+then clamps it to the inherited PurpleGfxMem region. In particular, the
+word at 0x29 is allocation size, not an opaque panel constant. For b3a8,
+native compression mode 2 normalizes to w40a with 8-byte elements; other
+modes use 4-byte and 1-byte planes. Compression modes 2 and 3 have distinct
+tile-allocation formulae. The driver still contains the donor's unqualified
+default-surface constants: wiring native query results and inherited region
+size is required before a presentation test.
+
+The native AP swap entry copies both flag words from its caller; the A408
+serializer only copies the record. This establishes layout, not that Neo's
+0x34865202/4 policy or gap bytes 2/3 are correct for this display. They remain
+unqualified pending caller-side or firmware-behavior evidence.
+
+The current SPTM DART backend uses a low-4-GiB DMA aperture with optional
+bit-40 force, disables a SID during attachment, and attaches a fresh root.
+DCP's inherited mappings must instead survive attachment. Separate driver
+instances also request exclusive ownership of their MMIO resource, so they
+cannot all claim the same synthetic doorbell page without a shared-provider
+change or distinct emulated aliases. These integration requirements and
+panel/provider behavior must be resolved before enabling the profile. No J714 DCP pageflip, power transition,
 backlight, or external-output result is claimed by this port.

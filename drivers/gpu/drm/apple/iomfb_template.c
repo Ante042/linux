@@ -44,6 +44,18 @@
 static_assert(offsetof(struct DCP_FW_NAME(dcp_swap), timestamp[6]) == 0x30);
 static_assert(offsetof(struct DCP_FW_NAME(dcp_swap), flags1) == 0x40);
 
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0)
+/* 26A428 SurfaceContents::from() and hidePointers(), shared by A408/A483. */
+static_assert(offsetof(struct dcp_surface, is_tearing_allowed) == 0x1);
+static_assert(offsetof(struct dcp_surface, is_premultiplied) == 0x2);
+static_assert(offsetof(struct dcp_surface, plane_cnt) == 0x3);
+static_assert(offsetof(struct dcp_surface, format) == 0xb);
+static_assert(offsetof(struct dcp_surface, buf_size) == 0x29);
+static_assert(offsetof(struct dcp_surface, has_comp) == 0x51);
+static_assert(offsetof(struct dcp_surface, has_planes) == 0x149);
+static_assert(offsetof(struct dcp_surface, has_compr_info) == 0x1ed);
+#endif
+
 struct dcp_wait_cookie {
 	struct kref refcount;
 	struct completion done;
@@ -1341,7 +1353,9 @@ static void release_swap_cookie(struct kref *ref)
 static void dcp_h17p_fix_swap_surfaces(struct apple_dcp *dcp)
 {
 	struct DCP_FW_NAME(dcp_swap_submit_req) *req = &DCP_FW_UNION(dcp->swap);
+#if DCP_FW_VER < DCP_FW_VERSION(27, 0, 0)
 	unsigned int i;
+#endif
 
 	/*
 	 * The swap's own flag words.  Our driver never sets either; macOS's
@@ -1359,6 +1373,10 @@ static void dcp_h17p_fix_swap_surfaces(struct apple_dcp *dcp)
 	req->swap.h17p_pre_swap_id[0x00] = 2;
 	req->swap.h17p_pre_swap_id[0x28] = 3;
 
+#if DCP_FW_VER < DCP_FW_VERSION(27, 0, 0)
+	/* 27.0 keeps both bytes: SurfaceContents::from() writes tearing at +1
+	 * and premultiplied at +2, including in swap_submit_main().
+	 */
 	for (i = 0; i < SWAP_SURFACES; i++) {
 		u8 *p = (u8 *)&req->surf[i];
 		size_t n = sizeof(req->surf[i]);
@@ -1366,6 +1384,7 @@ static void dcp_h17p_fix_swap_surfaces(struct apple_dcp *dcp)
 		memmove(p + 1, p + 3, n - 3);
 		memset(p + n - 2, 0, 2);
 	}
+#endif
 
 	/*
 	 * Our trailing null-flag block lands two bytes late.  In the capture
