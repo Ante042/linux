@@ -187,6 +187,9 @@ static struct ieee80211_rate rates[] = {
 	{ .bitrate = 60 }, { .bitrate = 90 }, { .bitrate = 120 }, { .bitrate = 180 },
 	{ .bitrate = 240 }, { .bitrate = 360 }, { .bitrate = 480 }, { .bitrate = 540 },
 };
+/* Keep userspace AKM selection consistent with wifi_connect(). */
+static const u32 akm_suites[] = { WLAN_AKM_SUITE_PSK };
+
 static const u32 cipher_suites[] = {
 	WLAN_CIPHER_SUITE_CCMP, WLAN_CIPHER_SUITE_AES_CMAC,
 };
@@ -812,11 +815,11 @@ static int command(struct centauri_wifi *wifi, u32 id, const void *payload, size
 	return -ETIMEDOUT;
 }
 
-static int radio_start(struct centauri_wifi *wifi)
+static int station_configure(struct centauri_wifi *wifi, const u8 *address)
 {
 	u8 start[5 + 4 + 3 * ETH_ALEN] = { 0, 0x0b, 0, 0, 0 };
 	size_t start_size = 5;
-	unsigned int ring, slot;
+	unsigned int slot;
 	int ret;
 
 	/* Stock 25G76 startInterface (0x1808e26ec) supplies TLV 385,
@@ -828,9 +831,20 @@ static int radio_start(struct centauri_wifi *wifi)
 		put_unaligned_le16(385, start + 5);
 		put_unaligned_le16(3 * ETH_ALEN, start + 7);
 		for (slot = 0; slot < 3; slot++)
-			ether_addr_copy(start + 9 + slot * ETH_ALEN, wifi->netdev->dev_addr);
+			ether_addr_copy(start + 9 + slot * ETH_ALEN, address);
 		start_size = sizeof(start);
 	}
+	ret = command(wifi, 1, address, ETH_ALEN);
+	if (!ret)
+		ret = command(wifi, 2, start, start_size);
+	return ret;
+}
+
+static int radio_start(struct centauri_wifi *wifi)
+{
+	unsigned int ring, slot;
+	int ret;
+
 	for (ring = 1; ring <= 4; ring++) {
 		ret = open_pair(wifi, ring);
 		if (ret)
@@ -848,9 +862,7 @@ static int radio_start(struct centauri_wifi *wifi)
 	msleep(400);
 	ret = command(wifi, 0, NULL, 0);
 	if (!ret)
-		ret = command(wifi, 1, wifi->netdev->dev_addr, ETH_ALEN);
-	if (!ret)
-		ret = command(wifi, 2, start, start_size);
+		ret = station_configure(wifi, wifi->netdev->dev_addr);
 	if (ret)
 		return ret;
 	msleep(1000);
@@ -1106,6 +1118,65 @@ static int rsn_caps_offset(const u8 *body, size_t size)
 	return offset + 2 <= size ? offset : -EINVAL;
 }
 
+/* Return the AKM count field only when this RSN offer includes PSK.
+ * Suite selectors are network byte order; list counts are little endian.
+ */
+static int rsn_psk_offset(const u8 *body, size_t size)
+{
+	size_t offset, end;
+	u16 count;
+	unsigned int i;
+
+	if (size < 8 || get_unaligned_le16(body) != 1)
+		return -EINVAL;
+	count = get_unaligned_le16(body + 6);
+	if (!count)
+		return -EINVAL;
+	offset = 8 + 4 * count;
+	if (offset + 2 > size)
+		return -EINVAL;
+	count = get_unaligned_le16(body + offset);
+	end = offset + 2 + 4 * count;
+	if (!count || end + 2 > size)
+		return -EINVAL;
+	for (i = 0; i < count; i++)
+		if (get_unaligned_be32(body + offset + 2 + 4 * i) == WLAN_AKM_SUITE_PSK)
+			return offset;
+	return -EOPNOTSUPP;
+}
+
+/* cfg80211 supplies acceptable AKMs, not necessarily one selected AKM.
+ * Select the implemented PSK tuple only if both the list and RSN offer it;
+ * emit exactly that tuple to firmware, retaining the optional RSN tail.
+ */
+static int select_psk_rsn(const struct cfg80211_crypto_settings *crypto,
+			const u8 *body, size_t size, u8 *selected)
+{
+	size_t tail;
+	unsigned int i;
+	int offset;
+
+	for (i = 0; i < crypto->n_akm_suites; i++)
+		if (crypto->akm_suites[i] == WLAN_AKM_SUITE_PSK)
+			break;
+	if (i == crypto->n_akm_suites)
+		return -EOPNOTSUPP;
+	offset = rsn_psk_offset(body, size);
+	if (offset < 0)
+		return offset;
+	/* Keep the RSN ciphers consistent with the accepted fixed tuple. */
+	if (get_unaligned_be32(body + 2) != WLAN_CIPHER_SUITE_CCMP ||
+	    get_unaligned_le16(body + 6) != 1 ||
+	    get_unaligned_be32(body + 8) != WLAN_CIPHER_SUITE_CCMP)
+		return -EOPNOTSUPP;
+	tail = offset + 2 + 4 * get_unaligned_le16(body + offset);
+	memcpy(selected, body, offset);
+	put_unaligned_le16(1, selected + offset);
+	put_unaligned_be32(WLAN_AKM_SUITE_PSK, selected + offset + 2);
+	memcpy(selected + offset + 6, body + tail, size - tail);
+	return offset + 6 + size - tail;
+}
+
 static void append_tlv(u8 *payload, size_t *size, u16 tag, const void *data, u16 length)
 {
 	put_unaligned_le16(tag, payload + *size);
@@ -1140,18 +1211,22 @@ static int wifi_connect(struct wiphy *wiphy, struct net_device *netdev,
 	const u8 *rsn, *ap_rsn;
 	u8 rsn_body[255], ssid[35], key[66], zero[20] = {}, pmf;
 	u8 *payload = wifi->connect_payload;
-	size_t size = 130, rsn_size;
+	size_t size = 130, rsn_size, rsn_prefix, rsn_tail;
 	u16 caps = 0;
 	int ret = 0, offset;
 
 	if (!params->ssid_len || params->ssid_len > 32 || !params->crypto.psk ||
-	    params->crypto.n_akm_suites != 1 || params->crypto.akm_suites[0] != WLAN_AKM_SUITE_PSK ||
 	    params->crypto.n_ciphers_pairwise != 1 || params->crypto.ciphers_pairwise[0] != WLAN_CIPHER_SUITE_CCMP ||
 	    params->crypto.cipher_group != WLAN_CIPHER_SUITE_CCMP || params->ie_len > sizeof(wifi->request_ie))
 		return -EOPNOTSUPP;
 	rsn = cfg80211_find_ie(WLAN_EID_RSN, params->ie, params->ie_len);
-	if (!rsn || rsn_caps_offset(rsn + 2, rsn[1]) < 0)
+	if (!rsn)
 		return -EINVAL;
+	ret = select_psk_rsn(&params->crypto, rsn + 2, rsn[1], rsn_body);
+	if (ret < 0)
+		return ret;
+	rsn_size = ret;
+	ret = 0;
 	mutex_lock(&wifi->lock);
 	if (READ_ONCE(wifi->stopping)) {
 		ret = -ENODEV;
@@ -1177,14 +1252,21 @@ static int wifi_connect(struct wiphy *wiphy, struct net_device *netdev,
 	rcu_read_lock();
 	ies = rcu_dereference(bss->ies);
 	ap_rsn = ies ? cfg80211_find_ie(WLAN_EID_RSN, ies->data, ies->len) : NULL;
-	if (ap_rsn) {
-		offset = rsn_caps_offset(ap_rsn + 2, ap_rsn[1]);
-		if (offset >= 0)
+	if (!ap_rsn) {
+		ret = -EINVAL;
+	} else {
+		ret = rsn_psk_offset(ap_rsn + 2, ap_rsn[1]);
+		if (ret >= 0) {
+			offset = rsn_caps_offset(ap_rsn + 2, ap_rsn[1]);
 			caps = get_unaligned_le16(ap_rsn + 2 + offset);
+			ret = 0;
+		}
 	}
 	rcu_read_unlock();
-	rsn_size = rsn[1];
-	memcpy(rsn_body, rsn + 2, rsn_size);
+	if (ret) {
+		cfg80211_put_bss(wiphy, bss);
+		goto out;
+	}
 	offset = rsn_caps_offset(rsn_body, rsn_size);
 	put_unaligned_le16(caps, rsn_body + offset);
 	pmf = !!(caps & BIT(7));
@@ -1228,8 +1310,16 @@ static int wifi_connect(struct wiphy *wiphy, struct net_device *netdev,
 	append_tlv(payload, &size, 376, mld_defaults,
 		   of_machine_is_compatible("apple,j714s") ? sizeof(mld_defaults) : 12);
 	wifi->connect_size = size;
-	memcpy(wifi->request_ie, params->ie, params->ie_len);
-	wifi->request_ie_size = params->ie_len;
+	/* Report the actual selected RSN tuple, preserving other request IEs. */
+	rsn_prefix = rsn - params->ie;
+	rsn_tail = rsn_prefix + 2 + rsn[1];
+	memcpy(wifi->request_ie, params->ie, rsn_prefix);
+	wifi->request_ie[rsn_prefix] = WLAN_EID_RSN;
+	wifi->request_ie[rsn_prefix + 1] = rsn_size;
+	memcpy(wifi->request_ie + rsn_prefix + 2, rsn_body, rsn_size);
+	memcpy(wifi->request_ie + rsn_prefix + 2 + rsn_size,
+	       params->ie + rsn_tail, params->ie_len - rsn_tail);
+	wifi->request_ie_size = params->ie_len - rsn[1] + rsn_size;
 	WRITE_ONCE(wifi->connect_abort, false);
 	wifi->connecting = true;
 	wifi->connect_status = 0;
@@ -1346,6 +1436,12 @@ static void connect_worker(struct work_struct *work)
 		cfg80211_connect_result(wifi->netdev, wifi->bssid,
 			wifi->request_ie, wifi->request_ie_size, NULL, 0, status, GFP_KERNEL);
 	if (status == WLAN_STATUS_SUCCESS && !READ_ONCE(wifi->stopping)) {
+		/* The firmware completion covers the offloaded four-way handshake,
+		 * not just 802.11 association. Tell userspace the controlled port
+		 * is authorized after queuing the connection event above.
+		 */
+		cfg80211_port_authorized(wifi->netdev, wifi->bssid, NULL, 0,
+					 GFP_KERNEL);
 		netif_carrier_on(wifi->netdev);
 		if (wifi->data_probe_done & BIT(5))
 			netif_wake_queue(wifi->netdev);
@@ -1546,6 +1642,13 @@ static int net_stop(struct net_device *netdev)
 {
 	struct centauri_wifi *wifi = *(struct centauri_wifi **)netdev_priv(netdev);
 
+	/* cfg80211 may skip .disconnect when an unassociated interface is
+	 * scanning. NETDEV_DOWN requires scan_done to have notified before
+	 * ndo_stop returns, even if an asynchronous abort is already pending.
+	 * Join the worker without wifi->lock held; cfg80211_scan_done itself
+	 * queues wiphy work and does not acquire the wiphy mutex.
+	 */
+	cancel_scan(wifi);
 	netif_stop_queue(netdev);
 	skb_queue_purge(&wifi->data_tx_queue);
 	return 0;
@@ -1572,11 +1675,80 @@ static netdev_tx_t net_transmit(struct sk_buff *skb, struct net_device *netdev)
 	return NETDEV_TX_OK;
 }
 
+/* Native27 ACIStationAdapter::reconfigureInterface (0x1809c12c8)
+ * stops command 3 before configuring command 1 and starting command 2.
+ * Command/data ring ownership survives this station-interface operation.
+ * The caller holds wifi->lock; do not publish a new netdev address until
+ * both firmware commands acknowledge it.
+ */
+static int station_reconfigure(struct centauri_wifi *wifi, const u8 *address)
+{
+	const u8 stop[5] = {};
+	int ret;
+
+	wifi->configured = false;
+	ret = command(wifi, 3, stop, sizeof(stop));
+	if (!ret)
+		ret = station_configure(wifi, address);
+	if (!ret)
+		wifi->configured = true;
+	return ret;
+}
+
+static int net_set_mac_address(struct net_device *netdev, void *data)
+{
+	struct centauri_wifi *wifi = *(struct centauri_wifi **)netdev_priv(netdev);
+	struct sockaddr *address = data;
+	int ret, restore;
+
+	ret = eth_prepare_mac_addr_change(netdev, data);
+	if (ret)
+		return ret;
+	mutex_lock(&wifi->lock);
+	if (READ_ONCE(wifi->stopping)) {
+		ret = -ENODEV;
+		goto out;
+	}
+	if (!wifi->configured) {
+		ret = -ENETDOWN;
+		goto out;
+	}
+	if (wifi->connecting || wifi->connected || wifi->scan_request) {
+		ret = -EBUSY;
+		goto out;
+	}
+	if (ether_addr_equal(netdev->dev_addr, address->sa_data))
+		goto out;
+	/* Only the captured current27 target has this reconfigure contract. */
+	if (!of_machine_is_compatible("apple,j714s")) {
+		ret = -EOPNOTSUPP;
+		goto out;
+	}
+	ret = station_reconfigure(wifi, (const u8 *)address->sa_data);
+	if (!ret) {
+		eth_commit_mac_addr_change(netdev, data);
+	} else {
+		/* One bounded recovery restores the prior device/host identity.
+		 * If it also fails, configured remains false: do not allow open
+		 * or connect against an unconfirmed firmware MAC.
+		 */
+		restore = station_reconfigure(wifi, netdev->dev_addr);
+		if (restore)
+			dev_err(&wifi->control->pdev->dev,
+				"Wi-Fi MAC restore failed: %d (change: %d)\n",
+				restore, ret);
+	}
+out:
+	mutex_unlock(&wifi->lock);
+	return ret;
+}
+
 static const struct net_device_ops net_ops = {
 	.ndo_open = net_open,
 	.ndo_stop = net_stop,
 	.ndo_start_xmit = net_transmit,
 	.ndo_validate_addr = eth_validate_addr,
+	.ndo_set_mac_address = net_set_mac_address,
 };
 
 static ssize_t passphrase_write(struct file *file, const char __user *input,
@@ -2577,6 +2749,8 @@ int centauri_wifi_register(struct centauri *c)
 	wifi->wiphy->reg_notifier = wifi_regulatory;
 	wifi->wiphy->cipher_suites = cipher_suites;
 	wifi->wiphy->n_cipher_suites = ARRAY_SIZE(cipher_suites);
+	wifi->wiphy->akm_suites = akm_suites;
+	wifi->wiphy->n_akm_suites = ARRAY_SIZE(akm_suites);
 	wiphy_ext_feature_set(wifi->wiphy, NL80211_EXT_FEATURE_4WAY_HANDSHAKE_STA_PSK);
 	for (i = 0; i < 13; i++) {
 		wifi->channels[i].band = NL80211_BAND_2GHZ;
