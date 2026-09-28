@@ -7,6 +7,7 @@
 #include <linux/pci.h>
 #include <linux/sizes.h>
 
+#define CEN_ALPHA_WINDOW_SIZE SZ_32M
 #define CEN_ALPHA_SCRATCH_OFFSET SZ_8M
 #define CEN_ALPHA_SCRATCH_SIZE (5 * SZ_1M)
 

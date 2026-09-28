@@ -151,3 +151,44 @@ The native ABI references are ACIScanAdapter::buildScanRequestNewApi at
 0x1809bf400 and IO80211ScanRequest defaults at0x1807b46d4 in the captured
 DriverKit cache. Firmware payload/calibration and network details remain
 private local artifacts.
+
+Wi-Fi association and data qualification
+---------------------------------------
+
+J714s now takes the permanent Wi-Fi address from its Alpha PCI DT node,
+using the captured ADT local-mac-address. Its native27 connection request
+uses the14-byte MLD TLV376 and the raw32-byte cfg80211 PMK field. Passphrase
+TLV313 is a separate native key-type path; it is not required for a normal
+WPA supplicant PMK on this firmware.
+
+Interface open creates native2048-entry CR76/CR15 and TR12/TR25 data rings,
+posting2047 RX buffers. A32MiB Alpha DMA window separates command rings,
+firmware scratch, RX payloads and TX payloads. Extended RX prefixes use their
+u16 data offset while retaining the native completion-length-minus-padding
+length rule, with explicit buffer bounds and the native delivery-status bit.
+TX completions accept native single and counted forms without reducing
+coalesced batches. Busy-cookie checks retain ownership until completion.
+
+On hardware, standard wpa_supplicant association/authentication completed,
+DHCP obtained a lease, gateway ping passed5/5, and key-authenticated SSH
+confirmed18CPUs online. Direct TCP transferred256MiB in each direction,
+with matching SHA256 at both ends: host-to-M5 about35.9MiB/s and M5-to-host
+about37.0MiB/s as measured on the M5. Both endpoints used the home wireless
+network, so this is not a controlled native-performance comparison.
+
+The post-transfer counters reported233507 submitted/completed TX packets,
+215923 received/reposted RX buffers, and zero malformed RX/TX completions
+or failed TX packets. The3-form TX completion parser and RX prefix bounds
+also passed isolated ASan/UBSan tests, including every2048-slot wrap and
+count1..2047. The hardware does not establish every synthetic corner case.
+
+Evidence: ``hardware-linux-n1-network-5-guest.log``,
+``n1-direct-256-host.log``, ``n1-direct-256-guest.log`` and
+``n1-after-throughput-bt-baseline.log``. Tested kernel
+``Image-n1-data-completions`` SHA256: ``c8754a9cad2a93b974cfa6aee955145325f7262c1b64b6f37fe50b6d26caf0df``.
+That test image also contained read-only transport snapshot diagnostics
+subsequently removed from the production source; they did not participate
+in the network path. Factory-address DT artifact:
+``t6050-n1-factory-mac.dtb``. Firmware, credentials and calibration remain
+private. Automatic firmware bootstrap and Bluetooth radio bring-up are
+separate remaining work; Bluetooth's default radio-power command still fails.

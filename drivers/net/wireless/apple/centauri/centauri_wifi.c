@@ -21,14 +21,20 @@
 #define RING_SPAN 0x20000
 #define TX_BUFFER 0x600000
 #define BUFFER_SIZE 2048
-#define DATA_TX_BUFFER 0xd00000
-#define DATA_RX_BUFFER 0xe00000
-#define DATA_TX_SLOTS 128
-#define DATA_TX_QUEUE_LIMIT 64
+/* Native 2048-entry data rings. RX payloads occupy16..24MiB and TX
+ * payloads24..28MiB; command buffers and firmware scratch stay below13MiB.
+ */
+#define DATA_RX_BUFFER SZ_16M
+#define DATA_TX_BUFFER (SZ_16M + SZ_8M)
+#define DATA_RX_SLOTS 2048
+#define DATA_TX_SLOTS 2048
+#define DATA_TX_QUEUE_LIMIT DATA_TX_SLOTS
 
 /* The firmware owns window +8 MiB through +13 MiB as scratch memory. */
 static_assert(DATA_TX_BUFFER >= CEN_ALPHA_SCRATCH_OFFSET + CEN_ALPHA_SCRATCH_SIZE);
-static_assert(DATA_TX_BUFFER + DATA_TX_SLOTS * BUFFER_SIZE <= DATA_RX_BUFFER);
+static_assert(DATA_RX_BUFFER >= CEN_ALPHA_SCRATCH_OFFSET + CEN_ALPHA_SCRATCH_SIZE);
+static_assert(DATA_RX_BUFFER + DATA_RX_SLOTS * 4096 <= DATA_TX_BUFFER);
+static_assert(DATA_TX_BUFFER + DATA_TX_SLOTS * BUFFER_SIZE <= CEN_ALPHA_WINDOW_SIZE);
 
 static bool verify_pmk;
 module_param(verify_pmk, bool, 0400);
@@ -155,6 +161,7 @@ struct centauri_wifi {
 	struct dentry *tx_power_report_file;
 	u16 stats_reply_size, stats_tag, stats_length;
 	u32 data_probe_done;
+	bool data_failed;
 	struct ieee80211_supported_band bands[2];
 	struct ieee80211_channel channels[39];
 };
@@ -312,6 +319,31 @@ static void post_receive(struct centauri_wifi *wifi, unsigned int ring, u16 slot
  * Ethernet framing with IPv4 header checksums and IPv6 payload lengths.
  * Called with wifi->lock, including during connect/command polling.
  */
+/* Native27 uses the extended prefix's offset but still subtracts only
+ * footer padding from completion length (AirshipDataRxTransferRing).
+ */
+static bool data_rx_frame(const u8 *packet, unsigned int capacity,
+			  unsigned int length, u32 footer,
+			  unsigned int *offset, unsigned int *frame_length)
+{
+	unsigned int padding = (footer >> 12) & 15;
+
+	/* Native recycles completions without the RX deliverable bit. */
+	if (!(footer & BIT(7)))
+		return false;
+	if (length < padding + ETH_HLEN || length > capacity)
+		return false;
+	if (footer & BIT(24)) {
+		if (capacity < 4)
+			return false;
+		*offset = get_unaligned_le16(packet + 2);
+	} else {
+		*offset = padding;
+	}
+	*frame_length = length - padding;
+	return *offset <= capacity && *frame_length <= capacity - *offset;
+}
+
 static void drain_data_rx(struct centauri_wifi *wifi)
 {
 	u16 head, tail, post;
@@ -322,22 +354,22 @@ static void drain_data_rx(struct centauri_wifi *wifi)
 	head = index_read(wifi, 0, 207);
 	tail = index_read(wifi, 2, 207);
 	post = index_read(wifi, 3, 12);
-	if (head >= 128 || tail >= 128 || post >= 128) {
+	if (head >= DATA_RX_SLOTS || tail >= DATA_RX_SLOTS || post >= DATA_RX_SLOTS) {
 		wifi->data_rx_bad++;
 		return;
 	}
 	dma_rmb();
-	while (tail != head && processed < 127) {
+	while (tail != head && processed < (DATA_RX_SLOTS - 1)) {
 		u8 *completion = wifi->a.window + 0x240000 + tail * 32;
 		u32 header = get_unaligned_le32(completion);
 		u32 info = get_unaligned_le32(completion + 4);
 		u16 cookie = info & 0xffff, length = info >> 16;
-		u16 next = (post + 1) % 128;
+		u16 next = (post + 1) % DATA_RX_SLOTS;
 		u32 count = le32_to_cpu(wifi->rx_snapshot.count);
 		u8 *packet, *descriptor;
 		u32 buffer;
 
-		if ((header >> 16) != 12 || !cookie || cookie > 127 ||
+		if ((header >> 16) != 12 || !cookie || cookie > (DATA_RX_SLOTS - 1) ||
 		    length > 4096 || get_unaligned_le32(completion + 8)) {
 			wifi->data_rx_bad++;
 			break;
@@ -356,18 +388,18 @@ static void drain_data_rx(struct centauri_wifi *wifi)
 		wifi->data_rx_received++;
 		if (wifi->connected && netif_running(wifi->netdev)) {
 			u32 footer = get_unaligned_le32(completion + 12);
-			unsigned int padding = (footer >> 12) & 15;
+			unsigned int offset, frame_length;
 			struct sk_buff *skb = NULL;
 
-			/* Extended prefix headers are not decoded yet. */
-			if (!(footer & BIT(24)) && length >= padding + ETH_HLEN)
-				skb = netdev_alloc_skb_ip_align(wifi->netdev, length - padding);
+			if (data_rx_frame(packet, 4096, length, footer,
+					  &offset, &frame_length))
+				skb = netdev_alloc_skb_ip_align(wifi->netdev, frame_length);
 			if (skb) {
-				skb_put_data(skb, packet + padding, length - padding);
+				skb_put_data(skb, packet + offset, frame_length);
 				skb->protocol = eth_type_trans(skb, wifi->netdev);
 				skb->ip_summed = CHECKSUM_NONE;
 				wifi->netdev->stats.rx_packets++;
-				wifi->netdev->stats.rx_bytes += length - padding;
+				wifi->netdev->stats.rx_bytes += frame_length;
 				netif_rx(skb);
 			} else {
 				wifi->netdev->stats.rx_dropped++;
@@ -380,7 +412,7 @@ static void drain_data_rx(struct centauri_wifi *wifi)
 		put_unaligned_le64(wifi->a.window_dma + buffer, descriptor + 4);
 		put_unaligned_le32(cookie, descriptor + 12);
 		wifi->data_rx_reposted++;
-		tail = (tail + 1) % 128;
+		tail = (tail + 1) % DATA_RX_SLOTS;
 		post = next;
 		processed++;
 	}
@@ -396,10 +428,27 @@ static void drain_data_rx(struct centauri_wifi *wifi)
 /* Serialized with the firmware poller. Payload slots remain owned until a
  * CR completion, even if the device has already consumed the TR descriptor.
  */
+/* Native complete_transfer requires count>0 exactly for counted CDs;
+ * the uncounted form completes the named cookie with a zero wire count.
+ * Our one-buffer transfers have no continuation fragments.
+ */
+static bool data_tx_completion_span(u16 cookie, u16 wire_count, u8 flags,
+				    unsigned int *first, u16 *count)
+{
+	bool counted = (flags & BIT(0)) || (flags & 0x0e) == 8;
+
+	if (!cookie || cookie > DATA_TX_SLOTS || counted != !!wire_count ||
+	    wire_count >= DATA_TX_SLOTS)
+		return false;
+	*count = counted ? wire_count : 1;
+	*first = (cookie + DATA_TX_SLOTS - *count) % DATA_TX_SLOTS;
+	return true;
+}
+
 static void drain_data_tx(struct centauri_wifi *wifi)
 {
 	u16 head, tail, post;
-	unsigned int budget = 256;
+	unsigned int budget = DATA_TX_SLOTS;
 	bool posted = false, completed = false;
 
 	if (!(wifi->data_probe_done & BIT(5)) || readl(wifi->a.bar + 8) != 2)
@@ -420,18 +469,13 @@ static void drain_data_tx(struct centauri_wifi *wifi)
 		if (ring == 25) {
 			unsigned int first, i;
 
-			/* Airship cr_controller::sync maps CD bytes 9:10 to the
-			 * transfer count. With the multicomp flag (CD byte 1 bit 0),
-			 * the cookie names the LAST transfer; prior transfers share
-			 * its completion status. We submit one contiguous DMA buffer
-			 * per slot, so those preceding cookies must all still be busy.
+			/* CD bytes9:10 are the wire count. For counted completions,
+			 * the cookie names the last completed transfer, including wrap.
 			 */
-			if (!cookie || cookie > DATA_TX_SLOTS || !count ||
-			    count >= DATA_TX_SLOTS || !(entry[1] & 1)) {
+			if (!data_tx_completion_span(cookie, count, entry[1], &first, &count)) {
 				wifi->data_tx_bad++;
 				break;
 			}
-			first = (cookie + DATA_TX_SLOTS - count) % DATA_TX_SLOTS;
 			for (i = 0; i < count; i++)
 				if (!wifi->data_tx_busy[(first + i) % DATA_TX_SLOTS])
 					break;
@@ -996,13 +1040,14 @@ static void append_tlv(u8 *payload, size_t *size, u16 tag, const void *data, u16
 static int wifi_connect(struct wiphy *wiphy, struct net_device *netdev,
 			struct cfg80211_connect_params *params)
 {
-	/* Stock 25G76 ACIConnectionAdapter::connectAp (0x1808e94cc) emits a
-	 * 12-byte TLV 376. The newer SDK 27 adapter uses 14 bytes. Preserve the
-	 * unspecified-link masks; all-zero is not the non-MLO default.
+	/* Current J714s native27 connectAp1809c85b8 emits14 bytes for TLV376.
+	 * initMldGlobalConfiguration1809c8bac preserves the unspecified-link
+	 * masks and adds default zero fields for this non-MLO client. J813
+	 * retains its measured12-byte firmware layout.
 	 */
-	static const u8 mld_defaults[12] = {
+	static const u8 mld_defaults[14] = {
 		1, 0, 1, 0xff, 0xff, 0xff, 0xff, 0xff,
-		0xff, 0xff, 0xff, 3,
+		0xff, 0xff, 0xff, 3, 0, 0,
 	};
 	/* Firmware connection-context defaults (aciw 0x511ee8). TLV 0xf913
 	 * replaces all five values. Sending zeros arms Supp_AddTimer with a
@@ -1035,7 +1080,7 @@ static int wifi_connect(struct wiphy *wiphy, struct net_device *netdev,
 		ret = -EBUSY;
 		goto out;
 	}
-	if (!wifi->passphrase_size) {
+	if (!of_machine_is_compatible("apple,j714s") && !wifi->passphrase_size) {
 		ret = -ENOKEY;
 		goto out;
 	}
@@ -1088,13 +1133,19 @@ static int wifi_connect(struct wiphy *wiphy, struct net_device *netdev,
 	memcpy(ssid + 3, params->ssid, params->ssid_len);
 	append_tlv(payload, &size, 342, ssid, 3 + params->ssid_len);
 	append_tlv(payload, &size, WLAN_EID_RSN, rsn_body, rsn_size);
-	/* The fixed field carries the PMK; TLV 313 carries the passphrase. */
-	put_unaligned_le16(wifi->passphrase_size, key);
-	memcpy(key + 2, wifi->passphrase, wifi->passphrase_size);
-	append_tlv(payload, &size, 313, key, 2 + wifi->passphrase_size);
-	memzero_explicit(key, sizeof(key));
+	/* Native27's raw-PMK path uses only the fixed key field above.
+	 * TLV313 belongs exclusively to the separate passphrase key type.
+	 * Retain the qualified older J813 path until separately tested.
+	 */
+	if (!of_machine_is_compatible("apple,j714s")) {
+		put_unaligned_le16(wifi->passphrase_size, key);
+		memcpy(key + 2, wifi->passphrase, wifi->passphrase_size);
+		append_tlv(payload, &size, 313, key, 2 + wifi->passphrase_size);
+		memzero_explicit(key, sizeof(key));
+	}
 	append_tlv(payload, &size, 316, &pmf, 1);
-	append_tlv(payload, &size, 376, mld_defaults, sizeof(mld_defaults));
+	append_tlv(payload, &size, 376, mld_defaults,
+		   of_machine_is_compatible("apple,j714s") ? sizeof(mld_defaults) : 12);
 	wifi->connect_size = size;
 	memcpy(wifi->request_ie, params->ie, params->ie_len);
 	wifi->request_ie_size = params->ie_len;
@@ -1301,11 +1352,19 @@ static const struct cfg80211_ops wifi_ops = {
 	.set_power_mgmt = wifi_power_mgmt,
 };
 
+static int data_start(struct centauri_wifi *wifi);
+
 static int net_open(struct net_device *netdev)
 {
+	struct centauri_wifi *wifi = *(struct centauri_wifi **)netdev_priv(netdev);
+	int ret;
+
 	netif_carrier_off(netdev);
 	netif_stop_queue(netdev);
-	return 0;
+	mutex_lock(&wifi->lock);
+	ret = wifi->configured ? data_start(wifi) : -ENETDOWN;
+	mutex_unlock(&wifi->lock);
+	return ret;
 }
 
 static int net_stop(struct net_device *netdev)
@@ -1566,21 +1625,20 @@ static const struct file_operations fwlog_buffer_ops = {
 
 /* The hardware data-ring callback requires the ten-byte WLAN clientdata
  * extension after the 44-byte ACIPC header. Without it UMAC asserts at
- * 0x11760e. Keep these empty-ring probes explicit until packet DMA is proven.
- * The reserved regions below do not overlap control rings or scan buffers.
+ * 0x11760e. Current native27 allocators retain this10-byte extension.
+ * These ring and buffer sizes use the native defaults, without reducing
+ * available descriptors for the normal interface path.
  */
-static ssize_t data_probe_write(struct file *file, const char __user *input,
-			       size_t count, loff_t *position)
+static int data_ring_open(struct centauri_wifi *wifi, unsigned int id)
 {
-	struct centauri_wifi *wifi = file->private_data;
 	u8 message[0x34 + 10] = { 0 };
-	unsigned int id, vector, offset, size, bit, doorbell, irq;
+	unsigned int vector, offset, size, bit, doorbell, irq;
 	bool transfer = false;
 	int ret;
 
-	ret = kstrtouint_from_user(input, count, 0, &id);
-	if (ret)
-		return ret;
+	lockdep_assert_held(&wifi->lock);
+	if (wifi->data_failed)
+		return -EIO;
 	if (id == 76) {
 		vector = 192;
 		offset = 0x200000;
@@ -1598,7 +1656,7 @@ static ssize_t data_probe_write(struct file *file, const char __user *input,
 	} else if (id == 15) {
 		vector = 207;
 		offset = 0x240000;
-		size = 128;
+		size = DATA_RX_SLOTS;
 		bit = 2;
 		doorbell = 11;
 		irq = 8;
@@ -1606,24 +1664,23 @@ static ssize_t data_probe_write(struct file *file, const char __user *input,
 		transfer = true;
 		vector = id;
 		offset = id == 12 ? 0x520000 : id == 24 ? 0x500000 : 0x540000;
-		size = 128;
+		size = id == 12 ? DATA_RX_SLOTS : DATA_TX_SLOTS;
 		bit = id == 12 ? 4 : id == 24 ? 3 : 5;
 		doorbell = id == 12 ? 11 : 18;
 		irq = id == 12 ? 8 : 3;
 	} else {
 		return -EINVAL;
 	}
-	mutex_lock(&wifi->lock);
 	if (readl(wifi->a.bar + 8) != 2) {
 		ret = -EIO;
 		goto out;
 	}
-	if (wifi->connecting || wifi->scan_request ||
-	    (wifi->data_probe_done & BIT(bit))) {
+	if (wifi->data_probe_done & BIT(bit))
+		return 0;
+	if (wifi->connecting || wifi->scan_request) {
 		ret = -EBUSY;
 		goto out;
 	}
-	wifi->data_probe_done |= BIT(bit);
 	memset(wifi->a.window + offset, 0, size * 32);
 	index_write(wifi, transfer ? 1 : 0, vector, 0);
 	index_write(wifi, transfer ? 3 : 2, vector, 0);
@@ -1657,19 +1714,26 @@ static ssize_t data_probe_write(struct file *file, const char __user *input,
 		eth_broadcast_addr(message + 0x34 + 4);
 	}
 	ret = alpha_message(wifi, message, (transfer ? 0x34 : 0x2c) + 10);
-	msleep(1000);
 	dev_info(&wifi->control->pdev->dev,
-		 "data %s probe id=%u index=%u extension=10 rc=%d stage=%u head=%u tail=%u\n",
+		 "data %s opened id=%u index=%u extension=10 rc=%d stage=%u head=%u tail=%u\n",
 		 transfer ? "TR" : "CR", id, vector, ret, readl(wifi->a.bar + 8),
 		 index_read(wifi, transfer ? 3 : 0, vector),
 		 index_read(wifi, transfer ? 1 : 2, vector));
 	if (!ret && readl(wifi->a.bar + 8) != 2)
 		ret = -EIO;
-	if (!ret && transfer && id == 12) {
+	if (ret) {
+		/* A timed-out open may already have published the ring. Do not
+		 * reinitialize its storage and race a late firmware completion.
+		 */
+		wifi->data_failed = true;
+		goto out;
+	}
+	wifi->data_probe_done |= BIT(bit);
+	if (transfer && id == 12) {
 		unsigned int slot;
 
-		/* Give the receive engine bounded, individually identifiable buffers.
-		 * No recycling or network delivery until the completion ABI is proven.
+		/* Cookies identify buffer ownership independently of ring position.
+		 * Completion processing recycles the same buffer only after DMA.
 		 */
 		for (slot = 0; slot < size - 1; slot++) {
 			u8 *descriptor = wifi->a.window + offset + slot * 16;
@@ -1684,13 +1748,42 @@ static ssize_t data_probe_write(struct file *file, const char __user *input,
 		index_write(wifi, 3, vector, size - 1);
 		dma_wmb();
 		writel(1, wifi->a.bar + 0x1050);
-		msleep(100);
 		dev_info(&wifi->control->pdev->dev,
 			 "data RX buffers posted=%u stage=%u tr_tail=%u cr_head=%u\n",
 			 size - 1, readl(wifi->a.bar + 8), index_read(wifi, 1, 12),
 			 index_read(wifi, 0, 207));
 	}
 out:
+	return ret;
+}
+
+static int data_start(struct centauri_wifi *wifi)
+{
+	/* Create completion resources before their transfer rings. Control and
+	 * scan rings are independent; monitor/EAPOL probes remain optional.
+	 */
+	static const unsigned int rings[] = { 76, 15, 12, 25 };
+	int ret;
+
+	for (unsigned int i = 0; i < ARRAY_SIZE(rings); i++) {
+		ret = data_ring_open(wifi, rings[i]);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
+static ssize_t data_probe_write(struct file *file, const char __user *input,
+			       size_t count, loff_t *position)
+{
+	struct centauri_wifi *wifi = file->private_data;
+	unsigned int id;
+	int ret = kstrtouint_from_user(input, count, 0, &id);
+
+	if (ret)
+		return ret;
+	mutex_lock(&wifi->lock);
+	ret = data_ring_open(wifi, id);
 	mutex_unlock(&wifi->lock);
 	return ret ?: count;
 }
@@ -2272,6 +2365,7 @@ static const struct file_operations tx_power_report_ops = {
 int centauri_wifi_register(struct centauri *c)
 {
 	struct centauri_wifi *wifi;
+	u8 address[ETH_ALEN];
 	unsigned int i;
 	int ret;
 
@@ -2327,6 +2421,18 @@ int centauri_wifi_register(struct centauri *c)
 	wifi->bands[1].n_bitrates = ARRAY_SIZE(rates) - 4;
 	wifi->wiphy->bands[NL80211_BAND_2GHZ] = &wifi->bands[0];
 	wifi->wiphy->bands[NL80211_BAND_5GHZ] = &wifi->bands[1];
+	/* Native Alpha exposes its factory address as local-mac-address. */
+	ret = eth_platform_get_mac_address(&wifi->a.pdev->dev, address);
+	if (!ret) {
+		eth_hw_addr_set(wifi->netdev, address);
+		ether_addr_copy(wifi->wiphy->perm_addr, address);
+	} else if (ret == -EPROBE_DEFER) {
+		goto failed;
+	} else {
+		eth_hw_addr_random(wifi->netdev);
+		dev_warn(&wifi->a.pdev->dev,
+			 "No valid factory MAC property; using a random address\n");
+	}
 	ret = wiphy_register(wifi->wiphy);
 	if (ret)
 		goto failed;
@@ -2339,7 +2445,6 @@ int centauri_wifi_register(struct centauri *c)
 	SET_NETDEV_DEV(wifi->netdev, &c->pdev->dev);
 	strscpy(wifi->netdev->name, "wlan%d", IFNAMSIZ);
 	wifi->netdev->max_mtu = ETH_DATA_LEN;
-	eth_hw_addr_random(wifi->netdev);
 	ret = register_netdev(wifi->netdev);
 	if (ret)
 		goto failed;
@@ -2348,7 +2453,7 @@ int centauri_wifi_register(struct centauri *c)
 		dev_err(&c->pdev->dev, "Wi-Fi ring/interface setup failed: %d\n", ret);
 		goto failed;
 	}
-	dev_info(&c->pdev->dev, "cfg80211 interface %s ready for scan tests; packet data unavailable\n",
+	dev_info(&c->pdev->dev, "cfg80211 interface %s ready; data rings initialize on interface open\n",
 		 wifi->netdev->name);
 	smp_store_release(&wifi->irq_ready, true);
 	schedule_work(&wifi->link_work);

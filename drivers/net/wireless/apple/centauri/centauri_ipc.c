@@ -438,7 +438,7 @@ int centauri_start_ipc(struct centauri *c)
 		ret = ret ?: -EIO;
 		goto failed;
 	}
-	ipc->window = buffer_alloc(c, 1, SZ_16M);
+	ipc->window = buffer_alloc(c, 1, CEN_ALPHA_WINDOW_SIZE);
 	if (!ipc->window) {
 		ret = -ENOMEM;
 		goto failed;
@@ -449,7 +449,7 @@ int centauri_start_ipc(struct centauri *c)
 		goto failed;
 	writel(lower_32_bits(ipc->window->dma), ipc->bar[1] + 0x18);
 	writel(upper_32_bits(ipc->window->dma), ipc->bar[1] + 0x1c);
-	writel(SZ_16M, ipc->bar[1] + 0x20);
+	writel(CEN_ALPHA_WINDOW_SIZE, ipc->bar[1] + 0x20);
 	ret = handshake(ipc->bar[1], &ipc->alpha, 0xc, 0x10, 0x1028);
 	if (ret)
 		goto failed;
