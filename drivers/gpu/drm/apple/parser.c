@@ -653,6 +653,7 @@ int parse_epic_service_init(struct dcp_parse_ctx *handle, const char **name,
 	int ret = 0;
 	struct iterator it;
 	bool parsed_unit = false;
+	bool explicit_unit = false;
 	bool parsed_name = false;
 	bool parsed_class = false;
 
@@ -690,10 +691,16 @@ int parse_epic_service_init(struct dcp_parse_ctx *handle, const char **name,
 			else
 				parsed_class = true;
 		} else if (!strcmp(key, "EPICUnit") ||
-			   !strcmp(key, "interface-id")) {
+			   (!explicit_unit && !strcmp(key, "interface-id"))) {
+			/* AFKV2 can supply both: EPICUnit identifies a port,
+			 * interface-id identifies its transport channel. Only use
+			 * the latter as a fallback for services without EPICUnit.
+			 */
 			ret = parse_int(it.handle, unit);
-			if (!ret)
+			if (!ret) {
 				parsed_unit = true;
+				explicit_unit |= !strcmp(key, "EPICUnit");
+			}
 		} else {
 			skip(it.handle);
 		}

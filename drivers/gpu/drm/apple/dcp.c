@@ -1276,13 +1276,14 @@ static void dcp_recv_msg(void *cookie, u8 endpoint, u64 message)
 			goto unbacked;
 		return;
 	case DPAVSERV_ENDPOINT:
-		if (dcp->dcpavservep)
+		if (dcp->dcpavservep && dcp->dcpavservep->endpoint == endpoint)
 			afk_receive_message(dcp->dcpavservep, message);
 		else
 			goto unbacked;
 		return;
+	case DPTX_ENDPOINT_V27:
 	case DPTX_ENDPOINT:
-		if (dcp->dptxep)
+		if (dcp->dptxep && dcp->dptxep->endpoint == endpoint)
 			afk_receive_message(dcp->dptxep, message);
 		else
 			goto unbacked;
@@ -1843,7 +1844,12 @@ int dcp_start(struct platform_device *pdev)
 				 ret);
 	}
 
-	if (dcp->phy && dcp->fw_compat >= DCP_FIRMWARE_V_13_5) {
+	/* Firmware 27 advertises DPTX services before a physical route is
+	 * assigned. Discover them without requiring an already-selected PHY.
+	 */
+	if ((dcp->phy || (dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
+			 dcp->hw.num_dptx_ports)) &&
+	    dcp->fw_compat >= DCP_FIRMWARE_V_13_5) {
 		ret = ibootep_init(dcp);
 		if (ret)
 			dev_warn(dcp->dev, "Failed to start IBOOT endpoint: %d\n",
@@ -2764,19 +2770,29 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 		ret = devm_clk_bulk_get_all(dev, &dcp->firmware_clocks);
 		if (ret < 0)
 			return dev_err_probe(dev, ret, "failed to acquire firmware clocks\n");
-		if (!ret || count != ret)
+		/* T6050 dispext has an explicitly empty native clock-ID table.
+		 * Missing metadata is still an error; do not borrow disp0's rates.
+		 */
+		if (count == -ENODATA && of_property_present(dev->of_node, "apple,clock-ids"))
+			count = 0;
+		if (count < 0 || count != ret)
 			return dev_err_probe(dev, -EINVAL, "firmware clock IDs must match clocks\n");
 		dcp->num_firmware_clocks = count;
-		dcp->firmware_clock_ids = devm_kcalloc(dev, count, sizeof(u32), GFP_KERNEL);
-		if (!dcp->firmware_clock_ids)
-			return -ENOMEM;
-		ret = of_property_read_u32_array(dev->of_node, "apple,clock-ids",
-						dcp->firmware_clock_ids, count);
-		if (ret)
-			return ret;
+		if (count) {
+			dcp->firmware_clock_ids = devm_kcalloc(dev, count, sizeof(u32), GFP_KERNEL);
+			if (!dcp->firmware_clock_ids)
+				return -ENOMEM;
+			ret = of_property_read_u32_array(dev->of_node, "apple,clock-ids",
+							dcp->firmware_clock_ids, count);
+			if (ret)
+				return ret;
+		}
 	}
 
-	dcp->clk = devm_clk_get(dev, NULL);
+	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0 && !dcp->num_firmware_clocks)
+		dcp->clk = devm_clk_get_optional(dev, NULL);
+	else
+		dcp->clk = devm_clk_get(dev, NULL);
 	if (IS_ERR(dcp->clk))
 		return dev_err_probe(dev, PTR_ERR(dcp->clk),
 				     "Unable to find clock\n");
@@ -3300,6 +3316,19 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t6050 = {
 	.firmware_compat = DCP_FIRMWARE_V_27_0,
 };
 
+/* The saved native T6050 topology has two DPTX ports. Use the
+ * same AFKV2/RTKit session contract as the internal T6050 controller.
+ */
+static const struct apple_dcp_hw_data apple_dcp_hw_t6050_dcpext = {
+	.firmware_dma_bits = 41,
+	.num_dptx_ports = 2,
+	.iomfb_method_profile = DCP_IOMFB_METHODS_H17G,
+	.adopt_running_coprocessor = true,
+	.adopt_live_session = true,
+	.discover_live_session = true,
+	.firmware_compat = DCP_FIRMWARE_V_27_0,
+};
+
 static const struct apple_dcp_hw_data apple_dcp_hw_dcp = {
 	.num_dptx_ports = 0,
 };
@@ -3313,6 +3342,7 @@ static const struct of_device_id of_match[] = {
 	{ .compatible = "apple,t8112-dcp", .data = &apple_dcp_hw_t8112,  },
 	{ .compatible = "apple,t8140-dcp", .data = &apple_dcp_hw_t8140,  },
 	{ .compatible = "apple,t6050-dcp", .data = &apple_dcp_hw_t6050, },
+	{ .compatible = "apple,t6050-dcpext", .data = &apple_dcp_hw_t6050_dcpext, },
 	{ .compatible = "apple,t8142-dcp", .data = &apple_dcp_hw_t8142,  },
 	{ .compatible = "apple,dcp",       .data = &apple_dcp_hw_dcp,    },
 	{ .compatible = "apple,dcpext",    .data = &apple_dcp_hw_dcpext, },

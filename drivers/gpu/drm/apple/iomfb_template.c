@@ -1196,7 +1196,15 @@ static void boot_1_10(struct apple_dcp *dcp, void *out, void *cookie)
 	 * The H17G capture is2560x1664; the H17P capture is2408x1506.
 	 */
 	memcpy(&dim, out, sizeof(dim));
-	if (!dim.width || !dim.height || dim.width > 16384 || dim.height > 16384) {
+	/* 26A428 start_hardware_boot forwards A453's result to A104 even
+	 * when an external display has no timing yet (0 x 0). Do not turn
+	 * that native disconnected state into a failed D120 boot callback.
+	 */
+	if (dim.width > 16384 || dim.height > 16384
+#if DCP_FW_VER < DCP_FW_VERSION(27, 0, 0)
+	    || !dim.width || !dim.height
+#endif
+	   ) {
 		struct dcp_channel *ch = &dcp->ch_cb;
 
 		dev_err(dcp->dev, "invalid default framebuffer dimensions %ux%u\n",
@@ -1215,6 +1223,18 @@ static void boot_1_9(struct apple_dcp *dcp, void *out, void *cookie)
 {
 	u32 zero = 0;
 
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0)
+	struct dcp_dfb_dimensions_h17p dim;
+
+	/* Native get_config_frame_size (A103) precedes the A453 fallback.
+	 * A configured frame needs neither replacement dimensions nor A105.
+	 */
+	memcpy(&dim, out, sizeof(dim));
+	if (dim.width && dim.height) {
+		boot_2(dcp, out, cookie);
+		return;
+	}
+#endif
 	dcp_get_dfb_state(dcp, false, &zero, boot_1_10, NULL);
 }
 
@@ -1248,6 +1268,17 @@ static void boot_1_6(struct apple_dcp *dcp, void *out, void *cookie)
 {
 	u64 zero = 0;
 
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0)
+	/* Native only calls setup_default_fb_info when A454 returns true.
+	 * A disconnected external pipeline has no default framebuffer.
+	 */
+	if (!(*(u8 *)out & 1)) {
+		struct dcp_dfb_layout_req_h17p req = {};
+
+		dcp_get_dfb_layout(dcp, false, &req, boot_1_9, NULL);
+		return;
+	}
+#endif
 	dcp_get_dfb_compression_info(dcp, false, &zero, boot_1_7, NULL);
 }
 #endif

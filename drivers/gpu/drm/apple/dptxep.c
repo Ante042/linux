@@ -856,7 +856,8 @@ int dptxep_init(struct apple_dcp *dcp)
 	init_completion(&dcp->dptxport[0].linkcfg_completion);
 	init_completion(&dcp->dptxport[1].linkcfg_completion);
 
-	dcp->dptxep = afk_init(dcp, DPTX_ENDPOINT, dptxep_ops);
+	dcp->dptxep = afk_init(dcp, dcp->fw_compat == DCP_FIRMWARE_V_27_0 ?
+			       DPTX_ENDPOINT_V27 : DPTX_ENDPOINT, dptxep_ops);
 	if (IS_ERR(dcp->dptxep))
 		return PTR_ERR(dcp->dptxep);
 

@@ -215,3 +215,72 @@ request is translated in reverse to the corresponding CPU resource before
 calling dma_map_resource. The HV/IOMMU resource-DMA path must preserve that distinction when forwarding
 to SPTM. Successful internal scanout does not qualify arbitrary additional
 MMIO ranges or external display pipelines.
+
+AFKV2 commands from firmware
+---------------------------
+
+26A428 AFKEPCommandRemote uses an 8-byte command context followed, when
+flag bit0 is set, by a 24-byte DMA descriptor. Descriptor presence does not
+require both directions to use DMA: a zero txlen leaves the request inline,
+and a zero rxlen leaves the response inline. DCPAV messages inside this
+context have a 64-byte header, unlike the older 68-byte AP-call envelope.
+The native implementations at 0xfffffe00091f6f34, 0xfffffe00091f7080,
+0xfffffe00091f71e0 and 0xfffffe000a13bac0 establish these layouts.
+
+The receive path translates each DMA page through the firmware device's
+IOMMU domain, allowing physically scattered buffers and inherited shared
+aliases. Replies retain the command tag; descriptor replies report the
+actual response length. Invalid requests and unavailable services receive
+native transport error statuses. The existing service handlers still own
+DCPAV command semantics. This does not reduce the outgoing command slots
+or serialize unrelated commands.
+
+Disconnected external pipeline boot
+-----------------------------------
+
+26A428 UnifiedPipeline2::start_hardware_boot at 0xfffffe00097b1600 only
+queries default-framebuffer information if A454 returns true. It next
+queries configured geometry with A103. Nonzero geometry needs no A104/A105;
+otherwise A453 supplies geometry and its result is forwarded to A104, then
+committed by A105, including the zero geometry of an external pipeline
+without a timing. Rejecting that zero result fails the D120 boot callback.
+The 27.0 path follows those branches; older firmware paths are unchanged.
+
+Native T6050 dispext clock-ids is explicitly empty. An external profile
+therefore accepts an empty clock table, while missing or inconsistent clock
+metadata remains an error. Its bandwidth request uses its own PMC agent:
+ApplePMC::getBWRMemory matches the BIRQ argument against 24-byte bwr-agent
+entries, and AppleT6050PMC::getBWRMemoryOffset returns 0x20000+(agent<<14).
+On J714s, dispext0 request54 selects agent3 at PMC+0x2c000; disp0 request150
+selects agent0 at PMC+0x20000. A guest must grant and describe the correct
+page rather than reuse the internal display's request slot.
+
+Standalone source-based regression checks run on the build host::
+
+  python3 tools/testing/selftests/drivers/gpu/apple-dcp-afkv2.py
+  python3 tools/testing/selftests/drivers/gpu/apple-dcp-native-boot.py
+
+They exercise native wire forms, scatter-backed DMA, allocation and mapping
+failures, response capacities, and the disconnected/native boot branches
+with sanitizers. They do not emulate DCP firmware or qualify optical output.
+
+The external 26A428 DPTX endpoint is 0x2c. Its captured announcements expose
+``EPICUnit`` 0 and 1 alongside ``interface-id`` 1 and 3. These fields are
+not interchangeable: the explicit unit must take precedence regardless of
+dictionary order. The lower-case H17P form still uses interface-id when an
+explicit EPICUnit is absent. A focused regression test covers both native
+port/channel pairs, reversed property order, and that fallback::
+
+  python3 tools/testing/selftests/drivers/gpu/apple-dcp-service-init.py
+
+Endpoint 0x24 advertises ``dcpav-controller-epic`` and
+``dcpdp-controller-epic``. Those controller interfaces must not be treated
+as the older ``dcpav-service-epic`` EDID service. Their routing and service
+creation protocol still needs separate integration. External IOMFB boot
+and DPTX announcements alone do not establish HDMI or USB-C scanout.
+
+On J714s hardware, the corrected 27.0 startup completes for both internal
+and external0 DCP. A read-only driver-state snapshot confirms both external
+DPTX ports enabled with units0/1 and initialized service cookies; the earlier
+port0 initialization timeout is gone. HDMI and USB-C routing, incoming DPTX
+link-training callbacks, and external scanout remain unqualified.

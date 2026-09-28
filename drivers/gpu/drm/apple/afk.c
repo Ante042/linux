@@ -5,6 +5,10 @@
 #include <linux/debugfs.h>
 #include <linux/dma-mapping.h>
 #include <linux/kconfig.h>
+#include <linux/io.h>
+#include <linux/iommu.h>
+#include <linux/mm.h>
+#include <linux/vmalloc.h>
 #include <linux/of_platform.h>
 #include <linux/slab.h>
 #include <linux/workqueue.h>
@@ -548,6 +552,144 @@ static void afk_recv_handle_std_service(struct apple_dcp_afkep *ep, u32 channel,
 				   payload_size, true);
 }
 
+/* The remote command can use an AFK DMA buffer or inline bytes independently
+ * for each direction. Copy page by page: a DMA-contiguous buffer need not be
+ * CPU-physically contiguous. Retained firmware buffers use their granted WB
+ * aliases; ordinary Linux-owned buffers resolve through the same IOMMU API.
+ */
+static int afk_copy_remote(struct apple_dcp_afkep *ep, u64 dva, void *buffer,
+			   size_t size, bool to_remote)
+{
+	struct iommu_domain *domain = iommu_get_domain_for_dev(ep->dcp->dev);
+	size_t off = 0;
+
+	if (!domain || !dva || size > U64_MAX - dva)
+		return -EINVAL;
+	while (off < size) {
+		phys_addr_t pa = iommu_iova_to_phys(domain, dva + off);
+		size_t chunk = min_t(size_t, size - off,
+				    PAGE_SIZE - ((dva + off) & ~PAGE_MASK));
+		void *cpu;
+
+		if (!pa) {
+			dev_err_ratelimited(ep->dcp->dev,
+				"AFK[ep:%02x]: unmapped remote buffer %#llx + %#zx (%s)\n",
+				ep->endpoint, dva, off, to_remote ? "reply" : "request");
+			return -ENXIO;
+		}
+		cpu = memremap(pa, chunk, MEMREMAP_WB);
+		if (!cpu)
+			return -ENOMEM;
+		if (to_remote)
+			memcpy(cpu, buffer + off, chunk);
+		else
+			memcpy(buffer + off, cpu, chunk);
+		memunmap(cpu);
+		off += chunk;
+	}
+	return 0;
+}
+
+/* 26A428 AFKEPCommandRemote and DCPAVProxy: 8-byte command context, optional
+ * 24-byte DMA descriptors, then a 64-byte DCPAVIPC::Message. Reply status is
+ * in the command context; service-specific status stays in the message data.
+ */
+static void afk_recv_command_v2(struct apple_dcp_afkep *ep, u32 channel, u8 subtype,
+			      const void *payload, size_t payload_size)
+{
+	const size_t inline_header = offsetof(struct epic_cmd_v2, rxbuf);
+	struct epic_cmd_v2 context = {};
+	struct apple_epic_service *service = afk_epic_find_service(ep, channel);
+	struct epic_service_call *call;
+	void *request = NULL, *reply = NULL;
+	size_t header_size = inline_header, request_size, call_size;
+	u32 status = 0xe00002c2; /* kIOReturnBadArgument */
+	int ret;
+
+	if (payload_size < inline_header)
+		return; /* There is no complete command tag to answer. */
+	memcpy(&context, payload, inline_header);
+	if (context.flags & 1) {
+		header_size = sizeof(context);
+		if (payload_size < header_size)
+			return;
+		memcpy(&context, payload, header_size);
+	}
+	if (!service || service->torndown || !service->ops || !service->ops->call ||
+	    subtype != EPIC_SUBTYPE_STD_SERVICE) {
+		status = 0xe00002d7; /* Native AFKV2 no-handler response. */
+		goto error;
+	}
+	request_size = (context.flags & 1) && context.txlen ?
+		le32_to_cpu(context.txlen) : payload_size - header_size;
+	if (request_size < sizeof(*call))
+		goto error;
+	request = kvmalloc(request_size, GFP_KERNEL);
+	if (!request) {
+		status = 0xe00002bd; /* kIOReturnNoMemory */
+		goto error;
+	}
+	if ((context.flags & 1) && context.txlen) {
+		dma_rmb();
+		ret = afk_copy_remote(ep, le64_to_cpu(context.txbuf), request,
+				      request_size, false);
+		if (ret)
+			goto error;
+	} else {
+		memcpy(request, payload + header_size, request_size);
+	}
+	call = request;
+	call_size = le32_to_cpu(call->data_len);
+	if (le32_to_cpu(call->magic) != EPIC_SERVICE_CALL_MAGIC ||
+	    call_size != request_size - sizeof(*call))
+		goto error;
+	if ((context.flags & 1) && context.rxlen &&
+	    (request_size > le32_to_cpu(context.length) ||
+	     request_size > le32_to_cpu(context.rxlen))) {
+		status = 0xe00002e1; /* Native AFKV2 response-capacity error. */
+		goto error;
+	}
+	reply = kvzalloc(header_size + request_size, GFP_KERNEL);
+	if (!reply) {
+		status = 0xe00002bd;
+		goto error;
+	}
+	memcpy(reply + header_size, call, sizeof(*call));
+	ret = service->ops->call(service, le32_to_cpu(call->command),
+				request + sizeof(*call), call_size,
+				reply + header_size + sizeof(*call), call_size);
+	if (ret) {
+		dev_warn(ep->dcp->dev, "AFK[ep:%02x]: channel %u command %u failed: %d\n",
+			 ep->endpoint, channel, le32_to_cpu(call->command), ret);
+		goto error;
+	}
+	if ((context.flags & 1) && context.rxlen) {
+		ret = afk_copy_remote(ep, le64_to_cpu(context.rxbuf),
+				      reply + header_size, request_size, true);
+		if (ret)
+			goto error;
+		context.rxlen = cpu_to_le32(request_size);
+		request_size = 0; /* Only the descriptor goes into the ring. */
+	}
+	context.length = 0;
+	memcpy(reply, &context, header_size);
+	dma_wmb();
+	ret = afk_send_epic(ep, channel, context.tag, EPIC_TYPE_REPLY, EPIC_CAT_REPLY,
+			    subtype, reply, header_size + request_size);
+	goto done;
+error:
+	context.length = cpu_to_le32(status);
+	context.rxlen = 0;
+	ret = afk_send_epic(ep, channel, context.tag, EPIC_TYPE_REPLY, EPIC_CAT_REPLY,
+			    subtype, &context, header_size);
+done:
+	if (ret)
+		dev_err(ep->dcp->dev, "AFK[ep:%02x]: channel %u reply failed: %d\n",
+			ep->endpoint, channel, ret);
+	kvfree(reply);
+	kvfree(request);
+}
+
 static void afk_recv_handle(struct apple_dcp_afkep *ep, u32 channel, u32 type,
 			    u8 *data, size_t data_size)
 {
@@ -609,6 +751,17 @@ static void afk_recv_handle(struct apple_dcp_afkep *ep, u32 channel, u32 type,
 		const struct epic_hdr_v2 *v2 = (const void *)data;
 
 		/* The queue type is no longer the command/reply discriminator. */
+		if (v2->category == 1) {
+			size_t length = le32_to_cpu(v2->length);
+
+			if (length < sizeof(*v2) - 8 || length > data_size - 8)
+				goto too_small;
+			h17p_eshdr.category = EPIC_CAT_COMMAND;
+			trace_afk_recv_handle(ep, channel, EPIC_TYPE_COMMAND,
+					     data_size, ehdr, eshdr);
+			return afk_recv_command_v2(ep, channel, v2->type, payload,
+						  length - (sizeof(*v2) - 8));
+		}
 		if (v2->category == 2) {
 			const struct epic_cmd_v2 *reply = (const void *)payload;
 
