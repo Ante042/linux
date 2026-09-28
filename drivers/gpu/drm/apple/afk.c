@@ -346,6 +346,9 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 	ep->services[ch_idx].ep = ep;
 	ep->services[ch_idx].channel = channel;
 	ep->services[ch_idx].cmd_tag = 0;
+	if (ep->dcp->fw_compat == DCP_FIRMWARE_V_27_0)
+		afk_send_epic(ep, channel, 0, EPIC_TYPE_NOTIFY, EPIC_CAT_REPORT,
+			      0x12, NULL, 0);
 	ops->init(&ep->services[ch_idx], epic_name, epic_class, epic_unit);
 	dev_info(ep->dcp->dev, "AFK[ep:%02x]: new service %s on channel %d\n",
 		 ep->endpoint, service_name, channel);
@@ -393,7 +396,7 @@ static void afk_recv_handle_reply(struct apple_dcp_afkep *ep, u32 channel,
 	struct epic_cmd *cmd = payload;
 	struct apple_epic_service *service;
 	unsigned long flags;
-	u8 idx = tag & 0xff;
+	u8 idx = tag & (ep->dcp->fw_compat == DCP_FIRMWARE_V_27_0 ? 0xf : 0xff);
 	void *rxbuf, *txbuf;
 	dma_addr_t rxbuf_dma, txbuf_dma;
 	size_t rxlen, txlen;
@@ -553,6 +556,7 @@ static void afk_recv_handle(struct apple_dcp_afkep *ep, u32 channel, u32 type,
 	struct epic_sub_hdr *eshdr =
 		(struct epic_sub_hdr *)(data + sizeof(*ehdr));
 	struct epic_sub_hdr h17p_eshdr;
+	struct epic_cmd v2_reply = {};
 	size_t hdr_len = sizeof(*ehdr) + sizeof(*eshdr);
 	u16 subtype;
 	u8 *payload;
@@ -600,6 +604,49 @@ static void afk_recv_handle(struct apple_dcp_afkep *ep, u32 channel, u32 type,
 	subtype = le16_to_cpu(eshdr->type);
 	payload = data + hdr_len;
 	payload_size = data_size - hdr_len;
+
+	if (ep->dcp->fw_compat == DCP_FIRMWARE_V_27_0) {
+		const struct epic_hdr_v2 *v2 = (const void *)data;
+
+		/* The queue type is no longer the command/reply discriminator. */
+		if (v2->category == 2) {
+			const struct epic_cmd_v2 *reply = (const void *)payload;
+
+			if (payload_size < offsetof(struct epic_cmd_v2, rxbuf))
+				goto too_small;
+			h17p_eshdr.category = EPIC_CAT_REPLY;
+			h17p_eshdr.tag = cpu_to_le16(reply->tag);
+			v2_reply.retcode = reply->length;
+			if (reply->flags & 1) {
+				if (payload_size < sizeof(*reply))
+					goto too_small;
+				v2_reply.rxbuf = reply->rxbuf;
+				v2_reply.txbuf = reply->txbuf;
+				v2_reply.rxlen = reply->rxlen;
+				v2_reply.txlen = reply->txlen;
+			} else {
+				/* Our commands request an OOB response. A status-only
+				 * error reply may omit the unused descriptors. */
+				if (!v2_reply.retcode) {
+					dev_err(ep->dcp->dev, "AFK: unexpected inline command reply\n");
+					return;
+				}
+			}
+			type = EPIC_TYPE_REPLY;
+			payload = (void *)&v2_reply;
+			payload_size = sizeof(v2_reply);
+		} else if (v2->category == 0) {
+			type = EPIC_TYPE_NOTIFY;
+			if (le16_to_cpu(v2->interface_flags) & 1) {
+				if (v2->type == 0x12)
+					return; /* native interface-open report */
+				if (v2->type == 0x13) {
+					afk_recv_handle_teardown(ep, channel);
+					return;
+				}
+			}
+		}
+	}
 
 	trace_afk_recv_handle(ep, channel, type, data_size, ehdr, eshdr);
 
@@ -841,7 +888,25 @@ int afk_send_epic(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 	struct epic_sub_hdr *eshdr;
 	unsigned long flags;
 	size_t total_epic_size, total_size;
+	bool v2 = ep->dcp->fw_compat == DCP_FIRMWARE_V_27_0;
+	struct epic_cmd_v2 v2_cmd = {};
 	int ret;
+
+	if (v2 && ecat == EPIC_CAT_COMMAND) {
+		const struct epic_cmd *cmd = payload;
+
+		if (payload_len != sizeof(*cmd))
+			return -EINVAL;
+		v2_cmd.flags = 1;
+		v2_cmd.tag = tag;
+		v2_cmd.length = cmd->rxlen;
+		v2_cmd.rxbuf = cmd->rxbuf;
+		v2_cmd.txbuf = cmd->txbuf;
+		v2_cmd.rxlen = cmd->rxlen;
+		v2_cmd.txlen = cmd->txlen;
+		payload = &v2_cmd;
+		payload_len = sizeof(v2_cmd);
+	}
 
 	spin_lock_irqsave(&ep->lock, flags);
 
@@ -849,7 +914,8 @@ int afk_send_epic(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 	rptr = le32_to_cpu(*afk_rb_rptr(&ep->txbfr));
 	wptr = le32_to_cpu(*afk_rb_wptr(&ep->txbfr));
 	trace_afk_send_rwptr_pre(ep, rptr, wptr);
-	total_epic_size = sizeof(*ehdr) + sizeof(*eshdr) + payload_len;
+	total_epic_size = (v2 ? sizeof(struct epic_hdr_v2) :
+			   sizeof(*ehdr) + sizeof(*eshdr)) + payload_len;
 	total_size = sizeof(*hdr) + total_epic_size;
 
 	hdr = hdr2 = NULL;
@@ -932,31 +998,46 @@ int afk_send_epic(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 
 	hdr->magic = cpu_to_le32(QE_MAGIC);
 	hdr->size = cpu_to_le32(total_epic_size);
-	hdr->channel = cpu_to_le32(channel);
-	hdr->type = cpu_to_le32(etype);
+	hdr->channel = cpu_to_le32(v2 ? 0 : channel);
+	hdr->type = cpu_to_le32(v2 ? 0 : etype);
 	if (hdr2)
 		memcpy(hdr2, hdr, sizeof(*hdr));
 
-	ehdr = ep->txbfr.buf + wptr;
-	memset(ehdr, 0, sizeof(*ehdr));
-	ehdr->version = 2;
-	ehdr->seq = cpu_to_le16(ep->qe_seq++);
-	ehdr->timestamp = cpu_to_le64(0);
-	wptr += sizeof(*ehdr);
+	if (v2) {
+		struct epic_hdr_v2 *h = ep->txbfr.buf + wptr;
 
-	eshdr = ep->txbfr.buf + wptr;
-	memset(eshdr, 0, sizeof(*eshdr));
-	eshdr->length = cpu_to_le32(payload_len);
-	eshdr->version = 4;
-	eshdr->category = ecat;
-	eshdr->type = cpu_to_le16(stype);
-	eshdr->timestamp = cpu_to_le64(0);
-	eshdr->tag = cpu_to_le16(tag);
-	if (ecat == EPIC_CAT_REPLY)
-		eshdr->inline_len = cpu_to_le32(payload_len - 4);
-	else
-		eshdr->inline_len = cpu_to_le32(0);
-	wptr += sizeof(*eshdr);
+		memset(h, 0, sizeof(*h));
+		h->seq = ep->qe_seq++;
+		h->channel = cpu_to_le16(channel);
+		h->length = cpu_to_le32(total_epic_size - 8);
+		h->type = stype;
+		h->category = ecat == EPIC_CAT_COMMAND ? 1 :
+			      ecat == EPIC_CAT_REPLY ? 2 : 0;
+		if (ecat == EPIC_CAT_REPORT && (stype == 0x12 || stype == 0x13))
+			h->interface_flags = cpu_to_le16(1);
+		wptr += sizeof(*h);
+	} else {
+		ehdr = ep->txbfr.buf + wptr;
+		memset(ehdr, 0, sizeof(*ehdr));
+		ehdr->version = 2;
+		ehdr->seq = cpu_to_le16(ep->qe_seq++);
+		ehdr->timestamp = cpu_to_le64(0);
+		wptr += sizeof(*ehdr);
+
+		eshdr = ep->txbfr.buf + wptr;
+		memset(eshdr, 0, sizeof(*eshdr));
+		eshdr->length = cpu_to_le32(payload_len);
+		eshdr->version = 4;
+		eshdr->category = ecat;
+		eshdr->type = cpu_to_le16(stype);
+		eshdr->timestamp = cpu_to_le64(0);
+		eshdr->tag = cpu_to_le16(tag);
+		if (ecat == EPIC_CAT_REPLY)
+			eshdr->inline_len = cpu_to_le32(payload_len - 4);
+		else
+			eshdr->inline_len = cpu_to_le32(0);
+		wptr += sizeof(*eshdr);
+	}
 
 	memcpy(ep->txbfr.buf + wptr, payload, payload_len);
 	wptr += payload_len;
@@ -990,18 +1071,20 @@ int afk_send_command_timeout(struct apple_epic_service *service, u8 type,
 			     unsigned int timeout_ms)
 {
 	struct epic_cmd cmd;
-	void *rxbuf, *txbuf;
-	dma_addr_t rxbuf_dma, txbuf_dma;
+	void *rxbuf = NULL, *txbuf;
+	dma_addr_t rxbuf_dma = 0, txbuf_dma;
 	unsigned long flags;
 	int ret, idx;
 	u16 tag;
 	struct apple_dcp_afkep *ep = service->ep;
 	DECLARE_COMPLETION_ONSTACK(completion);
 
-	rxbuf = dma_alloc_coherent(ep->dcp->dev, output_len, &rxbuf_dma,
-				   GFP_KERNEL);
-	if (!rxbuf)
-		return -ENOMEM;
+	if (output_len) {
+		rxbuf = dma_alloc_coherent(ep->dcp->dev, output_len, &rxbuf_dma,
+					   GFP_KERNEL);
+		if (!rxbuf)
+			return -ENOMEM;
+	}
 	txbuf = dma_alloc_coherent(ep->dcp->dev, payload_len, &txbuf_dma,
 				   GFP_KERNEL);
 	if (!txbuf) {
@@ -1025,8 +1108,13 @@ int afk_send_command_timeout(struct apple_epic_service *service, u8 type,
 		goto err_unlock;
 	}
 
-	tag = (service->cmd_tag & 0xff) << 8;
-	tag |= idx & 0xff;
+	if (ep->dcp->fw_compat == DCP_FIRMWARE_V_27_0) {
+		/* Keep all sixteen concurrent slots with a four-bit generation. */
+		tag = ((service->cmd_tag & 0xf) << 4) | idx;
+	} else {
+		tag = (service->cmd_tag & 0xff) << 8;
+		tag |= idx & 0xff;
+	}
 	service->cmd_tag++;
 
 	service->cmds[idx].tag = tag;
@@ -1085,7 +1173,8 @@ err_unlock:
 	spin_unlock_irqrestore(&service->lock, flags);
 	dma_free_coherent(ep->dcp->dev, payload_len, txbuf, txbuf_dma);
 err_free_rxbuf:
-	dma_free_coherent(ep->dcp->dev, output_len, rxbuf, rxbuf_dma);
+	if (rxbuf)
+		dma_free_coherent(ep->dcp->dev, output_len, rxbuf, rxbuf_dma);
 	return ret;
 }
 

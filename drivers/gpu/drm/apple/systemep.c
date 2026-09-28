@@ -36,7 +36,8 @@ static void system_log_work(struct work_struct *work_)
 	afk_send_command(work->service, SYSTEM_SET_PROPERTY,
 			 setprop_gAFKConfigLogMask_ffff,
 			 sizeof(setprop_gAFKConfigLogMask_ffff), NULL,
-			 sizeof(setprop_gAFKConfigLogMask_ffff), NULL);
+			 work->service->ep->dcp->fw_compat == DCP_FIRMWARE_V_27_0 ?
+				 0 : sizeof(setprop_gAFKConfigLogMask_ffff), NULL);
 	complete(&work->service->ep->dcp->systemep_done);
 	kfree(work);
 }

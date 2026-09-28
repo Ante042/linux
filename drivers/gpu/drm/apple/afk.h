@@ -127,6 +127,30 @@ struct epic_sub_hdr_h17p {
 
 #define EPIC_SUBTYPE_ANNOUNCE_H17P 0x11
 
+/* AFKEPV2 transport and interface headers, as used by 26A428. */
+struct epic_hdr_v2 {
+	u8 seq;
+	u8 flags;
+	__le16 channel;
+	__le32 length; /* bytes after this transport header */
+	__le64 timestamp;
+	u8 type;
+	u8 category; /* report=0, command=1, reply=2 */
+	__le16 interface_flags;
+	__le32 reserved;
+} __packed;
+
+struct epic_cmd_v2 {
+	u8 flags; /* bit 0: out-of-band buffer descriptors follow */
+	u8 tag;
+	__le16 reserved;
+	__le32 length; /* command: response capacity; reply: status */
+	__le64 rxbuf;
+	__le64 txbuf;
+	__le32 rxlen;
+	__le32 txlen;
+} __packed;
+
 struct epic_cmd {
 	__le32 retcode;
 	__le64 rxbuf;
