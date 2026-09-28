@@ -111,6 +111,7 @@ struct centauri_wifi {
 	bool scan_abort, connect_abort;
 	u8 scan_sequence;
 	bool connecting, connected, connect_event, disconnect_event;
+	bool disconnect_pending;
 	bool associated, pmk_seen, pmk_matches;
 	u8 expected_pmk[32];
 	u16 connect_status;
@@ -593,7 +594,7 @@ static void drain(struct centauri_wifi *wifi)
 
 		while (budget--) {
 			u16 slot = wifi->rx_next[ring], size, status, sequence;
-			u32 command;
+			u32 command, wire_command;
 			u8 *descriptor = wifi->a.window + TR_BASE + (ring - 1) * RING_SPAN + slot * 16;
 			u8 *packet = wifi->a.window + rx_buffer[ring] + slot * BUFFER_SIZE;
 
@@ -603,7 +604,8 @@ static void drain(struct centauri_wifi *wifi)
 			size = get_unaligned_le16(packet + 0x10);
 			status = get_unaligned_le16(packet + 0xe);
 			sequence = get_unaligned_le16(packet + 0x12);
-			command = get_unaligned_le32(packet + 0x14) & ~BIT(30);
+			wire_command = get_unaligned_le32(packet + 0x14);
+			command = wire_command & ~BIT(30);
 			wifi->rx_seen[ring]++;
 			wifi->rx_next[ring] = (slot + 1) % ring_size[ring];
 			if (size < 24 || size > BUFFER_SIZE)
@@ -646,6 +648,8 @@ static void drain(struct centauri_wifi *wifi)
 						 get_unaligned_le32(packet + 0x34));
 				if (command == 0x80000003 || command == 0x80000004)
 					wifi->disconnect_event = true;
+				if (command == 0x80000004)
+					wifi->disconnect_pending = false;
 				if (wifi->connecting && command != 0x80000000 &&
 				    command != 0x80000001 && command != 0x80000030 &&
 				    command != 0x80000005 && command != 0x80000050)
@@ -656,7 +660,8 @@ static void drain(struct centauri_wifi *wifi)
 				wifi->reply_valid = true;
 				wifi->reply_sequence = sequence;
 				wifi->reply_status = status;
-				wifi->reply_command = command;
+				/* Preserve the asynchronous ACK flag for completion waits. */
+				wifi->reply_command = wire_command;
 				if (command == 10) {
 					wifi->country_valid = !status && size >= 27;
 					if (wifi->country_valid)
@@ -770,6 +775,7 @@ static void drain(struct centauri_wifi *wifi)
 static int command(struct centauri_wifi *wifi, u32 id, const void *payload, size_t size)
 {
 	u16 slot = wifi->command_head, sequence = ++wifi->sequence;
+	u32 stage;
 	u8 *packet, *descriptor;
 	unsigned long deadline = jiffies + msecs_to_jiffies(1500);
 
@@ -796,8 +802,13 @@ static int command(struct centauri_wifi *wifi, u32 id, const void *payload, size
 	writel(1, wifi->a.bar + 0x1004);
 	do {
 		drain(wifi);
-		if (readl(wifi->a.bar + 8) != 2)
+		stage = readl(wifi->a.bar + 8);
+		if (stage != 2) {
+			dev_err(&wifi->control->pdev->dev,
+				"Wi-Fi command %#x lost transport: stage=%#x sequence=%u rx=%u\n",
+				id, stage, sequence, wifi->rx_seen[2]);
 			return -EIO;
+		}
 		/* Bit 30 is more-data-pending, not part of the command identity.
 		 * Scan/connect replies set it before their later completion event.
 		 */
@@ -1047,7 +1058,7 @@ static int wifi_scan(struct wiphy *wiphy, struct cfg80211_scan_request *request)
 		ret = -ENODEV;
 	else if (!wifi->configured)
 		ret = -ENETDOWN;
-	else if (wifi->scan_request || wifi->connecting)
+	else if (wifi->scan_request || wifi->connecting || wifi->disconnect_pending)
 		ret = -EBUSY;
 	else {
 		WRITE_ONCE(wifi->scan_abort, false);
@@ -1232,7 +1243,8 @@ static int wifi_connect(struct wiphy *wiphy, struct net_device *netdev,
 		ret = -ENODEV;
 		goto out;
 	}
-	if (!wifi->configured || wifi->connecting || wifi->connected || wifi->scan_request) {
+	if (!wifi->configured || wifi->connecting || wifi->connected ||
+	    wifi->scan_request || wifi->disconnect_pending) {
 		ret = -EBUSY;
 		goto out;
 	}
@@ -1485,6 +1497,28 @@ static void link_worker(struct work_struct *work)
 	mutex_unlock(&wifi->lock);
 }
 
+/* Native disconnect replies with bit30 set are acknowledgements, not
+ * completed teardown. macOS disconnectInProgress waits for event4 before
+ * allowing interface stop/reconfiguration, with a five-second deadline.
+ * Caller owns wifi->lock; drain processes the completion without reacquiring it.
+ */
+static int wait_disconnect(struct centauri_wifi *wifi)
+{
+	unsigned long deadline = jiffies + msecs_to_jiffies(5000);
+
+	while (wifi->disconnect_pending) {
+		drain(wifi);
+		if (READ_ONCE(wifi->stopping) || readl(wifi->a.bar + 8) != 2)
+			return -EIO;
+		if (!wifi->disconnect_pending)
+			break;
+		if (time_after_eq(jiffies, deadline))
+			return -ETIMEDOUT;
+		usleep_range(500, 1000);
+	}
+	return 0;
+}
+
 static int wifi_disconnect(struct wiphy *wiphy, struct net_device *netdev, u16 reason)
 {
 	struct centauri_wifi *wifi = *(struct centauri_wifi **)wiphy_priv(wiphy);
@@ -1504,9 +1538,21 @@ static int wifi_disconnect(struct wiphy *wiphy, struct net_device *netdev, u16 r
 	put_unaligned_le16(reason, payload);
 	put_unaligned_le16(328, payload + 8);
 	put_unaligned_le16(4, payload + 10);
+	/* Native27 AppleWLAN80211Connection::disconnect passes 10 to
+	 * disconnectCommon as TLV 328, separately from the 802.11 reason.
+	 */
+	put_unaligned_le32(10, payload + 12);
+	wifi->disconnect_pending = !READ_ONCE(wifi->stopping);
 	ret = READ_ONCE(wifi->stopping) ? 0 :
 		command(wifi, 131073, payload, sizeof(payload));
 	reply_status = wifi->reply_status;
+	if (!ret && wifi->disconnect_pending && (wifi->reply_command & BIT(30)))
+		ret = wait_disconnect(wifi);
+	else if (ret != -EIO)
+		wifi->disconnect_pending = false;
+	/* On timeout the pending state stays set until event4 arrives, so a
+	 * later scan/connect/MAC change cannot overtake firmware teardown.
+	 */
 	connected = wifi->connected;
 	wifi->connected = false;
 	netif_stop_queue(netdev);
@@ -1713,7 +1759,8 @@ static int net_set_mac_address(struct net_device *netdev, void *data)
 		ret = -ENETDOWN;
 		goto out;
 	}
-	if (wifi->connecting || wifi->connected || wifi->scan_request) {
+	if (wifi->connecting || wifi->connected || wifi->scan_request ||
+	    wifi->disconnect_pending) {
 		ret = -EBUSY;
 		goto out;
 	}
@@ -1816,7 +1863,8 @@ static ssize_t fwlog_start_write(struct file *file, const char __user *input,
 		ret = -ENODEV;
 		goto out;
 	}
-	if (!wifi->configured || wifi->connecting || wifi->connected || wifi->scan_request) {
+	if (!wifi->configured || wifi->connecting || wifi->connected ||
+	    wifi->scan_request || wifi->disconnect_pending) {
 		ret = -EBUSY;
 		goto out;
 	}
