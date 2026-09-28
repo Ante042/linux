@@ -192,3 +192,32 @@ in the network path. Factory-address DT artifact:
 ``t6050-n1-factory-mac.dtb``. Firmware, credentials and calibration remain
 private. Automatic firmware bootstrap and Bluetooth radio bring-up are
 separate remaining work; Bluetooth's default radio-power command still fails.
+
+Automatic startup and link lifecycle
+------------------------------------
+
+The J714 driver now schedules native ROM, port-cycle and IPC startup automatically.
+PCI rescan-lock contention is retried before mutation; actual firmware failures are
+reported without repeating a partially completed phase. Removal cancels the work
+before releasing transport state. The netdev is published after radio setup.
+
+Hardware on firmware 27 booted with no debugfs boot writes, associated using the
+standard WPA2 PMK path, obtained DHCP and accepted SSH. A connected scan completed
+with 20/20 gateway pings. Three additional cycles each aborted a scan, performed a
+full scan, disconnected and reconnected, then verified gateway traffic. A final
+netdev down/up recovered association, DHCP, gateway traffic and SSH. The test must
+wait for the DHCP route after association; association completion alone does not
+mean the IP configuration is ready. TX/RX completion counters showed no malformed
+or failed packets in these runs. Suspend/resume and firmware-crash recovery remain
+unqualified.
+
+Station reporting exposes per-association traffic counters and native RSSI from
+firmware command 20 / TLV 268. It queries on demand with a one-second cache; no
+periodic polling is introduced. Firmware rate fields have not been decoded, so a
+PHY rate is not invented.
+
+J714 Bluetooth startup uses the captured factory address and the native firmware
+initialization sequence automatically. Explicit native_startup=0 remains available
+for diagnostics; the J813 default is unchanged. Hardware accepted radio power
+cycling and LE discovery, producing 29 device reports. This does not qualify ACL,
+GATT, L2CAP, audio, suspend or recovery, and ACL remains opt-in.

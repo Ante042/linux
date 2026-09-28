@@ -345,11 +345,10 @@ static int enumerate_functions(struct centauri *c)
 	struct centauri_ipc *ipc = c->ipc;
 	int i, ret;
 
-	pci_lock_rescan_remove();
-	/* The ROM personality was single-function; boot exposes Alpha and Beta. */
+	/* Caller holds PCI rescan/remove ownership. The ROM personality was
+	 * single-function; boot exposes Alpha and Beta. */
 	c->pdev->multifunction = 1;
 	pci_rescan_bus(c->pdev->bus);
-	pci_unlock_rescan_remove();
 	for (i = 0; i < 3; i++) {
 		ipc->function[i] = pci_get_domain_bus_and_slot(pci_domain_nr(c->pdev->bus),
 				c->pdev->bus->number, PCI_DEVFN(0, i));
@@ -385,7 +384,7 @@ static int enumerate_functions(struct centauri *c)
 	return 0;
 }
 
-int centauri_start_ipc(struct centauri *c)
+static int centauri_start_ipc_locked(struct centauri *c)
 {
 	struct centauri_ipc *ipc;
 	u32 stage;
@@ -478,6 +477,20 @@ failed:
 	return ret;
 }
 
+int centauri_start_ipc(struct centauri *c)
+{
+	int ret;
+
+	/* remove may hold this lock while cancelling the firmware worker.
+	 * Return before allocating/publishing anything when it is unavailable.
+	 */
+	if (!pci_trylock_rescan_remove())
+		return -EAGAIN;
+	ret = READ_ONCE(c->removing) ? -ECANCELED : centauri_start_ipc_locked(c);
+	pci_unlock_rescan_remove();
+	return ret;
+}
+
 void centauri_free_ipc(struct centauri *c)
 {
 	struct centauri_ipc *ipc = c->ipc;
@@ -494,6 +507,13 @@ void centauri_free_ipc(struct centauri *c)
 		if (!ipc->function[i])
 			continue;
 		pci_clear_master(ipc->function[i]);
+	}
+	for (i = 0; i < 3; i++) {
+		if (ipc->function[i] && !pci_wait_for_pending_transaction(ipc->function[i])) {
+			dev_warn(&c->pdev->dev,
+				 "retaining IPC DMA after pending transaction timeout\n");
+			return;
+		}
 	}
 	list_for_each_entry_safe(buffer, next, &ipc->buffers, list) {
 		dma_free_coherent(buffer->owner, buffer->size, buffer->cpu, buffer->dma);

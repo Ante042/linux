@@ -3520,6 +3520,15 @@ void pci_lock_rescan_remove(void)
 }
 EXPORT_SYMBOL_GPL(pci_lock_rescan_remove);
 
+/* Work cancelled by a PCI remove callback must not wait for the lock that
+ * the remover already holds. Callers retry only after leaving that work.
+ */
+bool pci_trylock_rescan_remove(void)
+{
+	return mutex_trylock(&pci_rescan_remove_lock);
+}
+EXPORT_SYMBOL_GPL(pci_trylock_rescan_remove);
+
 void pci_unlock_rescan_remove(void)
 {
 	mutex_unlock(&pci_rescan_remove_lock);

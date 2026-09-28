@@ -192,7 +192,9 @@ int t6050_pcie_cycle(struct t6050_pcie *pcie, struct pci_dev *endpoint)
 	if (!bridge || endpoint->vendor != PCI_VENDOR_ID_APPLE ||
 	    (endpoint->device != 0x1900 && endpoint->device != 0x1901))
 		return -ENODEV;
-	pci_lock_rescan_remove();
+	/* No endpoint mutation before acquiring PCI topology ownership. */
+	if (!pci_trylock_rescan_remove())
+		return -EAGAIN;
 	mutex_lock(&pcie->lock);
 	list_for_each_entry(sibling, &endpoint->bus->devices, bus_list) {
 		if (sibling != endpoint) {

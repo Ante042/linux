@@ -18,6 +18,7 @@
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/pci.h>
+#include <linux/property.h>
 #include <linux/random.h>
 #include <linux/seq_file.h>
 #include <linux/sizes.h>
@@ -54,9 +55,15 @@ static bool arm_auxiliary_rings;
 module_param(arm_auxiliary_rings, bool, 0444);
 MODULE_PARM_DESC(arm_auxiliary_rings, "Diagnostic: arm remaining native Beta resources and capture received frames privately");
 
-static bool native_startup;
-module_param(native_startup, bool, 0444);
-MODULE_PARM_DESC(native_startup, "Diagnostic: program a temporary address, InitDone and random seed before the first HCI reset");
+static int native_startup = -1;
+module_param(native_startup, int, 0444);
+MODULE_PARM_DESC(native_startup, "Native firmware initialization: -1=board default, 0=off, 1=on");
+
+static bool cen_native_startup_enabled(void)
+{
+	return native_startup < 0 ? of_machine_is_compatible("apple,j714s") :
+		native_startup;
+}
 
 static char *native_bdaddr;
 module_param(native_bdaddr, charp, 0400);
@@ -658,27 +665,38 @@ static int cen_hci_setup(struct hci_dev *hdev)
 {
 	struct cen_bt *bt = hci_get_drvdata(hdev);
 	u8 address[6], init_done[16], seed[24];
+	bool factory = of_machine_is_compatible("apple,j714s");
 	int ret;
 
-	if (!native_startup)
+	if (!cen_native_startup_enabled())
 		return 0;
 
-	/* Native PROXIMA initialization starts with these three commands, then
-	 * HCI Reset. The core calls setup before its ordinary reset/init sequence.
-	 * Address provisioning is still diagnostic. A saved test identity permits
-	 * bond reuse; otherwise generate a temporary locally administered address.
-	 * Native WriteBdAddr takes display/network byte order in either case.
+	/* J714s factory initialization and repeated radio power/discovery are
+	 * qualified with firmware27. Other boards retain their diagnostic gate.
+	 * J714s uses its native DT address in display/network byte order,
+	 * which is the vendor WriteBdAddr wire order. HCI Read BD_ADDR later
+	 * returns the standard little-endian form to the Bluetooth core.
 	 */
-	if (native_bdaddr && (!mac_pton(native_bdaddr, address) ||
-	    is_zero_ether_addr(address) || is_broadcast_ether_addr(address)))
-		return -EINVAL;
-	ret = get_random_bytes_wait(seed, sizeof(seed));
-	if (ret)
-		return ret;
-	if (!native_bdaddr) {
+	if (factory) {
+		if (device_property_count_u8(&bt->pdev->dev, "local-mac-address") != 6)
+			return -EINVAL;
+		ret = device_property_read_u8_array(&bt->pdev->dev, "local-mac-address",
+						    address, sizeof(address));
+		if (ret)
+			return ret;
+		if (is_zero_ether_addr(address) || is_broadcast_ether_addr(address))
+			return -EINVAL;
+	} else if (native_bdaddr) {
+		if (!mac_pton(native_bdaddr, address) || is_zero_ether_addr(address) ||
+		    is_broadcast_ether_addr(address))
+			return -EINVAL;
+	} else {
 		get_random_bytes(address, sizeof(address));
 		address[0] = (address[0] & 0xfc) | 0x02;
 	}
+	ret = get_random_bytes_wait(seed, sizeof(seed));
+	if (ret)
+		return ret;
 	memset(init_done, 0xff, sizeof(init_done));
 	ret = cen_vendor_command(hdev, 0xfc06, address, sizeof(address));
 	if (ret)
@@ -697,8 +715,9 @@ out:
 		bt_dev_err(hdev, "Native startup stopped after %u commands: %d",
 			   bt->native_startup_steps, ret);
 	else
-		bt_dev_info(hdev, "Native startup accepted; %s diagnostic address in use",
-			    native_bdaddr ? "configured" : "temporary");
+		bt_dev_info(hdev, "Native startup accepted; %s address in use",
+			    factory ? "factory" : native_bdaddr ? "configured diagnostic" :
+			    "temporary diagnostic");
 	return ret;
 }
 
@@ -856,7 +875,7 @@ static int cen_status_show(struct seq_file *s, void *unused)
 		   bt->hdev->stat.err_tx, bt->hdev->stat.err_rx);
 	seq_printf(s, "le_rings=%u le_rx_packets=%u\n", arm_le_data_rings, bt->le_rx_packets);
 	seq_printf(s, "native_startup=%u native_startup_steps=%u\n",
-		   native_startup, READ_ONCE(bt->native_startup_steps));
+		   cen_native_startup_enabled(), READ_ONCE(bt->native_startup_steps));
 	seq_printf(s, "native_hrb=%u hrb_supported=%u proprietary_features=0x%08x hrb_commands=%u hrb_status_events=%u hrb_pending=%u\n",
 		   native_hrb, READ_ONCE(bt->hrb_supported),
 		   READ_ONCE(bt->proprietary_features), bt->hrb_commands,
@@ -941,7 +960,9 @@ static int cen_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	skb_queue_head_init(&bt->le_txq);
 	if (enable_acl && (!arm_le_data_rings || !arm_auxiliary_rings))
 		return -EINVAL;
-	if (native_hrb && (!native_startup || !enable_acl))
+	if (native_startup < -1 || native_startup > 1)
+		return -EINVAL;
+	if (native_hrb && (!cen_native_startup_enabled() || !enable_acl))
 		return -EINVAL;
 	INIT_WORK(&bt->poll, cen_poll);
 	ret = pcim_enable_device(pdev);

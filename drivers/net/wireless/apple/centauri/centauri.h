@@ -6,6 +6,7 @@
 #include <linux/mutex.h>
 #include <linux/pci.h>
 #include <linux/sizes.h>
+#include <linux/workqueue.h>
 
 #define CEN_ALPHA_WINDOW_SIZE SZ_32M
 #define CEN_ALPHA_SCRATCH_OFFSET SZ_8M
@@ -26,6 +27,15 @@ struct cen_alpha_resources {
 	void __iomem *bar;
 	u32 index[4], mtr, mcr;
 };
+enum centauri_boot_phase {
+	CEN_BOOT_ROM,
+	CEN_BOOT_CYCLE,
+	CEN_BOOT_IPC,
+	CEN_BOOT_READY,
+	CEN_BOOT_FAILED,
+	CEN_BOOT_STOPPED,
+};
+
 struct centauri {
 	struct pci_dev *pdev;
 	void __iomem *bar;
@@ -33,6 +43,10 @@ struct centauri {
 	u32 stage_offset;
 	struct dentry *debug;
 	struct mutex boot_lock;
+	struct delayed_work boot_work;
+	enum centauri_boot_phase boot_phase;
+	int boot_error;
+	bool automatic_boot, removing;
 	void *firmware, *descriptor;
 	struct centauri_irqs irqs, alpha_irqs;
 	atomic_t irq_count;

@@ -5,6 +5,7 @@
 #include <linux/kconfig.h>
 struct pci_dev;
 #if IS_REACHABLE(CONFIG_PCIE_APPLE_X1N1)
+/* Returns -EAGAIN, without changing hardware, if PCI rescan/removal is busy. */
 int apple_x1n1_pcie_cycle(struct pci_dev *pdev);
 #else
 static inline int apple_x1n1_pcie_cycle(struct pci_dev *pdev)

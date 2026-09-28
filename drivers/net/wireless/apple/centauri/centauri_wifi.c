@@ -108,6 +108,7 @@ struct centauri_wifi {
 	u32 reply_command, channels_seen, scans_done, beacons_seen;
 	bool reply_valid, registered, configured;
 	bool stopping;
+	bool scan_abort, connect_abort;
 	u8 scan_sequence;
 	bool connecting, connected, connect_event, disconnect_event;
 	bool associated, pmk_seen, pmk_matches;
@@ -143,6 +144,10 @@ struct centauri_wifi {
 	bool tx_profile_valid;
 	u8 link_count, link_prime[3], link_channel[3], link_band[3], emlsr_mode;
 	bool link_status_valid, emlsr_valid;
+	s8 station_signal;
+	bool station_signal_valid;
+	unsigned long station_signal_at, connected_at;
+	struct net_device_stats station_start;
 	u16 link_status_size;
 	u16 link_tags[12], link_lengths[12];
 	u8 link_tlv_count;
@@ -676,6 +681,14 @@ static void drain(struct centauri_wifi *wifi)
 							wifi->link_tags[wifi->link_tlv_count] = tag;
 							wifi->link_lengths[wifi->link_tlv_count++] = length;
 						}
+						/* Native27 getRssi's callback reads signed byte1 from
+						 * the115-byte interface-info TLV268 (180a1ba0c).
+						 */
+						if (tag == 268 && length >= 115) {
+							wifi->station_signal = (s8)value[1];
+							wifi->station_signal_valid = wifi->station_signal != 0;
+							wifi->station_signal_at = jiffies;
+						}
 						/* ACIDebugAdapter::dumpMloStatus, TLVs 377/378.
 						 * Keep only link count/channel/role. Do not retain MACs.
 						 */
@@ -867,7 +880,10 @@ static int scan_native27(struct centauri_wifi *wifi)
 		size_t size = 14;
 		unsigned long deadline;
 		int ret;
+		bool abort_sent = false;
 
+		if (READ_ONCE(wifi->scan_abort))
+			return -ECANCELED;
 		memset(scan, 0, sizeof(scan));
 		scan[0] = (++wifi->scan_sequence) & 0x1f;
 		scan[3] = 0x80;
@@ -930,12 +946,20 @@ static int scan_native27(struct centauri_wifi *wifi)
 				return -EIO;
 			if (wifi->scans_done != done)
 				break;
+			if (READ_ONCE(wifi->scan_abort) && !abort_sent) {
+				ret = command(wifi, 65537, NULL, 0);
+				if (ret)
+					return ret;
+				abort_sent = true;
+			}
 			usleep_range(1000, 2000);
 		} while (time_before(jiffies, deadline));
 		if (wifi->scans_done == done) {
 			command(wifi, 65537, NULL, 0);
 			return -ETIMEDOUT;
 		}
+		if (READ_ONCE(wifi->scan_abort))
+			return -ECANCELED;
 	}
 	return 0;
 }
@@ -950,6 +974,10 @@ static void scan_worker(struct work_struct *work)
 	int ret = 0;
 
 	mutex_lock(&wifi->lock);
+	if (READ_ONCE(wifi->scan_abort) || READ_ONCE(wifi->stopping)) {
+		ret = -ECANCELED;
+		goto completed;
+	}
 	if (of_machine_is_compatible("apple,j714s")) {
 		ret = scan_native27(wifi);
 		goto completed;
@@ -970,7 +998,8 @@ static void scan_worker(struct work_struct *work)
 				ret = -EIO;
 				break;
 			}
-			if (!stopped && wifi->channels_seen - channels >= 8) {
+			if (!stopped && (wifi->channels_seen - channels >= 8 ||
+			    READ_ONCE(wifi->scan_abort))) {
 				stopped = true;
 				ret = command(wifi, 65537, NULL, 0);
 				if (ret)
@@ -982,9 +1011,11 @@ static void scan_worker(struct work_struct *work)
 		} while (time_before(jiffies, deadline));
 		if (!ret && wifi->scans_done == done)
 			ret = -ETIMEDOUT;
+		if (READ_ONCE(wifi->scan_abort))
+			ret = -ECANCELED;
 	}
 completed:
-	info.aborted = !!ret;
+	info.aborted = !!ret || READ_ONCE(wifi->scan_abort) || READ_ONCE(wifi->stopping);
 	request = wifi->scan_request;
 	wifi->scan_request = NULL;
 	mutex_unlock(&wifi->lock);
@@ -1000,16 +1031,62 @@ static int wifi_scan(struct wiphy *wiphy, struct cfg80211_scan_request *request)
 	int ret = 0;
 
 	mutex_lock(&wifi->lock);
-	if (!wifi->configured)
+	if (READ_ONCE(wifi->stopping))
+		ret = -ENODEV;
+	else if (!wifi->configured)
 		ret = -ENETDOWN;
 	else if (wifi->scan_request || wifi->connecting)
 		ret = -EBUSY;
 	else {
+		WRITE_ONCE(wifi->scan_abort, false);
 		wifi->scan_request = request;
 		schedule_work(&wifi->scan_work);
 	}
 	mutex_unlock(&wifi->lock);
 	return ret;
+}
+
+/* cfg80211 owns the scan request until its one scan_done callback. The
+ * worker observes cancellation without requiring its command mutex.
+ */
+static void wifi_abort_scan(struct wiphy *wiphy, struct wireless_dev *wdev)
+{
+	struct centauri_wifi *wifi = *(struct centauri_wifi **)wiphy_priv(wiphy);
+
+	if (wdev == &wifi->wdev)
+		WRITE_ONCE(wifi->scan_abort, true);
+}
+
+static void cancel_scan(struct centauri_wifi *wifi)
+{
+	struct cfg80211_scan_info info = { .aborted = true };
+	struct cfg80211_scan_request *request;
+
+	WRITE_ONCE(wifi->scan_abort, true);
+	cancel_work_sync(&wifi->scan_work);
+	mutex_lock(&wifi->lock);
+	request = wifi->scan_request;
+	wifi->scan_request = NULL;
+	mutex_unlock(&wifi->lock);
+	/* A queued worker can be cancelled before it owns this completion. */
+	if (request)
+		cfg80211_scan_done(request, &info);
+}
+
+/* Only a still-pending attempt owns a terminal connection event. This also
+ * covers cancellation before its worker starts and touches firmware.
+ */
+static void cancel_connect_locked(struct centauri_wifi *wifi)
+{
+	if (!wifi->connecting)
+		return;
+	wifi->connecting = false;
+	wifi->connected = false;
+	memzero_explicit(wifi->connect_payload, sizeof(wifi->connect_payload));
+	memzero_explicit(wifi->expected_pmk, sizeof(wifi->expected_pmk));
+	cfg80211_connect_timeout(wifi->netdev, wifi->bssid,
+		wifi->request_ie, wifi->request_ie_size, GFP_KERNEL,
+		NL80211_TIMEOUT_UNSPECIFIED);
 }
 
 static int rsn_caps_offset(const u8 *body, size_t size)
@@ -1076,6 +1153,10 @@ static int wifi_connect(struct wiphy *wiphy, struct net_device *netdev,
 	if (!rsn || rsn_caps_offset(rsn + 2, rsn[1]) < 0)
 		return -EINVAL;
 	mutex_lock(&wifi->lock);
+	if (READ_ONCE(wifi->stopping)) {
+		ret = -ENODEV;
+		goto out;
+	}
 	if (!wifi->configured || wifi->connecting || wifi->connected || wifi->scan_request) {
 		ret = -EBUSY;
 		goto out;
@@ -1149,6 +1230,7 @@ static int wifi_connect(struct wiphy *wiphy, struct net_device *netdev,
 	wifi->connect_size = size;
 	memcpy(wifi->request_ie, params->ie, params->ie_len);
 	wifi->request_ie_size = params->ie_len;
+	WRITE_ONCE(wifi->connect_abort, false);
 	wifi->connecting = true;
 	wifi->connect_status = 0;
 	wifi->associated = wifi->pmk_seen = wifi->pmk_matches = false;
@@ -1169,12 +1251,18 @@ static void connect_worker(struct work_struct *work)
 	int ret;
 
 	mutex_lock(&wifi->lock);
+	if (READ_ONCE(wifi->connect_abort) || READ_ONCE(wifi->stopping)) {
+		cancel_connect_locked(wifi);
+		mutex_unlock(&wifi->lock);
+		return;
+	}
 	slot = wifi->command_head;
 	ret = command(wifi, 131072, wifi->connect_payload, wifi->connect_size);
 	command_status = wifi->reply_status;
 	memzero_explicit(wifi->connect_payload, sizeof(wifi->connect_payload));
 	deadline = jiffies + msecs_to_jiffies(15000);
-	while (!ret && !wifi->connect_event && time_before(jiffies, deadline)) {
+	while (!ret && !wifi->connect_event && !READ_ONCE(wifi->connect_abort) &&
+	       !READ_ONCE(wifi->stopping) && time_before(jiffies, deadline)) {
 		drain(wifi);
 		if (link_diagnostics && wifi->associated && !queried_link) {
 			unsigned int i;
@@ -1221,31 +1309,49 @@ static void connect_worker(struct work_struct *work)
 				 "Wi-Fi firmware key check: rc=%d available=%d matches=%d\n",
 				 key_ret, wifi->pmk_seen, wifi->pmk_matches);
 		}
+		if (wifi->disconnect_event)
+			ret = -ENOTCONN;
 		if (readl(wifi->a.bar + 8) != 2)
 			ret = -EIO;
 		usleep_range(1000, 2000);
 	}
-	if (!ret && !wifi->connect_event)
+	if (READ_ONCE(wifi->connect_abort) || READ_ONCE(wifi->stopping))
+		ret = -ECANCELED;
+	else if (!ret && !wifi->connect_event)
 		ret = -ETIMEDOUT;
 	status = !ret && wifi->connect_status == 0 ? WLAN_STATUS_SUCCESS : WLAN_STATUS_UNSPECIFIED_FAILURE;
 	wifi->connecting = false;
 	wifi->connected = status == WLAN_STATUS_SUCCESS;
+	wifi->station_signal_valid = false;
+	if (wifi->connected) {
+		wifi->connected_at = jiffies;
+		wifi->station_signal_at = jiffies - HZ;
+		wifi->station_start = wifi->netdev->stats;
+	}
 	memzero_explicit(wifi->expected_pmk, sizeof(wifi->expected_pmk));
 	/* The command and connection completion have consumed the PMK buffer. */
 	if (slot < ring_size[1])
 		memzero_explicit(wifi->a.window + TX_BUFFER + slot * BUFFER_SIZE, BUFFER_SIZE);
-	mutex_unlock(&wifi->lock);
 	dev_info(&wifi->control->pdev->dev,
 		 "Wi-Fi authentication result: rc=%d command_status=%u event_status=%u complete_event=%d\n",
 		 ret, command_status, wifi->connect_status, wifi->connect_event);
-	cfg80211_connect_result(wifi->netdev, wifi->bssid,
-		wifi->request_ie, wifi->request_ie_size, NULL, 0, status, GFP_KERNEL);
+	/* These cfg80211 APIs queue events without acquiring the wiphy mutex.
+	 * Serialize notification and carrier state with local/remote disconnect.
+	 */
+	if (ret == -ECANCELED || ret == -ETIMEDOUT)
+		cfg80211_connect_timeout(wifi->netdev, wifi->bssid,
+			wifi->request_ie, wifi->request_ie_size, GFP_KERNEL,
+			NL80211_TIMEOUT_UNSPECIFIED);
+	else
+		cfg80211_connect_result(wifi->netdev, wifi->bssid,
+			wifi->request_ie, wifi->request_ie_size, NULL, 0, status, GFP_KERNEL);
 	if (status == WLAN_STATUS_SUCCESS && !READ_ONCE(wifi->stopping)) {
 		netif_carrier_on(wifi->netdev);
 		if (wifi->data_probe_done & BIT(5))
 			netif_wake_queue(wifi->netdev);
 		schedule_work(&wifi->link_work);
 	}
+	mutex_unlock(&wifi->lock);
 }
 
 irqreturn_t centauri_alpha_irq(int irq, void *data)
@@ -1274,13 +1380,13 @@ static void link_worker(struct work_struct *work)
 		readl(wifi->a.bar + 8) != 2;
 	if (disconnected)
 		wifi->connected = false;
-	mutex_unlock(&wifi->lock);
 	if (disconnected && was_connected) {
 		netif_stop_queue(wifi->netdev);
 		skb_queue_purge(&wifi->data_tx_queue);
 		netif_carrier_off(wifi->netdev);
 		cfg80211_disconnected(wifi->netdev, WLAN_REASON_UNSPECIFIED, NULL, 0, false, GFP_KERNEL);
 	}
+	mutex_unlock(&wifi->lock);
 }
 
 static int wifi_disconnect(struct wiphy *wiphy, struct net_device *netdev, u16 reason)
@@ -1288,27 +1394,33 @@ static int wifi_disconnect(struct wiphy *wiphy, struct net_device *netdev, u16 r
 	struct centauri_wifi *wifi = *(struct centauri_wifi **)wiphy_priv(wiphy);
 	u8 payload[16] = {};
 	bool connected;
+	u16 reply_status;
 	int ret;
 
+	/* The running worker holds wifi->lock while waiting for firmware.
+	 * Signal it first, then join it without either driver mutex held.
+	 */
+	WRITE_ONCE(wifi->connect_abort, true);
+	cancel_scan(wifi);
+	cancel_work_sync(&wifi->connect_work);
 	mutex_lock(&wifi->lock);
-	if (wifi->connecting) {
-		mutex_unlock(&wifi->lock);
-		return -EBUSY;
-	}
+	cancel_connect_locked(wifi);
 	put_unaligned_le16(reason, payload);
 	put_unaligned_le16(328, payload + 8);
 	put_unaligned_le16(4, payload + 10);
-	ret = command(wifi, 131073, payload, sizeof(payload));
+	ret = READ_ONCE(wifi->stopping) ? 0 :
+		command(wifi, 131073, payload, sizeof(payload));
+	reply_status = wifi->reply_status;
 	connected = wifi->connected;
 	wifi->connected = false;
-	mutex_unlock(&wifi->lock);
-	cancel_work_sync(&wifi->link_work);
 	netif_stop_queue(netdev);
 	skb_queue_purge(&wifi->data_tx_queue);
 	netif_carrier_off(netdev);
 	if (connected)
 		cfg80211_disconnected(netdev, reason, NULL, 0, true, GFP_KERNEL);
-	return ret == -EREMOTEIO && wifi->reply_status == 326 ? 0 : ret;
+	mutex_unlock(&wifi->lock);
+	cancel_work_sync(&wifi->link_work);
+	return ret == -EREMOTEIO && reply_status == 326 ? 0 : ret;
 }
 
 static int wifi_power_mgmt(struct wiphy *wiphy, struct net_device *netdev,
@@ -1345,11 +1457,74 @@ static void wifi_regulatory(struct wiphy *wiphy, struct regulatory_request *requ
 	mutex_unlock(&wifi->lock);
 }
 
+/* On-demand status only: no periodic firmware query or traffic polling.
+ * Report host-accounted Ethernet counters separately from unproved PHY rates.
+ * Caller holds wifi->lock and has checked the currently associated peer.
+ */
+static void fill_station(struct centauri_wifi *wifi, struct station_info *sinfo)
+{
+	const struct net_device_stats *stats = &wifi->netdev->stats;
+
+	if (time_after_eq(jiffies, wifi->station_signal_at + HZ)) {
+		wifi->station_signal_valid = false;
+		wifi->station_signal_at = jiffies;
+		query_link_status(wifi);
+	}
+	sinfo->filled |= BIT_ULL(NL80211_STA_INFO_CONNECTED_TIME) |
+		BIT_ULL(NL80211_STA_INFO_RX_BYTES64) | BIT_ULL(NL80211_STA_INFO_TX_BYTES64) |
+		BIT_ULL(NL80211_STA_INFO_RX_PACKETS) | BIT_ULL(NL80211_STA_INFO_TX_PACKETS);
+	sinfo->connected_time = (jiffies - wifi->connected_at) / HZ;
+	sinfo->rx_bytes = stats->rx_bytes - wifi->station_start.rx_bytes;
+	sinfo->tx_bytes = stats->tx_bytes - wifi->station_start.tx_bytes;
+	sinfo->rx_packets = stats->rx_packets - wifi->station_start.rx_packets;
+	sinfo->tx_packets = stats->tx_packets - wifi->station_start.tx_packets;
+	if (wifi->station_signal_valid) {
+		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_SIGNAL);
+		sinfo->signal = wifi->station_signal;
+	}
+}
+
+static int wifi_get_station(struct wiphy *wiphy, struct wireless_dev *wdev,
+			    const u8 *mac, struct station_info *sinfo)
+{
+	struct centauri_wifi *wifi = *(struct centauri_wifi **)wiphy_priv(wiphy);
+	int ret = 0;
+
+	mutex_lock(&wifi->lock);
+	if (wdev != &wifi->wdev || !wifi->connected || READ_ONCE(wifi->stopping) ||
+	    !ether_addr_equal(mac, wifi->bssid))
+		ret = -ENOENT;
+	else
+		fill_station(wifi, sinfo);
+	mutex_unlock(&wifi->lock);
+	return ret;
+}
+
+static int wifi_dump_station(struct wiphy *wiphy, struct wireless_dev *wdev,
+			     int index, u8 *mac, struct station_info *sinfo)
+{
+	struct centauri_wifi *wifi = *(struct centauri_wifi **)wiphy_priv(wiphy);
+	int ret = 0;
+
+	mutex_lock(&wifi->lock);
+	if (index || wdev != &wifi->wdev || !wifi->connected || READ_ONCE(wifi->stopping))
+		ret = -ENOENT;
+	else {
+		ether_addr_copy(mac, wifi->bssid);
+		fill_station(wifi, sinfo);
+	}
+	mutex_unlock(&wifi->lock);
+	return ret;
+}
+
 static const struct cfg80211_ops wifi_ops = {
 	.scan = wifi_scan,
+	.abort_scan = wifi_abort_scan,
 	.connect = wifi_connect,
 	.disconnect = wifi_disconnect,
 	.set_power_mgmt = wifi_power_mgmt,
+	.get_station = wifi_get_station,
+	.dump_station = wifi_dump_station,
 };
 
 static int data_start(struct centauri_wifi *wifi);
@@ -1465,6 +1640,10 @@ static ssize_t fwlog_start_write(struct file *file, const char __user *input,
 		return ret ?: -EINVAL;
 	mutex_lock(&wifi->lock);
 	mutex_lock(&wifi->fwlog_lock);
+	if (READ_ONCE(wifi->stopping)) {
+		ret = -ENODEV;
+		goto out;
+	}
 	if (!wifi->configured || wifi->connecting || wifi->connected || wifi->scan_request) {
 		ret = -EBUSY;
 		goto out;
@@ -2445,14 +2624,17 @@ int centauri_wifi_register(struct centauri *c)
 	SET_NETDEV_DEV(wifi->netdev, &c->pdev->dev);
 	strscpy(wifi->netdev->name, "wlan%d", IFNAMSIZ);
 	wifi->netdev->max_mtu = ETH_DATA_LEN;
-	ret = register_netdev(wifi->netdev);
-	if (ret)
-		goto failed;
+	/* Userspace can open the interface as soon as it is registered. Finish
+	 * firmware setup before publication so that first open is usable.
+	 */
 	ret = radio_start(wifi);
 	if (ret) {
 		dev_err(&c->pdev->dev, "Wi-Fi ring/interface setup failed: %d\n", ret);
 		goto failed;
 	}
+	ret = register_netdev(wifi->netdev);
+	if (ret)
+		goto failed;
 	dev_info(&c->pdev->dev, "cfg80211 interface %s ready; data rings initialize on interface open\n",
 		 wifi->netdev->name);
 	smp_store_release(&wifi->irq_ready, true);
@@ -2491,6 +2673,8 @@ void centauri_wifi_unregister(struct centauri *c)
 	if (!wifi)
 		return;
 	WRITE_ONCE(wifi->stopping, true);
+	WRITE_ONCE(wifi->connect_abort, true);
+	WRITE_ONCE(wifi->scan_abort, true);
 	smp_store_release(&c->wifi, NULL);
 	/* A handler that observed the old pointer must finish before any work
 	 * item or Wi-Fi storage can be freed. Later IRQs observe NULL.
@@ -2516,16 +2700,13 @@ void centauri_wifi_unregister(struct centauri *c)
 	debugfs_remove(wifi->fwlog_status_file);
 	debugfs_remove(wifi->fwlog_buffer_file);
 	debugfs_remove(wifi->fwlog_ack_file);
-	cancel_work_sync(&wifi->scan_work);
+	cancel_scan(wifi);
 	cancel_work_sync(&wifi->connect_work);
 	cancel_work_sync(&wifi->link_work);
+	mutex_lock(&wifi->lock);
+	cancel_connect_locked(wifi);
+	mutex_unlock(&wifi->lock);
 	skb_queue_purge(&wifi->data_tx_queue);
-	if (wifi->scan_request) {
-		struct cfg80211_scan_info info = { .aborted = true };
-
-		cfg80211_scan_done(wifi->scan_request, &info);
-		wifi->scan_request = NULL;
-	}
 	if (wifi->netdev && wifi->netdev->reg_state == NETREG_REGISTERED)
 		unregister_netdev(wifi->netdev);
 	if (wifi->registered)

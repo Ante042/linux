@@ -4,6 +4,7 @@
  * J813 prototype. Firmware execution and radio operations are separate gates.
  */
 #include <linux/debugfs.h>
+#include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/firmware.h>
 #include <linux/io.h>
@@ -20,6 +21,10 @@
 #include "centauri.h"
 
 static struct dentry *centauri_debug;
+
+static bool auto_boot = true;
+module_param(auto_boot, bool, 0444);
+MODULE_PARM_DESC(auto_boot, "Boot J714s firmware automatically (disable only for manual diagnostics)");
 
 /* Fixed counts follow the native Control/Alpha/Beta resource maps. PCI's MSI
  * allocator owns the message addresses and data; never program a DMA mailbox.
@@ -81,6 +86,8 @@ static int centauri_status_show(struct seq_file *s, void *unused)
 	seq_printf(s, "transport=hardware-pci firmware_boot=%s image_response=%#x wifi=%s\n",
 		   c->boot_attempted ? "attempted" : "not-started", c->image_response,
 		   READ_ONCE(c->wifi) ? "registered" : "not-owned-by-this-function");
+	seq_printf(s, "automatic_boot=%u boot_phase=%u boot_error=%d\n",
+		   c->automatic_boot, READ_ONCE(c->boot_phase), READ_ONCE(c->boot_error));
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(centauri_status);
@@ -103,6 +110,10 @@ static void centauri_free_boot(struct centauri *c)
 	centauri_free_ipc(c);
 	pci_clear_master(c->pdev);
 	centauri_free_irqs(&c->irqs);
+	if (c->ipc || !pci_wait_for_pending_transaction(c->pdev)) {
+		dev_warn(dev, "retaining boot DMA until outstanding transactions stop\n");
+		return;
+	}
 	if (c->firmware)
 		dma_free_coherent(dev, c->firmware_size, c->firmware, c->firmware_dma);
 	if (c->descriptor)
@@ -149,9 +160,18 @@ static int centauri_rom_boot(struct centauri *c)
 	stage = readl(c->bar + 0x8000);
 	if (stage != 0 && stage != 4 && stage != 1)
 		return -EBUSY;
-	ret = request_firmware(&fw, profile->firmware, dev);
-	if (ret)
+	/* The initramfs/root must provide the personalized FTAB. Never wait for
+	 * a userspace fallback while remove is cancelling this worker.
+	 */
+	ret = request_firmware_direct(&fw, profile->firmware, dev);
+	if (ret) {
+		dev_err(dev, "required firmware %s unavailable: %d\n", profile->firmware, ret);
 		return ret;
+	}
+	if (READ_ONCE(c->removing)) {
+		ret = -ECANCELED;
+		goto release;
+	}
 	if (fw->size < 0x30 || fw->size > SZ_64M ||
 	    memcmp(fw->data + 0x20, "rkosftab", 8)) {
 		ret = -EINVAL;
@@ -190,13 +210,20 @@ static int centauri_rom_boot(struct centauri *c)
 	}
 	writel(1, c->bar + 0x9000);
 	ret = readl_poll_timeout(c->bar + 0x8040, c->image_response,
-				c->image_response != 0, 20000, 20000000);
+				READ_ONCE(c->removing) || c->image_response != 0, 20000, 20000000);
+	if (READ_ONCE(c->removing)) {
+		ret = -ECANCELED;
+		goto release;
+	}
 	if (!ret && c->image_response != 1)
 		ret = -EIO;
 	if (!ret)
-		ret = readl_poll_timeout(c->bar + 0x8000, stage, stage != 0, 20000, 20000000);
+		ret = readl_poll_timeout(c->bar + 0x8000, stage,
+				READ_ONCE(c->removing) || stage != 0, 20000, 20000000);
 	else
 		stage = readl(c->bar + 0x8000);
+	if (READ_ONCE(c->removing))
+		ret = -ECANCELED;
 	dma_rmb();
 	dev_info(dev, "ROM firmware result: response=%#x stage=%#x irqs=%d poll=%d\n",
 		 c->image_response, stage, atomic_read(&c->irq_count), ret);
@@ -211,6 +238,79 @@ release:
 	return ret;
 }
 
+static int centauri_cycle(struct centauri *c)
+{
+	int ret;
+
+	if (!c->firmware || !c->link_ready || readl(c->bar + 0x8000) != 4)
+		return -EBUSY;
+	c->link_ready = false;
+	ret = of_machine_is_compatible("apple,j714s") ?
+		apple_x1n1_pcie_cycle(c->pdev) : centauri_j813_port_cycle(c->pdev);
+	if (ret == -EAGAIN) {
+		/* Topology contention returns before any endpoint mutation. */
+		c->link_ready = true;
+	} else if (!ret) {
+		pci_restore_msi_state(c->pdev);
+		c->link_ready = true;
+		dev_info(&c->pdev->dev, "post-reset execution stage=%#x\n",
+			 readl(c->bar + 0x8000));
+	}
+	return ret;
+}
+
+static void centauri_boot_worker(struct work_struct *work)
+{
+	struct centauri *c = container_of(to_delayed_work(work), struct centauri, boot_work);
+	bool retry = false;
+	int ret;
+
+	mutex_lock(&c->boot_lock);
+	while (!READ_ONCE(c->removing)) {
+		switch (c->boot_phase) {
+		case CEN_BOOT_ROM:
+			ret = centauri_rom_boot(c);
+			if (!ret)
+				c->boot_phase = readl(c->bar + 0x8000) == 1 ?
+					CEN_BOOT_IPC : CEN_BOOT_CYCLE;
+			break;
+		case CEN_BOOT_CYCLE:
+			ret = centauri_cycle(c);
+			if (!ret)
+				c->boot_phase = CEN_BOOT_IPC;
+			break;
+		case CEN_BOOT_IPC:
+			ret = centauri_start_ipc(c);
+			if (!ret) {
+				c->boot_phase = CEN_BOOT_READY;
+				dev_info(&c->pdev->dev, "N1 automatic firmware startup complete\n");
+			}
+			break;
+		default:
+			goto out;
+		}
+		if (ret == -EAGAIN && (c->boot_phase == CEN_BOOT_CYCLE ||
+		    (c->boot_phase == CEN_BOOT_IPC && !c->ipc))) {
+			/* Only lock contention is retryable. No firmware phase repeats. */
+			retry = true;
+			break;
+		}
+		if (ret) {
+			c->boot_error = ret;
+			dev_err(&c->pdev->dev, "N1 automatic startup failed in phase%u: %d\n",
+				c->boot_phase, ret);
+			c->boot_phase = CEN_BOOT_FAILED;
+			break;
+		}
+	}
+out:
+	if (READ_ONCE(c->removing))
+		c->boot_phase = CEN_BOOT_STOPPED;
+	mutex_unlock(&c->boot_lock);
+	if (retry && !READ_ONCE(c->removing))
+		queue_delayed_work(system_long_wq, &c->boot_work, msecs_to_jiffies(20));
+}
+
 static ssize_t centauri_boot_write(struct file *file, const char __user *buffer,
 				  size_t count, loff_t *pos)
 {
@@ -221,24 +321,16 @@ static ssize_t centauri_boot_write(struct file *file, const char __user *buffer,
 	if (ret || value < 1 || value > 3)
 		return ret ?: -EINVAL;
 	mutex_lock(&c->boot_lock);
-	if (value == 1) {
-		ret = centauri_rom_boot(c);
-	} else if (value == 3) {
-		ret = centauri_start_ipc(c);
-	} else if (!c->firmware || !c->link_ready || readl(c->bar + 0x8000) != 4) {
+	if (READ_ONCE(c->removing))
+		ret = -ENODEV;
+	else if (c->automatic_boot)
 		ret = -EBUSY;
-	} else {
-		c->link_ready = false;
-		ret = of_machine_is_compatible("apple,j714s") ?
-			apple_x1n1_pcie_cycle(c->pdev) :
-			centauri_j813_port_cycle(c->pdev);
-		if (!ret) {
-			pci_restore_msi_state(c->pdev);
-			c->link_ready = true;
-			dev_info(&c->pdev->dev, "post-reset execution stage=%#x\n",
-				 readl(c->bar + 0x8000));
-		}
-	}
+	else if (value == 1)
+		ret = centauri_rom_boot(c);
+	else if (value == 3)
+		ret = centauri_start_ipc(c);
+	else
+		ret = centauri_cycle(c);
 	mutex_unlock(&c->boot_lock);
 	return ret ?: count;
 }
@@ -265,6 +357,9 @@ static int centauri_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	atomic_set(&c->irq_count, 0);
 	c->link_ready = true;
 	mutex_init(&c->boot_lock);
+	INIT_DELAYED_WORK(&c->boot_work, centauri_boot_worker);
+	c->boot_phase = CEN_BOOT_ROM;
+	c->automatic_boot = auto_boot && of_machine_is_compatible("apple,j714s");
 	c->stage_offset = id->driver_data;
 	ret = pcim_enable_device(pdev);
 	if (ret)
@@ -294,6 +389,8 @@ static int centauri_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	c->debug = debugfs_create_dir(pci_name(pdev), centauri_debug);
 	debugfs_create_file("status", 0400, c->debug, c, &centauri_status_fops);
 	debugfs_create_file("rom_boot", 0200, c->debug, c, &centauri_boot_fops);
+	if (c->automatic_boot)
+		queue_delayed_work(system_long_wq, &c->boot_work, 0);
 	return 0;
 }
 
@@ -301,9 +398,17 @@ static void centauri_remove(struct pci_dev *pdev)
 {
 	struct centauri *c = pci_get_drvdata(pdev);
 
-	centauri_wifi_unregister(c);
+	/* PCI remove can already own the global rescan lock. The worker uses
+	 * only trylock on that path and observes this before requeueing.
+	 */
+	WRITE_ONCE(c->removing, true);
 	debugfs_remove_recursive(c->debug);
+	cancel_delayed_work_sync(&c->boot_work);
+	mutex_lock(&c->boot_lock);
+	centauri_wifi_unregister(c);
 	centauri_free_boot(c);
+	c->boot_phase = CEN_BOOT_STOPPED;
+	mutex_unlock(&c->boot_lock);
 }
 
 static const struct pci_device_id centauri_ids[] = {
@@ -318,6 +423,7 @@ static struct pci_driver centauri_driver = {
 	.id_table = centauri_ids,
 	.probe = centauri_probe,
 	.remove = centauri_remove,
+	.shutdown = centauri_remove,
 };
 
 static int __init centauri_init(void)
