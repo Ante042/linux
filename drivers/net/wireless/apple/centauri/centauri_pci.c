@@ -61,22 +61,46 @@ static void centauri_free_boot(struct centauri *c)
 	c->firmware = c->descriptor = c->msi_page = NULL;
 }
 
+struct centauri_host_profile {
+	const char *compatible;
+	const char *firmware;
+	u32 platform_id;
+};
+
+static const struct centauri_host_profile centauri_host_profiles[] = {
+	{ "apple,j813", "apple/centauri/j813-ftab.bin", 0x00248142 },
+	/* Native CentauriBooter packs chip[15:0] and board[14:0] at bit16.
+	 * J714s ADT: chip0x6050, board8; use its personalized firmware. */
+	{ "apple,j714s", "apple/centauri/j714s-ftab.bin", 0x00086050 },
+};
+
+static const struct centauri_host_profile *centauri_host_profile(void)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(centauri_host_profiles); i++)
+		if (of_machine_is_compatible(centauri_host_profiles[i].compatible))
+			return &centauri_host_profiles[i];
+	return NULL;
+}
+
 static int centauri_rom_boot(struct centauri *c)
 {
 	const struct firmware *fw;
+	const struct centauri_host_profile *profile = centauri_host_profile();
 	struct device *dev = &c->pdev->dev;
 	u32 stage;
 	int ret;
 
 	if ((c->pdev->device != 0x1900 && c->pdev->device != 0x1901) ||
-	    !of_machine_is_compatible("apple,j813"))
+	    !profile)
 		return -ENODEV;
 	if (!c->link_ready || c->boot_attempted)
 		return -EBUSY;
 	stage = readl(c->bar + 0x8000);
 	if (stage != 0 && stage != 4 && stage != 1)
 		return -EBUSY;
-	ret = request_firmware(&fw, "apple/centauri/j813-ftab.bin", dev);
+	ret = request_firmware(&fw, profile->firmware, dev);
 	if (ret)
 		return ret;
 	if (fw->size < 0x30 || fw->size > SZ_64M ||
@@ -116,7 +140,7 @@ static int centauri_rom_boot(struct centauri *c)
 	pci_write_config_word(c->pdev, c->msi_cap + PCI_MSI_FLAGS,
 		(c->msi_original & ~PCI_MSI_FLAGS_QSIZE) | PCI_MSI_FLAGS_ENABLE);
 	pci_set_master(c->pdev);
-	writel(0x00248142, c->bar + 0x807c); /* J813 board 0x24, T8142 chip. */
+	writel(profile->platform_id, c->bar + 0x807c);
 	writel(0, c->bar + 0x803c);
 	writel(lower_32_bits(c->descriptor_dma), c->bar + 0x8044);
 	writel(upper_32_bits(c->descriptor_dma), c->bar + 0x8048);
@@ -276,3 +300,4 @@ module_exit(centauri_exit);
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Apple N1 Centauri native PCI and ACIPC bring-up backend");
 MODULE_FIRMWARE("apple/centauri/j813-ftab.bin");
+MODULE_FIRMWARE("apple/centauri/j714s-ftab.bin");
