@@ -128,10 +128,24 @@ explicitly. Its integer-only calculation reproduces native binary32 size
 rounding without using floating point in the kernel. Native arithmetic and
 layout checks pass; runtime query values/presentation are not tested.
 
-The native AP swap entry copies both flag words from its caller; the A408
-serializer only copies the record. This establishes layout, not that Neo's
-0x34865202/4 policy or gap bytes 2/3 are correct for this display. They remain
-unqualified pending caller-side or firmware-behavior evidence.
+The matching 26A428 Recovery image's IOMobileFramebuffer library resolves
+the previously opaque swap fields. Its _kern_SwapBegin clears the 0x6e0-byte
+record at context+0x18. _kern_SwapDebugInfo at 0x18e0c365c stores its two u64
+arguments at context+0x58: record offsets 0x40/0x48 are debug data, not mode
+flags. _kern_SwapSetEventWait writes per-layer u64 values at record+0x50;
+_kern_SwapSetEventSignalOnGlass writes at 0x70; _kern_SwapSetEventSignal
+writes per-layer values at 0x78. Corresponding shared-event port handles
+are supplied separately by these setters.
+
+The 27.0 structure names these fields and asserts their offsets. This
+Linux driver supplies no IOSurface shared-event handles, so it preserves
+the cleared native defaults instead of replaying Neo's captured debug
+words 0x34865202/4 and event values 2/3. Legacy 26.x behavior is unchanged.
+The reference library text SHA-256 is
+86598dec087d1a8919da72a545fafe4e084b50944385a909c7e02723413a4343.
+Executing its standalone debug setter against a private user buffer and
+comparing compiled structure offsets confirms this layout; it is not a
+hardware pageflip test.
 
 The current SPTM DART backend uses a low-4-GiB DMA aperture with optional
 bit-40 force, disables a SID during attachment, and attaches a fresh root.

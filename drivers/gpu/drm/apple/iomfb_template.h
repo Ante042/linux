@@ -22,6 +22,14 @@ struct DCP_FW_NAME(dcp_swap) {
 	u64 timestamp[7];
 	u64 unk_38;
 
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0)
+	/* _kern_SwapDebugInfo in the matching26A428 userspace library. */
+	u64 debug_info[2];
+	/* IOSurface shared-event values; Linux supplies no event handles. */
+	u64 event_wait[SWAP_SURFACES];
+	u64 event_signal_on_glass;
+	u64 event_signal[SWAP_SURFACES];
+#else
 	u64 flags1;
 	u64 flags2;
 
@@ -37,6 +45,7 @@ struct DCP_FW_NAME(dcp_swap) {
 	 * (at +0x50 and +0x78) are small counters we do not model yet.
 	 */
 	u8 h17p_pre_swap_id[0x48];
+#endif
 #endif
 
 	u32 swap_id;

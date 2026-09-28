@@ -43,7 +43,14 @@
 #define REG_DOORBELL_BIT(idx) (2 + (idx))
 
 static_assert(offsetof(struct DCP_FW_NAME(dcp_swap), timestamp[6]) == 0x30);
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0)
+static_assert(offsetof(struct DCP_FW_NAME(dcp_swap), debug_info) == 0x40);
+static_assert(offsetof(struct DCP_FW_NAME(dcp_swap), event_wait) == 0x50);
+static_assert(offsetof(struct DCP_FW_NAME(dcp_swap), event_signal_on_glass) == 0x70);
+static_assert(offsetof(struct DCP_FW_NAME(dcp_swap), event_signal) == 0x78);
+#else
 static_assert(offsetof(struct DCP_FW_NAME(dcp_swap), flags1) == 0x40);
+#endif
 
 #if DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0)
 /* 26A428 SurfaceContents::from() and hidePointers(), shared by A408/A483. */
@@ -1406,7 +1413,7 @@ static void release_swap_cookie(struct kref *ref)
         kfree(cookie);
 }
 
-#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0) && DCP_FW_VER < DCP_FW_VERSION(27, 0, 0)
 /*
  * H17P's swap surface has no is_tearing_allowed and no is_premultiplied:
  * plane_cnt sits at +1, plane_cnt2 at +5 and format at +9, two bytes earlier
@@ -1490,6 +1497,10 @@ static void dcp_h17p_fix_swap_surfaces(struct apple_dcp *dcp)
 #endif
 }
 #else
+/* 27.0 begins with a cleared native swap record. Its +0x40/+0x48 are
+ * optional debug words, and +0x50/+0x78 are shared-event wait/signal values,
+ * not display policy bits/counters. Do not replay another client's values.
+ */
 static void dcp_h17p_fix_swap_surfaces(struct apple_dcp *dcp) { }
 #endif
 
