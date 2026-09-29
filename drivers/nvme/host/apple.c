@@ -34,6 +34,7 @@
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/soc/apple/rtkit.h>
+#include <linux/suspend.h>
 #include <linux/soc/apple/sart.h>
 #include <linux/reset.h>
 #include <linux/time64.h>
@@ -243,6 +244,8 @@ struct apple_nvme {
 	unsigned long last_flush;
 	struct delayed_work flush_dwork;
 	struct blk_crypto_profile crypto_profile;
+	/* I/O parked for s2idle with the controller and firmware left running. */
+	bool s2idle_parked;
 };
 
 /* Serialized by anv->lock during I/O; reset configures queues before use.
@@ -2345,13 +2348,44 @@ static int apple_nvme_resume(struct device *dev)
 {
 	struct apple_nvme *anv = dev_get_drvdata(dev);
 
+	if (anv->s2idle_parked) {
+		anv->s2idle_parked = false;
+		nvme_unquiesce_admin_queue(&anv->ctrl);
+		nvme_unquiesce_io_queues(&anv->ctrl);
+		nvme_unfreeze(&anv->ctrl);
+		return 0;
+	}
+
 	return nvme_reset_ctrl(&anv->ctrl);
+}
+
+/*
+ * Post-M4 ANS firmware crashes in the RTKit shutdown handshake (see
+ * apple_nvme_shutdown()), so suspend cannot tear it down. s2idle keeps the
+ * SoC powered: drain and park I/O with the controller and firmware left
+ * running, and let ANS idle on its own until resume restarts the queues.
+ */
+static int apple_nvme_park_for_s2idle(struct apple_nvme *anv)
+{
+	flush_delayed_work(&anv->flush_dwork);
+	nvme_start_freeze(&anv->ctrl);
+	if (nvme_wait_freeze_timeout(&anv->ctrl, NVME_IO_TIMEOUT) <= 0) {
+		nvme_unfreeze(&anv->ctrl);
+		return -EBUSY;
+	}
+	nvme_quiesce_io_queues(&anv->ctrl);
+	nvme_quiesce_admin_queue(&anv->ctrl);
+	anv->s2idle_parked = true;
+	return 0;
 }
 
 static int apple_nvme_suspend(struct device *dev)
 {
 	struct apple_nvme *anv = dev_get_drvdata(dev);
 	int ret = 0;
+
+	if (anv->hw->needs_ioq_registers && !pm_suspend_via_firmware())
+		return apple_nvme_park_for_s2idle(anv);
 
 	apple_nvme_disable(anv, true);
 
