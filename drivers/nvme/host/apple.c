@@ -2384,7 +2384,8 @@ static int apple_nvme_suspend(struct device *dev)
 	struct apple_nvme *anv = dev_get_drvdata(dev);
 	int ret = 0;
 
-	if (anv->hw->needs_ioq_registers && !pm_suspend_via_firmware())
+	/* Post-M4 ANS cannot take the RTKit shutdown at any sleep depth. */
+	if (anv->hw->needs_ioq_registers)
 		return apple_nvme_park_for_s2idle(anv);
 
 	apple_nvme_disable(anv, true);
