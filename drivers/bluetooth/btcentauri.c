@@ -1144,6 +1144,23 @@ static void cen_remove(struct pci_dev *pdev)
 	cen_stop(bt);
 }
 
+/*
+ * Bluetooth shares the N1 firmware with Wi-Fi. Keep this function in D0 and
+ * enabled across s2idle (the PCI core's default suspend would clear its bus
+ * mastering); the Bluetooth core quiesces HCI traffic itself.
+ */
+static int cen_suspend(struct device *dev)
+{
+	return pci_save_state(to_pci_dev(dev));
+}
+
+static int cen_resume(struct device *dev)
+{
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(cen_pm_ops, cen_suspend, cen_resume);
+
 static const struct pci_device_id cen_ids[] = {
 	{ PCI_DEVICE(PCI_VENDOR_ID_APPLE, 0x1903) },
 	{ }
@@ -1155,6 +1172,7 @@ static struct pci_driver cen_driver = {
 	.id_table = cen_ids,
 	.probe = cen_probe,
 	.remove = cen_remove,
+	.driver.pm = pm_sleep_ptr(&cen_pm_ops),
 };
 module_pci_driver(cen_driver);
 MODULE_LICENSE("GPL");

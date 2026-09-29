@@ -8,6 +8,7 @@
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/list.h>
+#include <linux/pm_domain.h>
 #include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/sizes.h>
@@ -32,6 +33,7 @@ struct centauri_ipc {
 	struct list_head buffers;
 	struct pci_dev *function[3];
 	bool enabled[3];
+	bool alpha_pm_domain;
 	void __iomem *bar[3];
 	struct cen_context control, alpha;
 	struct cen_buffer *secondary, *window, *cchi_rx, *cchi_tx, *debug_rx;
@@ -340,6 +342,15 @@ static int memswap_handoff(struct centauri *c, unsigned int function, const char
 	return 0;
 }
 
+/*
+ * Function 1 carries the Alpha MSI vectors but has no driver of its own.
+ * PCI's default suspend of a driverless function clears its bus mastering
+ * and memory decode, which takes the shared N1 firmware down. This empty
+ * PM domain replaces those bus callbacks, so the function stays in D0 and
+ * enabled across s2idle, as the Wi-Fi and Bluetooth functions do.
+ */
+static struct dev_pm_domain centauri_alpha_pm_domain;
+
 static int enumerate_functions(struct centauri *c)
 {
 	struct centauri_ipc *ipc = c->ipc;
@@ -365,6 +376,10 @@ static int enumerate_functions(struct centauri *c)
 			if (ret)
 				return ret;
 			ipc->enabled[i] = true;
+		}
+		if (i == 1 && !ipc->function[i]->dev.driver) {
+			dev_pm_domain_set(&ipc->function[i]->dev, &centauri_alpha_pm_domain);
+			ipc->alpha_pm_domain = true;
 		}
 		ret = dma_set_mask_and_coherent(&ipc->function[i]->dev, DMA_BIT_MASK(40));
 		if (ret)
@@ -521,6 +536,8 @@ void centauri_free_ipc(struct centauri *c)
 		list_del(&buffer->list);
 		kfree(buffer);
 	}
+	if (ipc->alpha_pm_domain)
+		dev_pm_domain_set(&ipc->function[1]->dev, NULL);
 	for (i = 0; i < 3; i++) {
 		if (ipc->bar[i])
 			pci_iounmap(ipc->function[i], ipc->bar[i]);

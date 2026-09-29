@@ -417,6 +417,23 @@ static void centauri_remove(struct pci_dev *pdev)
 	c->debug = NULL;
 }
 
+/*
+ * The N1 functions share one firmware, which must stay up across s2idle.
+ * Saving the PCI state here keeps this function in D0 and enabled instead of
+ * the PCI core's default suspend; cfg80211 has already left the network.
+ */
+static int centauri_suspend(struct device *dev)
+{
+	return pci_save_state(to_pci_dev(dev));
+}
+
+static int centauri_resume(struct device *dev)
+{
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(centauri_pm_ops, centauri_suspend, centauri_resume);
+
 static const struct pci_device_id centauri_ids[] = {
 	{ PCI_DEVICE(PCI_VENDOR_ID_APPLE, 0x1900), .driver_data = 0x8000 },
 	{ PCI_DEVICE(PCI_VENDOR_ID_APPLE, 0x1901), .driver_data = 0x8000 },
@@ -430,6 +447,7 @@ static struct pci_driver centauri_driver = {
 	.probe = centauri_probe,
 	.remove = centauri_remove,
 	.shutdown = centauri_remove,
+	.driver.pm = pm_sleep_ptr(&centauri_pm_ops),
 };
 
 static int __init centauri_init(void)
