@@ -223,9 +223,18 @@ static int sn201202x_probe(struct spmi_device *device)
 		return -ETIMEDOUT;
 
 	ret = tipd_init(tps);
-	if (ret)
+	if (ret) {
 		spmi_command_sleep(device);
-	return ret;
+		return ret;
+	}
+
+	/* SPMI reports events as messages, not a continuously asserted GPIO.
+	 * Firmware may already have an event latched when the event IRQ is
+	 * registered. Drain it once with the handler now that the port and
+	 * work item exist; subsequent changes are handled by interrupts.
+	 */
+	tps->data->irq_handler(tps->irq, tps);
+	return 0;
 }
 
 static void sn201202x_remove(struct spmi_device *device)

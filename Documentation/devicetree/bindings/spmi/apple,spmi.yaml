@@ -17,6 +17,7 @@ allOf:
 properties:
   compatible:
     oneOf:
+      - const: apple,t6050-spmi
       - items:
           - enum:
               - apple,t6020-spmi
