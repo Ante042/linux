@@ -327,13 +327,17 @@ static int apple_spmi_irq_set_type(struct irq_data *d, unsigned int type)
 	return type == IRQ_TYPE_EDGE_RISING ? 0 : -EINVAL;
 }
 
+/*
+ * The parent line is a chained handler, which system suspend never disables,
+ * so a child wake request needs no controller-side action.
+ */
 static struct irq_chip apple_spmi_irq_chip = {
 	.name = "apple_spmi",
 	.irq_mask = apple_spmi_irq_mask,
 	.irq_unmask = apple_spmi_irq_unmask,
 	.irq_ack = apple_spmi_irq_ack,
 	.irq_set_type = apple_spmi_irq_set_type,
-	.flags = IRQCHIP_ONESHOT_SAFE,
+	.flags = IRQCHIP_ONESHOT_SAFE | IRQCHIP_SKIP_SET_WAKE,
 };
 
 static int apple_spmi_irq_domain_map(struct irq_domain *irqd,

@@ -2100,6 +2100,17 @@ config RTC_DRV_WILCO_EC
 	  This can also be built as a module. If so, the module will
 	  be named "rtc_wilco_ec".
 
+config RTC_DRV_APPLE_PMU
+	tristate "Apple SPMI PMU RTC and wake alarm"
+	depends on ARCH_APPLE || COMPILE_TEST
+	depends on NVMEM
+	help
+	  RTC and wake alarm of the SPMI PMU on Apple Silicon Macs, accessed
+	  through the PMU's NVMEM cells. Provides wakealarm for suspend.
+
+	  This driver can also be built as a module. If so, the module
+	  will be called rtc-apple-pmu.
+
 config RTC_DRV_MACSMC
 	tristate "Apple Mac System Management Controller RTC"
 	depends on MFD_MACSMC
