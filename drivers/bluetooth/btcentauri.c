@@ -71,14 +71,19 @@ MODULE_PARM_DESC(native_bdaddr, "Optional stable diagnostic address in XX:XX:XX:
 
 static bool enable_acl;
 module_param(enable_acl, bool, 0444);
-MODULE_PARM_DESC(enable_acl, "Experimental ACL data delivery; requires LE and auxiliary rings");
+MODULE_PARM_DESC(enable_acl, "Experimental ACL data delivery; requires LE rings and opens native ACL resources");
 
 static bool native_hrb;
 module_param(native_hrb, bool, 0444);
 MODULE_PARM_DESC(native_hrb, "Experimental native Proxima Create Connection; requires native startup, ACL and firmware capability bit 9");
 
+static bool flush_duplicates = true;
+module_param(flush_duplicates, bool, 0644);
+MODULE_PARM_DESC(flush_duplicates, "Reset the firmware LE duplicate filter before each filtered scan");
+
 #define CEN_OP_READ_PROP_FEATURES 0xffa3
 #define CEN_OP_HRB_CREATE_CONN 0xff7b
+#define CEN_OP_FLUSH_DUPLICATES 0xff3f
 #define CEN_PROP_HRB_CREATE BIT(9)
 
 struct cen_aux_spec {
@@ -106,6 +111,7 @@ static const struct cen_aux_spec cen_aux_specs[] = {
 struct cen_aux_state {
 	u32 offset, packets;
 	u16 head, post;
+	bool opened;
 };
 
 struct cen_bt {
@@ -134,6 +140,8 @@ struct cen_bt {
 	u32 proprietary_features, hrb_commands, hrb_status_events;
 	u32 hrb_connection_events;
 	u8 hrb_last_link_type;
+	bool dup_flush_failed;
+	u32 dup_flushes;
 };
 
 static u16 cen_tail(struct cen_bt *bt, u16 ring)
@@ -292,6 +300,14 @@ static void cen_aux_rx_buffer(struct cen_bt *bt, unsigned int index, u16 slot)
 	put_unaligned_le16(slot + 1, descriptor + 12);
 }
 
+/* ACL transport owns only its data rings. Opening debug/audio resources
+ * and capturing their payloads remains an explicitly requested diagnostic.
+ */
+static bool cen_aux_required(u16 id)
+{
+	return arm_auxiliary_rings || (enable_acl && (id == 2 || id == 8));
+}
+
 static int cen_aux_start(struct cen_bt *bt)
 {
 	u32 offset = CEN_AUX_BASE;
@@ -307,11 +323,14 @@ static int cen_aux_start(struct cen_bt *bt)
 			return -ENOSPC;
 		state->offset = offset;
 		offset = ALIGN(offset + length, SZ_4K);
+		if (!cen_aux_required(spec->id))
+			continue;
 		ret = cen_open_ring(bt, spec->id, spec->slots, state->offset, spec->footer);
 		if (ret) {
 			dev_err(&bt->pdev->dev, "Auxiliary ring %u open failed: %d\n", spec->id, ret);
 			return ret;
 		}
+		state->opened = true;
 		if (!spec->receive)
 			continue;
 		for (slot = 0; slot < spec->slots - 1; slot++)
@@ -332,7 +351,7 @@ static int cen_aux_drain(struct cen_bt *bt, bool repost)
 		u16 tail;
 		int budget = spec->slots;
 
-		if (!spec->receive)
+		if (!state->opened || !spec->receive)
 			continue;
 		tail = cen_tail(bt, spec->id);
 		if (tail >= spec->slots)
@@ -419,7 +438,7 @@ static int cen_start(struct cen_bt *bt)
 		bt->le_rx_post = CEN_LE_SLOTS - 1;
 		cen_post(bt, 10, bt->le_rx_post);
 	}
-	if (arm_auxiliary_rings)
+	if (arm_auxiliary_rings || enable_acl)
 		return cen_aux_start(bt);
 	return 0;
 }
@@ -479,6 +498,37 @@ static int cen_transmit(struct cen_bt *bt, struct sk_buff_head *queue,
 	return 0;
 }
 
+/* N1 firmware27 omits the scannable bit from legacy scan responses.
+ * A captured response to our peer's ADV_IND has type 0x2518 and carries
+ * its scan-response name. Restore only that missing standard property;
+ * preserve native upper bits, payload, address and non-legacy reports.
+ * The core bounds-checks every report itself, so stop at the first one
+ * that does not fit and pass the rest through untouched.
+ */
+static void cen_fixup_scan_response(u8 *event, size_t length)
+{
+	struct hci_ev_le_ext_adv_info *info;
+	size_t offset = HCI_EVENT_HDR_SIZE + 2;
+	u8 count;
+
+	if (length < offset || event[0] != HCI_EV_LE_META ||
+	    event[HCI_EVENT_HDR_SIZE] != HCI_EV_LE_EXT_ADV_REPORT)
+		return;
+	count = event[HCI_EVENT_HDR_SIZE + 1];
+	while (count-- && length - offset >= sizeof(*info)) {
+		u16 type;
+
+		info = (void *)(event + offset);
+		if (info->length > length - offset - sizeof(*info))
+			return;
+		type = get_unaligned_le16(&info->type);
+		if ((type & LE_EXT_ADV_EVT_TYPE_MASK) ==
+		    (LE_EXT_ADV_LEGACY_PDU | LE_EXT_ADV_SCAN_RSP))
+			put_unaligned_le16(type | LE_EXT_ADV_SCAN_IND, &info->type);
+		offset += sizeof(*info) + info->length;
+	}
+}
+
 static void cen_poll(struct work_struct *work)
 {
 	struct cen_bt *bt = container_of(work, struct cen_bt, poll);
@@ -496,11 +546,11 @@ static void cen_poll(struct work_struct *work)
 		/* Preserve already completed diagnostics after abort, without posting
 		 * any more buffers or ringing doorbells to the failed firmware.
 		 */
-		if (arm_auxiliary_rings && readl(bt->bar) == 2)
+		if ((arm_auxiliary_rings || enable_acl) && readl(bt->bar) == 2)
 			cen_aux_drain(bt, false);
 		goto protocol_error;
 	}
-	if (arm_auxiliary_rings && cen_aux_drain(bt, true))
+	if ((arm_auxiliary_rings || enable_acl) && cen_aux_drain(bt, true))
 		goto protocol_error;
 	if (arm_le_data_rings) {
 		tail = cen_tail(bt, 10);
@@ -536,6 +586,7 @@ static void cen_poll(struct work_struct *work)
 		skb = bt_skb_alloc(length, GFP_KERNEL);
 		if (skb) {
 			skb_put_data(skb, descriptor + 16, length);
+			cen_fixup_scan_response(skb->data, skb->len);
 			/* The firmware's status belongs to the standard connection
 			 * request tracked by Linux. Capture the native response before
 			 * restoring only its opcode; preserve status and command credit.
@@ -600,6 +651,7 @@ static int cen_hci_open(struct hci_dev *hdev)
 
 	mutex_lock(&bt->lock);
 	bt->running = true;
+	WRITE_ONCE(bt->dup_flush_failed, false);
 	schedule_work(&bt->poll);
 	mutex_unlock(&bt->lock);
 	return 0;
@@ -632,6 +684,32 @@ static int cen_vendor_command(struct hci_dev *hdev, u16 opcode,
 	ret = skb->len < 1 ? -EPROTO : -bt_to_errno(skb->data[0]);
 	kfree_skb(skb);
 	return ret;
+}
+
+/* Firmware27 keeps its LE duplicate filter across scan disable/enable and
+ * clears it only on HCI Reset or vendor command 0xff3f, whose handler resets
+ * the filter of both scanner PHYs. Without this, a peer reported during
+ * discovery is never reported to the connection scan that follows. Bit 2 of
+ * the parameter selects an additional, unrelated action, so send zero.
+ */
+static int cen_hci_reset_dup_filter(struct hci_dev *hdev)
+{
+	struct cen_bt *bt = hci_get_drvdata(hdev);
+	static const u8 flags;
+	int ret;
+
+	if (!READ_ONCE(flush_duplicates) || READ_ONCE(bt->dup_flush_failed))
+		return 0;
+	ret = __hci_cmd_sync_status(hdev, CEN_OP_FLUSH_DUPLICATES, sizeof(flags),
+				    &flags, HCI_CMD_TIMEOUT);
+	if (ret) {
+		/* Scanning still works; only repeated reports stay filtered. */
+		WRITE_ONCE(bt->dup_flush_failed, true);
+		bt_dev_warn(hdev, "Duplicate filter reset failed: %d", ret);
+		return 0;
+	}
+	WRITE_ONCE(bt->dup_flushes, bt->dup_flushes + 1);
+	return 0;
 }
 
 static int cen_hci_post_init(struct hci_dev *hdev)
@@ -882,15 +960,18 @@ static int cen_status_show(struct seq_file *s, void *unused)
 		   bt->hrb_status_events, bt->hrb_status_pending);
 	seq_printf(s, "hrb_connection_events=%u hrb_last_link_type=0x%02x\n",
 		   bt->hrb_connection_events, bt->hrb_last_link_type);
+	seq_printf(s, "flush_duplicates=%u dup_flushes=%u dup_flush_failed=%u\n",
+		   READ_ONCE(flush_duplicates), READ_ONCE(bt->dup_flushes),
+		   READ_ONCE(bt->dup_flush_failed));
 	seq_printf(s, "acl_enabled=%u acl_tx=%u acl_rx=%u acl_queued=%u le_queued=%u\n",
 		   enable_acl, bt->hdev->stat.acl_tx, bt->hdev->stat.acl_rx,
 		   skb_queue_len(&bt->acl_txq), skb_queue_len(&bt->le_txq));
 	seq_printf(s, "auxiliary_rings=%u messages=%u message_head=%u capture_bytes=%u capture_records=%u capture_dropped=%u\n",
 		   arm_auxiliary_rings, bt->message_tag, bt->message_head,
 		   bt->capture_used, bt->capture_records, bt->capture_dropped);
-	if (arm_auxiliary_rings)
+	if (arm_auxiliary_rings || enable_acl)
 		for (i = 0; i < ARRAY_SIZE(cen_aux_specs); i++)
-			if (cen_aux_specs[i].receive)
+			if (bt->aux[i].opened && cen_aux_specs[i].receive)
 				seq_printf(s, "aux_rx ring=%u packets=%u consumed=%u device_tail=%u\n",
 					   cen_aux_specs[i].id, bt->aux[i].packets,
 					   bt->aux[i].head, cen_tail(bt, cen_aux_specs[i].id));
@@ -958,7 +1039,7 @@ static int cen_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	skb_queue_head_init(&bt->txq);
 	skb_queue_head_init(&bt->acl_txq);
 	skb_queue_head_init(&bt->le_txq);
-	if (enable_acl && (!arm_le_data_rings || !arm_auxiliary_rings))
+	if (enable_acl && !arm_le_data_rings)
 		return -EINVAL;
 	if (native_startup < -1 || native_startup > 1)
 		return -EINVAL;
@@ -1013,6 +1094,9 @@ static int cen_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	hdev->send = cen_hci_send;
 	hdev->setup = cen_hci_setup;
 	hdev->post_init = cen_hci_post_init;
+	hdev->reset_dup_filter = cen_hci_reset_dup_filter;
+	/* N1 reports the native PHY metadata bit (e.g. 0x81 for LE 1M). */
+	hci_set_quirk(hdev, HCI_QUIRK_FIXUP_LE_EXT_ADV_REPORT_PHY);
 	SET_HCIDEV_DEV(hdev, &pdev->dev);
 	hci_set_drvdata(hdev, bt);
 	pci_set_drvdata(pdev, bt);
