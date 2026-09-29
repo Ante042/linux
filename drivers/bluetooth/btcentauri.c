@@ -69,13 +69,19 @@ static char *native_bdaddr;
 module_param(native_bdaddr, charp, 0400);
 MODULE_PARM_DESC(native_bdaddr, "Optional stable diagnostic address in XX:XX:XX:XX:XX:XX order; does not provision the factory address");
 
-static bool enable_acl;
-module_param(enable_acl, bool, 0444);
-MODULE_PARM_DESC(enable_acl, "Experimental ACL data delivery; requires LE rings and opens native ACL resources");
+static int enable_acl = -1;
+module_param(enable_acl, int, 0444);
+MODULE_PARM_DESC(enable_acl, "ACL data delivery: -1=board default, 0=off, 1=on; requires LE rings and opens native ACL resources");
 
-static bool native_hrb;
-module_param(native_hrb, bool, 0444);
-MODULE_PARM_DESC(native_hrb, "Experimental native Proxima Create Connection; requires native startup, ACL and firmware capability bit 9");
+/* J714s firmware27 rejects the standard HCI Create Connection with Command
+ * Disallowed; outgoing BR/EDR connections need the native request.
+ */
+static int native_hrb = -1;
+module_param(native_hrb, int, 0444);
+MODULE_PARM_DESC(native_hrb, "Native Proxima Create Connection: -1=board default, 0=off, 1=on; requires native startup, ACL and firmware capability bit 9");
+
+/* Resolved once at probe; the data path reads these per packet. */
+static bool cen_acl, cen_hrb;
 
 static bool flush_duplicates = true;
 module_param(flush_duplicates, bool, 0644);
@@ -305,7 +311,7 @@ static void cen_aux_rx_buffer(struct cen_bt *bt, unsigned int index, u16 slot)
  */
 static bool cen_aux_required(u16 id)
 {
-	return arm_auxiliary_rings || (enable_acl && (id == 2 || id == 8));
+	return arm_auxiliary_rings || (cen_acl && (id == 2 || id == 8));
 }
 
 static int cen_aux_start(struct cen_bt *bt)
@@ -365,7 +371,7 @@ static int cen_aux_drain(struct cen_bt *bt, bool repost)
 			if (length > spec->footer)
 				return -EPROTO;
 			cen_capture_frame(bt, spec->id, descriptor + 16, length);
-			if (repost && enable_acl && spec->id == 8 &&
+			if (repost && cen_acl && spec->id == 8 &&
 			    cen_receive_acl(bt, descriptor + 16, length))
 				return -EPROTO;
 			state->packets++;
@@ -438,7 +444,7 @@ static int cen_start(struct cen_bt *bt)
 		bt->le_rx_post = CEN_LE_SLOTS - 1;
 		cen_post(bt, 10, bt->le_rx_post);
 	}
-	if (arm_auxiliary_rings || enable_acl)
+	if (arm_auxiliary_rings || cen_acl)
 		return cen_aux_start(bt);
 	return 0;
 }
@@ -546,11 +552,11 @@ static void cen_poll(struct work_struct *work)
 		/* Preserve already completed diagnostics after abort, without posting
 		 * any more buffers or ringing doorbells to the failed firmware.
 		 */
-		if ((arm_auxiliary_rings || enable_acl) && readl(bt->bar) == 2)
+		if ((arm_auxiliary_rings || cen_acl) && readl(bt->bar) == 2)
 			cen_aux_drain(bt, false);
 		goto protocol_error;
 	}
-	if ((arm_auxiliary_rings || enable_acl) && cen_aux_drain(bt, true))
+	if ((arm_auxiliary_rings || cen_acl) && cen_aux_drain(bt, true))
 		goto protocol_error;
 	if (arm_le_data_rings) {
 		tail = cen_tail(bt, 10);
@@ -564,7 +570,7 @@ static void cen_poll(struct work_struct *work)
 				goto protocol_error;
 			bt->le_rx_packets++;
 			cen_capture_frame(bt, 10, descriptor + 16, length);
-			if (enable_acl && cen_receive_acl(bt, descriptor + 16, length))
+			if (cen_acl && cen_receive_acl(bt, descriptor + 16, length))
 				goto protocol_error;
 			bt->le_rx_head = (bt->le_rx_head + 1) % CEN_LE_SLOTS;
 			cen_le_rx_buffer(bt, bt->le_rx_post);
@@ -628,7 +634,7 @@ static void cen_poll(struct work_struct *work)
 			 CEN_FOOTER, &bt->tx_head))
 		goto protocol_error;
 	/* cen_aux_specs[0] is the native BR/EDR ACL TX resource (ring 2). */
-	if (enable_acl &&
+	if (cen_acl &&
 	    (cen_transmit(bt, &bt->acl_txq, 2, cen_aux_specs[0].slots,
 			  bt->aux[0].offset, cen_aux_specs[0].footer,
 			  &bt->acl_tx_head) ||
@@ -719,7 +725,7 @@ static int cen_hci_post_init(struct hci_dev *hdev)
 	u32 features;
 	int ret;
 
-	if (!native_hrb)
+	if (!cen_hrb)
 		return 0;
 	WRITE_ONCE(bt->hrb_supported, false);
 	skb = __hci_cmd_sync(hdev, CEN_OP_READ_PROP_FEATURES, 0, NULL,
@@ -730,10 +736,13 @@ static int cen_hci_post_init(struct hci_dev *hdev)
 	features = skb->len == 5 ? get_unaligned_le32(skb->data + 1) : 0;
 	kfree_skb(skb);
 	WRITE_ONCE(bt->proprietary_features, features);
-	if (ret)
-		return ret;
-	if (!(features & CEN_PROP_HRB_CREATE))
-		return -EOPNOTSUPP;
+	if (!ret && !(features & CEN_PROP_HRB_CREATE))
+		ret = -EOPNOTSUPP;
+	if (ret) {
+		/* Keep the controller usable; standard Create Connection remains. */
+		bt_dev_warn(hdev, "Native Proxima Create Connection unavailable: %d", ret);
+		return 0;
+	}
 	WRITE_ONCE(bt->hrb_supported, true);
 	bt_dev_info(hdev, "Native Proxima Create Connection capability confirmed");
 	return 0;
@@ -818,7 +827,7 @@ static int cen_hci_send(struct hci_dev *hdev, struct sk_buff *skb)
 	u8 link_type;
 	int ret = 0;
 
-	if (hci_skb_pkt_type(skb) == HCI_ACLDATA_PKT && enable_acl) {
+	if (hci_skb_pkt_type(skb) == HCI_ACLDATA_PKT && cen_acl) {
 		if (skb->len < HCI_ACL_HDR_SIZE ||
 		    skb->len != HCI_ACL_HDR_SIZE + get_unaligned_le16(skb->data + 2)) {
 			ret = -EMSGSIZE;
@@ -850,7 +859,7 @@ static int cen_hci_send(struct hci_dev *hdev, struct sk_buff *skb)
 		ret = -EMSGSIZE;
 		goto out;
 	}
-	if (hci_skb_pkt_type(skb) == HCI_COMMAND_PKT && native_hrb) {
+	if (hci_skb_pkt_type(skb) == HCI_COMMAND_PKT && cen_hrb) {
 		u16 opcode = get_unaligned_le16(skb->data);
 
 		/* Do not mix unmanaged native commands with translated requests. */
@@ -955,7 +964,7 @@ static int cen_status_show(struct seq_file *s, void *unused)
 	seq_printf(s, "native_startup=%u native_startup_steps=%u\n",
 		   cen_native_startup_enabled(), READ_ONCE(bt->native_startup_steps));
 	seq_printf(s, "native_hrb=%u hrb_supported=%u proprietary_features=0x%08x hrb_commands=%u hrb_status_events=%u hrb_pending=%u\n",
-		   native_hrb, READ_ONCE(bt->hrb_supported),
+		   cen_hrb, READ_ONCE(bt->hrb_supported),
 		   READ_ONCE(bt->proprietary_features), bt->hrb_commands,
 		   bt->hrb_status_events, bt->hrb_status_pending);
 	seq_printf(s, "hrb_connection_events=%u hrb_last_link_type=0x%02x\n",
@@ -964,12 +973,12 @@ static int cen_status_show(struct seq_file *s, void *unused)
 		   READ_ONCE(flush_duplicates), READ_ONCE(bt->dup_flushes),
 		   READ_ONCE(bt->dup_flush_failed));
 	seq_printf(s, "acl_enabled=%u acl_tx=%u acl_rx=%u acl_queued=%u le_queued=%u\n",
-		   enable_acl, bt->hdev->stat.acl_tx, bt->hdev->stat.acl_rx,
+		   cen_acl, bt->hdev->stat.acl_tx, bt->hdev->stat.acl_rx,
 		   skb_queue_len(&bt->acl_txq), skb_queue_len(&bt->le_txq));
 	seq_printf(s, "auxiliary_rings=%u messages=%u message_head=%u capture_bytes=%u capture_records=%u capture_dropped=%u\n",
 		   arm_auxiliary_rings, bt->message_tag, bt->message_head,
 		   bt->capture_used, bt->capture_records, bt->capture_dropped);
-	if (arm_auxiliary_rings || enable_acl)
+	if (arm_auxiliary_rings || cen_acl)
 		for (i = 0; i < ARRAY_SIZE(cen_aux_specs); i++)
 			if (bt->aux[i].opened && cen_aux_specs[i].receive)
 				seq_printf(s, "aux_rx ring=%u packets=%u consumed=%u device_tail=%u\n",
@@ -1039,11 +1048,14 @@ static int cen_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	skb_queue_head_init(&bt->txq);
 	skb_queue_head_init(&bt->acl_txq);
 	skb_queue_head_init(&bt->le_txq);
-	if (enable_acl && !arm_le_data_rings)
+	if (native_startup < -1 || native_startup > 1 ||
+	    enable_acl < -1 || enable_acl > 1 || native_hrb < -1 || native_hrb > 1)
 		return -EINVAL;
-	if (native_startup < -1 || native_startup > 1)
+	cen_acl = enable_acl < 0 ? of_machine_is_compatible("apple,j714s") : enable_acl;
+	cen_hrb = native_hrb < 0 ? of_machine_is_compatible("apple,j714s") : native_hrb;
+	if (cen_acl && !arm_le_data_rings)
 		return -EINVAL;
-	if (native_hrb && (!cen_native_startup_enabled() || !enable_acl))
+	if (cen_hrb && (!cen_native_startup_enabled() || !cen_acl))
 		return -EINVAL;
 	INIT_WORK(&bt->poll, cen_poll);
 	ret = pcim_enable_device(pdev);
@@ -1112,7 +1124,7 @@ static int cen_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		debugfs_create_file("capture_reset", 0200, bt->debug, bt, &cen_capture_reset_fops);
 	}
 	dev_info(&pdev->dev, "Beta HCI transport registered; ACL enabled=%u, SCO/ISO unsupported\n",
-		 enable_acl);
+		 cen_acl);
 	return 0;
 stop:
 	cen_stop(bt);
