@@ -60,8 +60,13 @@ static const struct mfd_cell apple_smc_telemetry_devs[] = {
 	MFD_CELL_OF("macsmc-hwmon", NULL, NULL, 0, 0, "apple,smc-hwmon"),
 };
 
-/* T6050 additionally describes native pcIO outputs explicitly in its DT. */
+/* T6050 additionally describes native pcIO outputs explicitly in its DT.
+ * Its firmware 27 SMC keeps the classic notification protocol: with NTAP
+ * set, power/Touch ID button (0x7201) and lid (0x7203) events arrive as on
+ * earlier SoCs, backed by the same MSLD and bHLD keys.
+ */
 static const struct mfd_cell apple_smc_t6050_devs[] = {
+	MFD_CELL_NAME("macsmc-input"),
 	MFD_CELL_OF("macsmc-hwmon", NULL, NULL, 0, 0, "apple,smc-hwmon"),
 	MFD_CELL_OF("macsmc-pcio-gpio", NULL, NULL, 0, 0, "apple,smc-pcio-gpio"),
 };
@@ -536,12 +541,6 @@ static int apple_smc_probe(struct platform_device *pdev)
 	/* T8152's key-read interface is qualified; notifications, GPIO and power
 	 * functions are not. The board DT exposes temperature and fan inputs only.
 	 */
-	if (of_device_is_compatible(dev->of_node, "apple,t6050-smc"))
-		return devm_mfd_add_devices(smc->dev, PLATFORM_DEVID_NONE,
-					    apple_smc_t6050_devs,
-					    ARRAY_SIZE(apple_smc_t6050_devs),
-					    NULL, 0, NULL);
-
 	if (of_device_is_compatible(dev->of_node, "apple,t8152-smc"))
 		return devm_mfd_add_devices(smc->dev, PLATFORM_DEVID_NONE,
 					    apple_smc_telemetry_devs,
@@ -553,6 +552,12 @@ static int apple_smc_probe(struct platform_device *pdev)
 	ret = devm_add_action_or_reset(dev, apple_smc_disable_notifications, smc);
 	if (ret)
 		return ret;
+
+	if (of_device_is_compatible(dev->of_node, "apple,t6050-smc"))
+		return devm_mfd_add_devices(smc->dev, PLATFORM_DEVID_NONE,
+					    apple_smc_t6050_devs,
+					    ARRAY_SIZE(apple_smc_t6050_devs),
+					    NULL, 0, NULL);
 
 	ret = devm_mfd_add_devices(smc->dev, PLATFORM_DEVID_NONE,
 				   apple_smc_devs, ARRAY_SIZE(apple_smc_devs),
