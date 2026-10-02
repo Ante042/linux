@@ -4118,6 +4118,12 @@ static int __folio_split(struct folio *folio, unsigned int new_order,
 		}
 		anon_vma_lock_write(anon_vma);
 		mapping = NULL;
+#ifdef CONFIG_MM_SUBPAGE
+		if (new_order < anon_vma->min_folio_order) {
+			ret = -EBUSY;
+			goto out_unlock;
+		}
+#endif
 	} else {
 		unsigned int min_order;
 		gfp_t gfp;
@@ -4394,7 +4400,7 @@ int folio_split(struct folio *folio, unsigned int new_order,
 unsigned int min_order_for_split(struct folio *folio)
 {
 	if (folio_test_anon(folio))
-		return 0;
+		return folio_anon_min_order(folio);
 
 	/*
 	 * If the folio got truncated, we don't know the previous mapping and

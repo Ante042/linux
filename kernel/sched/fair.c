@@ -1694,7 +1694,7 @@ static unsigned int task_nr_scan_windows(struct task_struct *p)
 	 * on resident pages
 	 */
 	nr_scan_pages = MB_TO_PAGES(sysctl_numa_balancing_scan_size);
-	rss = get_mm_rss(p->mm);
+	rss = mm_pages_to_native(p->mm, get_mm_rss(p->mm));
 	if (!rss)
 		rss = nr_scan_pages;
 

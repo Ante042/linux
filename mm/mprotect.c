@@ -13,6 +13,7 @@
 #include <linux/hugetlb.h>
 #include <linux/shm.h>
 #include <linux/mman.h>
+#include <linux/mm_subpage.h>
 #include <linux/fs.h>
 #include <linux/highmem.h>
 #include <linux/security.h>
@@ -58,6 +59,20 @@ static bool maybe_change_pte_writable(struct vm_area_struct *vma, pte_t pte)
 	return true;
 }
 
+#ifdef CONFIG_MM_SUBPAGE
+static bool subpage_pte_exclusive(struct vm_area_struct *vma, pte_t pte)
+{
+	struct mm_subpage *slot = mm_subpage_get_from_phys(pte_phys_mm(vma->vm_mm, pte));
+	bool exclusive;
+
+	if (!slot)
+		return false;
+	exclusive = mm_subpage_is_exclusive(slot);
+	mm_subpage_put(slot);
+	return exclusive;
+}
+#endif
+
 static bool can_change_private_pte_writable(struct vm_area_struct *vma,
 					    unsigned long addr, pte_t pte)
 {
@@ -73,6 +88,10 @@ static bool can_change_private_pte_writable(struct vm_area_struct *vma,
 	 * any additional checks while holding the PT lock.
 	 */
 	page = vm_normal_page(vma, addr, pte);
+#ifdef CONFIG_MM_SUBPAGE
+	if (mm_page_size(vma->vm_mm) < PAGE_SIZE)
+		return page && PageAnon(page) && subpage_pte_exclusive(vma, pte);
+#endif
 	return page && PageAnon(page) && PageAnonExclusive(page);
 }
 
@@ -103,12 +122,18 @@ bool can_change_pte_writable(struct vm_area_struct *vma, unsigned long addr,
 	return can_change_shared_pte_writable(vma, pte);
 }
 
-static int mprotect_folio_pte_batch(struct folio *folio, pte_t *ptep,
+
+static int mprotect_folio_pte_batch(struct vm_area_struct *vma, struct folio *folio, pte_t *ptep,
 				    pte_t pte, int max_nr_ptes, fpb_t flags)
 {
 	/* No underlying folio, so cannot batch */
 	if (!folio)
 		return 1;
+
+#ifdef CONFIG_MM_SUBPAGE
+	if (mm_page_size(vma->vm_mm) != PAGE_SIZE)
+		return folio_subpage_pte_batch(vma, folio, ptep, pte, max_nr_ptes, flags);
+#endif
 
 	if (!folio_test_large(folio))
 		return 1;
@@ -125,17 +150,17 @@ static __always_inline void prot_commit_flush_ptes(struct vm_area_struct *vma,
 	 * Advance the position in the batch by idx; note that if idx > 0,
 	 * then the nr_ptes passed here is <= batch size - idx.
 	 */
-	addr += idx * PAGE_SIZE;
+	addr += idx * mm_page_size(vma->vm_mm);
 	ptep += idx;
-	oldpte = pte_advance_pfn(oldpte, idx);
-	ptent = pte_advance_pfn(ptent, idx);
+	oldpte = pte_advance_pfn_mm(vma->vm_mm, oldpte, idx);
+	ptent = pte_advance_pfn_mm(vma->vm_mm, ptent, idx);
 
 	if (set_write)
 		ptent = pte_mkwrite(ptent, vma);
 
 	modify_prot_commit_ptes(vma, addr, ptep, oldpte, ptent, nr_ptes);
 	if (pte_needs_flush(oldpte, ptent))
-		tlb_flush_pte_range(tlb, addr, nr_ptes * PAGE_SIZE);
+		tlb_flush_pte_range(tlb, addr, nr_ptes * mm_page_size(vma->vm_mm));
 }
 
 /*
@@ -176,6 +201,25 @@ static __always_inline void commit_anon_folio_batch(struct vm_area_struct *vma,
 	bool expected_anon_exclusive;
 	int sub_batch_idx = 0;
 	int len;
+
+#ifdef CONFIG_MM_SUBPAGE
+	if (mm_page_size(vma->vm_mm) < PAGE_SIZE) {
+		while (nr_ptes) {
+			expected_anon_exclusive = subpage_pte_exclusive(vma,
+				pte_advance_pfn_mm(vma->vm_mm, oldpte, sub_batch_idx));
+			for (len = 1; len < nr_ptes; len++)
+				if (subpage_pte_exclusive(vma,
+				    pte_advance_pfn_mm(vma->vm_mm, oldpte, sub_batch_idx + len)) !=
+				    expected_anon_exclusive)
+					break;
+			prot_commit_flush_ptes(vma, addr, ptep, oldpte, ptent, len,
+					       sub_batch_idx, expected_anon_exclusive, tlb);
+			sub_batch_idx += len;
+			nr_ptes -= len;
+		}
+		return;
+	}
+#endif
 
 	while (nr_ptes) {
 		expected_anon_exclusive = PageAnonExclusive(first_page + sub_batch_idx);
@@ -265,6 +309,11 @@ static long change_softleaf_pte(struct vm_area_struct *vma,
 		newpte = oldpte;
 	}
 
+#ifdef CONFIG_MM_SUBPAGE
+	if (mm_page_size(vma->vm_mm) < PAGE_SIZE)
+		newpte = pte_swp_set_subpage_offset(newpte, pte_swp_subpage_offset(oldpte));
+#endif
+
 	if (uffd_wp)
 		newpte = pte_swp_mkuffd_wp(newpte);
 	else if (uffd_wp_resolve)
@@ -328,7 +377,7 @@ static long change_pte_range(struct mmu_gather *tlb,
 	bool uffd_wp = cp_flags & MM_CP_UFFD_WP;
 	int nr_ptes;
 
-	tlb_change_page_size(tlb, PAGE_SIZE);
+	tlb_change_page_size(tlb, mm_page_size(vma->vm_mm));
 	pte = pte_offset_map_lock(vma->vm_mm, pmd, addr, &ptl);
 	if (!pte)
 		return -EAGAIN;
@@ -343,7 +392,7 @@ static long change_pte_range(struct mmu_gather *tlb,
 		oldpte = ptep_get(pte);
 		if (pte_present(oldpte)) {
 			const fpb_t flags = FPB_RESPECT_SOFT_DIRTY | FPB_RESPECT_WRITE;
-			int max_nr_ptes = (end - addr) >> PAGE_SHIFT;
+			int max_nr_ptes = (end - addr) >> mm_page_shift(vma->vm_mm);
 			struct folio *folio = NULL;
 			struct page *page;
 
@@ -364,12 +413,12 @@ static long change_pte_range(struct mmu_gather *tlb,
 						is_private_single_threaded)) {
 
 				/* determine batch to skip */
-				nr_ptes = mprotect_folio_pte_batch(folio,
+				nr_ptes = mprotect_folio_pte_batch(vma, folio,
 					  pte, oldpte, max_nr_ptes, /* flags = */ 0);
 				continue;
 			}
 
-			nr_ptes = mprotect_folio_pte_batch(folio, pte, oldpte, max_nr_ptes, flags);
+			nr_ptes = mprotect_folio_pte_batch(vma, folio, pte, oldpte, max_nr_ptes, flags);
 
 			/*
 			 * Optimize for the small-folio common case by
@@ -408,7 +457,7 @@ static long change_pte_range(struct mmu_gather *tlb,
 		} else  {
 			pages += change_softleaf_pte(vma, addr, pte, oldpte, cp_flags);
 		}
-	} while (pte += nr_ptes, addr += nr_ptes * PAGE_SIZE, addr != end);
+	} while (pte += nr_ptes, addr += nr_ptes * mm_page_size(vma->vm_mm), addr != end);
 	lazy_mmu_mode_disable();
 	pte_unmap_unlock(pte - 1, ptl);
 
@@ -487,12 +536,12 @@ static inline long change_pmd_range(struct mmu_gather *tlb,
 	long pages = 0;
 	unsigned long nr_huge_updates = 0;
 
-	pmd = pmd_offset(pud, addr);
+	pmd = pmd_offset_mm(vma->vm_mm, pud, addr);
 	do {
 		long ret;
 		pmd_t _pmd;
 again:
-		next = pmd_addr_end(addr, end);
+		next = pmd_addr_end_mm(vma->vm_mm, addr, end);
 
 		ret = change_pmd_prepare(vma, pmd, cp_flags);
 		if (ret) {
@@ -559,10 +608,10 @@ static inline long change_pud_range(struct mmu_gather *tlb,
 
 	range.start = 0;
 
-	pudp = pud_offset(p4d, addr);
+	pudp = pud_offset_mm(vma->vm_mm, p4d, addr);
 	do {
 again:
-		next = pud_addr_end(addr, end);
+		next = pud_addr_end_mm(vma->vm_mm, addr, end);
 		ret = change_prepare(vma, pudp, pmd, addr, cp_flags);
 		if (ret) {
 			pages = ret;
@@ -615,13 +664,13 @@ static inline long change_p4d_range(struct mmu_gather *tlb,
 	unsigned long next;
 	long pages = 0, ret;
 
-	p4d = p4d_offset(pgd, addr);
+	p4d = p4d_offset_mm(vma->vm_mm, pgd, addr);
 	do {
-		next = p4d_addr_end(addr, end);
+		next = p4d_addr_end_mm(vma->vm_mm, addr, end);
 		ret = change_prepare(vma, p4d, pud, addr, cp_flags);
 		if (ret)
 			return ret;
-		if (p4d_none_or_clear_bad(p4d))
+		if (p4d_none_or_clear_bad_mm(vma->vm_mm, p4d))
 			continue;
 		pages += change_pud_range(tlb, vma, p4d, addr, next, newprot,
 					  cp_flags);
@@ -643,7 +692,7 @@ static long change_protection_range(struct mmu_gather *tlb,
 	pgd = pgd_offset(mm, addr);
 	tlb_start_vma(tlb, vma);
 	do {
-		next = pgd_addr_end(addr, end);
+		next = pgd_addr_end_mm(vma->vm_mm, addr, end);
 		ret = change_prepare(vma, pgd, p4d, addr, cp_flags);
 		if (ret) {
 			pages = ret;
@@ -729,7 +778,7 @@ mprotect_fixup(struct vma_iterator *vmi, struct mmu_gather *tlb,
 	struct mm_struct *mm = vma->vm_mm;
 	const vma_flags_t old_vma_flags = READ_ONCE(vma->flags);
 	vma_flags_t new_vma_flags = legacy_to_vma_flags(newflags);
-	long nrpages = (end - start) >> PAGE_SHIFT;
+	long nrpages = (end - start) >> mm_page_shift(mm);
 	unsigned int mm_cp_flags = 0;
 	unsigned long charged = 0;
 	int error;
@@ -777,7 +826,7 @@ mprotect_fixup(struct vma_iterator *vmi, struct mmu_gather *tlb,
 				VMA_ACCOUNT_BIT, VMA_WRITE_BIT, VMA_HUGETLB_BIT,
 				VMA_SHARED_BIT, VMA_NORESERVE_BIT)) {
 			charged = nrpages;
-			if (security_vm_enough_memory_mm(mm, charged))
+			if (mm_account_memory(mm, mm, charged))
 				return -ENOMEM;
 			vma_flags_set(&new_vma_flags, VMA_ACCOUNT_BIT);
 		}
@@ -808,7 +857,7 @@ mprotect_fixup(struct vma_iterator *vmi, struct mmu_gather *tlb,
 
 	if (vma_flags_test(&old_vma_flags, VMA_ACCOUNT_BIT) &&
 	    !vma_flags_test(&new_vma_flags, VMA_ACCOUNT_BIT))
-		vm_unacct_memory(nrpages);
+		mm_unacct_memory(mm, nrpages);
 
 	/*
 	 * Private VM_LOCKED VMA becoming writable: trigger COW to avoid major
@@ -826,7 +875,7 @@ mprotect_fixup(struct vma_iterator *vmi, struct mmu_gather *tlb,
 	return 0;
 
 fail:
-	vm_unacct_memory(charged);
+	mm_unacct_memory(mm, charged);
 	return error;
 }
 
@@ -851,11 +900,11 @@ static int do_mprotect_pkey(unsigned long start, size_t len,
 	if (grows == (PROT_GROWSDOWN|PROT_GROWSUP)) /* can't be both */
 		return -EINVAL;
 
-	if (start & ~PAGE_MASK)
+	if (start & ~mm_page_mask(current->mm))
 		return -EINVAL;
 	if (!len)
 		return 0;
-	len = PAGE_ALIGN(len);
+	len = mm_page_align(current->mm, len);
 	end = start + len;
 	if (end <= start)
 		return -ENOMEM;

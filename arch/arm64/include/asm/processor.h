@@ -202,6 +202,11 @@ struct thread_struct {
 #ifdef CONFIG_ARM64_ACTLR_STATE
 	u64			actlr;
 #endif
+#ifdef CONFIG_ARM64_USER4K_EXPERIMENTAL
+	/* Exec policies never change the live mm geometry. Fork inherits both. */
+	unsigned int		exec_page_shift;
+	unsigned int		default_exec_page_shift;
+#endif
 };
 
 static inline unsigned int thread_get_vl(struct thread_struct *thread,

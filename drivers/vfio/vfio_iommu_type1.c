@@ -430,10 +430,19 @@ static int vfio_iova_put_vfio_pfn(struct vfio_dma *dma, struct vfio_pfn *vpfn)
 static int mm_lock_acct(struct task_struct *task, struct mm_struct *mm,
 			bool lock_cap, long npage)
 {
-	int ret = mmap_write_lock_killable(mm);
+	int ret;
 
-	if (ret)
-		return ret;
+	if (!npage)
+		return 0;
+
+	/* A released pin must be refunded even if the caller is interrupted. */
+	if (npage < 0) {
+		mmap_write_lock(mm);
+	} else {
+		ret = mmap_write_lock_killable(mm);
+		if (ret)
+			return ret;
+	}
 
 	ret = __account_locked_vm(mm, abs(npage), npage > 0, task, lock_cap);
 	mmap_write_unlock(mm);
@@ -443,20 +452,21 @@ static int mm_lock_acct(struct task_struct *task, struct mm_struct *mm,
 static int vfio_lock_acct(struct vfio_dma *dma, long npage, bool async)
 {
 	struct mm_struct *mm;
+	bool get_mm = async && npage > 0;
 	int ret;
 
 	if (!npage)
 		return 0;
 
 	mm = dma->mm;
-	if (async && !mmget_not_zero(mm))
+	if (get_mm && !mmget_not_zero(mm))
 		return -ESRCH; /* process exited */
 
 	ret = mm_lock_acct(dma->task, mm, dma->lock_cap, npage);
 	if (!ret)
 		dma->locked_vm += npage;
 
-	if (async)
+	if (get_mm)
 		mmput(mm);
 
 	return ret;
@@ -765,7 +775,8 @@ static long vfio_pin_pages_remote(struct vfio_dma *dma, unsigned long vaddr,
 			 */
 			if (acct_pages) {
 				if (!dma->lock_cap &&
-				    mm->locked_vm + lock_acct + acct_pages > limit) {
+				    mm_locked_vm_native_pages(mm) +
+				    lock_acct + acct_pages > limit) {
 					pr_warn("%s: RLIMIT_MEMLOCK (%ld) exceeded\n",
 						__func__, limit << PAGE_SHIFT);
 					ret = -ENOMEM;
@@ -1644,25 +1655,24 @@ static bool vfio_iommu_iova_dma_valid(struct vfio_iommu *iommu,
 	return list_empty(iova);
 }
 
-static int vfio_change_dma_owner(struct vfio_dma *dma)
+static int vfio_change_dma_mm(struct vfio_dma *dma, struct task_struct *task,
+			      struct mm_struct *mm, bool lock_cap)
 {
-	struct task_struct *task = current->group_leader;
-	struct mm_struct *mm = current->mm;
 	long npage = dma->locked_vm;
-	bool lock_cap;
 	int ret;
 
 	if (mm == dma->mm)
 		return 0;
 
-	lock_cap = capable(CAP_IPC_LOCK);
 	ret = mm_lock_acct(task, mm, lock_cap, npage);
 	if (ret)
 		return ret;
 
-	if (mmget_not_zero(dma->mm)) {
-		mm_lock_acct(dma->task, dma->mm, dma->lock_cap, -npage);
-		mmput(dma->mm);
+	/* dma retains mm_count after exit; its old charge still needs a refund. */
+	ret = mm_lock_acct(dma->task, dma->mm, dma->lock_cap, -npage);
+	if (ret) {
+		mm_lock_acct(task, mm, lock_cap, -npage);
+		return ret;
 	}
 
 	if (dma->task != task) {
@@ -1674,6 +1684,12 @@ static int vfio_change_dma_owner(struct vfio_dma *dma)
 	mmgrab(dma->mm);
 	dma->lock_cap = lock_cap;
 	return 0;
+}
+
+static int vfio_change_dma_owner(struct vfio_dma *dma)
+{
+	return vfio_change_dma_mm(dma, current->group_leader, current->mm,
+				  capable(CAP_IPC_LOCK));
 }
 
 static int vfio_dma_do_map(struct vfio_iommu *iommu,
@@ -3281,3 +3297,7 @@ MODULE_VERSION(DRIVER_VERSION);
 MODULE_LICENSE("GPL v2");
 MODULE_AUTHOR(DRIVER_AUTHOR);
 MODULE_DESCRIPTION(DRIVER_DESC);
+
+#ifdef CONFIG_VFIO_TYPE1_ACCOUNT_KUNIT_TEST
+#include "vfio_iommu_type1_account_test.c"
+#endif
