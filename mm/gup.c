@@ -3799,6 +3799,7 @@ long get_user_fragments_remote(struct mm_struct *mm, unsigned long start,
 	return user_fragments_remote(mm, start, length, flags, fragments, capacity,
 				     false, NULL, false);
 }
+EXPORT_SYMBOL_GPL(get_user_fragments_remote);
 
 int get_user_fragment_vma_remote(struct mm_struct *mm, unsigned long start,
 		unsigned long length, unsigned int flags,
@@ -3848,6 +3849,22 @@ int get_dump_fragment(unsigned long addr, struct user_page_fragment *fragment)
 }
 #endif
 
+void mark_user_fragment_dirty(struct user_page_fragment *fragment)
+{
+	struct folio *folio = fragment->folio;
+
+	if (!folio)
+		return;
+	if (!is_zero_folio(folio) && !folio_test_dirty(folio)) {
+		folio_lock(folio);
+		folio_mark_dirty(folio);
+		folio_unlock(folio);
+	}
+	if (fragment->subpage)
+		mm_subpage_cancel_lazyfree(fragment->subpage);
+}
+EXPORT_SYMBOL_GPL(mark_user_fragment_dirty);
+
 void release_user_fragments(struct user_page_fragment *fragments,
 		unsigned long count, bool dirty)
 {
@@ -3859,14 +3876,9 @@ void release_user_fragments(struct user_page_fragment *fragments,
 
 		if (!folio)
 			continue;
-		if (dirty && !is_zero_folio(folio) && !folio_test_dirty(folio)) {
-			folio_lock(folio);
-			folio_mark_dirty(folio);
-			folio_unlock(folio);
-		}
+		if (dirty)
+			mark_user_fragment_dirty(fragment);
 		if (fragment->subpage) {
-			if (dirty)
-				mm_subpage_cancel_lazyfree(fragment->subpage);
 			if (fragment->pinned)
 				mm_subpage_unpin(fragment->subpage);
 			else

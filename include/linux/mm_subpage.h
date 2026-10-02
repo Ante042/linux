@@ -260,6 +260,8 @@ int pin_user_fragment_vma_remote(struct mm_struct *mm, unsigned long start,
 		struct user_page_fragment *fragment, struct vm_area_struct **vma);
 /* Current mm, one aligned fragment; sparse zero pages return a negative errno. */
 int get_dump_fragment(unsigned long addr, struct user_page_fragment *fragment);
+/* Dirty a retained reference without releasing its allocation identity. */
+void mark_user_fragment_dirty(struct user_page_fragment *fragment);
 void release_user_fragments(struct user_page_fragment *fragments,
 		unsigned long count, bool dirty);
 #endif

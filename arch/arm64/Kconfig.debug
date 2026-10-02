@@ -77,7 +77,7 @@ config ARM64_USER4K_IOMMUFD_TEST
 	  Say N for normal kernels.
 
 config ARM64_USER4K_VFIO_ACCOUNT_TEST
-	bool "VFIO type1 accounting harness for mixed userspace granules"
+	bool "VFIO type1 pinning harness for mixed userspace granules"
 	depends on ARM64_USER4K_EXPERIMENTAL && KUNIT=y
 	select VFIO
 	select VFIO_GROUP
@@ -86,9 +86,21 @@ config ARM64_USER4K_VFIO_ACCOUNT_TEST
 	select VFIO_TYPE1_ACCOUNT_KUNIT_TEST
 	default n
 	help
-	  Enable built-in VFIO type1 and its source-mm accounting tests in
-	  a disposable mixed-granule test guest. This does not establish
-	  physical-device DMA or alternative-page pinning support.
+	  Enable built-in VFIO type1 accounting and retained-fragment tests
+	  in a disposable mixed-granule guest. Recorded IOMMU translations
+	  do not establish physical-device DMA support.
+	  Say N for normal kernels.
+
+config ARM64_USER4K_VFIO_IOCTL_TEST
+	bool "Private VFIO type1 ioctl harness for mixed userspace granules"
+	depends on ARM64_USER4K_EXPERIMENTAL && KUNIT=y && DEBUG_KERNEL
+	depends on RUNTIME_TESTING_MENU
+	select ARM64_USER4K_VFIO_ACCOUNT_TEST
+	default n
+	help
+	  Expose a root-only disposable-guest misc device forwarding real EL0
+	  arguments to type1 ioctls and supplying recording IOMMU domains.
+	  These privileged test controls perform no physical device DMA.
 	  Say N for normal kernels.
 
 config ARM64_USER4K_DATA_KUNIT_TEST

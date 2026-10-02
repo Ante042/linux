@@ -4300,3 +4300,107 @@ user4k-vm-state/gem-granule-v1/. This extends common GEM shmem/PRIME CPU
 mapping coverage using VGEM. It does not execute Asahi GPU commands or
 qualify imported buffers from other exporters, hardware DMA, Vulkan/GL,
 Windows games or performance.
+
+
+Legacy VFIO retained fragment provider (2026-10-02)
+-------------------------------------------------
+
+Type1 now retains typed pin records for alternative-granule mappings and
+native mappings whose virtual address, IOVA or length requires finer
+alignment. The native-aligned default continues through its existing GUP
+and batching path. Retained records identify the original pinned allocation
+and byte range; IOMMU translations are no longer used to reconstruct pin
+ownership on the new path. Accounting counts unique native physical pages
+within each mapping provider and refunds the retained mm after source exit.
+
+Mapping and replay merge physically contiguous byte runs, check the actual
+domain minimum alignment, and unwind successful prefixes on failure. IOTLB
+synchronization precedes pin release. Cached pins preserve the original DMA
+bytes after source-mm exit or address replacement; missing CPU-only ranges
+use temporary GET references. A typed dirty helper records writes without
+releasing cached pins. External native-page arrays accept complete, aligned,
+physically contiguous native spans and preserve callers' original byte
+offsets. Layouts that need an explicit physical offset or cannot be represented
+by one native page pointer remain rejected; spans across separate fine-grained
+DMA mappings still need aggregate ownership support.
+
+The container advertises the composed minimum supported by attached domains,
+with a 4K floor while the mixed-page feature is enabled. Software dirty
+tracking uses a stable 4K unit, independent of domain attachment and minimum
+translation size, and marks every covered unit for native-page external pins.
+A native mapping's VADDR owner change to an alternative mm still requires
+ownership conversion and is rejected explicitly until that path is implemented.
+
+The private type1 KUnit harness exercises real typed pins, source mm lifetime,
+canonical mapping, replay, external pins, CPU access and DMA removal against
+recording IOMMU domain operations. Seven fragment cases and two accounting
+cases pass on both native16K and native64K kernels. Coverage includes failed
+second-domain mapping, replay rollback with retained external pins, exact fine
+ranges and dirty bits, anonymous 4K pins after source exit and transfer to a
+native owner, and stable dirty granularity with a 16K-only domain. The first
+callback-unpin test exposed an inconsistent device-list/IOMMU mutex order;
+registration, removal and notification now use a consistent order and
+notification snapshots the range before releasing the IOMMU lock.
+
+The final source also passes the broader mixed-page KUnit suites and real EL0
+IOMMUFD USER/MM regressions. These tests do not establish real EL0 legacy
+VFIO ioctl behavior, physical-device DMA, Apple boot, GPU execution, Windows
+games or throughput. Native-to-alternative ownership conversion, aggregate
+external spans and hardware qualification remain unfinished.
+
+Matched native-GUP controls retain the new harness and corrected lock order,
+but disable fragment-provider selection and restore the native PAGE_SIZE
+alignment floor. Both controls fail all seven fragment cases while their two
+accounting cases pass. They power down without kernel warnings. These are
+matched behavior controls, not literal original-source kernel Images.
+
+A separate native16K MODULES=y configuration builds VFIO and type1 as modules,
+with the mixed-page feature enabled and the private tests disabled. Full
+MODPOST succeeds; a guest loads and unloads both modules and verifies type1
+registration in six checks. This qualifies linkage of the typed PIN, GET,
+mark-dirty and release APIs, rather than physical device operation.
+
+
+Real EL0 legacy VFIO ioctl coverage (2026-10-02)
+----------------------------------------------
+
+A separate default-off ARM64_USER4K_VFIO_IOCTL_TEST option exposes a 0600,
+CAP_SYS_ADMIN-only disposable-guest misc fixture. Standard GET_INFO, MAP_DMA,
+UNMAP_DMA and DIRTY_PAGES requests call the canonical type1 dispatcher with
+actual userspace arguments and the calling process's real mm. Private controls
+supply recording IOMMU domains, external-page consumers and bounded CPU access.
+The fixture serializes its requests; this does not qualify concurrent type1
+ioctls or physical IOMMU group/device attachment. Normal kernels do not expose
+this test interface.
+
+All 29 AArch64 checks pass under native16K/4K and native64K/4K/16K. They cover
+argument rejection, lazy mappings without DMA charges, temporary CPU GET,
+duplicate external pins with unaligned caller offsets, every 4K dirty unit
+covered by a native external page, and unmap-callback cleanup. A child maps a
+fine-offset shmem range and exits. Its real mm_users reaches zero while two
+native physical pages remain charged and mapped. A foreign userspace process
+still receives EFAULT from direct CPU access, while a kernel worker reads and
+writes the retained original bytes. Failed second-domain replay leaves the
+first domain and pins intact; retry succeeds without resurrecting the source
+mm. Canonical dirty-bitmap output reports exactly the two touched 4K units;
+final unmap clears both domains and refunds all charges.
+
+A freestanding AArch32 probe passes real type1 ioctls, external arrays, dirty
+bitmap pointer layout, child-mm exit, kernel-worker access and final cleanup.
+It checks actual AT_PAGESZ and protection alignment. With 4K available it uses
+4K pages; boot models removing TGran4 support still execute it with native16K
+or native64K and reject a 4K-only mprotect operation. These are capability
+models, not Apple A9 or other AArch32 hardware tests.
+
+Matched native-GUP controls retain the real ioctl fixture but disable the new
+provider and restore native PAGE_SIZE alignment. They reproduce rejection of
+fine mappings and alternative external pins; the fixtures fail and power down
+without kernel warnings. They are matched behavior controls, not original-source
+kernel Images. Existing type1 KUnit and broader mixed-page regressions also
+pass on the fixture-enabled kernels.
+
+Evidence is under user4k-vm-state/vfio-ioctl-v1/. These tests qualify the actual
+EL0-to-type1 provider/ABI path with supplied domains, not the VFIO core group
+attachment protocol, physical DMA, Apple boot, GPU execution or game throughput.
+Native-to-alternative VADDR ownership conversion and external spans crossing
+multiple fine DMA mappings remain unfinished.
