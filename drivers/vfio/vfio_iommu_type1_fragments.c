@@ -231,6 +231,24 @@ static void vfio_fragments_put_native_pin(struct vfio_dma *dma, unsigned long pf
 		vfio_lock_acct(dma, -(long)(dma->locked_vm - provider->npinned), true);
 }
 
+static bool vfio_fragments_external_overlap(struct vfio_dma *dma,
+					    dma_addr_t start, unsigned long length)
+{
+	struct rb_node *node = dma->pfn_list.rb_node;
+
+	while (node) {
+		struct vfio_pfn *vpfn = rb_entry(node, struct vfio_pfn, node);
+
+		if (start + length <= vpfn->iova)
+			node = node->rb_left;
+		else if (start >= vpfn->iova + vpfn->length)
+			node = node->rb_right;
+		else
+			return true;
+	}
+	return false;
+}
+
 /* Device unmaps and their IOTLB synchronization must precede this call. */
 static void vfio_fragments_release_range(struct vfio_dma *dma, unsigned long start,
 					 unsigned long length)
@@ -251,9 +269,7 @@ static void vfio_fragments_release_range(struct vfio_dma *dma, unsigned long sta
 			break;
 		node = rb_next(node);
 		/* Native-page consumers retain all records overlapping their page. */
-		if (vfio_find_vpfn_range(dma, iova >= PAGE_SIZE - 1 ?
-					iova - (PAGE_SIZE - 1) : 0,
-					iova + record->pin.length))
+		if (vfio_fragments_external_overlap(dma, iova, record->pin.length))
 			continue;
 		pfn = PHYS_PFN(vfio_fragment_phys(&record->pin));
 		count = xa_to_value(xa_load(&provider->physical_pages, pfn));
@@ -437,18 +453,18 @@ static void vfio_fragments_destroy(struct vfio_dma *dma)
 	dma->fragments = NULL;
 }
 
-/* The output page has no offset field: validate every byte in its native span. */
+/* The output page has no offset field: validate every byte and its native offset. */
 static int vfio_fragments_external(struct vfio_dma *dma, dma_addr_t iova,
-				    unsigned long *pfn)
+				    unsigned long length, unsigned long *pfn)
 {
 	unsigned long first = iova - dma->iova, done = 0;
 	phys_addr_t phys = 0;
 	int ret;
 
-	ret = vfio_fragments_acquire(dma, first, PAGE_SIZE);
+	ret = vfio_fragments_acquire(dma, first, length);
 	if (ret)
 		return ret;
-	while (done < PAGE_SIZE) {
+	while (done < length) {
 		struct vfio_fragment *record = vfio_fragment_find(dma, first + done);
 		phys_addr_t next;
 		unsigned long offset;
@@ -461,17 +477,17 @@ static int vfio_fragments_external(struct vfio_dma *dma, dma_addr_t iova,
 		next = vfio_fragment_phys(&record->pin) + offset;
 		if (!done)
 			phys = next;
-		if (!IS_ALIGNED(phys, PAGE_SIZE) || next != phys + done) {
+		if (offset_in_page(phys) != offset_in_page(iova) || next != phys + done) {
 			ret = -EINVAL;
 			goto out;
 		}
-		done += min_t(unsigned long, record->pin.length - offset, PAGE_SIZE - done);
+		done += min_t(unsigned long, record->pin.length - offset, length - done);
 	}
 	*pfn = PHYS_PFN(phys);
-	ret = vfio_add_to_pfn_list(dma, iova, *pfn);
+	ret = vfio_add_to_pfn_list(dma, iova, *pfn, length);
 out:
 	if (ret)
-		vfio_fragments_release_range(dma, first, PAGE_SIZE);
+		vfio_fragments_release_range(dma, first, length);
 	return ret;
 }
 
@@ -580,7 +596,8 @@ static void vfio_fragments_unmap(struct vfio_iommu *iommu, struct vfio_dma *dma)
 static void vfio_fragments_destroy(struct vfio_dma *dma)
 {
 }
-static int vfio_fragments_external(struct vfio_dma *dma, dma_addr_t iova, unsigned long *pfn)
+static int vfio_fragments_external(struct vfio_dma *dma, dma_addr_t iova,
+				    unsigned long length, unsigned long *pfn)
 {
 	return -EOPNOTSUPP;
 }

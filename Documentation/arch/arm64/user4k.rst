@@ -4321,8 +4321,8 @@ use temporary GET references. A typed dirty helper records writes without
 releasing cached pins. External native-page arrays accept complete, aligned,
 physically contiguous native spans and preserve callers' original byte
 offsets. Layouts that need an explicit physical offset or cannot be represented
-by one native page pointer remain rejected; spans across separate fine-grained
-DMA mappings still need aggregate ownership support.
+by one native page pointer remain rejected. Aggregate ownership across separate
+fine-grained DMA mappings is qualified in the later external-span section.
 
 The container advertises the composed minimum supported by attached domains,
 with a 4K floor while the mixed-page feature is enabled. Software dirty
@@ -4402,8 +4402,9 @@ pass on the fixture-enabled kernels.
 Evidence is under user4k-vm-state/vfio-ioctl-v1/. These tests qualify the actual
 EL0-to-type1 provider/ABI path with supplied domains, not the VFIO core group
 attachment protocol, physical DMA, Apple boot, GPU execution or game throughput.
-Native-to-alternative VADDR ownership conversion and external spans crossing
-multiple fine DMA mappings remain unfinished.
+At this checkpoint, native-to-alternative VADDR ownership conversion and
+external spans crossing multiple fine DMA mappings were unfinished; the later
+sections record their implementation and bounded qualification.
 
 
 Native VFIO VADDR ownership conversion (2026-10-02)
@@ -4460,3 +4461,39 @@ module build/load/unload checks also pass. Evidence is under
 user4k-vm-state/vfio-owner-v1/. This qualifies the tested provider ownership
 paths with supplied domains, not concurrent physical-device attachment/DMA,
 Apple GPU execution, game performance or the remaining full ABI requirements.
+
+
+VFIO native-page arrays across fine DMA mappings (2026-10-02)
+------------------------------------------------------------
+
+An external native-page array may now span several adjacent fine-grained DMA
+mappings. Each constituent retains a reference in its own DMA owner, with its
+exact byte extent and existing per-provider physical-page accounting. Every
+byte must resolve to the same native physical page at the corresponding native
+offset. Missing mappings, denied permissions, discontinuous physical pages and
+incompatible offsets reject the request and unwind all references acquired by
+that request. Previously held references remain intact. Ordinary native-aligned
+mappings keep their existing native GUP path.
+
+Unpin walks the same constituents under the container lock. Unmapping any
+constituent invokes the existing device notification contract: a consumer must
+release the native-page reference, including all of its constituent references,
+before that mapping can disappear. Exact extents also bound dirty bitmap writes
+and determine whether a cached pin is still protected by an external consumer.
+A physical page shared by independent DMA providers remains charged separately
+to each provider; this does not add cross-provider charge deduplication.
+
+The new KUnit case passes lazy/mapped spans with separate 4K/native mm owners,
+source-mm exit, duplicate references, failed larger requests, reverse-order page
+release, fine dirty bitmaps and constituent notification/cleanup. Four negative
+variants cover a hole, permission denial, discontinuous backing and wrong native
+offset. The type1 suites total eleven passes and zero failures on each native16K
+and native64K kernel.
+
+Real EL0 creates a native-page span with independent 4K MAP ioctls, pins before
+source exit and reuses all cached constituents after exit. Lazy and mapped
+variants check each provider's charge, fine dirty bits, duplicate references and
+UNMAP of one constituent followed by full cleanup. These add sixteen assertions
+to each tested A64 ABI: native16K/4K and native64K/4K/16K. The supplied domains
+record translations; these results do not qualify physical device DMA, concurrent
+type1 consumers, Apple boot/GPU execution or game throughput.

@@ -110,6 +110,74 @@ static int all_bytes(const unsigned char *data, size_t size, unsigned char value
 	return 1;
 }
 
+static void external_span(int backing, size_t native)
+{
+	const size_t fine = 4096, count = native / fine;
+	uint64_t bits;
+
+	for (unsigned int mapped = 0; mapped < 2; mapped++) {
+		struct vfio_type1_test_cmd cmd;
+		struct vfio_iommu_type1_dma_unmap remove = {
+			.argsz = sizeof(remove), .iova = IOVA, .size = fine,
+		};
+		int fd = open("/dev/vfio-test", O_RDWR), status = 0;
+		pid_t child;
+
+		result(fd >= 0 && (!mapped || !domain(fd, 0, 1, fine, 0)),
+		       "span fixture opens lazy or mapped type1 container");
+		if (fd < 0)
+			continue;
+		result(!dirty(fd, VFIO_IOMMU_DIRTY_PAGES_FLAG_START),
+		       "span dirty tracking starts before fine mappings");
+		child = fork();
+		if (!child) {
+			unsigned char *data = mmap(NULL, native, PROT_READ | PROT_WRITE,
+						  MAP_SHARED, backing, 0);
+
+			if (data == MAP_FAILED)
+				_exit(1);
+			for (size_t i = 0; i < count; i++) {
+				struct vfio_iommu_type1_dma_map area = {
+					.argsz = sizeof(area),
+					.flags = VFIO_DMA_MAP_FLAG_READ | VFIO_DMA_MAP_FLAG_WRITE,
+					.iova = IOVA + i * fine,
+					.vaddr = (uintptr_t)data + i * fine,
+					.size = fine,
+				};
+
+				if (ioctl(fd, VFIO_IOMMU_MAP_DMA, &area))
+					_exit(2);
+			}
+			cmd = (struct vfio_type1_test_cmd) { .iova = IOVA + 17 };
+			_exit(ioctl(fd, VFIO_TYPE1_TEST_PIN, &cmd) ? 3 : 0);
+		}
+		result(child > 0 && waitpid(child, &status, 0) == child &&
+		       WIFEXITED(status) && !WEXITSTATUS(status),
+		       "source pins native page across independent fine MAP ioctls");
+		result(!state(fd, &cmd) && !cmd.owner_users && cmd.external_refs == 1 &&
+		       cmd.locked_bytes == count * native &&
+		       cmd.owner_locked_bytes == count * native,
+		       "every fine DMA area retains its own charge after source exit");
+		cmd = (struct vfio_type1_test_cmd) { .iova = IOVA + 31 };
+		result(!ioctl(fd, VFIO_TYPE1_TEST_PIN, &cmd) && !state(fd, &cmd) &&
+		       cmd.external_refs == 2 && cmd.locked_bytes == count * native,
+		       "cross-area duplicate pin reuses all cached constituent pins");
+		result(!bitmap(fd, native, &bits) && bits == ((1ULL << count) - 1),
+		       "cross-area dirty bitmap marks only each mapping's fine extent");
+		result(!ioctl(fd, VFIO_IOMMU_UNMAP_DMA, &remove) && remove.size == fine &&
+		       !state(fd, &cmd) && !cmd.external_refs && cmd.notifications == 1 &&
+		       cmd.locked_bytes == (mapped ? (count - 1) * native : 0),
+		       "unmapping one constituent drains references in all page constituents");
+		remove.iova = IOVA + fine;
+		remove.size = native - fine;
+		result(!ioctl(fd, VFIO_IOMMU_UNMAP_DMA, &remove) &&
+		       remove.size == native - fine && !state(fd, &cmd) &&
+		       !cmd.locked_bytes && !cmd.mapped_bytes[0],
+		       "remaining fine mappings unmap without pins or translations");
+		close(fd);
+	}
+}
+
 static void native_owner(int fd, int backing, unsigned char *data, size_t native)
 {
 	struct vfio_type1_test_cmd cmd = {};
@@ -295,6 +363,7 @@ static int exercise(size_t native)
 	       "source-exit cleanup refunds pins and clears all translations");
 	result(!domain(fd, 1, 0, 0, 0) && !domain(fd, 0, 0, 0, 0),
 	       "both domains detach after complete cleanup");
+	external_span(backing, native);
 	if (getauxval(AT_PAGESZ) != native)
 		native_owner(fd, backing, data, native);
 out:

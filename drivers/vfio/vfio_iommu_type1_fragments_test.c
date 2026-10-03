@@ -662,6 +662,135 @@ static void vfio_fragments_native_owner_test(struct kunit *test)
 	}
 }
 
+static int vfio_fragment_map_area(struct vfio_fragment_fixture *f,
+		struct vfio_account_mm *ctx, unsigned long iova_offset,
+		unsigned long va_offset, unsigned long length, unsigned int flags)
+{
+	struct vfio_iommu_type1_dma_map map = {
+		.argsz = sizeof(map),
+		.flags = flags,
+		.vaddr = VFIO_TEST_VA + va_offset,
+		.iova = VFIO_TEST_IOVA + iova_offset,
+		.size = length,
+	};
+	int ret;
+
+	kthread_use_mm(ctx->mm);
+	ret = vfio_dma_do_map(f->iommu, &map);
+	kthread_unuse_mm(ctx->mm);
+	return ret;
+}
+
+static void vfio_fragments_external_span_test(struct kunit *test)
+{
+	unsigned int rw = VFIO_DMA_MAP_FLAG_READ | VFIO_DMA_MAP_FLAG_WRITE;
+
+	for (unsigned int mapped = 0; mapped < 2; mapped++) {
+		struct vfio_account_mm *a = vfio_account_mm_new(test, 12);
+		struct vfio_account_mm *b = vfio_account_mm_new(test, PAGE_SHIFT);
+		struct vfio_fragment_fixture *f = vfio_fragment_fixture_new(test);
+		struct file *file = vfio_fragment_file(test, 2 * PAGE_SIZE, 0x6b);
+		struct vfio_iommu_type1_dma_unmap unmap = {
+			.argsz = sizeof(unmap), .iova = VFIO_TEST_IOVA, .size = SZ_4K,
+		};
+		struct vfio_bitmap bitmap = {};
+		struct vfio_dma *first, *rest;
+		struct page *pages[3];
+		unsigned long bits = 2 * PAGE_SIZE / SZ_4K - 1;
+
+		KUNIT_ASSERT_NOT_NULL(test, a);
+		KUNIT_ASSERT_NOT_NULL(test, b);
+		KUNIT_ASSERT_NOT_NULL(test, f);
+		KUNIT_ASSERT_NOT_ERR_OR_NULL(test, file);
+		KUNIT_ASSERT_EQ(test, vfio_fragment_source(a, file, 2 * PAGE_SIZE), VFIO_TEST_VA);
+		KUNIT_ASSERT_EQ(test, vfio_fragment_source(b, file, 2 * PAGE_SIZE), VFIO_TEST_VA);
+		if (mapped) {
+			list_add_tail(&f->domains[0].type1.next, &f->iommu->domain_list);
+			vfio_update_pgsize_bitmap(f->iommu);
+		}
+		KUNIT_ASSERT_EQ(test, vfio_fragment_map_area(f, a, 0, 0, SZ_4K, rw), 0);
+		KUNIT_ASSERT_EQ(test, vfio_fragment_map_area(f, b, SZ_4K, SZ_4K,
+			2 * PAGE_SIZE - SZ_4K, rw), 0);
+		first = vfio_find_dma(f->iommu, VFIO_TEST_IOVA, 1);
+		rest = vfio_find_dma(f->iommu, VFIO_TEST_IOVA + SZ_4K, 1);
+		KUNIT_ASSERT_NOT_NULL(test, first);
+		KUNIT_ASSERT_NOT_NULL(test, rest);
+		f->iommu->dirty_page_tracking = true;
+		KUNIT_ASSERT_EQ(test, vfio_dma_bitmap_alloc_all(f->iommu, SZ_4K), 0);
+		KUNIT_ASSERT_EQ(test, vfio_iommu_type1_pin_pages(f->iommu,
+			f->group.iommu_group, VFIO_TEST_IOVA + 37, 2,
+			IOMMU_READ | IOMMU_WRITE, pages), 2);
+		KUNIT_EXPECT_EQ(test, first->locked_vm, 1UL);
+		KUNIT_EXPECT_EQ(test, rest->locked_vm, 2UL);
+		KUNIT_EXPECT_EQ(test, bitmap_weight(first->bitmap, 1), 1);
+		KUNIT_EXPECT_EQ(test, bitmap_weight(rest->bitmap, bits), (int)bits);
+		bitmap_clear(rest->bitmap, 0, bits);
+		vfio_dma_populate_bitmap(rest, SZ_4K);
+		KUNIT_EXPECT_EQ(test, bitmap_weight(rest->bitmap, bits), (int)bits);
+		if (mapped)
+			KUNIT_EXPECT_EQ(test, page_to_phys(pages[0]),
+				iommu_iova_to_phys(&f->domains[0].core, VFIO_TEST_IOVA));
+		/* A failed larger request must leave prior caller references intact. */
+		KUNIT_EXPECT_EQ(test, vfio_iommu_type1_pin_pages(f->iommu,
+			f->group.iommu_group, VFIO_TEST_IOVA, 3, IOMMU_READ, pages), -EINVAL);
+		KUNIT_EXPECT_PTR_EQ(test, pages[0], NULL);
+		KUNIT_EXPECT_PTR_EQ(test, pages[1], NULL);
+		KUNIT_EXPECT_PTR_EQ(test, pages[2], NULL);
+		a->live = b->live = false;
+		mmput(a->mm);
+		mmput(b->mm);
+		KUNIT_ASSERT_EQ(test, vfio_iommu_type1_pin_pages(f->iommu,
+			f->group.iommu_group, VFIO_TEST_IOVA, 2, IOMMU_READ, pages), 2);
+		vfio_iommu_type1_unpin_pages(f->iommu, VFIO_TEST_IOVA, 2);
+		/* Release the second page first: it shares the second DMA owner. */
+		vfio_iommu_type1_unpin_pages(f->iommu, VFIO_TEST_IOVA + PAGE_SIZE + 7, 1);
+		KUNIT_EXPECT_EQ(test, rest->locked_vm, mapped ? 2UL : 1UL);
+		f->external_refs = 1;
+		KUNIT_ASSERT_EQ(test, vfio_dma_do_unmap(f->iommu, &unmap, &bitmap), 0);
+		KUNIT_EXPECT_EQ(test, f->notifications, 1U);
+		KUNIT_EXPECT_EQ(test, f->external_refs, 0U);
+		KUNIT_EXPECT_EQ(test, mm_locked_vm_bytes(a->mm), 0UL);
+		KUNIT_EXPECT_EQ(test, rest->locked_vm, mapped ? 2UL : 0UL);
+		unmap.iova += SZ_4K;
+		unmap.size = 2 * PAGE_SIZE - SZ_4K;
+		KUNIT_ASSERT_EQ(test, vfio_dma_do_unmap(f->iommu, &unmap, &bitmap), 0);
+		KUNIT_EXPECT_EQ(test, mm_locked_vm_bytes(b->mm), 0UL);
+		kunit_release_action(test, vfio_fragment_fixture_free, f);
+	}
+	for (unsigned int failure = 0; failure < 4; failure++) {
+		struct vfio_account_mm *ctx = vfio_account_mm_new(test, 12);
+		struct vfio_fragment_fixture *f = vfio_fragment_fixture_new(test);
+		struct file *file = vfio_fragment_file(test, 2 * PAGE_SIZE, 0x3a);
+		struct page *page = NULL;
+		struct rb_node *node;
+		unsigned long va = failure == 2 ? PAGE_SIZE + SZ_4K : SZ_4K;
+		int expected = failure == 1 ? -EPERM : -EINVAL;
+
+		KUNIT_ASSERT_NOT_NULL(test, ctx);
+		KUNIT_ASSERT_NOT_NULL(test, f);
+		KUNIT_ASSERT_NOT_ERR_OR_NULL(test, file);
+		KUNIT_ASSERT_EQ(test, vfio_fragment_source(ctx, file, 2 * PAGE_SIZE), VFIO_TEST_VA);
+		KUNIT_ASSERT_EQ(test, vfio_fragment_map_area(f, ctx, 0, 0, SZ_4K, rw), 0);
+		if (failure == 3)
+			va += SZ_4K;
+		if (failure != 0)
+			KUNIT_ASSERT_EQ(test, vfio_fragment_map_area(f, ctx, SZ_4K, va,
+				SZ_4K, failure == 1 ? VFIO_DMA_MAP_FLAG_READ : rw), 0);
+		KUNIT_EXPECT_EQ(test, vfio_iommu_type1_pin_pages(f->iommu,
+			f->group.iommu_group, VFIO_TEST_IOVA, 1,
+			IOMMU_READ | IOMMU_WRITE, &page), expected);
+		KUNIT_EXPECT_PTR_EQ(test, page, NULL);
+		KUNIT_EXPECT_EQ(test, mm_locked_vm_bytes(ctx->mm), 0UL);
+		for (node = rb_first(&f->iommu->dma_list); node; node = rb_next(node)) {
+			struct vfio_dma *dma = rb_entry(node, struct vfio_dma, node);
+
+			KUNIT_EXPECT_TRUE(test, RB_EMPTY_ROOT(&dma->pfn_list));
+			KUNIT_EXPECT_TRUE(test, RB_EMPTY_ROOT(&dma->fragments->records));
+		}
+		kunit_release_action(test, vfio_fragment_fixture_free, f);
+	}
+}
+
 static struct kunit_case vfio_fragments_cases[] = {
 	KUNIT_CASE(vfio_fragments_lifetime_test),
 	KUNIT_CASE(vfio_fragments_lazy_test),
@@ -671,6 +800,7 @@ static struct kunit_case vfio_fragments_cases[] = {
 	KUNIT_CASE(vfio_fragments_anon_owner_test),
 	KUNIT_CASE(vfio_fragments_domain_granule_test),
 	KUNIT_CASE(vfio_fragments_native_owner_test),
+	KUNIT_CASE(vfio_fragments_external_span_test),
 	{}
 };
 
