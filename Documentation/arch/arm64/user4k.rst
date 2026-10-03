@@ -90,6 +90,40 @@ fixture, the existing native16/4K static/dynamic execution suite, and the
 Windows memory contract through the existing private Wine/FEX fixture in a VM.
 Apple hardware boot, GPU execution and game testing remain unqualified.
 
+Perf ring mappings and sampling (2026-10-03)
+-------------------------------------------
+
+Ordinary perf mappings now place the data ring after one process-sized
+metadata page. The first mapper fixes that layout for the ring's lifetime;
+an attempt to mmap the same ring from a different process granule returns
+EINVAL. Same-granule aliases remain supported. This restriction is specific
+to perf ring layout and does not prohibit mixed-granule shared memory.
+
+The requested data capacity and wrap boundary are independent of physical
+allocation. Small rings occupy native backing pages but wrap at their exact
+requested capacity; larger rings retain native allocation chunks. The
+vmalloc backend retains its contiguous output buffer. Both allocation and
+locked-memory accounting use native pages, including a full backing page
+for metadata. Only the first process page is writable by userspace.
+
+AUX offsets retain their complete byte position, including the subpage
+part, for mapping selection and lifetime management. AUX buffer sizes
+remain native-page multiples because PMU setup_aux callbacks consume
+native-page arrays. This does not establish hardware AUX tracing support:
+the current runtime fixture tests byte-offset routing to a software event's
+expected EOPNOTSUPP response, not a hardware PMU's AUX allocation or output.
+
+The former kernel rejects conventional metadata-only and two-data-page
+ring mappings in smaller-granule processes. The fixed kernel passes real
+software page-fault sampling on native16/4K and native64/16K/4K, including
+records crossing the ring boundary, rings smaller and larger than native
+pages, metadata writes, read-only data, alias lifetime and incompatible
+mixed-granule alias rejection. Both ordinary and vmalloc backends pass.
+Freestanding AArch32 probes pass automatic 4K and capability-masked
+native16/native64 fallback, including mmap2's fixed 4K offset units.
+Feature-disabled arm64 and x86 perf objects compile. These are disposable
+VM tests, not Apple hardware, game or performance qualification.
+
 Current userfaultfd support (2026-10-02)
 ---------------------------------------
 
