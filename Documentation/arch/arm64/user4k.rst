@@ -61,6 +61,35 @@ host BSS start. The assertion remains enabled. The full image links with
 identical host/hypervisor BSS starts; focused LLVM and GNU linker fixtures
 cover native4K, native16K, mixed16K/64K alignment and native64K.
 
+System V shared memory across process granules (2026-10-03)
+----------------------------------------------------------
+
+SysV attach and detach now use the calling mm's page granule. The arm64
+attach-alignment hook scales the native and compat rounding rules only for
+SysV attachments; the global SHMLBA constant remains unchanged for kernel
+allocation users. AArch32 keeps its four-process-page rounding rule, including
+the existing native-page restriction when 4K translation is unavailable.
+
+Detach compares both the native file index and subpage byte offset when
+recognizing fragments left by mprotect or partial munmap. Its segment extent
+is rounded to the process granule. This preserves shared-object identity and
+removes all matching fragments without including adjacent mappings.
+
+The old kernel rejected valid smaller-page fixed and rounded attaches and
+could reject detach of an automatically placed smaller-page alias. The new
+PID1 fixture passes native16/4K and native64/16K/4K mapping cases, partial
+unmap/protection splits, alias lifetime and all directed mixed-granule SysV
+sharing pairs, including attachment after IPC_RMID while another alias lives.
+AArch32 automatic4K passes on both builds. Capability-masked no4K models pass
+native16/native64 AArch32 attach/detach and retain rejection of 4K-only
+mprotect requests. Feature-disabled arm64 and x86 SysV objects also compile.
+The fixture requires CONFIG_SYSVIPC and runs only in a disposable guest.
+
+The Apple-enabled ``7.1.12-aurora-mixed-mm2`` Image also passes the SysV
+fixture, the existing native16/4K static/dynamic execution suite, and the
+Windows memory contract through the existing private Wine/FEX fixture in a VM.
+Apple hardware boot, GPU execution and game testing remain unqualified.
+
 Current userfaultfd support (2026-10-02)
 ---------------------------------------
 
