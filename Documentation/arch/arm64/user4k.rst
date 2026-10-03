@@ -124,6 +124,28 @@ native16/native64 fallback, including mmap2's fixed 4K offset units.
 Feature-disabled arm64 and x86 perf objects compile. These are disposable
 VM tests, not Apple hardware, game or performance qualification.
 
+Protection-walk geometry cost (2026-10-03)
+-----------------------------------------
+
+The PTE protection walk now decodes its immutable mm granule once and
+passes that value to the inlined batching selector. This removes repeated
+granule decoding and restores an inline small-folio path; the batching
+rules, permission checks and TLB operations remain the same.
+
+Matched non-debug, native16 TCG kernels before and after this change used
+the same configuration and benchmark executable. Three paired boots with
+five retained trials each measured an 8MiB protection change about 5.8%
+faster for native16 processes and 2.5% faster for 4K processes. These are
+emulator results, not Apple hardware or game performance. Other timings
+varied, including a roughly 1.4% increase in the 4K fork/COW measurement;
+the result does not establish a universal speedup or zero native overhead.
+
+The existing protection, COW-batching, accounting and migration KUnit
+cases pass on native16 and native64 KASAN/lockdep kernels. Current-source
+EL0 userfaultfd and SysV fixtures also pass, covering native16/4K and
+native64/16K/4K permissions and AArch32 SysV execution. Feature-disabled
+arm64 and x86 protection objects also compile.
+
 Current userfaultfd support (2026-10-02)
 ---------------------------------------
 

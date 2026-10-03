@@ -123,15 +123,16 @@ bool can_change_pte_writable(struct vm_area_struct *vma, unsigned long addr,
 }
 
 
-static int mprotect_folio_pte_batch(struct vm_area_struct *vma, struct folio *folio, pte_t *ptep,
-				    pte_t pte, int max_nr_ptes, fpb_t flags)
+static __always_inline int mprotect_folio_pte_batch(struct vm_area_struct *vma,
+		struct folio *folio, pte_t *ptep, pte_t pte, int max_nr_ptes,
+		fpb_t flags, unsigned int page_shift)
 {
 	/* No underlying folio, so cannot batch */
 	if (!folio)
 		return 1;
 
 #ifdef CONFIG_MM_SUBPAGE
-	if (mm_page_size(vma->vm_mm) != PAGE_SIZE)
+	if (page_shift != PAGE_SHIFT)
 		return folio_subpage_pte_batch(vma, folio, ptep, pte, max_nr_ptes, flags);
 #endif
 
@@ -369,6 +370,9 @@ static long change_pte_range(struct mmu_gather *tlb,
 		struct vm_area_struct *vma, pmd_t *pmd, unsigned long addr,
 		unsigned long end, pgprot_t newprot, unsigned long cp_flags)
 {
+	/* The mm's mapping granule cannot change during the walk. */
+	const unsigned int page_shift = mm_page_shift(vma->vm_mm);
+	const unsigned long page_size = 1UL << page_shift;
 	pte_t *pte, oldpte;
 	spinlock_t *ptl;
 	long pages = 0;
@@ -377,7 +381,7 @@ static long change_pte_range(struct mmu_gather *tlb,
 	bool uffd_wp = cp_flags & MM_CP_UFFD_WP;
 	int nr_ptes;
 
-	tlb_change_page_size(tlb, mm_page_size(vma->vm_mm));
+	tlb_change_page_size(tlb, page_size);
 	pte = pte_offset_map_lock(vma->vm_mm, pmd, addr, &ptl);
 	if (!pte)
 		return -EAGAIN;
@@ -392,7 +396,7 @@ static long change_pte_range(struct mmu_gather *tlb,
 		oldpte = ptep_get(pte);
 		if (pte_present(oldpte)) {
 			const fpb_t flags = FPB_RESPECT_SOFT_DIRTY | FPB_RESPECT_WRITE;
-			int max_nr_ptes = (end - addr) >> mm_page_shift(vma->vm_mm);
+			int max_nr_ptes = (end - addr) >> page_shift;
 			struct folio *folio = NULL;
 			struct page *page;
 
@@ -414,11 +418,13 @@ static long change_pte_range(struct mmu_gather *tlb,
 
 				/* determine batch to skip */
 				nr_ptes = mprotect_folio_pte_batch(vma, folio,
-					  pte, oldpte, max_nr_ptes, /* flags = */ 0);
+					  pte, oldpte, max_nr_ptes, /* flags = */ 0,
+					  page_shift);
 				continue;
 			}
 
-			nr_ptes = mprotect_folio_pte_batch(vma, folio, pte, oldpte, max_nr_ptes, flags);
+			nr_ptes = mprotect_folio_pte_batch(vma, folio, pte, oldpte,
+						   max_nr_ptes, flags, page_shift);
 
 			/*
 			 * Optimize for the small-folio common case by
@@ -457,7 +463,7 @@ static long change_pte_range(struct mmu_gather *tlb,
 		} else  {
 			pages += change_softleaf_pte(vma, addr, pte, oldpte, cp_flags);
 		}
-	} while (pte += nr_ptes, addr += nr_ptes * mm_page_size(vma->vm_mm), addr != end);
+	} while (pte += nr_ptes, addr += nr_ptes * page_size, addr != end);
 	lazy_mmu_mode_disable();
 	pte_unmap_unlock(pte - 1, ptl);
 
