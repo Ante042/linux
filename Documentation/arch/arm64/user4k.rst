@@ -22,6 +22,14 @@ native ABI are tested. Real mixed-size processes share memfd/futex state and
 use process_vm_readv/writev in both directions. See the latest milestone below
 for exact evidence and limits; this is not yet a complete or battle-tested ABI.
 
+User-reported gaming result (2026-10-03)
+---------------------------------------
+
+The user reports having tested this work for gaming and that it "works
+super well". The report did not specify the device, kernel build, game
+titles or measured frame rates. This adds user-reported gameplay evidence
+to the reproducible VM results below; it is not an automated benchmark.
+
 Apple-enabled build and process launch (2026-10-03)
 --------------------------------------------------
 
@@ -49,8 +57,8 @@ large argument transitions, proc/memory interfaces, and mixed 16K/4K shared
 futex/COW and process_vm copies. The actual launcher passed native/4K/native
 transitions, and FEX passed the x86 memory/protection/COW/JIT/re-exec contract
 with its AArch64 processes reporting 4096-byte pages. These are VM results;
-this candidate has not been booted on an Apple Mac, submitted Apple GPU
-commands, or run a Windows game.
+these automated tests do not cover Apple hardware boot or GPU command
+submission. The subsequent user-reported gaming result is recorded above.
 
 The Apple profile exposed a link-layout failure: the mixed-granule zero page
 requires 64K BSS alignment while KVM aligned ``__bss_start`` only to the
@@ -88,7 +96,7 @@ The fixture requires CONFIG_SYSVIPC and runs only in a disposable guest.
 The Apple-enabled ``7.1.12-aurora-mixed-mm2`` Image also passes the SysV
 fixture, the existing native16/4K static/dynamic execution suite, and the
 Windows memory contract through the existing private Wine/FEX fixture in a VM.
-Apple hardware boot, GPU execution and game testing remain unqualified.
+These are VM tests; the subsequent user-reported gaming result is recorded above.
 
 Perf ring mappings and sampling (2026-10-03)
 -------------------------------------------
