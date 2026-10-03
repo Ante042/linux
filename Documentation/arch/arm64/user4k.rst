@@ -4497,3 +4497,27 @@ UNMAP of one constituent followed by full cleanup. These add sixteen assertions
 to each tested A64 ABI: native16K/4K and native64K/4K/16K. The supplied domains
 record translations; these results do not qualify physical device DMA, concurrent
 type1 consumers, Apple boot/GPU execution or game throughput.
+
+
+VFIO compat dirty-bitmap pointer decoding (2026-10-02)
+----------------------------------------------------
+
+The AArch32 probe now tests nonzero padding after the 32-bit bitmap pointer.
+The prior kernel accepted the zero-padded request but rejected the same valid
+pointer with a changed padding byte, for both GET_BITMAP and bitmap-returning
+UNMAP. The native pointer copy interpreted that padding as pointer bits.
+Separate old-kernel probes isolate each rejection on native16K/native64K.
+
+Type1 now decodes a compat pointer at its actual width, retaining the 64-bit
+bitmap scalars and ignoring pointer padding. Payload-size checks use the
+architecture's compat alignment fixup, preserving aligned AArch32/x32 sizes
+and accounting for the smaller IA32 layout. Native calls keep their existing
+structure copy. No public UAPI structure changes.
+
+Real AArch32 tests check a zero-padded query, a nonzero-padded query and a
+nonzero-padded bitmap-returning unmap, including returned bits, callback pin
+cleanup and locked-memory refund. They run with automatic4K and the modeled
+no4K native16K/native64K fallback. The existing A64 type1 tests remain applicable
+across all five native/alternative granule contexts. Supplied recording domains
+qualify this ioctl path, not physical-device DMA or Apple GPU/game execution.
+IA32/x32 compilation is covered separately; their runtime behavior is unqualified.

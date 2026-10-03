@@ -3028,6 +3028,63 @@ static int vfio_iommu_type1_map_dma(struct vfio_iommu *iommu,
 	return vfio_dma_do_map(iommu, &map);
 }
 
+#ifdef CONFIG_COMPAT
+struct compat_vfio_bitmap {
+	compat_u64 pgsize;
+	compat_u64 size;
+	compat_uptr_t data;
+};
+#endif
+
+static size_t vfio_bitmap_size(void)
+{
+#ifdef CONFIG_COMPAT
+	/* IA32 differs from AArch32/x32 in its u64 alignment and tail padding. */
+	if (in_compat_syscall() && compat_need_64bit_alignment_fixup())
+		return sizeof(struct compat_vfio_bitmap);
+#endif
+	return sizeof(struct vfio_bitmap);
+}
+
+static size_t vfio_dirty_bitmap_get_size(void)
+{
+	return offsetof(struct vfio_iommu_type1_dirty_bitmap_get, bitmap) +
+		vfio_bitmap_size();
+}
+
+static int vfio_bitmap_from_user(struct vfio_bitmap *bitmap, void __user *user)
+{
+#ifdef CONFIG_COMPAT
+	if (in_compat_syscall()) {
+		compat_uptr_t data;
+		unsigned long offset = offsetof(struct vfio_bitmap, data);
+
+		/* Read only the pointer field, never its trailing compat padding. */
+		if (copy_from_user(bitmap, user, offset) ||
+		    get_user(data, (compat_uptr_t __user *)(user + offset)))
+			return -EFAULT;
+		bitmap->data = compat_ptr(data);
+		return 0;
+	}
+#endif
+	return copy_from_user(bitmap, user, sizeof(*bitmap)) ? -EFAULT : 0;
+}
+
+static int vfio_dirty_bitmap_get_from_user(
+		struct vfio_iommu_type1_dirty_bitmap_get *range, void __user *user)
+{
+#ifdef CONFIG_COMPAT
+	if (in_compat_syscall()) {
+		unsigned long offset = offsetof(typeof(*range), bitmap);
+
+		if (copy_from_user(range, user, offset))
+			return -EFAULT;
+		return vfio_bitmap_from_user(&range->bitmap, user + offset);
+	}
+#endif
+	return copy_from_user(range, user, sizeof(*range)) ? -EFAULT : 0;
+}
+
 static int vfio_iommu_type1_unmap_dma(struct vfio_iommu *iommu,
 				      unsigned long arg)
 {
@@ -3055,13 +3112,12 @@ static int vfio_iommu_type1_unmap_dma(struct vfio_iommu *iommu,
 	if (unmap.flags & VFIO_DMA_UNMAP_FLAG_GET_DIRTY_BITMAP) {
 		unsigned long pgshift;
 
-		if (unmap.argsz < (minsz + sizeof(bitmap)))
+		if (unmap.argsz < minsz + vfio_bitmap_size())
 			return -EINVAL;
 
-		if (copy_from_user(&bitmap,
-				   (void __user *)(arg + minsz),
-				   sizeof(bitmap)))
-			return -EFAULT;
+		ret = vfio_bitmap_from_user(&bitmap, (void __user *)(arg + minsz));
+		if (ret)
+			return ret;
 
 		if (!access_ok((void __user *)bitmap.data, bitmap.size))
 			return -EINVAL;
@@ -3133,12 +3189,12 @@ static int vfio_iommu_type1_dirty_pages(struct vfio_iommu *iommu,
 		size_t size, iommu_pgsize;
 		dma_addr_t iova, iova_end;
 
-		if (!data_size || data_size < sizeof(range))
+		if (data_size < vfio_dirty_bitmap_get_size())
 			return -EINVAL;
 
-		if (copy_from_user(&range, (void __user *)(arg + minsz),
-				   sizeof(range)))
-			return -EFAULT;
+		ret = vfio_dirty_bitmap_get_from_user(&range, (void __user *)(arg + minsz));
+		if (ret)
+			return ret;
 
 		iova = range.iova;
 		size = range.size;

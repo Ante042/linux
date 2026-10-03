@@ -153,7 +153,8 @@ _Noreturn void probe(u32 *sp)
 	cmd.iova = IOVA + 19;
 	CHECK(!ioctl_test(fd, VFIO_TYPE1_TEST_PIN, &cmd));
 	CHECK(!state(fd, &cmd) && cmd.locked_bytes == native && cmd.external_refs == 1);
-	/* The compat pointer's padding is zeroed for the native64 wire layout. */
+	/* Compat pointer padding must not become part of the native pointer. */
+	_Alignas(struct vfio_iommu_type1_dirty_bitmap_get)
 	unsigned char buffer[sizeof(dirty) + sizeof(struct vfio_iommu_type1_dirty_bitmap_get)];
 	struct vfio_iommu_type1_dirty_bitmap *header = (void *)buffer;
 	struct vfio_iommu_type1_dirty_bitmap_get *range = (void *)header->data;
@@ -169,7 +170,32 @@ _Noreturn void probe(u32 *sp)
 	range->bitmap.data = &bits;
 	CHECK(!ioctl_test(fd, VFIO_IOMMU_DIRTY_PAGES, buffer) &&
 	      bits == ((1ULL << (native >> 12)) - 1));
-	CHECK(!unmap(fd, 2 * native));
+	_Static_assert(sizeof(range->bitmap.data) == 4 && sizeof(range->bitmap) == 24,
+		       "AArch32 bitmap has a 32-bit pointer and trailing padding");
+	((unsigned char *)&range->bitmap)[
+		__builtin_offsetof(struct vfio_bitmap, data) + sizeof(range->bitmap.data)] = 0xa5;
+	bits = 0;
+	CHECK(!ioctl_test(fd, VFIO_IOMMU_DIRTY_PAGES, buffer) &&
+	      bits == ((1ULL << (native >> 12)) - 1));
+	_Alignas(struct vfio_bitmap)
+	unsigned char unmap_buffer[sizeof(struct vfio_iommu_type1_dma_unmap) +
+				   sizeof(struct vfio_bitmap)];
+	struct vfio_iommu_type1_dma_unmap *remove = (void *)unmap_buffer;
+	struct vfio_bitmap *remove_bitmap = (void *)remove->data;
+
+	clear(unmap_buffer, sizeof(unmap_buffer));
+	remove->argsz = sizeof(unmap_buffer);
+	remove->flags = VFIO_DMA_UNMAP_FLAG_GET_DIRTY_BITMAP;
+	remove->iova = IOVA;
+	remove->size = 2 * native;
+	remove_bitmap->pgsize = 4096;
+	remove_bitmap->size = sizeof(bits);
+	remove_bitmap->data = &bits;
+	((unsigned char *)remove_bitmap)[
+		__builtin_offsetof(struct vfio_bitmap, data) + sizeof(remove_bitmap->data)] = 0x5a;
+	bits = 0;
+	CHECK(!ioctl_test(fd, VFIO_IOMMU_UNMAP_DMA, unmap_buffer) &&
+	      remove->size == 2 * native && bits == ((1ULL << (native >> 12)) - 1));
 	CHECK(!state(fd, &cmd) && !cmd.locked_bytes && !cmd.external_refs &&
 	      cmd.notifications == 1);
 	clear(&cmd, sizeof(cmd));
