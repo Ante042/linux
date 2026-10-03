@@ -235,9 +235,10 @@ scan budgets continue to count native-page byte units, rounding partial-native
 VMA spans up instead of letting them consume zero budget.
 
 The disposable ``numa-balancing-init`` fixture requires two nodes with CPU0
-on node0 and CPU1 on node1, CONFIG_NUMA_BALANCING, CONFIG_SCHED_DEBUG and
-CONFIG_DEBUG_FS. Put it at ``/init`` with empty ``/proc`` and ``/debug`` mount
-points and ``/dev/console``. It first allocates an 8MiB anonymous range on
+on node0 and CPU1 on node1, CONFIG_NUMA_BALANCING, CONFIG_SCHED_DEBUG,
+CONFIG_DEBUG_FS and CONFIG_COMPAT. Put it at ``/init`` and the freestanding
+``compat-numa-balancing-probe`` at the initramfs root, with empty ``/proc`` and
+``/debug`` mount points plus ``/dev/console``. It first allocates an 8MiB anonymous range on
 node0, clears its binding, and runs on CPU1 until every accessible test leaf
 is on node1. No explicit migration syscall is used for that transition.
 Bytes, write counters, read-only protection and PROT_NONE isolation survive.
@@ -253,11 +254,24 @@ The explicit-policy and AArch32 fallback fixtures still pass with balancing
 enabled. Feature-disabled arm64 and x86 NUMA objects compile. The native64
 runs retain the separately documented ``debug_vm_pgtable`` boot-test exclusion.
 
+The AArch32 probe also passes automatic migration of every accessible leaf
+in an 8MiB range, with byte markers, write counters and read-only/PROT_NONE
+protection retained. It runs with automatic 4K pages on both native kernels,
+and with native16/native64 pages when 4K capability is masked. Those fallback
+runs retain rejection of 4K-only protection addresses. The probe uses the
+64-bit time syscall and does not require CONFIG_COMPAT_32BIT_TIME. No kernel
+implementation change was needed for this additional AArch32 coverage.
+
+Use ``--compat-only`` as an init argument for the isolated AArch32 cases.
+For the no4K model, append ``id_aa64mmfr0.tgran4=f -- --compat-only --no4k``
+to the kernel command line. The driver requires the probe and checks the
+expected page size and child exit status; missing binaries are failures.
+These are capability-masked VM results, not tests on an Apple A9 device.
+
 This covers bounded anonymous balancing and exact COW hint selection, not
-AArch32 automatic-migration workloads, large file-folio balancing, broad
-pressure or memory-tiering performance. The node checks are functional VM
-results, not throughput measurements. The published Apple mm4 artifact is
-unchanged and continues to use NUMA=n.
+large file-folio balancing, broad pressure or memory-tiering performance.
+The node checks are functional VM results, not throughput measurements.
+The published Apple mm4 artifact is unchanged and continues to use NUMA=n.
 
 Current userfaultfd support (2026-10-02)
 ---------------------------------------

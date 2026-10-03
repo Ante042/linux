@@ -228,7 +228,7 @@ static void exercise(void)
 int main(int argc, char **argv)
 {
 	unsigned long native = getauxval(AT_PAGESZ), sizes[] = {4096, 16384, 65536};
-	int failed = 0;
+	int failed = 0, compat_only = 0, no4k = 0;
 
 	setvbuf(stdout, NULL, _IONBF, 0);
 	if (argc == 3 && !strcmp(argv[1], "--case")) {
@@ -237,6 +237,14 @@ int main(int argc, char **argv)
 		return 0;
 	}
 	CHECK(getpid() == 1);
+	for (int i = 1; i < argc; i++) {
+		if (!strcmp(argv[i], "--compat-only"))
+			compat_only = 1;
+		else if (!strcmp(argv[i], "--no4k"))
+			no4k = 1;
+		else
+			CHECK(0);
+	}
 	CHECK(!mount("proc", "/proc", "proc", 0, NULL));
 	CHECK(!mount("debugfs", "/debug", "debugfs", 0, NULL));
 	setting("/proc/sys/kernel/numa_balancing", "1\n");
@@ -248,7 +256,7 @@ int main(int argc, char **argv)
 		pid_t child;
 		int status;
 
-		if (sizes[i] > native)
+		if (compat_only || sizes[i] > native || (no4k && sizes[i] == 4096))
 			continue;
 		child = fork();
 		CHECK(child >= 0);
@@ -263,6 +271,21 @@ int main(int argc, char **argv)
 		CHECK(waitpid(child, &status, 0) == child);
 		failed |= !WIFEXITED(status) || WEXITSTATUS(status);
 	}
+	CHECK(!access("/compat-numa-balancing-probe", X_OK));
+	pid_t child = fork();
+	int status;
+
+	CHECK(child >= 0);
+	if (!child) {
+		char s[32];
+
+		snprintf(s, sizeof(s), "%lu", no4k ? native : 4096UL);
+		execl("/compat-numa-balancing-probe", "/compat-numa-balancing-probe", s, NULL);
+		_exit(2);
+	}
+	CHECK(waitpid(child, &status, 0) == child);
+	failed |= !WIFEXITED(status) || WEXITSTATUS(status);
+	printf("A32 NUMAB expected-page=%lu status=%d\n", no4k ? native : 4096UL, status);
 	printf("NUMA BALANCING %s\n", failed ? "FAIL" : "PASS");
 	reboot(RB_POWER_OFF);
 	for (;;)

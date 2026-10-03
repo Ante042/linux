@@ -6,7 +6,7 @@ TEST_GEN_PROGS_EXTENDED += aio-ring-init numa-policy-init numa-balancing-init
 CFLAGS += -Wall -Wextra -O2 -ffixed-x18
 TEST_GEN_FILES += compat-probe-4k compat-probe-64k compat-probe-dynamic compat-interp32 compat-aslr-probe compat-mlock-probe
 TEST_GEN_FILES += fex-x86-contract libfex-abi.so compat-policy-probe compat-uffd-probe compat-vfio-probe
-TEST_GEN_FILES += compat-shm-probe compat-perf-probe compat-numa-probe
+TEST_GEN_FILES += compat-shm-probe compat-perf-probe compat-numa-probe compat-numa-balancing-probe
 TEST_FILES += compat-script runtime-app.py
 include ../../lib.mk
 
@@ -129,3 +129,6 @@ $(OUTPUT)/compat-numa-probe: compat-numa-probe.c
 
 $(OUTPUT)/numa-balancing-init: LDFLAGS += -static -Wl,-z,max-page-size=65536
 $(OUTPUT)/numa-balancing-init: LDLIBS += -pthread
+
+$(OUTPUT)/compat-numa-balancing-probe: compat-numa-balancing-probe.c
+	$(AARCH32_CC) $(AARCH32_FLAGS) -Wl,-z,max-page-size=65536 $< -o $@
