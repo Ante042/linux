@@ -146,6 +146,21 @@ EL0 userfaultfd and SysV fixtures also pass, covering native16/4K and
 native64/16K/4K permissions and AArch32 SysV execution. Feature-disabled
 arm64 and x86 protection objects also compile.
 
+Legacy AIO ring relocation (2026-10-03)
+--------------------------------------
+
+The AIO completion ring retains native-page backing while its virtual
+address follows the process granule. The disposable ``aio-ring-init``
+fixture checks small and large rings in AArch64 native16/4K and
+native64/16K/4K processes. Smaller-granule tasks move the ring to an address
+that is aligned to their own granule but not to the native kernel page.
+
+Buffered memfd writes complete through the relocated ring, including a
+completion queued before the move. Subsequent reads verify exact bytes
+across process-page boundaries. Eventfd notification, context destruction,
+removal of the ring mapping and adjacent guard preservation also pass.
+The Apple-enabled mm4 Image passes the native16/4K fixture in a VM.
+
 Current userfaultfd support (2026-10-02)
 ---------------------------------------
 
@@ -242,6 +257,11 @@ process granule; their exact coverage is recorded below. No performance, M5 hard
 or complete NCE compatibility claim is made. Milestone sections below retain
 their historical status statements; the latest exec milestone supersedes
 earlier statements that EL0 activation was absent.
+
+The current native16/native64 VM profiles and Apple candidate have NUMA
+disabled. NUMA policy integration requires further work: policy range
+alignment and PTE loops in ``mm/mempolicy.c`` still use native-page units.
+NUMA-enabled mixed-granule operation is not covered by these results.
 
 The expanded objective is concurrent 4K, 16K and 64K userspace granules on
 arm64, with the kernel/physical allocator granule independently fixed for the
