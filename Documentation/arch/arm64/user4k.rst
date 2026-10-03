@@ -4521,3 +4521,35 @@ no4K native16K/native64K fallback. The existing A64 type1 tests remain applicabl
 across all five native/alternative granule contexts. Supplied recording domains
 qualify this ioctl path, not physical-device DMA or Apple GPU/game execution.
 IA32/x32 compilation is covered separately; their runtime behavior is unqualified.
+
+
+VFIO concurrent pin, unmap and registration qualification (2026-10-02)
+---------------------------------------------------------------------
+
+A new KUnit case uses a separately locked test consumer and three kernel
+workers to force pinning, device registration and overlapping DMA unmaps.
+The consumer publishes references under its own lock. An unmap callback
+signals a pending registration while holding the production device-list lock,
+then permits a consumer to acquire a duplicate pin, read the original native
+page and release its references before callback cleanup. This exercises actual
+type1 APIs and their lock ordering rather than removing serialization from the
+real-ioctl fixture.
+
+Half the cycles force a second unmap to remove the first fine DMA mapping
+while its callback still runs. A second permanent consumer verifies the
+original range snapshot after removal; the two unmaps together report exactly
+one removed mapping. Each cycle checks page identity and bytes, per-mm locked
+memory refund, the DMA tree and recording-domain translations. The final cycle
+retains a seed pin and drops the last source-mm user before worker pinning,
+including the overlapping unmap and callback refund after source exit.
+
+Native16K runs 4K/native16K metadata mms and native64K runs
+4K/16K/native64K metadata mms, each with lazy and mapped providers. The areas
+alternate between two fine DMA mappings and a separate mapping per 4K unit.
+Each of the ten models passes 1,024 cycles: 10,240 forced interleavings,
+including 5,120 overlapping unmaps. The type1 suites total twelve passes and
+zero failures on both KASAN/lockdep kernels, with no reported kernel warning.
+These are retained test mms with real page tables and pins; concurrent EL0
+ioctls, physical-device DMA, all possible concurrency schedules and hardware
+performance remain unqualified. The root-only real-ioctl fixture still
+serializes its own requests. No production MM or type1 behavior changes here.

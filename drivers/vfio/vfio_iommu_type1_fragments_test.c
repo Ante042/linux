@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Actual type1 lifecycle with recorded translations; no physical device DMA. */
+#include <linux/completion.h>
 #include <linux/shmem_fs.h>
 #include <linux/mman.h>
 #include <linux/sizes.h>
@@ -791,6 +792,369 @@ static void vfio_fragments_external_span_test(struct kunit *test)
 	}
 }
 
+#define VFIO_STRESS_CYCLES 1024
+
+struct vfio_pin_stress {
+	struct vfio_fragment_fixture *fixture;
+	struct vfio_device consumer;
+	struct vfio_device registrar;
+	struct vfio_device observer;
+	struct task_struct *competing_thread;
+	struct task_struct *pin_thread;
+	struct task_struct *register_thread;
+	struct mutex consumer_lock;
+	struct completion pin_go;
+	struct completion pin_ready;
+	struct completion notify_entered;
+	struct completion pin_done;
+	struct completion register_go;
+	struct completion register_entered;
+	struct completion register_done;
+	struct completion competing_go;
+	struct completion competing_done;
+	unsigned long competing_size;
+	int competing_ret;
+	bool competing;
+	unsigned int competing_unmaps;
+	unsigned int observations;
+	atomic_t error;
+	unsigned int pins;
+	unsigned int registrations;
+	bool stopping;
+};
+
+static void vfio_stress_error(struct vfio_pin_stress *s, int ret)
+{
+	atomic_cmpxchg(&s->error, 0, ret < 0 ? ret : -EIO);
+}
+
+static void vfio_stress_notify(struct vfio_device *device, u64 iova, u64 length)
+{
+	struct vfio_pin_stress *s = container_of(device, typeof(*s), consumer);
+	struct vfio_fragment_fixture *f = s->fixture;
+
+	/* The callback holds the production device-list lock, not the DMA lock. */
+	complete(&s->register_go);
+	if (!wait_for_completion_timeout(&s->register_entered, msecs_to_jiffies(5000)))
+		vfio_stress_error(s, -ETIMEDOUT);
+	complete(&s->notify_entered);
+	mutex_lock(&s->consumer_lock);
+	f->notifications++;
+	while (f->external_refs) {
+		vfio_iommu_type1_unpin_pages(f->iommu, VFIO_TEST_IOVA, 1);
+		f->external_refs--;
+	}
+	mutex_unlock(&s->consumer_lock);
+	if (s->competing) {
+		/* A second unmap may free the DMA while this callback still runs. */
+		complete(&s->competing_go);
+		if (!wait_for_completion_timeout(&s->competing_done, msecs_to_jiffies(5000)))
+			vfio_stress_error(s, -ETIMEDOUT);
+	}
+}
+
+static void vfio_stress_observe(struct vfio_device *device, u64 iova, u64 length)
+{
+	struct vfio_pin_stress *s = container_of(device, typeof(*s), observer);
+
+	s->observations++;
+	if (iova != VFIO_TEST_IOVA || length != SZ_4K)
+		vfio_stress_error(s, -ESTALE);
+}
+
+static void vfio_stress_empty_notify(struct vfio_device *device, u64 iova, u64 length)
+{
+}
+
+static const struct vfio_device_ops vfio_stress_consumer_ops = {
+	.dma_unmap = vfio_stress_notify,
+};
+
+static const struct vfio_device_ops vfio_stress_registrar_ops = {
+	.dma_unmap = vfio_stress_empty_notify,
+};
+
+static const struct vfio_device_ops vfio_stress_observer_ops = {
+	.dma_unmap = vfio_stress_observe,
+};
+
+static int vfio_stress_competing_unmaps(void *data)
+{
+	struct vfio_pin_stress *s = data;
+
+	for (;;) {
+		struct vfio_iommu_type1_dma_unmap unmap = {
+			.argsz = sizeof(unmap), .iova = VFIO_TEST_IOVA,
+					.size = SZ_4K,
+		};
+		struct vfio_bitmap bitmap = {};
+
+		wait_for_completion(&s->competing_go);
+		if (READ_ONCE(s->stopping) || kthread_should_stop())
+			break;
+		s->competing_ret = vfio_dma_do_unmap(s->fixture->iommu, &unmap, &bitmap);
+		s->competing_size = unmap.size;
+		s->competing_unmaps++;
+		complete(&s->competing_done);
+	}
+	return 0;
+}
+
+static int vfio_stress_pinner(void *data)
+{
+	struct vfio_pin_stress *s = data;
+	struct vfio_fragment_fixture *f = s->fixture;
+
+	for (;;) {
+		struct page *page = NULL, *original;
+		void *bytes;
+		int ret;
+
+		wait_for_completion(&s->pin_go);
+		if (READ_ONCE(s->stopping) || kthread_should_stop())
+			break;
+		mutex_lock(&s->consumer_lock);
+		ret = vfio_iommu_type1_pin_pages(f->iommu, f->group.iommu_group,
+			VFIO_TEST_IOVA + 37, 1, IOMMU_READ | IOMMU_WRITE, &page);
+		if (ret != 1) {
+			vfio_stress_error(s, ret);
+			mutex_unlock(&s->consumer_lock);
+			complete(&s->pin_ready);
+			complete(&s->pin_done);
+			continue;
+		}
+		f->external_refs++;
+		s->pins++;
+		original = page;
+		complete(&s->pin_ready);
+		/* Unmap cannot revoke a reference before the consumer publishes it. */
+		if (!wait_for_completion_timeout(&s->notify_entered, msecs_to_jiffies(5000)))
+			vfio_stress_error(s, -ETIMEDOUT);
+		if (!READ_ONCE(s->stopping)) {
+			ret = vfio_iommu_type1_pin_pages(f->iommu, f->group.iommu_group,
+				VFIO_TEST_IOVA + 17, 1, IOMMU_READ, &page);
+			if (ret == 1) {
+				f->external_refs++;
+				s->pins++;
+				if (page != original)
+					vfio_stress_error(s, -ESTALE);
+				vfio_iommu_type1_unpin_pages(f->iommu, VFIO_TEST_IOVA + 17, 1);
+				f->external_refs--;
+			} else {
+				vfio_stress_error(s, ret);
+			}
+			bytes = kmap_local_page(original);
+			if (memchr_inv(bytes, 0x6b, PAGE_SIZE))
+				vfio_stress_error(s, -EIO);
+			kunmap_local(bytes);
+		}
+		vfio_iommu_type1_unpin_pages(f->iommu, VFIO_TEST_IOVA + 37, 1);
+		f->external_refs--;
+		mutex_unlock(&s->consumer_lock);
+		complete(&s->pin_done);
+	}
+	return 0;
+}
+
+static int vfio_stress_registrations(void *data)
+{
+	struct vfio_pin_stress *s = data;
+
+	for (;;) {
+		wait_for_completion(&s->register_go);
+		if (READ_ONCE(s->stopping) || kthread_should_stop())
+			break;
+		complete(&s->register_entered);
+		vfio_iommu_type1_register_device(s->fixture->iommu, &s->registrar);
+		vfio_iommu_type1_unregister_device(s->fixture->iommu, &s->registrar);
+		s->registrations++;
+		complete(&s->register_done);
+	}
+	return 0;
+}
+
+static void vfio_stress_free(void *data)
+{
+	struct vfio_pin_stress *s = data;
+	struct vfio_fragment_fixture *f = s->fixture;
+
+	WRITE_ONCE(s->stopping, true);
+	complete_all(&s->pin_go);
+	complete_all(&s->notify_entered);
+	complete_all(&s->register_go);
+	complete_all(&s->competing_go);
+	if (s->competing_thread) {
+		kthread_stop(s->competing_thread);
+		put_task_struct(s->competing_thread);
+	}
+	if (s->pin_thread) {
+		kthread_stop(s->pin_thread);
+		put_task_struct(s->pin_thread);
+	}
+	if (s->register_thread) {
+		kthread_stop(s->register_thread);
+		put_task_struct(s->register_thread);
+	}
+	mutex_lock(&s->consumer_lock);
+	while (f->external_refs) {
+		vfio_iommu_type1_unpin_pages(f->iommu, VFIO_TEST_IOVA, 1);
+		f->external_refs--;
+	}
+	mutex_unlock(&s->consumer_lock);
+	vfio_iommu_type1_unregister_device(f->iommu, &s->consumer);
+	vfio_iommu_type1_unregister_device(f->iommu, &s->observer);
+}
+
+static struct vfio_pin_stress *vfio_stress_new(struct kunit *test,
+					     struct vfio_fragment_fixture *f)
+{
+	struct vfio_pin_stress *s = kunit_kzalloc(test, sizeof(*s), GFP_KERNEL);
+
+	if (!s)
+		return NULL;
+	s->fixture = f;
+	mutex_init(&s->consumer_lock);
+	init_completion(&s->pin_go);
+	init_completion(&s->pin_ready);
+	init_completion(&s->notify_entered);
+	init_completion(&s->pin_done);
+	init_completion(&s->register_go);
+	init_completion(&s->register_entered);
+	init_completion(&s->register_done);
+	init_completion(&s->competing_go);
+	init_completion(&s->competing_done);
+	atomic_set(&s->error, 0);
+	s->consumer.ops = &vfio_stress_consumer_ops;
+	s->registrar.ops = &vfio_stress_registrar_ops;
+	s->observer.ops = &vfio_stress_observer_ops;
+	vfio_iommu_type1_unregister_device(f->iommu, &f->device);
+	/* list_add puts the consumer before the observer in callback order. */
+	vfio_iommu_type1_register_device(f->iommu, &s->observer);
+	vfio_iommu_type1_register_device(f->iommu, &s->consumer);
+	if (kunit_add_action_or_reset(test, vfio_stress_free, s))
+		return NULL;
+	s->pin_thread = kthread_run(vfio_stress_pinner, s, "vfio-pin-stress");
+	if (IS_ERR(s->pin_thread)) {
+		s->pin_thread = NULL;
+		return NULL;
+	}
+	get_task_struct(s->pin_thread);
+	s->register_thread = kthread_run(vfio_stress_registrations, s, "vfio-reg-stress");
+	if (IS_ERR(s->register_thread)) {
+		s->register_thread = NULL;
+		return NULL;
+	}
+	get_task_struct(s->register_thread);
+	s->competing_thread = kthread_run(vfio_stress_competing_unmaps, s, "vfio-unmap-stress");
+	if (IS_ERR(s->competing_thread)) {
+		s->competing_thread = NULL;
+		return NULL;
+	}
+	get_task_struct(s->competing_thread);
+	return s;
+}
+
+static void vfio_fragments_concurrency_test(struct kunit *test)
+{
+	unsigned int shifts[] = { 12, 14, 16 };
+	unsigned int rw = VFIO_DMA_MAP_FLAG_READ | VFIO_DMA_MAP_FLAG_WRITE;
+
+	for (unsigned int shift = 0; shift < ARRAY_SIZE(shifts); shift++) {
+		if (shifts[shift] > PAGE_SHIFT)
+			continue;
+		for (unsigned int mapped = 0; mapped < 2; mapped++) {
+			struct vfio_account_mm *ctx = vfio_account_mm_new(test, shifts[shift]);
+			struct vfio_fragment_fixture *f = vfio_fragment_fixture_new(test);
+			struct file *file = vfio_fragment_file(test, PAGE_SIZE, 0x6b);
+			struct vfio_pin_stress *s;
+
+			KUNIT_ASSERT_NOT_NULL(test, ctx);
+			KUNIT_ASSERT_NOT_NULL(test, f);
+			KUNIT_ASSERT_NOT_ERR_OR_NULL(test, file);
+			KUNIT_ASSERT_EQ(test, vfio_fragment_source(ctx, file, PAGE_SIZE),
+				VFIO_TEST_VA);
+			s = vfio_stress_new(test, f);
+			KUNIT_ASSERT_NOT_NULL(test, s);
+			if (mapped) {
+				list_add_tail(&f->domains[0].type1.next, &f->iommu->domain_list);
+				vfio_update_pgsize_bitmap(f->iommu);
+			}
+			for (unsigned int cycle = 0; cycle < VFIO_STRESS_CYCLES; cycle++) {
+				struct vfio_iommu_type1_dma_unmap unmap = {
+					.argsz = sizeof(unmap), .iova = VFIO_TEST_IOVA,
+					.size = SZ_4K,
+				};
+				struct vfio_bitmap bitmap = {};
+				bool fine = cycle & 1;
+				unsigned long remaining = PAGE_SIZE - SZ_4K;
+
+				KUNIT_ASSERT_EQ(test,
+					vfio_fragment_map_area(f, ctx, 0, 0, SZ_4K, rw), 0);
+				for (unsigned long offset = SZ_4K; offset < PAGE_SIZE;) {
+					unsigned long length = fine ? SZ_4K : remaining;
+
+					KUNIT_ASSERT_EQ(test, vfio_fragment_map_area(f, ctx, offset,
+						offset, length, rw), 0);
+					offset += length;
+				}
+				if (cycle == VFIO_STRESS_CYCLES - 1) {
+					struct page *page;
+
+					KUNIT_ASSERT_EQ(test, vfio_iommu_type1_pin_pages(f->iommu,
+						f->group.iommu_group, VFIO_TEST_IOVA, 1,
+						IOMMU_READ, &page), 1);
+					f->external_refs = 1;
+					ctx->live = false;
+					mmput(ctx->mm);
+					KUNIT_ASSERT_EQ(test, atomic_read(&ctx->mm->mm_users), 0);
+				}
+				s->competing = cycle & 2;
+				complete(&s->pin_go);
+				KUNIT_ASSERT_NE(test, wait_for_completion_timeout(&s->pin_ready,
+					msecs_to_jiffies(5000)), 0UL);
+				KUNIT_ASSERT_EQ(test, atomic_read(&s->error), 0);
+				KUNIT_ASSERT_EQ(test,
+					vfio_dma_do_unmap(f->iommu, &unmap, &bitmap), 0);
+				KUNIT_EXPECT_EQ(test, unmap.size, s->competing ? 0UL : SZ_4K);
+				if (s->competing) {
+					KUNIT_EXPECT_EQ(test, s->competing_ret, 0);
+					KUNIT_EXPECT_EQ(test, s->competing_size, SZ_4K);
+				}
+				unmap.iova += SZ_4K;
+				unmap.size = remaining;
+				KUNIT_ASSERT_EQ(test,
+					vfio_dma_do_unmap(f->iommu, &unmap, &bitmap), 0);
+				KUNIT_EXPECT_EQ(test, unmap.size, remaining);
+				KUNIT_ASSERT_NE(test, wait_for_completion_timeout(&s->pin_done,
+					msecs_to_jiffies(5000)), 0UL);
+				KUNIT_ASSERT_NE(test, wait_for_completion_timeout(&s->register_done,
+					msecs_to_jiffies(5000)), 0UL);
+				KUNIT_ASSERT_EQ(test, atomic_read(&s->error), 0);
+				KUNIT_EXPECT_EQ(test, f->external_refs, 0U);
+				KUNIT_EXPECT_EQ(test, mm_locked_vm_bytes(ctx->mm), 0UL);
+				KUNIT_EXPECT_TRUE(test, RB_EMPTY_ROOT(&f->iommu->dma_list));
+				KUNIT_EXPECT_EQ(test, f->domains[0].mapped, 0UL);
+				reinit_completion(&s->pin_ready);
+				reinit_completion(&s->notify_entered);
+				reinit_completion(&s->pin_done);
+				reinit_completion(&s->register_entered);
+				reinit_completion(&s->register_done);
+				reinit_completion(&s->competing_done);
+			}
+			KUNIT_EXPECT_EQ(test, s->pins, 2U * VFIO_STRESS_CYCLES);
+			KUNIT_EXPECT_EQ(test, s->registrations, (unsigned int)VFIO_STRESS_CYCLES);
+			KUNIT_EXPECT_EQ(test, f->notifications, (unsigned int)VFIO_STRESS_CYCLES);
+			KUNIT_EXPECT_EQ(test, s->observations, (unsigned int)VFIO_STRESS_CYCLES);
+			KUNIT_EXPECT_EQ(test, s->competing_unmaps, VFIO_STRESS_CYCLES / 2U);
+			kunit_info(test, "%uK user/%luK native mapped=%u: %u forced pin/unmap/register cycles, half with competing unmap",
+				1U << (shifts[shift] - 10), PAGE_SIZE >> 10,
+				mapped, VFIO_STRESS_CYCLES);
+			kunit_release_action(test, vfio_stress_free, s);
+			kunit_release_action(test, vfio_fragment_fixture_free, f);
+		}
+	}
+}
+
 static struct kunit_case vfio_fragments_cases[] = {
 	KUNIT_CASE(vfio_fragments_lifetime_test),
 	KUNIT_CASE(vfio_fragments_lazy_test),
@@ -801,6 +1165,7 @@ static struct kunit_case vfio_fragments_cases[] = {
 	KUNIT_CASE(vfio_fragments_domain_granule_test),
 	KUNIT_CASE(vfio_fragments_native_owner_test),
 	KUNIT_CASE(vfio_fragments_external_span_test),
+	KUNIT_CASE(vfio_fragments_concurrency_test),
 	{}
 };
 
