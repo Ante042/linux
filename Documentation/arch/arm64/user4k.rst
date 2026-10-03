@@ -10,8 +10,7 @@ Status and scope
 This work starts from Aurora's M5 Pro branch, commit
 4832ab22bb9080d82c29f0ca4ee686492f0552f8. The experimental branch is
 ``mm-mixed-userspace-abi`` in ``aurora-silicon/linux-aurora``.
-It does not include the source worktree's uncommitted
-display changes. Do not deploy it to the M5 or replace the host kernel.
+It does not include the source worktree's uncommitted display changes.
 
 The experimental kernel now executes opted-in 4K EL0 processes alongside
 ordinary native-granule processes on 16K and 64K kernels. Opt-in 16K EL0
@@ -22,6 +21,45 @@ selection, large argument/environment copies and transitions back to the
 native ABI are tested. Real mixed-size processes share memfd/futex state and
 use process_vm_readv/writev in both directions. See the latest milestone below
 for exact evidence and limits; this is not yet a complete or battle-tested ABI.
+
+Apple-enabled build and process launch (2026-10-03)
+--------------------------------------------------
+
+On a native 16K arm64 kernel, enable ``ARM64_USER4K_EXPERIMENTAL`` with
+48-bit kernel VA and PA configurations. ``MM_SUBPAGE`` is selected by the
+option. Keep the ordinary kernel page-size choice at 16K. Neither the
+private KUnit/test-device options nor ``arm64.user4k_test=1`` are needed
+for application execution.
+
+Build the launcher with ``make -C tools/aurora-userpages``. Opt a process
+tree in using::
+
+    tools/aurora-userpages/userpages 4k COMMAND [ARGUMENTS...]
+
+``userpages --status`` reports the current process size and exec preferences.
+``userpages native COMMAND`` clears an inherited alternative preference.
+Ordinary processes continue to use 16K pages. See the launcher's README for
+one-shot selection and the supported 64K-native combinations.
+
+An Apple-enabled native16 image was built with Rust, Asahi DRM, Apple DART
+and KVM, using the available M2 Pro's kernel configuration as the starting
+profile. Private mixed-page test devices were disabled. That same image
+booted in a QEMU virt guest and passed native/4K static and dynamic execution,
+large argument transitions, proc/memory interfaces, and mixed 16K/4K shared
+futex/COW and process_vm copies. The actual launcher passed native/4K/native
+transitions, and FEX passed the x86 memory/protection/COW/JIT/re-exec contract
+with its AArch64 processes reporting 4096-byte pages. These are VM results;
+this candidate has not been booted on an Apple Mac, submitted Apple GPU
+commands, or run a Windows game.
+
+The Apple profile exposed a link-layout failure: the mixed-granule zero page
+requires 64K BSS alignment while KVM aligned ``__bss_start`` only to the
+native 16K page. Kallsyms growth could then leave ``__hyp_bss_start`` at a
+different address and fail the existing linker assertion. The linker script
+now uses the greater of the native page size and ``ALIGNOF(.bss)`` for the
+host BSS start. The assertion remains enabled. The full image links with
+identical host/hypervisor BSS starts; focused LLVM and GNU linker fixtures
+cover native4K, native16K, mixed16K/64K alignment and native64K.
 
 Current userfaultfd support (2026-10-02)
 ---------------------------------------
