@@ -91,6 +91,146 @@ static int vfio_fragment_store(struct vfio_dma *dma, unsigned long start,
 	return 0;
 }
 
+/* These descriptors borrow existing native GUP pins until owner commit. */
+static int vfio_fragment_native_pin(unsigned long pfn, struct user_page_fragment *pin)
+{
+	struct page *page;
+
+	if (!pfn_valid(pfn))
+		return -EOPNOTSUPP;
+	page = pfn_to_page(pfn);
+	if (PageReserved(page))
+		return -EOPNOTSUPP;
+	*pin = (struct user_page_fragment) {
+		.folio = page_folio(page),
+		.offset = page_to_phys(page) - PFN_PHYS(folio_pfn(page_folio(page))),
+		.length = PAGE_SIZE,
+		.pinned = true,
+	};
+	return 0;
+}
+
+/* No PIN, GET or account reference was acquired while preparing metadata. */
+static void vfio_fragments_abort_native(struct vfio_fragment_provider *provider)
+{
+	struct rb_node *node;
+
+	while ((node = rb_first(&provider->records))) {
+		struct vfio_fragment *record = rb_entry(node, struct vfio_fragment, node);
+
+		rb_erase(node, &provider->records);
+		kfree(record);
+	}
+	xa_destroy(&provider->physical_pages);
+	kfree(provider);
+}
+
+static struct vfio_fragment_provider *
+vfio_fragments_prepare_native(struct vfio_iommu *iommu, struct vfio_dma *dma)
+{
+	struct vfio_fragment_provider *provider;
+	struct vfio_dma stage = {};
+	struct vfio_domain *domain = NULL;
+	struct rb_node *node;
+	int ret;
+
+	if (mm_page_size(dma->mm) != PAGE_SIZE || dma->has_rsvd)
+		return ERR_PTR(-EOPNOTSUPP);
+	if (dma->iommu_mapped) {
+		if (list_empty(&iommu->domain_list))
+			return ERR_PTR(-EFAULT);
+		domain = list_first_entry(&iommu->domain_list, struct vfio_domain, next);
+	}
+	provider = kzalloc_obj(*provider, GFP_KERNEL_ACCOUNT);
+	if (!provider)
+		return ERR_PTR(-ENOMEM);
+	provider->records = RB_ROOT;
+	xa_init(&provider->physical_pages);
+	stage.fragments = provider;
+	/* One descriptor owns each original native GUP pin, including aliases. */
+	if (domain) {
+		for (unsigned long offset = 0; offset < dma->size; offset += PAGE_SIZE) {
+			phys_addr_t phys = iommu_iova_to_phys(domain->domain, dma->iova + offset);
+			struct user_page_fragment pin;
+
+			if (!phys || !IS_ALIGNED(phys, PAGE_SIZE)) {
+				ret = -EFAULT;
+				goto out;
+			}
+			ret = vfio_fragment_native_pin(PHYS_PFN(phys), &pin);
+			if (!ret)
+				ret = vfio_fragment_store(&stage, offset, &pin);
+			if (ret)
+				goto out;
+			cond_resched();
+		}
+	}
+	for (node = rb_first(&dma->pfn_list); node; node = rb_next(node)) {
+		struct vfio_pfn *vpfn = rb_entry(node, struct vfio_pfn, node);
+		struct user_page_fragment pin;
+
+		ret = vfio_fragment_native_pin(vpfn->pfn, &pin);
+		if (ret)
+			goto out;
+		if (!domain) {
+			/* Without a domain, the external pin is the cached buffer. */
+			ret = vfio_fragment_store(&stage, vpfn->iova - dma->iova, &pin);
+		} else {
+			unsigned long count = xa_to_value(xa_load(&provider->physical_pages,
+								  vpfn->pfn));
+
+			/* The external GUP reference may identify a different page. */
+			ret = xa_err(xa_store(&provider->physical_pages, vpfn->pfn,
+					     xa_mk_value(count + 1), GFP_KERNEL_ACCOUNT));
+			if (!ret && !count)
+				provider->npinned++;
+		}
+		if (ret)
+			goto out;
+	}
+	return provider;
+out:
+	vfio_fragments_abort_native(provider);
+	return ERR_PTR(ret);
+}
+
+static unsigned long vfio_fragments_native_pages(struct vfio_fragment_provider *provider)
+{
+	return provider->npinned;
+}
+
+static void vfio_fragments_commit_native(struct vfio_dma *dma,
+					 struct vfio_fragment_provider *provider)
+{
+	struct rb_node *node;
+
+	/* Mapped legacy external consumers own separate native GUP references. */
+	if (dma->iommu_mapped) {
+		for (node = rb_first(&dma->pfn_list); node; node = rb_next(node))
+			rb_entry(node, struct vfio_pfn, node)->native_pin = true;
+	}
+	dma->fragments = provider;
+}
+
+static void vfio_fragments_put_native_pin(struct vfio_dma *dma, unsigned long pfn)
+{
+	struct vfio_fragment_provider *provider = dma->fragments;
+	unsigned long count = xa_to_value(xa_load(&provider->physical_pages, pfn));
+	struct user_page_fragment pin;
+
+	if (WARN_ON(!count || vfio_fragment_native_pin(pfn, &pin)))
+		return;
+	if (count == 1) {
+		xa_erase(&provider->physical_pages, pfn);
+		provider->npinned--;
+	} else {
+		xa_store(&provider->physical_pages, pfn, xa_mk_value(count - 1), GFP_NOWAIT);
+	}
+	release_user_fragments(&pin, 1, dma->prot & IOMMU_WRITE);
+	if (provider->npinned < dma->locked_vm)
+		vfio_lock_acct(dma, -(long)(dma->locked_vm - provider->npinned), true);
+}
+
 /* Device unmaps and their IOTLB synchronization must precede this call. */
 static void vfio_fragments_release_range(struct vfio_dma *dma, unsigned long start,
 					 unsigned long length)
@@ -391,6 +531,25 @@ static int vfio_fragments_rw(struct vfio_dma *dma, unsigned long offset, void *d
 	return ret;
 }
 #else
+static struct vfio_fragment_provider *
+vfio_fragments_prepare_native(struct vfio_iommu *iommu, struct vfio_dma *dma)
+{
+	return ERR_PTR(-EOPNOTSUPP);
+}
+static void vfio_fragments_abort_native(struct vfio_fragment_provider *provider)
+{
+}
+static unsigned long vfio_fragments_native_pages(struct vfio_fragment_provider *provider)
+{
+	return 0;
+}
+static void vfio_fragments_commit_native(struct vfio_dma *dma,
+					 struct vfio_fragment_provider *provider)
+{
+}
+static void vfio_fragments_put_native_pin(struct vfio_dma *dma, unsigned long pfn)
+{
+}
 static int vfio_fragments_init(struct vfio_dma *dma, size_t length)
 {
 	return 0;

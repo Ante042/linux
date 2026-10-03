@@ -135,6 +135,7 @@ struct vfio_pfn {
 	dma_addr_t		iova;		/* Device address */
 	unsigned long		pfn;		/* Host pfn */
 	unsigned int		ref_count;
+	bool			native_pin; /* separately adopted legacy external PIN */
 };
 
 struct vfio_regions {
@@ -158,6 +159,7 @@ struct vfio_regions {
 #define DIRTY_BITMAP_SIZE_MAX	 DIRTY_BITMAP_BYTES(DIRTY_BITMAP_PAGES_MAX)
 
 static int put_pfn(unsigned long pfn, int prot);
+static void vfio_fragments_put_native_pin(struct vfio_dma *dma, unsigned long pfn);
 static void vfio_fragments_release_range(struct vfio_dma *dma, unsigned long start,
 					 unsigned long length);
 
@@ -439,7 +441,12 @@ static int vfio_iova_put_vfio_pfn(struct vfio_dma *dma, struct vfio_pfn *vpfn)
 		if (dma->fragments) {
 			unsigned long offset = vpfn->iova - dma->iova;
 
+			unsigned long pfn = vpfn->pfn;
+			bool native_pin = vpfn->native_pin;
+
 			vfio_remove_from_pfn_list(dma, vpfn);
+			if (native_pin)
+				vfio_fragments_put_native_pin(dma, pfn);
 			vfio_fragments_release_range(dma, offset, PAGE_SIZE);
 		} else {
 			ret = put_pfn(vpfn->pfn, dma->prot);
@@ -1703,25 +1710,30 @@ static bool vfio_iommu_iova_dma_valid(struct vfio_iommu *iommu,
 	return list_empty(iova);
 }
 
-static int vfio_change_dma_mm(struct vfio_dma *dma, struct task_struct *task,
-			      struct mm_struct *mm, bool lock_cap)
+static int vfio_change_dma_mm_pages(struct vfio_dma *dma, struct task_struct *task,
+				    struct mm_struct *mm, bool lock_cap, unsigned long pages)
 {
-	long npage = dma->locked_vm;
+	long old_pages = dma->locked_vm;
 	int ret;
 
-	if (mm == dma->mm)
-		return 0;
-	ret = mm_lock_acct(task, mm, lock_cap, npage);
+	if (mm == dma->mm) {
+		if (pages == old_pages)
+			return 0;
+		ret = mm_lock_acct(task, mm, lock_cap, (long)pages - old_pages);
+		if (!ret)
+			dma->locked_vm = pages;
+		return ret;
+	}
+	ret = mm_lock_acct(task, mm, lock_cap, pages);
 	if (ret)
 		return ret;
 
-	/* dma retains mm_count after exit; its old charge still needs a refund. */
-	ret = mm_lock_acct(dma->task, dma->mm, dma->lock_cap, -npage);
+	/* Metadata adoption can deduplicate charges, but not original PIN refs. */
+	ret = mm_lock_acct(dma->task, dma->mm, dma->lock_cap, -old_pages);
 	if (ret) {
-		mm_lock_acct(task, mm, lock_cap, -npage);
+		mm_lock_acct(task, mm, lock_cap, -(long)pages);
 		return ret;
 	}
-
 	if (dma->task != task) {
 		put_task_struct(dma->task);
 		dma->task = get_task_struct(task);
@@ -1730,16 +1742,38 @@ static int vfio_change_dma_mm(struct vfio_dma *dma, struct task_struct *task,
 	dma->mm = mm;
 	mmgrab(dma->mm);
 	dma->lock_cap = lock_cap;
+	dma->locked_vm = pages;
 	return 0;
 }
 
-static int vfio_change_dma_owner(struct vfio_dma *dma)
+static int vfio_change_dma_mm(struct vfio_dma *dma, struct task_struct *task,
+			      struct mm_struct *mm, bool lock_cap)
 {
-	/* Native mappings need ownership conversion before a granule change. */
-	if (!dma->fragments && mm_page_size(current->mm) != PAGE_SIZE)
-		return -EOPNOTSUPP;
-	return vfio_change_dma_mm(dma, current->group_leader, current->mm,
-				  capable(CAP_IPC_LOCK));
+	return vfio_change_dma_mm_pages(dma, task, mm, lock_cap, dma->locked_vm);
+}
+
+static int vfio_change_dma_owner(struct vfio_iommu *iommu, struct vfio_dma *dma,
+				 unsigned long vaddr)
+{
+	struct vfio_fragment_provider *provider;
+	int ret;
+
+	if (dma->fragments || (mm_page_size(current->mm) == PAGE_SIZE &&
+			      IS_ALIGNED(vaddr, PAGE_SIZE)))
+		return vfio_change_dma_mm(dma, current->group_leader, current->mm,
+					  capable(CAP_IPC_LOCK));
+
+	/* Prepare only metadata: failure must preserve every legacy pin/charge. */
+	provider = vfio_fragments_prepare_native(iommu, dma);
+	if (IS_ERR(provider))
+		return PTR_ERR(provider);
+	ret = vfio_change_dma_mm_pages(dma, current->group_leader, current->mm,
+				      capable(CAP_IPC_LOCK), vfio_fragments_native_pages(provider));
+	if (ret)
+		vfio_fragments_abort_native(provider);
+	else
+		vfio_fragments_commit_native(dma, provider);
+	return ret;
 }
 
 static int vfio_dma_do_map(struct vfio_iommu *iommu,
@@ -1792,7 +1826,7 @@ static int vfio_dma_do_map(struct vfio_iommu *iommu,
 			   dma->size != size) {
 			ret = -EINVAL;
 		} else {
-			ret = vfio_change_dma_owner(dma);
+			ret = vfio_change_dma_owner(iommu, dma, vaddr);
 			if (ret)
 				goto out_unlock;
 			dma->vaddr = vaddr;

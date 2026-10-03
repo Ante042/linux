@@ -543,6 +543,125 @@ static void vfio_fragments_domain_granule_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, mm_locked_vm_bytes(ctx->mm), 0UL);
 }
 
+static void vfio_fragments_native_owner_test(struct kunit *test)
+{
+	for (unsigned int variant = 0; variant < 9; variant++) {
+		bool same_mm = variant == 8;
+		bool mapped = same_mm || (variant & 1);
+		bool alias = same_mm || (variant & 2), different = variant & 4;
+		struct vfio_account_mm *old = vfio_account_mm_new(test, PAGE_SHIFT);
+		struct vfio_account_mm *next = same_mm ? old : vfio_account_mm_new(test, 12);
+		struct vfio_fragment_fixture *f;
+		struct vfio_fragment_provider *prepared;
+		struct file *file, *replacement;
+		struct vfio_dma *dma;
+		struct page *pages[2];
+		phys_addr_t external[2];
+		unsigned long unique, addr;
+		unsigned char data[32];
+		int ret;
+
+		KUNIT_ASSERT_NOT_NULL(test, old);
+		KUNIT_ASSERT_NOT_NULL(test, next);
+		file = vfio_fragment_file(test, 2 * PAGE_SIZE, 0x63);
+		replacement = vfio_fragment_file(test, 2 * PAGE_SIZE, 0x44);
+		KUNIT_ASSERT_NOT_ERR_OR_NULL(test, file);
+		KUNIT_ASSERT_NOT_ERR_OR_NULL(test, replacement);
+		KUNIT_ASSERT_EQ(test, vfio_fragment_source(old, file, 2 * PAGE_SIZE), VFIO_TEST_VA);
+		if (alias) {
+			kthread_use_mm(old->mm);
+			addr = vm_mmap(file, VFIO_TEST_VA + PAGE_SIZE, PAGE_SIZE,
+				PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, 0);
+			kthread_unuse_mm(old->mm);
+			KUNIT_ASSERT_EQ(test, addr, VFIO_TEST_VA + PAGE_SIZE);
+		}
+		f = vfio_fragment_fixture_new(test);
+		KUNIT_ASSERT_NOT_NULL(test, f);
+		if (mapped) {
+			list_add_tail(&f->domains[0].type1.next, &f->iommu->domain_list);
+			vfio_update_pgsize_bitmap(f->iommu);
+		}
+		KUNIT_ASSERT_EQ(test, vfio_fragment_test_map(f, old, 0, 2 * PAGE_SIZE), 0);
+		dma = vfio_find_dma(f->iommu, VFIO_TEST_IOVA, 1);
+		KUNIT_ASSERT_NOT_NULL(test, dma);
+		KUNIT_ASSERT_NULL(test, dma->fragments);
+		if (different) {
+			kthread_use_mm(old->mm);
+			addr = vm_mmap(replacement, VFIO_TEST_VA, 2 * PAGE_SIZE,
+				PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, 0);
+			kthread_unuse_mm(old->mm);
+			KUNIT_ASSERT_EQ(test, addr, VFIO_TEST_VA);
+		}
+		KUNIT_ASSERT_EQ(test, vfio_iommu_type1_pin_pages(f->iommu,
+			f->group.iommu_group, VFIO_TEST_IOVA + 17, 2,
+			IOMMU_READ | IOMMU_WRITE, pages), 2);
+		for (unsigned int i = 0; i < 2; i++)
+			external[i] = page_to_phys(pages[i]);
+		if (mapped && different)
+			KUNIT_EXPECT_NE(test, external[0],
+				iommu_iova_to_phys(&f->domains[0].core, VFIO_TEST_IOVA));
+		KUNIT_ASSERT_EQ(test, dma->locked_vm, 2UL);
+		if (!same_mm) {
+			old->live = false;
+			mmput(old->mm);
+			KUNIT_ASSERT_EQ(test, atomic_read(&old->mm->mm_users), 0);
+		}
+
+		prepared = vfio_fragments_prepare_native(f->iommu, dma);
+		KUNIT_ASSERT_NOT_ERR_OR_NULL(test, prepared);
+		unique = mapped ? (alias ? 1UL : 2UL) : 0;
+		if (!mapped || different)
+			unique += different || !alias ? 2UL : 1UL;
+		KUNIT_EXPECT_EQ(test, vfio_fragments_native_pages(prepared), unique);
+		/* Failed new-owner credit must not publish metadata or release pins. */
+		if (!same_mm && task_rlimit(dma->task, RLIMIT_MEMLOCK) != RLIM_INFINITY) {
+			unsigned long budget = task_rlimit(dma->task, RLIMIT_MEMLOCK) >>
+				mm_page_shift(next->mm);
+
+			next->mm->locked_vm = budget;
+			KUNIT_EXPECT_EQ(test, vfio_change_dma_mm_pages(dma, dma->task,
+				next->mm, false, unique), -ENOMEM);
+			KUNIT_EXPECT_PTR_EQ(test, dma->mm, old->mm);
+			KUNIT_EXPECT_EQ(test, dma->locked_vm, 2UL);
+			KUNIT_EXPECT_EQ(test, mm_locked_vm_native_pages(old->mm), 2UL);
+			KUNIT_EXPECT_EQ(test, next->mm->locked_vm, budget);
+			next->mm->locked_vm = 0;
+		}
+		vfio_fragments_abort_native(prepared);
+		KUNIT_EXPECT_PTR_EQ(test, dma->fragments, NULL);
+		KUNIT_EXPECT_TRUE(test, folio_maybe_dma_pinned(page_folio(pages[0])));
+		kthread_use_mm(next->mm);
+		ret = vfio_change_dma_owner(f->iommu, dma,
+			VFIO_TEST_VA + (same_mm ? SZ_4K : 0));
+		kthread_unuse_mm(next->mm);
+		KUNIT_ASSERT_EQ(test, ret, 0);
+		KUNIT_ASSERT_NOT_NULL(test, dma->fragments);
+		KUNIT_EXPECT_EQ(test, dma->locked_vm, unique);
+		KUNIT_EXPECT_EQ(test, mm_locked_vm_native_pages(old->mm), same_mm ? unique : 0UL);
+		KUNIT_EXPECT_EQ(test, mm_locked_vm_native_pages(next->mm), unique);
+		KUNIT_ASSERT_EQ(test, vfio_iommu_type1_dma_rw(f->iommu, VFIO_TEST_IOVA,
+			data, sizeof(data), false), 0);
+		KUNIT_EXPECT_PTR_EQ(test,
+			memchr_inv(data, !mapped && different ? 0x44 : 0x63, sizeof(data)), NULL);
+		KUNIT_ASSERT_EQ(test, vfio_iommu_type1_pin_pages(f->iommu,
+			f->group.iommu_group, VFIO_TEST_IOVA + 31, 2,
+			IOMMU_READ | IOMMU_WRITE, pages), 2);
+		for (unsigned int i = 0; i < 2; i++)
+			KUNIT_EXPECT_EQ(test, page_to_phys(pages[i]), external[i]);
+		KUNIT_EXPECT_EQ(test, dma->locked_vm, unique);
+		KUNIT_ASSERT_EQ(test, vfio_iommu_replay(f->iommu, &f->domains[1].type1), 0);
+		list_add_tail(&f->domains[1].type1.next, &f->iommu->domain_list);
+		vfio_iommu_type1_unpin_pages(f->iommu, VFIO_TEST_IOVA + 31, 2);
+		vfio_iommu_type1_unpin_pages(f->iommu, VFIO_TEST_IOVA + 17, 2);
+		KUNIT_EXPECT_EQ(test, dma->locked_vm,
+			mapped ? (alias ? 1UL : 2UL) : unique);
+		kunit_release_action(test, vfio_fragment_fixture_free, f);
+		KUNIT_EXPECT_EQ(test, mm_locked_vm_native_pages(next->mm), 0UL);
+		kunit_info(test, "native ownership variant=%u preserves PIN identity and unique charge",
+			   variant);
+	}
+}
+
 static struct kunit_case vfio_fragments_cases[] = {
 	KUNIT_CASE(vfio_fragments_lifetime_test),
 	KUNIT_CASE(vfio_fragments_lazy_test),
@@ -551,6 +670,7 @@ static struct kunit_case vfio_fragments_cases[] = {
 	KUNIT_CASE(vfio_fragments_replay_failure_test),
 	KUNIT_CASE(vfio_fragments_anon_owner_test),
 	KUNIT_CASE(vfio_fragments_domain_granule_test),
+	KUNIT_CASE(vfio_fragments_native_owner_test),
 	{}
 };
 

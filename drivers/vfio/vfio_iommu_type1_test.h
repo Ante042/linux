@@ -29,6 +29,8 @@ struct vfio_type1_test_cmd {
 #define VFIO_TYPE1_TEST_PIN        _IOWR('V', 4, struct vfio_type1_test_cmd)
 #define VFIO_TYPE1_TEST_UNPIN      _IOWR('V', 5, struct vfio_type1_test_cmd)
 #define VFIO_TYPE1_TEST_STATE      _IOWR('V', 6, struct vfio_type1_test_cmd)
+#define VFIO_TYPE1_TEST_EMULATED _IOWR('V', 7, struct vfio_type1_test_cmd)
+#define VFIO_TYPE1_TEST_STATE_FRAGMENTS 1U
 #define VFIO_TYPE1_TEST_WRITE 1U
 #define VFIO_TYPE1_TEST_WORKER 2U
 #endif

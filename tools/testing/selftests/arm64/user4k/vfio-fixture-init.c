@@ -4,6 +4,7 @@
 #define __user
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/capability.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,6 +15,8 @@
 #include <sys/mount.h>
 #include <sys/prctl.h>
 #include <sys/reboot.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <sys/wait.h>
@@ -105,6 +108,95 @@ static int all_bytes(const unsigned char *data, size_t size, unsigned char value
 		if (data[i] != value)
 			return 0;
 	return 1;
+}
+
+static void native_owner(int fd, int backing, unsigned char *data, size_t native)
+{
+	struct vfio_type1_test_cmd cmd = {};
+	struct vfio_iommu_type1_dma_unmap invalidate = {
+		.argsz = sizeof(invalidate), .flags = VFIO_DMA_UNMAP_FLAG_VADDR,
+		.iova = IOVA, .size = 2 * native,
+	};
+	struct vfio_iommu_type1_dma_map update = {
+		.argsz = sizeof(update), .flags = VFIO_DMA_MAP_FLAG_VADDR,
+		.iova = IOVA, .size = 2 * native, .vaddr = (uintptr_t)data,
+	};
+	struct __user_cap_header_struct header = { .version = _LINUX_CAPABILITY_VERSION_3 };
+	struct __user_cap_data_struct saved[2], reduced[2];
+	struct rlimit limit, empty;
+	unsigned char bytes[64];
+	int file_flags = fcntl(backing, F_GETFD), status = 0;
+	pid_t child;
+	int budget_ready, budget_captured, transferred;
+
+	result(!ioctl(fd, VFIO_TYPE1_TEST_EMULATED, &cmd) &&
+	       !domain(fd, 0, 1, 4096, 0), "VADDR fixture retains production group restrictions");
+	result(file_flags >= 0 && !fcntl(backing, F_SETFD, file_flags & ~FD_CLOEXEC),
+	       "native source inherits exact backing descriptor");
+	child = fork();
+	if (!child) {
+		char fd_arg[24], file_arg[24], native_arg[24];
+
+		snprintf(fd_arg, sizeof(fd_arg), "%d", fd);
+		snprintf(file_arg, sizeof(file_arg), "%d", backing);
+		snprintf(native_arg, sizeof(native_arg), "%zu", native);
+		if (prctl(PR_AURORA_SET_EXEC_PAGE_SIZE, 0UL, 0UL, 0UL, 0UL))
+			_exit(98);
+		execl("/init", "/init", "--native-source", fd_arg, file_arg, native_arg, NULL);
+		_exit(99);
+	}
+	if (file_flags >= 0)
+		fcntl(backing, F_SETFD, file_flags);
+	result(child > 0 && waitpid(child, &status, 0) == child &&
+	       WIFEXITED(status) && !WEXITSTATUS(status) && !state(fd, &cmd) &&
+	       !cmd.owner_users && !(cmd.flags & VFIO_TYPE1_TEST_STATE_FRAGMENTS) &&
+	       cmd.locked_bytes == 2 * native && cmd.mapped_bytes[0] == 2 * native,
+	       "exited native source owns legacy GUP pins before transfer");
+	result(!ioctl(fd, VFIO_IOMMU_UNMAP_DMA, &invalidate),
+	       "canonical VADDR invalidation leaves device translations alive");
+	budget_captured = !getrlimit(RLIMIT_MEMLOCK, &limit) &&
+		!syscall(SYS_capget, &header, saved);
+	budget_ready = budget_captured;
+	if (budget_ready) {
+		memcpy(reduced, saved, sizeof(saved));
+		reduced[CAP_IPC_LOCK / 32].effective &= ~(1U << (CAP_IPC_LOCK % 32));
+		empty = (struct rlimit) { .rlim_cur = 0, .rlim_max = limit.rlim_max };
+		budget_ready = !setrlimit(RLIMIT_MEMLOCK, &empty) &&
+			!syscall(SYS_capset, &header, reduced);
+	}
+	errno = 0;
+	result(budget_ready && ioctl(fd, VFIO_IOMMU_MAP_DMA, &update) < 0 && errno == ENOMEM &&
+	       !state(fd, &cmd) && !cmd.owner_users &&
+	       !(cmd.flags & VFIO_TYPE1_TEST_STATE_FRAGMENTS) &&
+	       cmd.locked_bytes == 2 * native && cmd.mapped_bytes[0] == 2 * native,
+	       "failed owner credit preserves native pins, metadata and charge");
+	if (budget_captured) {
+		result(!syscall(SYS_capset, &header, saved) && !setrlimit(RLIMIT_MEMLOCK, &limit),
+		       "restore original memlock budget and effective capability");
+	} else {
+		result(0, "owner budget setup failed");
+	}
+	transferred = !ioctl(fd, VFIO_IOMMU_MAP_DMA, &update) && !state(fd, &cmd) &&
+		cmd.owner_users && (cmd.flags & VFIO_TYPE1_TEST_STATE_FRAGMENTS) &&
+		cmd.locked_bytes == 2 * native && cmd.owner_locked_bytes == 2 * native;
+	result(transferred, "canonical VADDR retry adopts native pins for alternative owner");
+	/* Dependent CPU access is prohibited while VADDR remains invalid. */
+	if (!transferred)
+		return;
+	result(!rw(fd, 0, bytes, sizeof(bytes), 0) && all_bytes(bytes, sizeof(bytes), 0x64),
+	       "new owner accesses retained native buffer with its own mm authorization");
+	cmd = (struct vfio_type1_test_cmd) { .flags = 1 };
+	result(!ioctl(fd, VFIO_TYPE1_TEST_EMULATED, &cmd),
+	       "external consumer rejoins after VADDR update");
+	cmd = (struct vfio_type1_test_cmd) { .iova = IOVA + 17 };
+	result(!ioctl(fd, VFIO_TYPE1_TEST_PIN, &cmd) && !state(fd, &cmd) &&
+	       cmd.locked_bytes == 2 * native && cmd.external_refs == 1,
+	       "external page array reuses adopted pins without new charge");
+	result(!unmap(fd, 2 * native) && !state(fd, &cmd) &&
+	       !cmd.locked_bytes && !cmd.owner_locked_bytes && !cmd.external_refs &&
+	       !cmd.mapped_bytes[0],
+	       "owner transfer final cleanup refunds recipient and clears domain");
+	result(!domain(fd, 0, 0, 0, 0), "owner transfer domain detaches");
 }
 
 static int exercise(size_t native)
@@ -203,6 +295,8 @@ static int exercise(size_t native)
 	       "source-exit cleanup refunds pins and clears all translations");
 	result(!domain(fd, 1, 0, 0, 0) && !domain(fd, 0, 0, 0, 0),
 	       "both domains detach after complete cleanup");
+	if (getauxval(AT_PAGESZ) != native)
+		native_owner(fd, backing, data, native);
 out:
 	if (data != MAP_FAILED)
 		munmap(data, 2 * native);
@@ -217,6 +311,16 @@ out:
 int main(int argc, char **argv)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
+	if (argc == 5 && !strcmp(argv[1], "--native-source")) {
+		size_t native = strtoul(argv[4], NULL, 10);
+		int fd = atoi(argv[2]), backing = atoi(argv[3]);
+		void *data;
+
+		if (getauxval(AT_PAGESZ) != native)
+			return 2;
+		data = mmap(NULL, 2 * native, PROT_READ | PROT_WRITE, MAP_SHARED, backing, 0);
+		return data == MAP_FAILED || map(fd, data, 2 * native) ? 1 : 0;
+	}
 	if (argc == 4 && !strcmp(argv[1], "--test") && getppid() == 1) {
 		size_t expected = strtoul(argv[3], NULL, 10);
 

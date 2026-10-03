@@ -4404,3 +4404,59 @@ EL0-to-type1 provider/ABI path with supplied domains, not the VFIO core group
 attachment protocol, physical DMA, Apple boot, GPU execution or game throughput.
 Native-to-alternative VADDR ownership conversion and external spans crossing
 multiple fine DMA mappings remain unfinished.
+
+
+Native VFIO VADDR ownership conversion (2026-10-02)
+-------------------------------------------------
+
+Native-aligned mappings continue using their existing GUP and batching path.
+When VADDR updates transfer such a mapping to an alternative-page mm, or
+supply a fine-aligned new address, type1 now prepares retained-provider
+metadata for the original native GUP pins. Known native pin provenance and
+the existing native IOMMU translations identify these references; this is
+not inference of an alternative allocation's slot identity. No new pin is
+acquired during preparation. Metadata allocation or failed new-owner credit
+frees the candidate metadata without publishing it, releasing old pins or
+changing the old account. The new account is credited with the unique physical
+page count before the old full charge is refunded and ownership is committed.
+Same-mm conversion adjusts only the charge difference.
+
+Physical aliases retain each original GUP reference while charging a physical
+page once within the provider. Existing native external consumers may own
+independent GUP references, including different physical pages after a source
+VA replacement. Their identities and references remain separate from the
+mapped buffer and participate in the physical-page count. Without a mapped
+domain, existing external pins become the original cached buffer records.
+Native reserved/PFNMAP conversion remains unsupported by this ordinary-pin
+provider; the native path's existing behavior is unchanged.
+
+A new type1 KUnit case passes mapped/lazy, physical-alias and distinct
+external-page variants on both native16K and native64K kernels. It checks
+metadata abort, failed credit, exited-source refunds, transfer to a 4K mm,
+original buffer bytes, duplicate external identities, replay and complete
+reference/account cleanup. A same-mm native fine-address variant checks
+alias charge reduction without changing the process or releasing native pins.
+The total type1 result is ten passes, zero failures
+on both kernels, including the existing accounting and fragment cases.
+
+Real EL0 tests fork/exec a native-page source, verify that its full aligned MAP
+uses legacy GUP, and retain the mapping after that source exits. Alternative
+4K/16K recipients use canonical VADDR invalidation and update ioctls. A zero
+memlock limit with only effective CAP_IPC_LOCK removed forces ENOMEM; the old
+owner, native pins, metadata and charge remain intact. Restoring the original
+limit/capability permits retry, CPU access under the new mm's authorization,
+external native-page pin reuse and final recipient refund. Native16 runs 29
+native checks and 41 alternative4K checks; native64 runs 29 native checks and
+41 checks for each alternative4K/16K. AArch32 auto4K remains covered by the
+same fixture. Group restrictions stay in production; only a default-off,
+root-only recording-domain control changes the private test group's membership.
+
+Matched controls restore the previous native-to-alternative owner gate while
+retaining the new harness. Their real VADDR tests return EOPNOTSUPP instead of
+permitting credit/retry; dependent CPU operations stop while VADDR is invalid.
+These are matched behavior controls, not original-source kernel Images.
+Broader mixed-page KUnit regressions, feature-off arm64/x86 compilation and
+module build/load/unload checks also pass. Evidence is under
+user4k-vm-state/vfio-owner-v1/. This qualifies the tested provider ownership
+paths with supplied domains, not concurrent physical-device attachment/DMA,
+Apple GPU execution, game performance or the remaining full ABI requirements.

@@ -232,9 +232,27 @@ static long vfio_ioctl_test_ioctl(struct file *file, unsigned int request,
 			ret = -ENOENT;
 		}
 		break;
+	case VFIO_TYPE1_TEST_EMULATED:
+		if (cmd.flags > 1 || f->external_refs) {
+			ret = -EBUSY;
+			break;
+		}
+		mutex_lock(&f->iommu->lock);
+		if (cmd.flags && list_empty(&f->group.next)) {
+			list_add(&f->group.next, &f->iommu->emulated_iommu_groups);
+			if (!f->group.pinned_page_dirty_scope)
+				f->iommu->num_non_pinned_groups++;
+		} else if (!cmd.flags && !list_empty(&f->group.next)) {
+			list_del_init(&f->group.next);
+			if (!f->group.pinned_page_dirty_scope)
+				f->iommu->num_non_pinned_groups--;
+		}
+		mutex_unlock(&f->iommu->lock);
+		break;
 	case VFIO_TYPE1_TEST_STATE:
 		cmd.locked_bytes = 0;
-		cmd.owner_locked_bytes = 0;
+		cmd.owner_locked_bytes = mm_locked_vm_bytes(current->mm);
+		cmd.flags = 0;
 		cmd.owner_users = 0;
 		mutex_lock(&f->iommu->lock);
 		for (struct rb_node *node = rb_first(&f->iommu->dma_list);
@@ -244,6 +262,8 @@ static long vfio_ioctl_test_ioctl(struct file *file, unsigned int request,
 			cmd.locked_bytes += dma->locked_vm * PAGE_SIZE;
 			cmd.owner_locked_bytes = mm_locked_vm_bytes(dma->mm);
 			cmd.owner_users = atomic_read(&dma->mm->mm_users);
+			if (dma->fragments)
+				cmd.flags |= VFIO_TYPE1_TEST_STATE_FRAGMENTS;
 		}
 		cmd.native_page_size = PAGE_SIZE;
 		cmd.minimum_page_size = 1UL << __ffs(f->iommu->pgsize_bitmap);
