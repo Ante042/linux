@@ -213,9 +213,51 @@ its dependent huge-page tests are therefore not qualified. The isolated
 64K NUMA runs use ``initcall_blacklist=debug_vm_pgtable`` to omit that separate
 boot test while retaining KASAN and lockdep. This does not fix its allocation
 failure. The 16K runs retain the boot test. Automatic NUMA balancing was
-disabled in these guests and remains unqualified; these results do not cover
-broad pressure or memory hotplug. The published Apple mm4 configuration has
-NUMA disabled and its artifact is unchanged.
+disabled for these explicit-policy runs; its separate coverage follows below.
+These results do not cover broad pressure or memory hotplug. The published
+Apple mm4 configuration has NUMA disabled and its artifact is unchanged.
+
+Automatic NUMA hinting and migration (2026-10-03)
+------------------------------------------------
+
+NUMA protection scans now distinguish private anonymous subpages from shared
+COW subpages. Several private leaves in one native folio no longer make each
+leaf appear shared merely because the native folio has multiple PTE mappings.
+Batching stops at a change in subpage COW ownership, so a shared neighbour
+does not cause a private leaf to be skipped or acquire its hinting decision.
+Native-granule and huge-PMD sharing checks retain their existing rules.
+
+Hint-fault recovery restores mappings at the mm's granule using the actual
+physical byte offset within the folio. Restoration is clipped to the VMA and
+PTE table, and includes the other leaves of a native owner. It retains each
+leaf's permission checks and can leave unrelated PTEs untouched. Scheduler
+scan budgets continue to count native-page byte units, rounding partial-native
+VMA spans up instead of letting them consume zero budget.
+
+The disposable ``numa-balancing-init`` fixture requires two nodes with CPU0
+on node0 and CPU1 on node1, CONFIG_NUMA_BALANCING, CONFIG_SCHED_DEBUG and
+CONFIG_DEBUG_FS. Put it at ``/init`` with empty ``/proc`` and ``/debug`` mount
+points and ``/dev/console``. It first allocates an 8MiB anonymous range on
+node0, clears its binding, and runs on CPU1 until every accessible test leaf
+is on node1. No explicit migration syscall is used for that transition.
+Bytes, write counters, read-only protection and PROT_NONE isolation survive.
+A two-thread local phase records local NUMA hints and verifies recovery when
+migration is unnecessary. Guest scan-delay/period tunables are shortened
+only for this fixture; no production default is changed.
+
+These checks pass for native16/4K and native64/16K/4K AArch64 processes with
+KASAN and lockdep. A focused KUnit case also reuses one private slot among
+shared COW neighbours in the same physical owner, makes their PTE permissions
+identical, and verifies that only the private slot receives a NUMA hint.
+The explicit-policy and AArch32 fallback fixtures still pass with balancing
+enabled. Feature-disabled arm64 and x86 NUMA objects compile. The native64
+runs retain the separately documented ``debug_vm_pgtable`` boot-test exclusion.
+
+This covers bounded anonymous balancing and exact COW hint selection, not
+AArch32 automatic-migration workloads, large file-folio balancing, broad
+pressure or memory-tiering performance. The node checks are functional VM
+results, not throughput measurements. The published Apple mm4 artifact is
+unchanged and continues to use NUMA=n.
 
 Current userfaultfd support (2026-10-02)
 ---------------------------------------
@@ -315,8 +357,9 @@ their historical status statements; the latest exec milestone supersedes
 earlier statements that EL0 activation was absent.
 
 The Apple candidate keeps NUMA disabled. Separate two-node native16/native64
-guests now cover explicit policy ranges, placement and migration as described
-above. Automatic NUMA balancing and broader NUMA workloads remain unqualified.
+guests now cover explicit policy ranges, placement, migration and bounded
+anonymous automatic balancing as described above. Broader NUMA workloads,
+file-folio balancing and memory-tiering performance remain unqualified.
 
 The expanded objective is concurrent 4K, 16K and 64K userspace granules on
 arm64, with the kernel/physical allocator granule independently fixed for the

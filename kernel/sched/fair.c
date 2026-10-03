@@ -3682,8 +3682,8 @@ retry_pids:
 			 * areas faster.
 			 */
 			if (nr_pte_updates)
-				pages -= (end - start) >> PAGE_SHIFT;
-			virtpages -= (end - start) >> PAGE_SHIFT;
+				pages -= DIV_ROUND_UP(end - start, PAGE_SIZE);
+			virtpages -= DIV_ROUND_UP(end - start, PAGE_SIZE);
 
 			start = end;
 			if (pages <= 0 || virtpages <= 0)

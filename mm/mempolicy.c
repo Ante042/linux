@@ -832,6 +832,7 @@ unlock:
  * @folio: The folio whose mapping considered for being made NUMA hintable
  * @vma: The VMA that the folio belongs to.
  * @is_private_single_threaded: Is this a single-threaded private VMA or not
+ * @shared: Is the mapped memory potentially shared between address spaces
  *
  * This function checks to see if the folio actually indicates that
  * we need to make the mapping one which causes a NUMA hinting fault,
@@ -841,7 +842,7 @@ unlock:
  * Return: True if the mapping of the folio needs to be changed, false otherwise.
  */
 bool folio_can_map_prot_numa(struct folio *folio, struct vm_area_struct *vma,
-		bool is_private_single_threaded)
+		bool is_private_single_threaded, bool shared)
 {
 	int nid;
 
@@ -849,7 +850,7 @@ bool folio_can_map_prot_numa(struct folio *folio, struct vm_area_struct *vma,
 		return false;
 
 	/* Also skip shared copy-on-write folios */
-	if (is_cow_mapping(vma->vm_flags) && folio_maybe_mapped_shared(folio))
+	if (is_cow_mapping(vma->vm_flags) && shared)
 		return false;
 
 	/* Folios are pinned and can't be migrated */

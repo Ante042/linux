@@ -2715,7 +2715,8 @@ int change_huge_pmd(struct mmu_gather *tlb, struct vm_area_struct *vma,
 			goto unlock;
 
 		if (!folio_can_map_prot_numa(pmd_folio(*pmd), vma,
-					     vma_is_single_threaded_private(vma)))
+					     vma_is_single_threaded_private(vma),
+					     folio_maybe_mapped_shared(pmd_folio(*pmd))))
 			goto unlock;
 	}
 	/*

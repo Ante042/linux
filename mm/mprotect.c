@@ -71,6 +71,17 @@ static bool subpage_pte_exclusive(struct vm_area_struct *vma, pte_t pte)
 	mm_subpage_put(slot);
 	return exclusive;
 }
+
+static int subpage_exclusive_pte_batch(struct vm_area_struct *vma, pte_t *ptep,
+		int nr_ptes, bool exclusive)
+{
+	int nr;
+
+	for (nr = 1; nr < nr_ptes; nr++)
+		if (subpage_pte_exclusive(vma, ptep_get(ptep + nr)) != exclusive)
+			break;
+	return nr;
+}
 #endif
 
 static bool can_change_private_pte_writable(struct vm_area_struct *vma,
@@ -412,15 +423,28 @@ static long change_pte_range(struct mmu_gather *tlb,
 			 * Avoid trapping faults against the zero or KSM
 			 * pages. See similar comment in change_huge_pmd.
 			 */
-			if (prot_numa &&
-			    !folio_can_map_prot_numa(folio, vma,
-						is_private_single_threaded)) {
+			if (prot_numa) {
+				bool shared = folio && folio_maybe_mapped_shared(folio);
 
-				/* determine batch to skip */
-				nr_ptes = mprotect_folio_pte_batch(vma, folio,
-					  pte, oldpte, max_nr_ptes, /* flags = */ 0,
-					  page_shift);
-				continue;
+#ifdef CONFIG_MM_SUBPAGE
+				/* Multiple private leaves do not imply shared COW data. */
+				if (folio && folio_test_anon(folio) && page_shift < PAGE_SHIFT) {
+					shared = !subpage_pte_exclusive(vma, oldpte);
+					max_nr_ptes = folio_subpage_pte_batch(vma, folio,
+						pte, oldpte, max_nr_ptes, flags);
+					/* COW sharing can differ within one physical owner. */
+					max_nr_ptes = subpage_exclusive_pte_batch(vma, pte,
+									max_nr_ptes, !shared);
+				}
+#endif
+				if (!folio_can_map_prot_numa(folio, vma,
+						is_private_single_threaded, shared)) {
+					/* determine batch to skip */
+					nr_ptes = mprotect_folio_pte_batch(vma, folio,
+						pte, oldpte, max_nr_ptes, /* flags = */ 0,
+						page_shift);
+					continue;
+				}
 			}
 
 			nr_ptes = mprotect_folio_pte_batch(vma, folio, pte, oldpte,

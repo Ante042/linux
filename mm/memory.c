@@ -7501,31 +7501,33 @@ static void numa_rebuild_single_mapping(struct vm_fault *vmf, struct vm_area_str
 	update_mmu_cache_range(vmf, vma, fault_addr, fault_pte, 1);
 }
 
-static void numa_rebuild_large_mapping(struct vm_fault *vmf, struct vm_area_struct *vma,
+static void numa_rebuild_folio_mapping(struct vm_fault *vmf, struct vm_area_struct *vma,
 				       struct folio *folio, pte_t fault_pte,
 				       bool ignore_writable, bool pte_write_upgrade)
 {
-	int nr = pte_pfn(fault_pte) - folio_pfn(folio);
+	struct mm_struct *mm = vma->vm_mm;
+	unsigned int page_shift = mm_page_shift(mm);
+	unsigned long page_size = 1UL << page_shift;
+	unsigned long offset = pte_phys_mm(mm, fault_pte) - PFN_PHYS(folio_pfn(folio));
 	unsigned long start, end, addr = vmf->address;
-	unsigned long addr_start = addr - (nr << PAGE_SHIFT);
-	unsigned long pt_start = ALIGN_DOWN(addr, PMD_SIZE);
+	unsigned long lower = max(addr & pmd_mask_mm(mm), vma->vm_start);
+	unsigned long upper = pmd_addr_end_mm(mm, addr, vma->vm_end);
 	pte_t *start_ptep;
 
-	/* Stay within the VMA and within the page table. */
-	start = max3(addr_start, pt_start, vma->vm_start);
-	end = min3(addr_start + folio_size(folio), pt_start + PMD_SIZE,
-		   vma->vm_end);
-	start_ptep = vmf->pte - ((addr - start) >> PAGE_SHIFT);
+	/* Stay within the VMA, page table and physical owner without wrapping. */
+	start = addr - min(offset, addr - lower);
+	end = addr + min(folio_size(folio) - offset, upper - addr);
+	start_ptep = vmf->pte - ((addr - start) >> page_shift);
 
-	/* Restore all PTEs' mapping of the large folio */
-	for (addr = start; addr != end; start_ptep++, addr += PAGE_SIZE) {
+	/* Restore the owner's PTEs, including smaller leaves in a native folio. */
+	for (addr = start; addr != end; start_ptep++, addr += page_size) {
 		pte_t ptent = ptep_get(start_ptep);
 		bool writable = false;
 
 		if (!pte_present(ptent) || !pte_protnone(ptent))
 			continue;
 
-		if (pfn_folio(pte_pfn(ptent)) != folio)
+		if (pfn_folio(PHYS_PFN(pte_phys_mm(mm, ptent))) != folio)
 			continue;
 
 		if (!ignore_writable) {
@@ -7618,8 +7620,8 @@ out_map:
 	 * Make it present again, depending on how arch implements
 	 * non-accessible ptes, some can allow access by kernel mode.
 	 */
-	if (folio && folio_test_large(folio))
-		numa_rebuild_large_mapping(vmf, vma, folio, pte, ignore_writable,
+	if (folio && (folio_test_large(folio) || mm_page_shift(vma->vm_mm) < PAGE_SHIFT))
+		numa_rebuild_folio_mapping(vmf, vma, folio, pte, ignore_writable,
 					   pte_write_upgrade);
 	else
 		numa_rebuild_single_mapping(vmf, vma, vmf->address, vmf->pte,

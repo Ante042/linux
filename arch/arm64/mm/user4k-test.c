@@ -8795,6 +8795,72 @@ detach:
 	}
 }
 
+#ifdef CONFIG_NUMA_BALANCING
+static void user_subpage_numa_cow_batch_test(struct kunit *test)
+{
+	unsigned int shift;
+
+	for (shift = 12; shift < PAGE_SHIFT; shift += 2) {
+		unsigned long size = 1UL << shift, start = TEST_VA;
+		struct vm_area_struct *vma;
+		struct mm_struct *child = test_vma_mm_granule(test, shift);
+		struct mm_struct *mm = test_vma_mm_granule(test, shift);
+		phys_addr_t before;
+		unsigned long marked, mapped;
+		long ret;
+		unsigned int i;
+
+		KUNIT_ASSERT_NOT_NULL(test, mm);
+		KUNIT_ASSERT_NOT_NULL(test, child);
+		/* Use mmap accounting because the child will partially unmap. */
+		kthread_use_mm(mm);
+		mapped = vm_mmap(NULL, start, 4 * size, PROT_READ | PROT_WRITE,
+				 MAP_FIXED_NOREPLACE | MAP_PRIVATE | MAP_ANONYMOUS, 0);
+		kthread_unuse_mm(mm);
+		KUNIT_ASSERT_EQ(test, mapped, start);
+		vma = test_vma_lookup(mm, start);
+		KUNIT_ASSERT_NOT_NULL(test, vma);
+		for (i = 0; i < 4; i++)
+			KUNIT_ASSERT_EQ(test, test_file_fault(vma, start + i * size, true),
+					(vm_fault_t)0);
+		before = pte_phys_mm(mm, test_fault_entry(test, mm, start + size));
+		uprobe_start_dup_mmap();
+		ret = dup_mmap(child, mm);
+		uprobe_end_dup_mmap();
+		KUNIT_ASSERT_EQ(test, ret, 0L);
+		kthread_use_mm(child);
+		ret = vm_munmap(start + size, size);
+		kthread_unuse_mm(child);
+		KUNIT_ASSERT_EQ(test, ret, 0L);
+		/* Reuse the now-private slot without replacing its native owner. */
+		KUNIT_ASSERT_EQ(test, test_file_fault(vma, start + size, true), (vm_fault_t)0);
+		KUNIT_ASSERT_EQ(test, pte_phys_mm(mm,
+			test_fault_entry(test, mm, start + size)), before);
+		kthread_use_mm(mm);
+		ret = test_mprotect(start, 4 * size, PROT_READ);
+		kthread_unuse_mm(mm);
+		KUNIT_ASSERT_EQ(test, ret, 0L);
+		vma = test_vma_lookup(mm, start);
+		KUNIT_ASSERT_NOT_NULL(test, vma);
+		/* Permit local-node hinting, which normally skips a single user. */
+		mmget(mm);
+		mmap_read_lock(mm);
+		marked = change_prot_numa(vma, start, start + 4 * size);
+		mmap_read_unlock(mm);
+		mmput(mm);
+		KUNIT_EXPECT_EQ(test, marked, 1UL);
+		for (i = 0; i < 4; i++) {
+			pte_t pte = test_fault_entry(test, mm, start + i * size);
+
+			KUNIT_EXPECT_EQ(test, !!pte_protnone(pte), i == 1);
+			KUNIT_EXPECT_FALSE(test, pte_write(pte));
+		}
+		kunit_release_action(test, user4k_vma_mm_free, child);
+		kunit_release_action(test, user4k_vma_mm_free, mm);
+	}
+}
+#endif
+
 static void user4k_mprotect_cow_batch_test(struct kunit *test)
 {
 	struct mm_struct *mm, *child;
@@ -13981,6 +14047,9 @@ static struct kunit_case user4k_test_cases[] = {
 	KUNIT_CASE(user4k_vm_mmap_test),
 	KUNIT_CASE(user4k_mprotect_test),
 	KUNIT_CASE(user4k_mprotect_cow_batch_test),
+#ifdef CONFIG_NUMA_BALANCING
+	KUNIT_CASE(user_subpage_numa_cow_batch_test),
+#endif
 	KUNIT_CASE(user4k_mprotect_accounting_test),
 	KUNIT_CASE(user4k_file_cow_test),
 	KUNIT_CASE(user4k_file_eof_test),
