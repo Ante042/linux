@@ -169,6 +169,54 @@ across process-page boundaries. Eventfd notification, context destruction,
 removal of the ring mapping and adjacent guard preservation also pass.
 The Apple-enabled mm4 Image passes the native16/4K fixture in a VM.
 
+NUMA policy ranges and physical placement (2026-10-03)
+-----------------------------------------------------
+
+``mbind`` and ``set_mempolicy_home_node`` now align anonymous policy ranges
+using the process granule. NUMA PTE walks advance and batch at that granule,
+including native folios represented by several smaller leaves. Address-based
+``get_mempolicy(MPOL_F_NODE)`` queries retain an exact fragment reference rather
+than rounding the address to a native page and using legacy page-array GUP.
+
+Physical NUMA placement remains a native-folio property. Migration of a 4K
+leaf can move its whole 16K or 64K owner, including neighbouring leaves;
+it preserves their bytes and does not change their individual VMA policies.
+``MPOL_MF_MOVE`` retains the existing conservative shared-folio check.
+The migration tests use the privileged ``MPOL_MF_MOVE_ALL`` flag.
+
+Shared shmem policy is indexed by native page-cache units. Policy changes
+must cover whole native file-page units within each affected VMA; partial
+units return EINVAL before that VMA is split or its policy is replaced.
+This is a placement restriction, not a restriction on sharing data across
+process granules. Shared policy lookup includes the VMA's subpage file offset,
+so an alias beginning partway through a native page selects the correct
+policy after crossing into the next one. Interleave indices likewise retain
+native allocation units and account for the subpage offset.
+
+The disposable ``numa-policy-init`` and ``compat-numa-probe`` fixtures require
+two memory nodes, CONFIG_NUMA, CONFIG_NUMA_MIGRATION and CONFIG_COMPAT. Put
+both executables in the initramfs root, with the former named ``/init`` and
+an empty ``/proc`` directory plus ``/dev/console``. Native16/4K and
+native64/16K/4K KASAN/lockdep guests pass fine-range policy updates, placement,
+strict-policy checking, native-owner migration with byte preservation, and
+shared-file offset/rejection tests. AArch32 passes with automatic 4K pages
+and with native16/native64 fallback when 4K translation is capability-masked.
+The latter models use ``id_aa64mmfr0.tgran4=f`` and retain rejection of
+4K-only policy addresses. All cases verify that both memory nodes exist.
+
+The pre-change control rejects valid smaller-granule anonymous policy ranges;
+``numa_fixture_baseline=1`` runs only that benign control check. The x86 NUMA
+policy/shmem objects and feature-disabled arm64 shmem object also compile.
+The 64K guest's boot-time ``debug_vm_pgtable`` test failed to allocate a
+contiguous 512MiB block on both the unchanged control and the new kernel;
+its dependent huge-page tests are therefore not qualified. The isolated
+64K NUMA runs use ``initcall_blacklist=debug_vm_pgtable`` to omit that separate
+boot test while retaining KASAN and lockdep. This does not fix its allocation
+failure. The 16K runs retain the boot test. Automatic NUMA balancing was
+disabled in these guests and remains unqualified; these results do not cover
+broad pressure or memory hotplug. The published Apple mm4 configuration has
+NUMA disabled and its artifact is unchanged.
+
 Current userfaultfd support (2026-10-02)
 ---------------------------------------
 
@@ -266,10 +314,9 @@ or complete NCE compatibility claim is made. Milestone sections below retain
 their historical status statements; the latest exec milestone supersedes
 earlier statements that EL0 activation was absent.
 
-The current native16/native64 VM profiles and Apple candidate have NUMA
-disabled. NUMA policy integration requires further work: policy range
-alignment and PTE loops in ``mm/mempolicy.c`` still use native-page units.
-NUMA-enabled mixed-granule operation is not covered by these results.
+The Apple candidate keeps NUMA disabled. Separate two-node native16/native64
+guests now cover explicit policy ranges, placement and migration as described
+above. Automatic NUMA balancing and broader NUMA workloads remain unqualified.
 
 The expanded objective is concurrent 4K, 16K and 64K userspace granules on
 arm64, with the kernel/physical allocator granule independently fixed for the
