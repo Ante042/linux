@@ -1778,8 +1778,13 @@ static int __mm_subpage_add_anon_rmap(struct mm_subpage *subpage, struct vm_area
 		/* Slot references can survive the last VMA in this root. */
 		mm_subpage_hold_anon_root(subpage, vma->anon_vma->root,
 					  vma->vm_flags & VM_DROPPABLE);
+		/*
+		 * A restored folio is already visible in the swap cache. Other
+		 * faults may set PG_waiters while we hold its lock; preserve those
+		 * concurrent flag updates even when PG_swapbacked is already set.
+		 */
 		if (!(vma->vm_flags & VM_DROPPABLE))
-			__folio_set_swapbacked(folio);
+			folio_set_swapbacked(folio);
 		/* Neighboring slots may acquire different fork/COW relationships. */
 		__folio_set_anon(folio, vma, address, false);
 		if (!was_anon)
