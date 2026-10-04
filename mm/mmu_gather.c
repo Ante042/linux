@@ -406,6 +406,13 @@ static inline void __tlb_remove_table_one(void *table)
 {
 	struct ptdesc *ptdesc;
 
+	/* Preserve opaque architecture tokens through the RCU grace period. */
+	if (!tlb_table_is_ptdesc(table)) {
+		tlb_remove_table_sync_rcu();
+		__tlb_remove_table(table);
+		return;
+	}
+
 	ptdesc = table;
 	call_rcu(&ptdesc->pt_rcu_head, __tlb_remove_table_one_rcu);
 }

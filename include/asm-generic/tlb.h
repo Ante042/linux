@@ -222,6 +222,15 @@ static inline void __tlb_remove_table(void *table)
 }
 #endif
 
+/* Architectures may pass opaque table tokens instead of descriptors. */
+#ifndef tlb_table_is_ptdesc
+static inline bool tlb_table_is_ptdesc(void *table)
+{
+	(void)table;
+	return true;
+}
+#endif
+
 extern void tlb_remove_table(struct mmu_gather *tlb, void *table);
 
 #else /* !CONFIG_MMU_GATHER_TABLE_FREE */

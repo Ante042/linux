@@ -12,6 +12,8 @@
 
 #ifdef CONFIG_ARM64_USER4K_EXPERIMENTAL
 void __tlb_remove_table(void *token);
+/* Fragment tokens do not carry a private descriptor callback head. */
+#define tlb_table_is_ptdesc(token) (!((unsigned long)(token) & 1UL))
 #endif
 
 #define tlb_flush tlb_flush
