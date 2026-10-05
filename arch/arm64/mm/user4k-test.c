@@ -5272,6 +5272,12 @@ static void user4k_exec_arguments_test(struct kunit *test)
 		KUNIT_EXPECT_MEMEQ(test, buf, b, b_len + 1);
 		KUNIT_EXPECT_MEMEQ(test, buf + b_len + 1, a, a_len + 1);
 		KUNIT_EXPECT_STREQ(test, buf + b_len + a_len + 2, "tail");
+		/* /proc/PID/cmdline and environ read the stack with FOLL_ANON. */
+		memset(buf, 0, copied);
+		KUNIT_ASSERT_EQ(test, access_remote_vm(mm, bprm->p, buf, copied, FOLL_ANON),
+				(int)copied);
+		KUNIT_EXPECT_MEMEQ(test, buf, b, b_len + 1);
+		KUNIT_EXPECT_STREQ(test, buf + b_len + a_len + 2, "tail");
 		/* Interpreter argument removal scans several user granules. */
 		initial = bprm->p;
 		KUNIT_ASSERT_EQ(test, remove_arg_zero(bprm), 0);

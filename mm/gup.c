@@ -3658,7 +3658,7 @@ static long user_fragments_remote(struct mm_struct *mm, unsigned long start,
 		struct vm_area_struct **vma_out, bool dump)
 {
 	const unsigned int allowed = FOLL_WRITE | FOLL_FORCE | FOLL_NOFAULT |
-		FOLL_NOWAIT | FOLL_INTERRUPTIBLE | FOLL_LONGTERM;
+		FOLL_NOWAIT | FOLL_INTERRUPTIBLE | FOLL_LONGTERM | FOLL_ANON;
 	unsigned int internal = flags | FOLL_TOUCH | FOLL_REMOTE |
 		(pin ? FOLL_PIN : FOLL_GET) | (dump ? FOLL_DUMP : 0);
 	unsigned long end, count = 0;
