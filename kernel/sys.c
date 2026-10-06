@@ -1927,7 +1927,7 @@ out_thread:
 	}
 
 out_children:
-	r->ru_maxrss = maxrss * (PAGE_SIZE / 1024); /* convert pages to KBs */
+	r->ru_maxrss = maxrss; /* signal and mm high-water maxima are in kB */
 	r->ru_utime = ns_to_kernel_old_timeval(utime);
 	r->ru_stime = ns_to_kernel_old_timeval(stime);
 }
@@ -2542,6 +2542,28 @@ int __weak arch_prctl_mem_model_set(struct task_struct *t, unsigned long val)
 	return -EINVAL;
 }
 
+int __weak arch_prctl_exec_page_size_get(struct task_struct *task)
+{
+	return -EINVAL;
+}
+
+int __weak arch_prctl_exec_page_size_set(struct task_struct *task,
+				       unsigned long size)
+{
+	return -EINVAL;
+}
+
+int __weak arch_prctl_default_page_size_get(struct task_struct *task)
+{
+	return -EINVAL;
+}
+
+int __weak arch_prctl_default_page_size_set(struct task_struct *task,
+					  unsigned long size)
+{
+	return -EINVAL;
+}
+
 SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 		unsigned long, arg4, unsigned long, arg5)
 {
@@ -2555,6 +2577,22 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 
 	error = 0;
 	switch (option) {
+	case PR_AURORA_GET_EXEC_PAGE_SIZE:
+		if (arg2 || arg3 || arg4 || arg5)
+			return -EINVAL;
+		return arch_prctl_exec_page_size_get(me);
+	case PR_AURORA_SET_EXEC_PAGE_SIZE:
+		if (arg3 || arg4 || arg5)
+			return -EINVAL;
+		return arch_prctl_exec_page_size_set(me, arg2);
+	case PR_AURORA_GET_DEFAULT_PAGE_SIZE:
+		if (arg2 || arg3 || arg4 || arg5)
+			return -EINVAL;
+		return arch_prctl_default_page_size_get(me);
+	case PR_AURORA_SET_DEFAULT_PAGE_SIZE:
+		if (arg3 || arg4 || arg5)
+			return -EINVAL;
+		return arch_prctl_default_page_size_set(me, arg2);
 	case PR_GET_MEM_MODEL:
 		if (arg2 || arg3 || arg4 || arg5)
 			return -EINVAL;
