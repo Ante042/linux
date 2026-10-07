@@ -23,7 +23,8 @@
 static void check(int ok, const char *expression, int line)
 {
 	if (!ok) {
-		fprintf(stderr, "FAIL line %d: %s errno=%d\n", line, expression, errno);
+		fprintf(stderr, "FAIL line %d: %s errno=%d\n", line, expression,
+			errno);
 		exit(1);
 	}
 }
@@ -101,8 +102,8 @@ static void sampling(unsigned long pages)
 	unsigned long page = getauxval(AT_PAGESZ), capacity = pages * page;
 	unsigned long length = page + capacity;
 	int fd = event_open(1);
-	struct perf_event_mmap_page *map = mmap(NULL, length, PROT_READ | PROT_WRITE,
-					      MAP_SHARED, fd, 0);
+	struct perf_event_mmap_page *map =
+		mmap(NULL, length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 	unsigned char *region, *ring;
 	uint64_t tail = 0, samples = 0, wrapped = 0, region_samples = 0;
 
@@ -116,13 +117,15 @@ static void sampling(unsigned long pages)
 	region = mmap(NULL, 16 * page, PROT_READ | PROT_WRITE,
 		      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	CHECK(region != MAP_FAILED);
-	for (unsigned int batch = 0; batch < 10000 && tail < 3 * capacity; batch++) {
+	for (unsigned int batch = 0; batch < 10000 && tail < 3 * capacity;
+	     batch++) {
 		CHECK(!madvise(region, 16 * page, MADV_DONTNEED));
 		CHECK(!ioctl(fd, PERF_EVENT_IOC_ENABLE, 0));
 		for (unsigned int i = 0; i < 16; i++)
 			*(volatile unsigned char *)(region + i * page) = 1;
 		CHECK(!ioctl(fd, PERF_EVENT_IOC_DISABLE, 0));
-		uint64_t head = __atomic_load_n(&map->data_head, __ATOMIC_ACQUIRE);
+		uint64_t head =
+			__atomic_load_n(&map->data_head, __ATOMIC_ACQUIRE);
 
 		CHECK(head >= tail && head - tail <= capacity);
 		while (tail < head) {
@@ -133,19 +136,24 @@ static void sampling(unsigned long pages)
 				uint64_t time, address, period;
 			} record;
 
-			copy_record(&header, ring, capacity, tail, sizeof(header));
-			CHECK(header.size >= sizeof(header) && header.size <= head - tail);
+			copy_record(&header, ring, capacity, tail,
+				    sizeof(header));
+			CHECK(header.size >= sizeof(header) &&
+			      header.size <= head - tail);
 			if (header.type == PERF_RECORD_SAMPLE) {
 				CHECK(header.size == sizeof(record));
-				copy_record(&record, ring, capacity, tail, sizeof(record));
+				copy_record(&record, ring, capacity, tail,
+					    sizeof(record));
 				CHECK(record.pid == (uint32_t)getpid());
 				CHECK(record.tid == (uint32_t)getpid());
 				if (record.address >= (uintptr_t)region &&
-				    record.address < (uintptr_t)region + 16 * page)
+				    record.address <
+					    (uintptr_t)region + 16 * page)
 					region_samples++;
 				CHECK(record.period == 1);
 				samples++;
-				if ((tail & (capacity - 1)) + header.size > capacity)
+				if ((tail & (capacity - 1)) + header.size >
+				    capacity)
 					wrapped++;
 			} else {
 				CHECK(header.type == PERF_RECORD_THROTTLE ||
@@ -171,8 +179,8 @@ static void layout(unsigned long native)
 {
 	unsigned long page = getauxval(AT_PAGESZ);
 	int fd = event_open(0);
-	struct perf_event_mmap_page *map = mmap(NULL, page, PROT_READ | PROT_WRITE,
-					      MAP_SHARED, fd, 0);
+	struct perf_event_mmap_page *map =
+		mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 
 	CHECK(map != MAP_FAILED);
 	CHECK(map->data_offset == page && map->data_size == 0);
@@ -181,12 +189,13 @@ static void layout(unsigned long native)
 	CHECK(!close(fd));
 	fd = event_open(0);
 	errno = 0;
-	CHECK(mmap(NULL, 4 * page, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0) == MAP_FAILED);
+	CHECK(mmap(NULL, 4 * page, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0) ==
+	      MAP_FAILED);
 	CHECK(errno == EINVAL);
 	map = mmap(NULL, 3 * page, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 	CHECK(map != MAP_FAILED);
-	struct perf_event_mmap_page *alias = mmap(NULL, 3 * page, PROT_READ | PROT_WRITE,
-						MAP_SHARED, fd, 0);
+	struct perf_event_mmap_page *alias =
+		mmap(NULL, 3 * page, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 	CHECK(alias != MAP_FAILED);
 	map->data_tail = 7;
 	CHECK(alias->data_tail == 7);
@@ -196,12 +205,14 @@ static void layout(unsigned long native)
 	map->aux_offset = 3 * page;
 	map->aux_size = native;
 	errno = 0;
-	CHECK(mmap(NULL, native, PROT_READ, MAP_SHARED, fd, map->aux_offset) == MAP_FAILED);
+	CHECK(mmap(NULL, native, PROT_READ, MAP_SHARED, fd, map->aux_offset) ==
+	      MAP_FAILED);
 	CHECK(errno == EOPNOTSUPP);
-	unsigned long sizes[] = {4096, 16384, 65536};
+	unsigned long sizes[] = { 4096, 16384, 65536 };
 
 	for (unsigned int i = 0; i < 3; i++) {
-		if (sizes[i] > native || sizes[i] == page || (no4k && sizes[i] == 4096))
+		if (sizes[i] > native || sizes[i] == page ||
+		    (no4k && sizes[i] == 4096))
 			continue;
 		pid_t child = fork();
 
@@ -210,7 +221,8 @@ static void layout(unsigned long native)
 
 			snprintf(f, sizeof(f), "%d", fd);
 			snprintf(s, sizeof(s), "%lu", sizes[i]);
-			if (prctl(PR_AURORA_SET_EXEC_PAGE_SIZE, sizes[i], 0UL, 0UL, 0UL))
+			if (prctl(PR_AURORA_SET_EXEC_PAGE_SIZE, sizes[i], 0UL,
+				  0UL, 0UL))
 				_exit(2);
 			execl("/init", "/init", "--alias", f, s, NULL);
 			_exit(3);
@@ -220,7 +232,8 @@ static void layout(unsigned long native)
 	CHECK(map->data_size == 2 * page && map->data_offset == page);
 	CHECK(!munmap(map, 3 * page));
 	CHECK(!close(fd));
-	printf("ok - perf page=%lu metadata, invalid size, aliases, AUX routing\n", page);
+	printf("ok - perf page=%lu metadata, invalid size, aliases, AUX routing\n",
+	       page);
 }
 
 int main(int argc, char **argv)
@@ -235,8 +248,8 @@ int main(int argc, char **argv)
 
 		CHECK(getauxval(AT_PAGESZ) == page);
 		errno = 0;
-		CHECK(mmap(NULL, 3 * page, PROT_READ | PROT_WRITE,
-			   MAP_SHARED, atoi(argv[2]), 0) == MAP_FAILED);
+		CHECK(mmap(NULL, 3 * page, PROT_READ | PROT_WRITE, MAP_SHARED,
+			   atoi(argv[2]), 0) == MAP_FAILED);
 		CHECK(errno == EINVAL);
 		return 0;
 	}
@@ -259,10 +272,11 @@ int main(int argc, char **argv)
 		if (!strcmp(argv[i], "--compat-only"))
 			compat_only = 1;
 	}
-	unsigned long sizes[] = {4096, 16384, 65536};
+	unsigned long sizes[] = { 4096, 16384, 65536 };
 
 	for (unsigned int i = 0; i < 3; i++) {
-		if (compat_only || sizes[i] > native || (no4k && sizes[i] == 4096))
+		if (compat_only || sizes[i] > native ||
+		    (no4k && sizes[i] == 4096))
 			continue;
 		pid_t child = fork();
 
@@ -271,14 +285,16 @@ int main(int argc, char **argv)
 
 			snprintf(n, sizeof(n), "%lu", native);
 			snprintf(s, sizeof(s), "%lu", sizes[i]);
-			if (prctl(PR_AURORA_SET_EXEC_PAGE_SIZE, sizes[i], 0UL, 0UL, 0UL))
+			if (prctl(PR_AURORA_SET_EXEC_PAGE_SIZE, sizes[i], 0UL,
+				  0UL, 0UL))
 				_exit(2);
 			execl("/init", "/init", "--case", n, s, NULL);
 			_exit(3);
 		}
 		int bad = wait_child(child);
 
-		printf("%s - perf native=%lu process=%lu\n", bad ? "not ok" : "ok", native, sizes[i]);
+		printf("%s - perf native=%lu process=%lu\n",
+		       bad ? "not ok" : "ok", native, sizes[i]);
 		failed |= bad;
 	}
 	if (compat_only)

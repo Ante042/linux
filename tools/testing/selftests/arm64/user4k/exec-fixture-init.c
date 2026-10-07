@@ -43,7 +43,8 @@ static int run(const char *path, const char *arg, unsigned long size)
 	do {
 		got = waitpid(pid, &status, 0);
 	} while (got < 0 && errno == EINTR);
-	printf("# child %s %s: wait=%d status=%#x\n", path, arg ? arg : "", got, status);
+	printf("# child %s %s: wait=%d status=%#x\n", path, arg ? arg : "", got,
+	       status);
 	return got == pid && WIFEXITED(status) && !WEXITSTATUS(status) ? 0 : -1;
 }
 
@@ -69,8 +70,10 @@ static int argument_exec(unsigned long size)
 		payload[120000] = 0;
 		if (setenv("ARG_PAYLOAD", payload, 1))
 			_exit(122);
-		snprintf(expected, sizeof(expected), "%lu", size ? size : 16384UL);
-		execl("/init", "/init", "--args-check", expected, payload, NULL);
+		snprintf(expected, sizeof(expected), "%lu",
+			 size ? size : 16384UL);
+		execl("/init", "/init", "--args-check", expected, payload,
+		      NULL);
 		perror("argument exec");
 		_exit(123);
 	}
@@ -95,8 +98,8 @@ int main(int argc, char **argv)
 		unsigned int i;
 
 		if (getauxval(AT_PAGESZ) != strtoul(argv[2], NULL, 10) ||
-		    pending_size() != 0 || strlen(argv[3]) != 120000 ||
-		    !env || strlen(env) != 120000)
+		    pending_size() != 0 || strlen(argv[3]) != 120000 || !env ||
+		    strlen(env) != 120000)
 			return 1;
 		for (i = 0; i < 120000; i++)
 			if (argv[3][i] != 'a' + i % 23 || env[i] != argv[3][i])
@@ -133,12 +136,14 @@ int main(int argc, char **argv)
 	execl("/does-not-exist", "/does-not-exist", NULL);
 	ok &= errno == ENOENT && pending_size() == 4096;
 	ok &= getauxval(AT_PAGESZ) == 16384;
-	printf("%s - request validation and failed exec preserve live geometry\n", ok ? "ok" : "not ok");
+	printf("%s - request validation and failed exec preserve live geometry\n",
+	       ok ? "ok" : "not ok");
 	failures += !ok;
 	/* fork inherits the pending request; successful child exec consumes it. */
 	failures += run("/page-contract-4k", "--expect-4k", 0) != 0;
 	ok = pending_size() == 4096 && exec_size(0) == 0 && pending_size() == 0;
-	printf("%s - child exec leaves parent request intact; reset works\n", ok ? "ok" : "not ok");
+	printf("%s - child exec leaves parent request intact; reset works\n",
+	       ok ? "ok" : "not ok");
 	failures += !ok;
 	failures += run("/page-contract-dynamic-4k", "--expect-4k", 4096) != 0;
 	failures += run("/init", "--exec-cycle", 4096) != 0;
@@ -155,7 +160,8 @@ int main(int argc, char **argv)
 	failures += argument_exec(4096) != 0;
 	failures += run("/init", "--args-from-4k", 4096) != 0;
 	failures += run("/page-contract", NULL, 0) != 0;
-	printf("%s - exec fixture complete: failures=%d\n", failures ? "not ok" : "ok", failures);
+	printf("%s - exec fixture complete: failures=%d\n",
+	       failures ? "not ok" : "ok", failures);
 	reboot(RB_POWER_OFF);
 	return failures ? 1 : 0;
 }

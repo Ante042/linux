@@ -1190,7 +1190,11 @@ EXPORT_SYMBOL_IF_KUNIT(mm_alloc);
 
 struct mm_struct *mm_alloc_exec(void)
 {
+#ifdef CONFIG_ARCH_HAS_USER_PAGE_SIZE
+	return __mm_alloc(true, current->exec_page_shift);
+#else
 	return __mm_alloc(true, 0);
+#endif
 }
 
 /* The caller has validated the requested exec granule. */

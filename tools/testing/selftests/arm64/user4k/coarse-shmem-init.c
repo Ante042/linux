@@ -54,13 +54,14 @@ static int injection_on(bool page)
 	    fault_setting(kind, "verbose", "0") ||
 	    fault_setting(kind, "ignore-gfp-wait", "N") ||
 	    fault_setting(kind, "times", "-1") ||
-	    fault_setting(kind, "interval", "1") || fault_setting(kind, "space", "0"))
+	    fault_setting(kind, "interval", "1") ||
+	    fault_setting(kind, "space", "0"))
 		return -1;
 	if (!page)
 		return 0; /* Only current->fail_nth selects the slab allocation. */
 	return fault_setting(kind, "ignore-gfp-highmem", "N") ||
-		fault_setting(kind, "min-order", "2") ||
-		fault_setting(kind, "probability", "100");
+	       fault_setting(kind, "min-order", "2") ||
+	       fault_setting(kind, "probability", "100");
 }
 
 static int move_worker(const char *text, bool enter, bool swap_limit)
@@ -85,22 +86,27 @@ static int move_worker(const char *text, bool enter, bool swap_limit)
 	if (strncmp(comm, "kunit_", 6))
 		return -1;
 	if (enter) {
-		if (mount("cgroup2", "/sys/fs/cgroup", "cgroup2", 0, NULL) && errno != EBUSY)
+		if (mount("cgroup2", "/sys/fs/cgroup", "cgroup2", 0, NULL) &&
+		    errno != EBUSY)
 			return -1;
 		if (setting("/sys/fs/cgroup/cgroup.subtree_control", "+memory"))
 			return -1;
 		snprintf(path, sizeof(path), "/sys/fs/cgroup/%s", group);
 		if (mkdir(path, 0755) && errno != EEXIST)
 			return -1;
-		snprintf(path, sizeof(path), "/sys/fs/cgroup/%s/memory.max", group);
+		snprintf(path, sizeof(path), "/sys/fs/cgroup/%s/memory.max",
+			 group);
 		if (setting(path, swap_limit ? "max" : "0"))
 			return -1;
-		if (swap_limit && setting("/sys/fs/cgroup/coarse-swap-limit/memory.swap.max", "0"))
+		if (swap_limit &&
+		    setting("/sys/fs/cgroup/coarse-swap-limit/memory.swap.max",
+			    "0"))
 			return -1;
 	}
 	snprintf(pid, sizeof(pid), "%ld", nr);
 	if (enter)
-		snprintf(path, sizeof(path), "/sys/fs/cgroup/%s/cgroup.procs", group);
+		snprintf(path, sizeof(path), "/sys/fs/cgroup/%s/cgroup.procs",
+			 group);
 	else
 		snprintf(path, sizeof(path), "/sys/fs/cgroup/cgroup.procs");
 	return setting(path, pid);
@@ -110,8 +116,9 @@ static int helper(const char *op)
 {
 	struct stat init, self;
 
-	if (getpid() == 1 || stat("/proc/1/exe", &init) || stat("/proc/self/exe", &self) ||
-	    init.st_dev != self.st_dev || init.st_ino != self.st_ino)
+	if (getpid() == 1 || stat("/proc/1/exe", &init) ||
+	    stat("/proc/self/exe", &self) || init.st_dev != self.st_dev ||
+	    init.st_ino != self.st_ino)
 		return 1;
 	if (!strcmp(op, "--coarse-fixture-check"))
 		return getauxval(AT_PAGESZ) != 16384;
@@ -124,7 +131,8 @@ static int helper(const char *op)
 	if (!strncmp(op, "--coarse-swap-leave=", 20))
 		return move_worker(op + 20, false, true) != 0;
 	if (!strcmp(op, "--coarse-swap-unlimit"))
-		return setting("/sys/fs/cgroup/coarse-swap-limit/memory.swap.max", "max") != 0;
+		return setting("/sys/fs/cgroup/coarse-swap-limit/memory.swap.max",
+			       "max") != 0;
 	if (!strcmp(op, "--coarse-injection-off"))
 		return injection_off() != 0;
 	if (!strcmp(op, "--coarse-slab-on"))
@@ -155,7 +163,8 @@ static int run_suite(void)
 	fd = open(path, O_RDONLY | O_CLOEXEC);
 	if (fd < 0)
 		goto out;
-	while (used < capacity - 1 && (n = read(fd, log + used, capacity - used - 1)) > 0)
+	while (used < capacity - 1 &&
+	       (n = read(fd, log + used, capacity - used - 1)) > 0)
 		used += n;
 	close(fd);
 	fputs(log, stdout);
@@ -177,7 +186,8 @@ int main(int argc, char **argv)
 
 	if (getpid() != 1 && argc == 2)
 		return helper(argv[1]);
-	if (getpid() != 1 || (argc != 1 && (argc != 2 || strcmp(argv[1], "--swapfile"))))
+	if (getpid() != 1 ||
+	    (argc != 1 && (argc != 2 || strcmp(argv[1], "--swapfile"))))
 		return 2;
 	setvbuf(stdout, NULL, _IONBF, 0);
 	if (getauxval(AT_PAGESZ) != 16384)

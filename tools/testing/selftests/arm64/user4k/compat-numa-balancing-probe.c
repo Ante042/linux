@@ -3,12 +3,16 @@
 typedef unsigned int u32;
 static long call(long n, long a, long b, long c, long d, long e, long f)
 {
-	register long r0 __asm__("r0") = a, r1 __asm__("r1") = b, r2 __asm__("r2") = c;
-	register long r3 __asm__("r3") = d, r4 __asm__("r4") = e, r5 __asm__("r5") = f;
+	register long r0 __asm__("r0") = a, r1 __asm__("r1") = b,
+			 r2 __asm__("r2") = c;
+	register long r3 __asm__("r3") = d, r4 __asm__("r4") = e,
+			 r5 __asm__("r5") = f;
 	register long r7 __asm__("r7") = n;
 
-	__asm__ volatile("svc 0" : "+r"(r0) : "r"(r1), "r"(r2), "r"(r3),
-			 "r"(r4), "r"(r5), "r"(r7) : "memory", "cc");
+	__asm__ volatile("svc 0"
+			 : "+r"(r0)
+			 : "r"(r1), "r"(r2), "r"(r3), "r"(r4), "r"(r5), "r"(r7)
+			 : "memory", "cc");
 	return r0;
 }
 
@@ -55,7 +59,9 @@ static void value(const char *label, unsigned int length, u32 n)
 
 static u32 seconds(void)
 {
-	struct { long long sec, nsec; } ts;
+	struct {
+		long long sec, nsec;
+	} ts;
 
 	/* Use time64 even when CONFIG_COMPAT_32BIT_TIME is disabled. */
 	if (call(403, 1, (long)&ts, 0, 0, 0, 0))
@@ -115,13 +121,14 @@ static void forbidden(unsigned char *address, int write_access)
 static void mapping(u32 page)
 {
 	const u32 length = 8U << 20;
-	u32 mask[2] = {1, 0}, got[2] = {0, 0};
+	u32 mask[2] = { 1, 0 }, got[2] = { 0, 0 };
 	u32 loops = 0, moved = 0, started, total = length / page - 1;
 	int mode = -1;
 	long raw;
 	unsigned char *base;
 
-	if (call(320, (long)&mode, (long)got, 64, 0, 4, 0) || got[0] != 3 || got[1])
+	if (call(320, (long)&mode, (long)got, 64, 0, 4, 0) || got[0] != 3 ||
+	    got[1])
 		finish(20);
 	cpu(0);
 	raw = call(192, 0, length, 3, 0x22, -1, 0);
@@ -149,7 +156,8 @@ static void mapping(u32 page)
 	if (call(125, raw + page, page, 1, 0, 0, 0) ||
 	    call(125, raw + 2 * page, page, 0, 0, 0, 0))
 		finish(27);
-	if (call(319, raw, length, 0, 0, 0, 0)) /* MPOL_DEFAULT, no MOVE flags */
+	if (call(319, raw, length, 0, 0, 0,
+		 0)) /* MPOL_DEFAULT, no MOVE flags */
 		finish(28);
 	cpu(1);
 	started = seconds();
@@ -180,7 +188,8 @@ static void mapping(u32 page)
 	if (moved != total)
 		finish(30);
 	for (u32 off = 0; off < length; off += page)
-		if (off != page && off != 2 * page && *(u32 *)(base + off + 4) != loops)
+		if (off != page && off != 2 * page &&
+		    *(u32 *)(base + off + 4) != loops)
 			finish(31);
 	forbidden(base + page, 1);
 	forbidden(base + 2 * page, 0);

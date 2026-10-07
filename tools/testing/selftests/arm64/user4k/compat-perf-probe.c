@@ -5,12 +5,16 @@ typedef unsigned long long u64;
 
 static long call(long n, long a, long b, long c, long d, long e, long f)
 {
-	register long r0 __asm__("r0") = a, r1 __asm__("r1") = b, r2 __asm__("r2") = c;
-	register long r3 __asm__("r3") = d, r4 __asm__("r4") = e, r5 __asm__("r5") = f;
+	register long r0 __asm__("r0") = a, r1 __asm__("r1") = b,
+			 r2 __asm__("r2") = c;
+	register long r3 __asm__("r3") = d, r4 __asm__("r4") = e,
+			 r5 __asm__("r5") = f;
 	register long r7 __asm__("r7") = n;
 
-	__asm__ volatile("svc 0" : "+r"(r0) : "r"(r1), "r"(r2), "r"(r3),
-			 "r"(r4), "r"(r5), "r"(r7) : "memory", "cc");
+	__asm__ volatile("svc 0"
+			 : "+r"(r0)
+			 : "r"(r1), "r"(r2), "r"(r3), "r"(r4), "r"(r5), "r"(r7)
+			 : "memory", "cc");
 	return r0;
 }
 
@@ -41,7 +45,8 @@ static _Noreturn void finish(int code)
 		;
 }
 
-static void mapping(unsigned long pages, unsigned long native, unsigned int count)
+static void mapping(unsigned long pages, unsigned long native,
+		    unsigned int count)
 {
 	static const struct {
 		u32 type, size;

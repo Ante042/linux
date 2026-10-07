@@ -35,7 +35,8 @@ static void fault(int sig, siginfo_t *info, void *context)
 {
 	(void)context;
 	if (sig != SIGSEGV || !expected_fault ||
-	    (uintptr_t)info->si_addr != expected_fault || info->si_code != SEGV_ACCERR)
+	    (uintptr_t)info->si_addr != expected_fault ||
+	    info->si_code != SEGV_ACCERR)
 		_exit(90);
 	expected_fault = 0;
 	siglongjmp(fault_return, 1);
@@ -77,7 +78,8 @@ static bool validate(unsigned char *p, unsigned long serial, unsigned long len)
 
 static int worker(unsigned long serial, unsigned long ps, int control)
 {
-	struct sigaction action = { .sa_sigaction = fault, .sa_flags = SA_SIGINFO };
+	struct sigaction action = { .sa_sigaction = fault,
+				    .sa_flags = SA_SIGINFO };
 	unsigned char *data;
 	uint32_t *code;
 	unsigned int cpus = sysconf(_SC_NPROCESSORS_ONLN);
@@ -89,7 +91,8 @@ static int worker(unsigned long serial, unsigned long ps, int control)
 	    self.st_dev != init.st_dev || self.st_ino != init.st_ino ||
 	    prctl(PR_AURORA_GET_EXEC_PAGE_SIZE, 0UL, 0UL, 0UL, 0UL) != 0)
 		return 91;
-	if (cpus < 2 || migrate(serial % cpus) || sigaction(SIGSEGV, &action, NULL))
+	if (cpus < 2 || migrate(serial % cpus) ||
+	    sigaction(SIGSEGV, &action, NULL))
 		return 92;
 	data = mmap((void *)DATA_ADDRESS, 4 * ps, PROT_NONE,
 		    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
@@ -123,8 +126,9 @@ static int worker(unsigned long serial, unsigned long ps, int control)
 		sched_yield();
 		if (fn() != (int)expected || !validate(data, serial, 3 * ps))
 			return 99;
-		if (!(iterations % 64) && (!rejects_write(DATA_ADDRESS + 3 * ps) ||
-					   !rejects_write(DATA_ADDRESS + ps)))
+		if (!(iterations % 64) &&
+		    (!rejects_write(DATA_ADDRESS + 3 * ps) ||
+		     !rejects_write(DATA_ADDRESS + ps)))
 			return 101;
 		iterations++;
 		if (control < 0)
@@ -136,11 +140,13 @@ static int worker(unsigned long serial, unsigned long ps, int control)
 			return 100;
 	} while (true);
 	if (control >= 0)
-		printf("# persistent %luK worker: %lu migration/JIT/data cycles\n", ps / 1024, iterations);
+		printf("# persistent %luK worker: %lu migration/JIT/data cycles\n",
+		       ps / 1024, iterations);
 	return 0;
 }
 
-static pid_t spawn(unsigned long serial, unsigned long ps, int control, int close_fd)
+static pid_t spawn(unsigned long serial, unsigned long ps, int control,
+		   int close_fd)
 {
 	pid_t pid = fork();
 
@@ -154,8 +160,7 @@ static pid_t spawn(unsigned long serial, unsigned long ps, int control, int clos
 		snprintf(seq, sizeof(seq), "%lu", serial);
 		snprintf(size, sizeof(size), "%lu", ps);
 		snprintf(fd, sizeof(fd), "%d", control);
-		if (prctl(PR_AURORA_SET_EXEC_PAGE_SIZE, ps,
-			  0UL, 0UL, 0UL))
+		if (prctl(PR_AURORA_SET_EXEC_PAGE_SIZE, ps, 0UL, 0UL, 0UL))
 			_exit(111);
 		execl("/init", "/init", "--worker", seq, size, fd, NULL);
 		_exit(112);
@@ -205,7 +210,8 @@ int main(int argc, char **argv)
 
 	setvbuf(stdout, NULL, _IONBF, 0);
 	if (argc == 5 && !strcmp(argv[1], "--worker"))
-		return worker(strtoul(argv[2], NULL, 10), strtoul(argv[3], NULL, 10), atoi(argv[4]));
+		return worker(strtoul(argv[2], NULL, 10),
+			      strtoul(argv[3], NULL, 10), atoi(argv[4]));
 	if (argc == 2 && !strcmp(argv[1], "--short"))
 		contexts = SHORT_CONTEXTS;
 	if (getpid() != 1 || (argc != 1 && contexts != SHORT_CONTEXTS)) {
@@ -214,12 +220,14 @@ int main(int argc, char **argv)
 	}
 	if (mount("proc", "/proc", "proc", 0, NULL) ||
 	    mount("sysfs", "/sys", "sysfs", 0, NULL) ||
-	    glob("/sys/module/*/parameters/user4k_asid_generation", 0, NULL, &paths) ||
+	    glob("/sys/module/*/parameters/user4k_asid_generation", 0, NULL,
+		 &paths) ||
 	    paths.gl_pathc != 1) {
 		perror("fixture setup");
 		return 2;
 	}
-	snprintf(generation_path, sizeof(generation_path), "%s", paths.gl_pathv[0]);
+	snprintf(generation_path, sizeof(generation_path), "%s",
+		 paths.gl_pathv[0]);
 	globfree(&paths);
 	data = mmap((void *)DATA_ADDRESS, 4 * native, PROT_READ | PROT_WRITE,
 		    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
@@ -233,7 +241,8 @@ int main(int argc, char **argv)
 	for (unsigned int i = 0; i < nr; i++) {
 		if (pipe2(pipes, O_NONBLOCK | O_CLOEXEC))
 			return 4;
-		persistent[i] = spawn(CONTEXTS + i + 1, granules[i], pipes[0], pipes[1]);
+		persistent[i] = spawn(CONTEXTS + i + 1, granules[i], pipes[0],
+				      pipes[1]);
 		if (persistent[i] < 0)
 			return 5;
 		close(pipes[0]);
@@ -243,12 +252,14 @@ int main(int argc, char **argv)
 		pid_t pid = spawn(i, granules[i % nr], -1, -1);
 
 		if (pid < 0 || !reap(pid) || !validate(data, 0, 4 * native)) {
-			printf("not ok - churn/parent isolation at worker %lu\n", i);
+			printf("not ok - churn/parent isolation at worker %lu\n",
+			       i);
 			ok = false;
 			break;
 		}
 		if (!(i % 128))
-			printf("# workers=%lu ASID generation=%llu\n", i, generation());
+			printf("# workers=%lu ASID generation=%llu\n", i,
+			       generation());
 	}
 	after = generation();
 	for (unsigned int i = 0; i < nr; i++) {

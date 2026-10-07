@@ -2453,10 +2453,10 @@ static inline int pte_same_as_swp(pte_t pte, pte_t swp_pte)
 #ifdef CONFIG_MM_SUBPAGE
 /* Caller holds the swap-cache folio lock and the VMA's mmap read lock. */
 static int unuse_subpage(struct vm_area_struct *vma, pmd_t *pmd,
-			unsigned long addr, swp_entry_t entry, struct folio *folio)
+			unsigned long addr, swp_entry_t entry, struct folio *folio,
+			unsigned int offset)
 {
 	struct mm_struct *mm = vma->vm_mm;
-	unsigned int offset = vma_page_offset_at(vma, addr).offset;
 	struct mm_subpage *slot = NULL;
 	spinlock_t *ptl;
 	pte_t *ptep, old, pte;
@@ -2478,10 +2478,9 @@ static int unuse_subpage(struct vm_area_struct *vma, pmd_t *pmd,
 	old = ptep_get(ptep);
 	if (softleaf_from_pte(old).val != entry.val)
 		goto unlock;
-	if (pte_swp_subpage_offset(old) != offset) {
-		ret = -EINVAL;
+	/* A moved swap PTE retains its backing offset, not its VMA offset. */
+	if (pte_swp_subpage_offset(old) != offset)
 		goto unlock;
-	}
 	if (poisoned) {
 		pte = swp_entry_to_pte(PageHWPoison(&folio->page) ?
 			make_hwpoison_entry(&folio->page) : make_poisoned_swp_entry());
@@ -2522,8 +2521,9 @@ out:
  * force COW, vm_page_prot omits write permission from any private vma.
  */
 static int unuse_pte(struct vm_area_struct *vma, pmd_t *pmd,
-		unsigned long addr, swp_entry_t entry, struct folio *folio)
+		unsigned long addr, pte_t orig_pte, struct folio *folio)
 {
+	swp_entry_t entry = softleaf_from_pte(orig_pte);
 	struct page *page;
 	struct folio *swapcache;
 	spinlock_t *ptl;
@@ -2540,7 +2540,8 @@ static int unuse_pte(struct vm_area_struct *vma, pmd_t *pmd,
 
 #ifdef CONFIG_MM_SUBPAGE
 	if (mm_page_size(vma->vm_mm) < PAGE_SIZE)
-		return unuse_subpage(vma, pmd, addr, entry, folio);
+		return unuse_subpage(vma, pmd, addr, entry, folio,
+				     pte_swp_subpage_offset(orig_pte));
 #endif
 
 	swapcache = folio;
@@ -2702,7 +2703,7 @@ static int unuse_pte_range(struct vm_area_struct *vma, pmd_t *pmd,
 
 		folio_lock(folio);
 		folio_wait_writeback(folio);
-		ret = unuse_pte(vma, pmd, addr, entry, folio);
+		ret = unuse_pte(vma, pmd, addr, ptent, folio);
 		if (ret < 0) {
 			folio_unlock(folio);
 			folio_put(folio);

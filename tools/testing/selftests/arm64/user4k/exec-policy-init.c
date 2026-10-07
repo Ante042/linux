@@ -14,9 +14,14 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#define REQUIRE(x) do { if (!(x)) { \
-	fprintf(stderr, "FAIL line %d: %s errno=%d\n", __LINE__, #x, errno); \
-	exit(1); } } while (0)
+#define REQUIRE(x)                                                     \
+	do {                                                           \
+		if (!(x)) {                                            \
+			fprintf(stderr, "FAIL line %d: %s errno=%d\n", \
+				__LINE__, #x, errno);                  \
+			exit(1);                                       \
+		}                                                      \
+	} while (0)
 
 static int policy(int op, unsigned long value)
 {
@@ -79,21 +84,32 @@ static int run_preference(unsigned long native, unsigned long preferred)
 		pthread_t thread;
 		REQUIRE(!policy(PR_AURORA_SET_DEFAULT_PAGE_SIZE, preferred));
 		REQUIRE(!policy(PR_AURORA_SET_EXEC_PAGE_SIZE, preferred));
-		REQUIRE(!pthread_create(&thread, NULL, thread_policy, &preferred));
+		REQUIRE(!pthread_create(&thread, NULL, thread_policy,
+					&preferred));
 		REQUIRE(!pthread_join(thread, NULL));
 		state(native, preferred, preferred);
 		/* Rejected values and reserved arguments must preserve both policies. */
-		REQUIRE(policy(PR_AURORA_SET_DEFAULT_PAGE_SIZE, 8192) == -1 && errno == EINVAL);
-		REQUIRE(policy(PR_AURORA_SET_EXEC_PAGE_SIZE, 8192) == -1 && errno == EINVAL);
-		int ops[] = {PR_AURORA_SET_DEFAULT_PAGE_SIZE, PR_AURORA_GET_DEFAULT_PAGE_SIZE,
-			PR_AURORA_SET_EXEC_PAGE_SIZE, PR_AURORA_GET_EXEC_PAGE_SIZE};
-		for (unsigned int i = 0; i < sizeof(ops) / sizeof(ops[0]); i++) {
-			REQUIRE(prctl(ops[i], 0UL, 1UL, 0UL, 0UL) == -1 && errno == EINVAL);
-			REQUIRE(prctl(ops[i], 0UL, 0UL, 1UL, 0UL) == -1 && errno == EINVAL);
-			REQUIRE(prctl(ops[i], 0UL, 0UL, 0UL, 1UL) == -1 && errno == EINVAL);
+		REQUIRE(policy(PR_AURORA_SET_DEFAULT_PAGE_SIZE, 8192) == -1 &&
+			errno == EINVAL);
+		REQUIRE(policy(PR_AURORA_SET_EXEC_PAGE_SIZE, 8192) == -1 &&
+			errno == EINVAL);
+		int ops[] = { PR_AURORA_SET_DEFAULT_PAGE_SIZE,
+			      PR_AURORA_GET_DEFAULT_PAGE_SIZE,
+			      PR_AURORA_SET_EXEC_PAGE_SIZE,
+			      PR_AURORA_GET_EXEC_PAGE_SIZE };
+		for (unsigned int i = 0; i < sizeof(ops) / sizeof(ops[0]);
+		     i++) {
+			REQUIRE(prctl(ops[i], 0UL, 1UL, 0UL, 0UL) == -1 &&
+				errno == EINVAL);
+			REQUIRE(prctl(ops[i], 0UL, 0UL, 1UL, 0UL) == -1 &&
+				errno == EINVAL);
+			REQUIRE(prctl(ops[i], 0UL, 0UL, 0UL, 1UL) == -1 &&
+				errno == EINVAL);
 		}
-		REQUIRE(policy(PR_AURORA_GET_DEFAULT_PAGE_SIZE, 1) == -1 && errno == EINVAL);
-		REQUIRE(policy(PR_AURORA_GET_EXEC_PAGE_SIZE, 1) == -1 && errno == EINVAL);
+		REQUIRE(policy(PR_AURORA_GET_DEFAULT_PAGE_SIZE, 1) == -1 &&
+			errno == EINVAL);
+		REQUIRE(policy(PR_AURORA_GET_EXEC_PAGE_SIZE, 1) == -1 &&
+			errno == EINVAL);
 		execl("/does-not-exist", "/does-not-exist", NULL);
 		REQUIRE(errno == ENOENT);
 		state(native, preferred, preferred);
@@ -131,7 +147,8 @@ int main(int argc, char **argv)
 		unsigned long p = strtoul(argv[4], NULL, 10);
 
 		state(stage == 2 || stage == 5 ? n : p, stage < 4 ? p : 0, 0);
-		if (stage == 5) return 0;
+		if (stage == 5)
+			return 0;
 		if (stage == 1) {
 			REQUIRE(!policy(PR_AURORA_SET_EXEC_PAGE_SIZE, 0));
 			state(p, p, n);
@@ -152,32 +169,41 @@ int main(int argc, char **argv)
 	REQUIRE(!mount("proc", "/proc", "proc", 0, NULL));
 	state(native, 0, 0);
 	int no4k = argc == 2 && !strcmp(argv[1], "--no4k");
-	unsigned long preferences[] = {4096, 16384};
+	unsigned long preferences[] = { 4096, 16384 };
 	for (unsigned int i = 0; i < 2; i++) {
 		unsigned long p = preferences[i];
-		if (p >= native || (no4k && p == 4096)) continue;
+		if (p >= native || (no4k && p == 4096))
+			continue;
 		int ok = run_preference(native, p);
-		printf("%s - exec policy native=%lu alternative=%lu\n", ok ? "ok" : "not ok", native, p);
+		printf("%s - exec policy native=%lu alternative=%lu\n",
+		       ok ? "ok" : "not ok", native, p);
 		failed |= !ok;
 		pid_t pid = fork();
 		if (!pid) {
 			pthread_t thread;
-			unsigned long sizes[] = {native, p};
-			REQUIRE(!pthread_create(&thread, NULL, thread_exec, sizes));
-			for (;;) pause();
+			unsigned long sizes[] = { native, p };
+			REQUIRE(!pthread_create(&thread, NULL, thread_exec,
+						sizes));
+			for (;;)
+				pause();
 		}
 		ok = wait_child(pid);
-		printf("%s - non-leader exec alternative=%lu\n", ok ? "ok" : "not ok", p);
+		printf("%s - non-leader exec alternative=%lu\n",
+		       ok ? "ok" : "not ok", p);
 		failed |= !ok;
 		ok = compat(native, p, no4k);
-		printf("%s - compat policy alternative=%lu no4k=%d\n", ok ? "ok" : "not ok", p, no4k);
+		printf("%s - compat policy alternative=%lu no4k=%d\n",
+		       ok ? "ok" : "not ok", p, no4k);
 		failed |= !ok;
 	}
 	if (no4k) {
-		int ok = policy(PR_AURORA_SET_DEFAULT_PAGE_SIZE, 4096) == -1 && errno == EOPNOTSUPP;
-		ok &= policy(PR_AURORA_SET_EXEC_PAGE_SIZE, 4096) == -1 && errno == EOPNOTSUPP;
+		int ok = policy(PR_AURORA_SET_DEFAULT_PAGE_SIZE, 4096) == -1 &&
+			 errno == EOPNOTSUPP;
+		ok &= policy(PR_AURORA_SET_EXEC_PAGE_SIZE, 4096) == -1 &&
+		      errno == EOPNOTSUPP;
 		ok &= compat(native, 0, 1);
-		printf("%s - no4k preserves native compat restrictions\n", ok ? "ok" : "not ok");
+		printf("%s - no4k preserves native compat restrictions\n",
+		       ok ? "ok" : "not ok");
 		failed |= !ok;
 	}
 	state(native, 0, 0);

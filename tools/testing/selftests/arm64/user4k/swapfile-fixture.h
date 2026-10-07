@@ -4,7 +4,8 @@
 
 static const char *swap_path(void)
 {
-	return access("/swapdir/swapfile", F_OK) ? "/dev/vda" : "/swapdir/swapfile";
+	return access("/swapdir/swapfile", F_OK) ? "/dev/vda" :
+						   "/swapdir/swapfile";
 }
 
 /* Remove every fourth native page: every 64K group crosses file extents. */
@@ -18,7 +19,8 @@ static int prepare_swapfile(void)
 	if (!buf || (mkdir("/swapdir", 0755) && errno != EEXIST) ||
 	    mount("/dev/vda", "/swapdir", "ext4", 0, NULL))
 		goto out;
-	fd = open("/swapdir/swapfile", O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600);
+	fd = open("/swapdir/swapfile", O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC,
+		  0600);
 	if (fd < 0)
 		goto out;
 	memset(buf, 0xa5, page);
@@ -28,7 +30,8 @@ static int prepare_swapfile(void)
 	if (fsync(fd))
 		goto out;
 	for (offset = initial; offset; offset -= 4 * page)
-		if (fallocate(fd, FALLOC_FL_COLLAPSE_RANGE, offset - 2 * page, page))
+		if (fallocate(fd, FALLOC_FL_COLLAPSE_RANGE, offset - 2 * page,
+			      page))
 			goto out;
 	memset(buf, 0, page);
 	((unsigned int *)(buf + 1024))[0] = 1;

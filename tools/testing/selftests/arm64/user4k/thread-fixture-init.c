@@ -78,7 +78,8 @@ static void *worker(void *arg)
 			CPU_SET((id + round) % 2, &cpu);
 			ok &= !sched_setaffinity(0, sizeof(cpu), &cpu);
 			memset(p, pattern, PAGES * ps);
-			ok &= !mprotect(p + ps, ps, PROT_READ) && p[ps] == pattern;
+			ok &= !mprotect(p + ps, ps, PROT_READ) &&
+			      p[ps] == pattern;
 			ok &= !mprotect(p + ps, ps, PROT_READ | PROT_WRITE);
 			ok &= !madvise(p + 2 * ps, ps, MADV_FREE);
 			memset(p + 2 * ps, pattern, ps);
@@ -90,12 +91,15 @@ static void *worker(void *arg)
 				ok = false;
 			} else {
 				memset(heap, pattern, 5000 + id * 777);
-				ok &= bytes_equal(heap, 5000 + id * 777, pattern);
+				ok &= bytes_equal(heap, 5000 + id * 777,
+						  pattern);
 				free(heap);
 			}
 			ok &= !pthread_kill(pthread_self(), SIGUSR1);
-			ok &= tls_id == id && signals == (sig_atomic_t)(round + 1);
-			ok &= prctl(PR_AURORA_GET_EXEC_PAGE_SIZE, 0UL, 0UL, 0UL, 0UL) == (int)request;
+			ok &= tls_id == id &&
+			      signals == (sig_atomic_t)(round + 1);
+			ok &= prctl(PR_AURORA_GET_EXEC_PAGE_SIZE, 0UL, 0UL, 0UL,
+				    0UL) == (int)request;
 			ok &= !mincore(p, PAGES * ps, residency);
 			ok &= bytes_equal(p, PAGES * ps, pattern);
 		}
@@ -141,13 +145,19 @@ static bool wait_for_pi_block(void)
 		FILE *f;
 
 		if (tid) {
-			snprintf(path, sizeof(path), "/proc/self/task/%d/syscall", tid);
+			snprintf(path, sizeof(path),
+				 "/proc/self/task/%d/syscall", tid);
 			f = fopen(path, "re");
 			if (f) {
 				bool blocked = fgets(line, sizeof(line), f) &&
-					sscanf(line, "%lu %lx %lx", &nr, &address, &operation) == 3 &&
-					nr == SYS_futex && ((operation & FUTEX_CMD_MASK) == FUTEX_LOCK_PI ||
-					(operation & FUTEX_CMD_MASK) == FUTEX_LOCK_PI2);
+					       sscanf(line, "%lu %lx %lx", &nr,
+						      &address,
+						      &operation) == 3 &&
+					       nr == SYS_futex &&
+					       ((operation & FUTEX_CMD_MASK) ==
+							FUTEX_LOCK_PI ||
+						(operation & FUTEX_CMD_MASK) ==
+							FUTEX_LOCK_PI2);
 
 				fclose(f);
 				if (blocked)
@@ -174,10 +184,12 @@ static int exercise(void)
 	ps = getauxval(AT_PAGESZ);
 	ksft_print_header();
 	ksft_set_plan(6);
-	if (sigaction(SIGUSR1, &action, NULL) || pthread_barrier_init(&barrier, NULL, THREADS + 1))
+	if (sigaction(SIGUSR1, &action, NULL) ||
+	    pthread_barrier_init(&barrier, NULL, THREADS + 1))
 		ksft_exit_fail_msg("thread setup\n");
 	for (unsigned int i = 0; i < THREADS; i++)
-		if (pthread_create(&threads[i], NULL, worker, (void *)(uintptr_t)(i + 1)))
+		if (pthread_create(&threads[i], NULL, worker,
+				   (void *)(uintptr_t)(i + 1)))
 			ksft_exit_fail_msg("pthread_create\n");
 	pthread_barrier_wait(&barrier);
 	for (unsigned int round = 0; round < ROUNDS; round++) {
@@ -185,7 +197,8 @@ static int exercise(void)
 		while (total < (round + 1) * THREADS)
 			pthread_cond_wait(&condition, &mutex);
 		pthread_mutex_unlock(&mutex);
-		ok &= prctl(PR_AURORA_GET_EXEC_PAGE_SIZE, 0UL, 0UL, 0UL, 0UL) == 0;
+		ok &= prctl(PR_AURORA_GET_EXEC_PAGE_SIZE, 0UL, 0UL, 0UL, 0UL) ==
+		      0;
 		if (!(round % 16)) {
 			pid_t child = fork();
 			int status = 0;
@@ -193,8 +206,10 @@ static int exercise(void)
 			if (!child) {
 				unsigned char *p = malloc(32768);
 
-				if (!p || tls_id || total != (round + 1) * THREADS ||
-				    prctl(PR_AURORA_GET_EXEC_PAGE_SIZE, 0UL, 0UL, 0UL, 0UL))
+				if (!p || tls_id ||
+				    total != (round + 1) * THREADS ||
+				    prctl(PR_AURORA_GET_EXEC_PAGE_SIZE, 0UL,
+					  0UL, 0UL, 0UL))
 					_exit(10);
 				memset(p, 0x75, 32768);
 				if (!bytes_equal(p, 32768, 0x75))
@@ -202,17 +217,21 @@ static int exercise(void)
 				free(p);
 				_exit(0);
 			}
-			forks &= child > 0 && waitpid(child, &status, 0) == child &&
+			forks &= child > 0 &&
+				 waitpid(child, &status, 0) == child &&
 				 WIFEXITED(status) && !WEXITSTATUS(status);
 		}
 		pthread_barrier_wait(&barrier);
 	}
 	for (unsigned int i = 0; i < THREADS; i++)
 		ok &= !pthread_join(threads[i], NULL);
-	ksft_test_result(ok && !atomic_load(&failures) && total == THREADS * ROUNDS,
+	ksft_test_result(
+		ok && !atomic_load(&failures) && total == THREADS * ROUNDS,
 		"%luK %u concurrent memory/TLS/signal/exec-request rounds across %u threads\n",
 		ps / 1024, ROUNDS, THREADS);
-	ksft_test_result(forks, "%luK fork and allocator from a multithreaded process\n", ps / 1024);
+	ksft_test_result(
+		forks, "%luK fork and allocator from a multithreaded process\n",
+		ps / 1024);
 	pthread_barrier_destroy(&barrier);
 	ok = !pthread_mutexattr_init(&attributes);
 	ok &= !pthread_mutexattr_setrobust(&attributes, PTHREAD_MUTEX_ROBUST);
@@ -227,7 +246,8 @@ static int exercise(void)
 		ok &= !pthread_mutex_consistent(&robust);
 	if (!error || error == EOWNERDEAD)
 		ok &= !pthread_mutex_unlock(&robust);
-	ksft_test_result(ok, "%luK robust futex owner-death recovery\n", ps / 1024);
+	ksft_test_result(ok, "%luK robust futex owner-death recovery\n",
+			 ps / 1024);
 	pthread_mutex_destroy(&robust);
 	/* Exercise repeated TLS/stack allocation and set_tid_address clear/wake. */
 	for (unsigned int i = 0; i < 128; i++) {
@@ -246,7 +266,9 @@ static int exercise(void)
 		if (!ok)
 			break;
 	}
-	ksft_test_result(ok && !atomic_load(&failures), "%luK repeated thread exit/join and robust recovery\n", ps / 1024);
+	ksft_test_result(ok && !atomic_load(&failures),
+			 "%luK repeated thread exit/join and robust recovery\n",
+			 ps / 1024);
 	ok = !pthread_mutexattr_setprotocol(&attributes, PTHREAD_PRIO_INHERIT);
 	ok &= !pthread_mutex_init(&robust, &attributes);
 	ok &= !pthread_mutex_lock(&robust);
@@ -260,7 +282,10 @@ static int exercise(void)
 
 		ok &= !pthread_join(owner, &result) && !result;
 	}
-	ksft_test_result(ok, "%luK confirmed contended priority-inheritance futex handoff\n", ps / 1024);
+	ksft_test_result(
+		ok,
+		"%luK confirmed contended priority-inheritance futex handoff\n",
+		ps / 1024);
 	ok = !pthread_create(&owner, NULL, owner_dies, NULL);
 	if (!ok)
 		ksft_exit_fail_msg("PI owner setup\n");
@@ -273,7 +298,9 @@ static int exercise(void)
 		ok &= !pthread_mutex_unlock(&robust);
 	pthread_mutex_destroy(&robust);
 	pthread_mutexattr_destroy(&attributes);
-	ksft_test_result(ok, "%luK priority-inheritance robust owner-death recovery\n", ps / 1024);
+	ksft_test_result(
+		ok, "%luK priority-inheritance robust owner-death recovery\n",
+		ps / 1024);
 	ksft_print_cnts();
 	return ksft_get_fail_cnt() ? 1 : 0;
 }
@@ -295,8 +322,7 @@ static void *exec_nonleader(void *arg)
 	char size[32];
 
 	snprintf(size, sizeof(size), "%lu", target);
-	if (prctl(PR_AURORA_SET_EXEC_PAGE_SIZE, target,
-		  0UL, 0UL, 0UL))
+	if (prctl(PR_AURORA_SET_EXEC_PAGE_SIZE, target, 0UL, 0UL, 0UL))
 		_exit(30);
 	pthread_barrier_wait(&exec_barrier);
 	execl("/init", "/init", "--after-thread-exec", size, NULL);
@@ -312,7 +338,8 @@ static int thread_exec(unsigned long target)
 	for (unsigned int i = 0; i < 2; i++)
 		if (pthread_create(&siblings[i], NULL, exec_sibling, NULL))
 			return 33;
-	if (pthread_create(&executor, NULL, exec_nonleader, (void *)(uintptr_t)target))
+	if (pthread_create(&executor, NULL, exec_nonleader,
+			   (void *)(uintptr_t)target))
 		return 34;
 	pthread_barrier_wait(&exec_barrier);
 	for (;;)
@@ -328,11 +355,13 @@ int main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IONBF, 0);
 	if (argc == 3 && !strcmp(argv[1], "--thread-exec") && getppid() == 1)
 		return thread_exec(strtoul(argv[2], NULL, 10));
-	if (argc == 3 && !strcmp(argv[1], "--after-thread-exec") && getppid() == 1) {
+	if (argc == 3 && !strcmp(argv[1], "--after-thread-exec") &&
+	    getppid() == 1) {
 		unsigned long expected = strtoul(argv[2], NULL, 10);
 
 		return getauxval(AT_PAGESZ) != expected ||
-			prctl(PR_AURORA_GET_EXEC_PAGE_SIZE, 0UL, 0UL, 0UL, 0UL) != 0;
+		       prctl(PR_AURORA_GET_EXEC_PAGE_SIZE, 0UL, 0UL, 0UL,
+			     0UL) != 0;
 	}
 	if (argc == 3 && !strcmp(argv[1], "--test") && getppid() == 1) {
 		if (getauxval(AT_PAGESZ) != strtoul(argv[2], NULL, 10))
@@ -360,7 +389,7 @@ int main(int argc, char **argv)
 			_exit(4);
 		}
 		ok &= pid > 0 && waitpid(pid, &status, 0) == pid &&
-			WIFEXITED(status) && !WEXITSTATUS(status);
+		      WIFEXITED(status) && !WEXITSTATUS(status);
 	}
 	for (unsigned int source = 0; source < nr; source++) {
 		for (unsigned int target = 0; target < nr; target++) {
@@ -371,17 +400,21 @@ int main(int argc, char **argv)
 			if (!pid) {
 				char size[32];
 
-				snprintf(size, sizeof(size), "%lu", granules[target]);
-				if (prctl(PR_AURORA_SET_EXEC_PAGE_SIZE, granules[source],
-					  0UL, 0UL, 0UL))
+				snprintf(size, sizeof(size), "%lu",
+					 granules[target]);
+				if (prctl(PR_AURORA_SET_EXEC_PAGE_SIZE,
+					  granules[source], 0UL, 0UL, 0UL))
 					_exit(36);
-				execl("/init", "/init", "--thread-exec", size, NULL);
+				execl("/init", "/init", "--thread-exec", size,
+				      NULL);
 				_exit(37);
 			}
 			passed = pid > 0 && waitpid(pid, &status, 0) == pid &&
 				 WIFEXITED(status) && !WEXITSTATUS(status);
 			printf("%s - non-leader exec %luK -> %luK status=%#x\n",
-			       passed ? "ok" : "not ok", granules[source] / 1024, granules[target] / 1024, status);
+			       passed ? "ok" : "not ok",
+			       granules[source] / 1024, granules[target] / 1024,
+			       status);
 			ok &= passed;
 		}
 	}

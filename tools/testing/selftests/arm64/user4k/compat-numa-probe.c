@@ -3,12 +3,16 @@
 typedef unsigned int u32;
 static long call(long n, long a, long b, long c, long d, long e, long f)
 {
-	register long r0 __asm__("r0") = a, r1 __asm__("r1") = b, r2 __asm__("r2") = c;
-	register long r3 __asm__("r3") = d, r4 __asm__("r4") = e, r5 __asm__("r5") = f;
+	register long r0 __asm__("r0") = a, r1 __asm__("r1") = b,
+			 r2 __asm__("r2") = c;
+	register long r3 __asm__("r3") = d, r4 __asm__("r4") = e,
+			 r5 __asm__("r5") = f;
 	register long r7 __asm__("r7") = n;
 
-	__asm__ volatile("svc 0" : "+r"(r0) : "r"(r1), "r"(r2), "r"(r3),
-			 "r"(r4), "r"(r5), "r"(r7) : "memory", "cc");
+	__asm__ volatile("svc 0"
+			 : "+r"(r0)
+			 : "r"(r1), "r"(r2), "r"(r3), "r"(r4), "r"(r5), "r"(r7)
+			 : "memory", "cc");
 	return r0;
 }
 
@@ -44,13 +48,14 @@ static void mapping(unsigned long native, unsigned long page)
 	unsigned long length = 4 * native;
 	long raw = call(192, 0, length, 3, 0x22, -1, 0);
 	unsigned char *base;
-	u32 mask[2] = {1, 0}, got[2] = {0, 0};
+	u32 mask[2] = { 1, 0 }, got[2] = { 0, 0 };
 	int mode = -1, node;
 
 	if ((unsigned long)raw >= 0xfffff001UL)
 		finish(20);
 	base = (void *)(((unsigned long)raw + native - 1) & ~(native - 1));
-	if (call(320, (long)&mode, (long)got, 64, 0, 4, 0) || got[0] != 3 || got[1])
+	if (call(320, (long)&mode, (long)got, 64, 0, 4, 0) || got[0] != 3 ||
+	    got[1])
 		finish(21);
 	if (call(319, (long)base, 2 * native, 2, (long)mask, 64, 0))
 		finish(22);
@@ -65,7 +70,8 @@ static void mapping(unsigned long native, unsigned long page)
 	for (unsigned long off = 0; off < 2 * native; off += page) {
 		base[off + 17] = 0x51 + off / page;
 		node = -1;
-		if (call(320, (long)&node, 0, 0, (long)(base + off + 17), 3, 0) ||
+		if (call(320, (long)&node, 0, 0, (long)(base + off + 17), 3,
+			 0) ||
 		    node != (off == page ? 1 : 0))
 			finish(26);
 	}
@@ -79,7 +85,9 @@ static void mapping(unsigned long native, unsigned long page)
 	for (unsigned long off = 0; off < 2 * native; off += page) {
 		node = -1;
 		if (base[off + 17] != (unsigned char)(0x51 + off / page) ||
-		    call(320, (long)&node, 0, 0, (long)(base + off + 17), 3, 0) || node != 1)
+		    call(320, (long)&node, 0, 0, (long)(base + off + 17), 3,
+			 0) ||
+		    node != 1)
 			finish(30);
 	}
 	if (call(91, raw, length, 0, 0, 0, 0))

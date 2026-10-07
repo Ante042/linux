@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Run unchanged in native 16K and explicitly opted-in 4K processes.
- * Default expectation is 16K. --expect-4k MUST fail on an ordinary 16K mm;
- * it is an assertion, not a launcher or an emulation of the missing ABI.
+ * Run unchanged under the current process ABI, including native 4K/16K/64K.
+ * Explicit --expect-{4k,16k,64k} options assert the selected size; they never
+ * launch a different ABI or emulate it.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -26,7 +26,8 @@
 
 #define X18_SENTINEL UINT64_C(0xfedcba9876543210)
 
-extern long x18_syscall(long nr, long arg0, long arg1, long arg2, uint64_t *seen);
+extern long x18_syscall(long nr, long arg0, long arg1, long arg2,
+			uint64_t *seen);
 
 static volatile sig_atomic_t signal_seen;
 static uint64_t signal_x18;
@@ -57,7 +58,8 @@ static bool wait_for(pid_t child, int expected_signal)
 	if (ret != child)
 		return false;
 	if (expected_signal)
-		return WIFSIGNALED(status) && WTERMSIG(status) == expected_signal;
+		return WIFSIGNALED(status) &&
+		       WTERMSIG(status) == expected_signal;
 	return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 
@@ -85,22 +87,26 @@ static void private_mappings(size_t page)
 	if (p == MAP_FAILED)
 		ksft_exit_fail_msg("anonymous mmap: %s\n", strerror(errno));
 	memset(p, 0x41, 4 * page);
-	if (page == 16384) {
+	if (page > 4096) {
 		errno = 0;
-		ok = mprotect(p + 4096, 4096, PROT_READ) == -1 && errno == EINVAL;
+		ok = mprotect(p + 4096, 4096, PROT_READ) == -1 &&
+		     errno == EINVAL;
 	} else {
 		ok = mprotect(p + page, page, PROT_READ) == 0;
 	}
-	ksft_test_result(ok, "mapping alignment agrees with the selected ABI\n");
+	ksft_test_result(ok,
+			 "mapping alignment agrees with the selected ABI\n");
 	ok = mprotect(p + page, page, PROT_READ) == 0 &&
 	     mprotect(p + 2 * page, page, PROT_NONE) == 0;
-	ksft_test_result(ok && access_faults(p + page, true) &&
-			 access_faults(p + 2 * page, false),
-			 "read-only and inaccessible neighbors fault independently\n");
+	ksft_test_result(
+		ok && access_faults(p + page, true) &&
+			access_faults(p + 2 * page, false),
+		"read-only and inaccessible neighbors fault independently\n");
 	p[0] = 0x10;
 	p[3 * page] = 0x30;
-	ksft_test_result(p[page] == 0x41 && p[0] == 0x10 && p[3 * page] == 0x30,
-			 "neighbor permissions do not remove writable mappings\n");
+	ksft_test_result(
+		p[page] == 0x41 && p[0] == 0x10 && p[3 * page] == 0x30,
+		"neighbor permissions do not remove writable mappings\n");
 	child = fork();
 	if (!child) {
 		p[0] = 0x99;
@@ -109,8 +115,8 @@ static void private_mappings(size_t page)
 	ksft_test_result(wait_for(child, 0) && p[0] == 0x10,
 			 "fork preserves private COW isolation\n");
 	ok = munmap(p + page, page) == 0;
-	ksft_test_result(ok && access_faults(p + page, false) &&
-			 p[0] == 0x10 && p[3 * page] == 0x30,
+	ksft_test_result(ok && access_faults(p + page, false) && p[0] == 0x10 &&
+				 p[3 * page] == 0x30,
 			 "single-page unmap preserves surrounding mappings\n");
 	munmap(p, 4 * page);
 }
@@ -141,9 +147,9 @@ static void shared_mappings(size_t page)
 		_exit(a[page] != 0x73);
 	}
 	ok &= wait_for(child, 0);
-	ksft_test_result(ok && a[page] == 0x73 &&
-			 access_faults(a + page, true),
-			 "shared writes cross fork while alias permissions stay local\n");
+	ksft_test_result(
+		ok && a[page] == 0x73 && access_faults(a + page, true),
+		"shared writes cross fork while alias permissions stay local\n");
 	munmap(a, 4 * page);
 	munmap(b, 4 * page);
 	close(fd);
@@ -151,7 +157,8 @@ static void shared_mappings(size_t page)
 
 static void x18_contract(void)
 {
-	struct sigaction sa = { .sa_sigaction = x18_signal, .sa_flags = SA_SIGINFO };
+	struct sigaction sa = { .sa_sigaction = x18_signal,
+				.sa_flags = SA_SIGINFO };
 	struct timespec pause = { .tv_nsec = 1000000 };
 	struct rusage before, after;
 	uint64_t seen;
@@ -165,37 +172,52 @@ static void x18_contract(void)
 	ret = x18_syscall(SYS_nanosleep, (long)&pause, 0, 0, &seen);
 	ok &= getrusage(RUSAGE_SELF, &after) == 0;
 	ksft_test_result(ok && ret == 0 && seen == X18_SENTINEL &&
-			 after.ru_nvcsw > before.ru_nvcsw,
+				 after.ru_nvcsw > before.ru_nvcsw,
 			 "x18 survives a measured voluntary context switch\n");
 	sigemptyset(&sa.sa_mask);
 	ok = sigaction(SIGUSR1, &sa, NULL) == 0;
 	if (ok)
-		ret = x18_syscall(SYS_tgkill, getpid(), syscall(SYS_gettid), SIGUSR1, &seen);
-	ksft_test_result(ok && ret == 0 && signal_seen &&
-			 signal_x18 == X18_SENTINEL && seen == X18_SENTINEL,
-			 "signal frame and sigreturn preserve x18 after handler clobber\n");
+		ret = x18_syscall(SYS_tgkill, getpid(), syscall(SYS_gettid),
+				  SIGUSR1, &seen);
+	ksft_test_result(
+		ok && ret == 0 && signal_seen && signal_x18 == X18_SENTINEL &&
+			seen == X18_SENTINEL,
+		"signal frame and sigreturn preserve x18 after handler clobber\n");
 }
 
 int main(int argc, char **argv)
 {
 	const struct rlimit no_core = { 0, 0 };
-	size_t expected = 16384;
+	size_t expected = getauxval(AT_PAGESZ);
 	int result;
 
 	if (argc == 2 && !strcmp(argv[1], "--expect-4k")) {
 		expected = 4096;
+	} else if (argc == 2 && !strcmp(argv[1], "--expect-16k")) {
+		expected = 16384;
+	} else if (argc == 2 && !strcmp(argv[1], "--expect-64k")) {
+		expected = 65536;
 	} else if (argc != 1) {
-		fprintf(stderr, "usage: %s [--expect-4k]\n", argv[0]);
+		fprintf(stderr,
+			"usage: %s [--expect-4k|--expect-16k|--expect-64k]\n",
+			argv[0]);
 		return KSFT_FAIL;
 	}
 	ksft_print_header();
 	ksft_set_plan(11);
-	if (sysconf(_SC_PAGESIZE) != (long)expected || getauxval(AT_PAGESZ) != expected)
-		ksft_exit_fail_msg("expected %zu-byte ABI; sysconf=%ld AT_PAGESZ=%lu\n",
-				   expected, sysconf(_SC_PAGESIZE), getauxval(AT_PAGESZ));
-	ksft_test_result_pass("process reports the expected %zu-byte page ABI\n", expected);
+	if (expected != 4096 && expected != 16384 && expected != 65536)
+		ksft_exit_skip("unsupported process page size: %zu\n",
+			       expected);
+	if (sysconf(_SC_PAGESIZE) != (long)expected ||
+	    getauxval(AT_PAGESZ) != expected)
+		ksft_exit_fail_msg(
+			"expected %zu-byte ABI; sysconf=%ld AT_PAGESZ=%lu\n",
+			expected, sysconf(_SC_PAGESIZE), getauxval(AT_PAGESZ));
+	ksft_test_result_pass(
+		"process reports the expected %zu-byte page ABI\n", expected);
 	if (setrlimit(RLIMIT_CORE, &no_core))
-		ksft_exit_fail_msg("disable child core dumps: %s\n", strerror(errno));
+		ksft_exit_fail_msg("disable child core dumps: %s\n",
+				   strerror(errno));
 	private_mappings(expected);
 	shared_mappings(expected);
 	x18_contract();

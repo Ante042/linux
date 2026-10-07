@@ -889,8 +889,8 @@ unsigned long arch_align_stack(unsigned long sp)
 #ifdef CONFIG_ARM64_USER4K_EXPERIMENTAL
 int arm64_bprm_prepare_mm(struct linux_binprm *bprm, bool compat)
 {
-	unsigned int requested = current->thread.exec_page_shift ?:
-				 current->thread.default_exec_page_shift;
+	unsigned int requested = current->exec_page_shift ?:
+				 current->default_exec_page_shift;
 	unsigned int shift = arm64_exec_page_shift(compat,
 			cpus_have_final_cap(ARM64_HAS_USER4K_GRANULE), PAGE_SHIFT,
 			requested);
@@ -899,7 +899,7 @@ int arm64_bprm_prepare_mm(struct linux_binprm *bprm, bool compat)
 }
 
 /* Return zero for the native default, or a validated alternative shift. */
-static int exec_page_size_shift(unsigned long size)
+int arch_exec_page_size_shift(unsigned long size)
 {
 	if (!size || size == PAGE_SIZE)
 		return 0;
@@ -910,41 +910,6 @@ static int exec_page_size_shift(unsigned long size)
 		return cpus_have_final_cap(ARM64_HAS_USER16K_GRANULE) ?
 			14 : -EOPNOTSUPP;
 	return -EINVAL;
-}
-
-int arch_prctl_exec_page_size_get(struct task_struct *task)
-{
-	return task->thread.exec_page_shift ?
-		1U << task->thread.exec_page_shift : 0;
-}
-
-int arch_prctl_exec_page_size_set(struct task_struct *task, unsigned long size)
-{
-	int shift = exec_page_size_shift(size);
-
-	if (shift < 0)
-		return shift;
-	/* A native request overrides an inherited alternative for one exec. */
-	if (!shift && task->thread.default_exec_page_shift)
-		shift = PAGE_SHIFT;
-	task->thread.exec_page_shift = shift;
-	return 0;
-}
-
-int arch_prctl_default_page_size_get(struct task_struct *task)
-{
-	return task->thread.default_exec_page_shift ?
-		1U << task->thread.default_exec_page_shift : 0;
-}
-
-int arch_prctl_default_page_size_set(struct task_struct *task, unsigned long size)
-{
-	int shift = exec_page_size_shift(size);
-
-	if (shift < 0)
-		return shift;
-	task->thread.default_exec_page_shift = shift;
-	return 0;
 }
 #endif
 
@@ -976,10 +941,6 @@ int compat_elf_check_arch(const struct elf32_hdr *hdr)
 void arch_setup_new_exec(void)
 {
 	unsigned long mmflags = current->mm->context.flags & MMCF_USER_GRANULE;
-
-#ifdef CONFIG_ARM64_USER4K_EXPERIMENTAL
-	current->thread.exec_page_shift = 0;
-#endif
 
 	if (is_compat_task()) {
 		mmflags |= MMCF_AARCH32;

@@ -11,12 +11,16 @@ static unsigned int stage;
 
 static long call(long n, long a, long b, long c, long d, long e, long f)
 {
-	register long r0 __asm__("r0") = a, r1 __asm__("r1") = b, r2 __asm__("r2") = c;
-	register long r3 __asm__("r3") = d, r4 __asm__("r4") = e, r5 __asm__("r5") = f;
+	register long r0 __asm__("r0") = a, r1 __asm__("r1") = b,
+			 r2 __asm__("r2") = c;
+	register long r3 __asm__("r3") = d, r4 __asm__("r4") = e,
+			 r5 __asm__("r5") = f;
 	register long r7 __asm__("r7") = n;
 
-	__asm__ volatile("svc 0" : "+r"(r0) : "r"(r1), "r"(r2), "r"(r3),
-			 "r"(r4), "r"(r5), "r"(r7) : "memory", "cc");
+	__asm__ volatile("svc 0"
+			 : "+r"(r0)
+			 : "r"(r1), "r"(r2), "r"(r3), "r"(r4), "r"(r5), "r"(r7)
+			 : "memory", "cc");
 	return r0;
 }
 
@@ -38,9 +42,18 @@ static void clear(void *data, u32 size)
 }
 
 /* Aggregate initialization may use these compiler-runtime entry points. */
-void __aeabi_memclr8(void *data, u32 size) { clear(data, size); }
-void __aeabi_memclr4(void *data, u32 size) { clear(data, size); }
-void __aeabi_memclr(void *data, u32 size) { clear(data, size); }
+void __aeabi_memclr8(void *data, u32 size)
+{
+	clear(data, size);
+}
+void __aeabi_memclr4(void *data, u32 size)
+{
+	clear(data, size);
+}
+void __aeabi_memclr(void *data, u32 size)
+{
+	clear(data, size);
+}
 
 _Noreturn static void finish(int code)
 {
@@ -55,7 +68,12 @@ _Noreturn static void finish(int code)
 	for (;;)
 		;
 }
-#define CHECK(x) do { stage++; if (!(x)) finish(stage); } while (0)
+#define CHECK(x)                       \
+	do {                           \
+		stage++;               \
+		if (!(x))              \
+			finish(stage); \
+	} while (0)
 
 static long ioctl_test(int fd, u32 request, void *arg)
 {
@@ -135,13 +153,15 @@ _Noreturn void probe(u32 *sp)
 	CHECK(fd >= 0 && file >= 0 && !call(93, file, 2 * native, 0, 0, 0, 0));
 	data = call(192, 0, 2 * native, 3, 1, file, 0);
 	CHECK((u32)data < 0xfffff001U);
-	CHECK(call(125, data + 4096, 4096, 1, 0, 0, 0) == (pages == 4096 ? 0 : -22));
+	CHECK(call(125, data + 4096, 4096, 1, 0, 0, 0) ==
+	      (pages == 4096 ? 0 : -22));
 	CHECK(!call(125, data, 2 * native, 3, 0, 0, 0));
 	for (u32 i = 0; i < 2 * native; i++)
 		((volatile unsigned char *)data)[i] = 0x53;
 	clear(&info, sizeof(info));
 	info.argsz = sizeof(info);
-	CHECK(!ioctl_test(fd, VFIO_IOMMU_GET_INFO, &info) && (info.iova_pgsizes & 4096));
+	CHECK(!ioctl_test(fd, VFIO_IOMMU_GET_INFO, &info) &&
+	      (info.iova_pgsizes & 4096));
 	CHECK(!map(fd, data, 2 * native));
 	CHECK(!state(fd, &cmd) && !cmd.locked_bytes);
 	CHECK(!rw(fd, bytes, 0) && bytes[0] == 0x53 && bytes[15] == 0x53);
@@ -152,10 +172,12 @@ _Noreturn void probe(u32 *sp)
 	clear(&cmd, sizeof(cmd));
 	cmd.iova = IOVA + 19;
 	CHECK(!ioctl_test(fd, VFIO_TYPE1_TEST_PIN, &cmd));
-	CHECK(!state(fd, &cmd) && cmd.locked_bytes == native && cmd.external_refs == 1);
+	CHECK(!state(fd, &cmd) && cmd.locked_bytes == native &&
+	      cmd.external_refs == 1);
 	/* Compat pointer padding must not become part of the native pointer. */
-	_Alignas(struct vfio_iommu_type1_dirty_bitmap_get)
-	unsigned char buffer[sizeof(dirty) + sizeof(struct vfio_iommu_type1_dirty_bitmap_get)];
+	_Alignas(struct vfio_iommu_type1_dirty_bitmap_get) unsigned char
+		buffer[sizeof(dirty) +
+		       sizeof(struct vfio_iommu_type1_dirty_bitmap_get)];
 	struct vfio_iommu_type1_dirty_bitmap *header = (void *)buffer;
 	struct vfio_iommu_type1_dirty_bitmap_get *range = (void *)header->data;
 	u64 bits = 0;
@@ -170,16 +192,18 @@ _Noreturn void probe(u32 *sp)
 	range->bitmap.data = &bits;
 	CHECK(!ioctl_test(fd, VFIO_IOMMU_DIRTY_PAGES, buffer) &&
 	      bits == ((1ULL << (native >> 12)) - 1));
-	_Static_assert(sizeof(range->bitmap.data) == 4 && sizeof(range->bitmap) == 24,
-		       "AArch32 bitmap has a 32-bit pointer and trailing padding");
-	((unsigned char *)&range->bitmap)[
-		__builtin_offsetof(struct vfio_bitmap, data) + sizeof(range->bitmap.data)] = 0xa5;
+	_Static_assert(
+		sizeof(range->bitmap.data) == 4 && sizeof(range->bitmap) == 24,
+		"AArch32 bitmap has a 32-bit pointer and trailing padding");
+	((unsigned char *)&range
+		 ->bitmap)[__builtin_offsetof(struct vfio_bitmap, data) +
+			   sizeof(range->bitmap.data)] = 0xa5;
 	bits = 0;
 	CHECK(!ioctl_test(fd, VFIO_IOMMU_DIRTY_PAGES, buffer) &&
 	      bits == ((1ULL << (native >> 12)) - 1));
-	_Alignas(struct vfio_bitmap)
-	unsigned char unmap_buffer[sizeof(struct vfio_iommu_type1_dma_unmap) +
-				   sizeof(struct vfio_bitmap)];
+	_Alignas(struct vfio_bitmap) unsigned char
+		unmap_buffer[sizeof(struct vfio_iommu_type1_dma_unmap) +
+			     sizeof(struct vfio_bitmap)];
 	struct vfio_iommu_type1_dma_unmap *remove = (void *)unmap_buffer;
 	struct vfio_bitmap *remove_bitmap = (void *)remove->data;
 
@@ -191,11 +215,13 @@ _Noreturn void probe(u32 *sp)
 	remove_bitmap->pgsize = 4096;
 	remove_bitmap->size = sizeof(bits);
 	remove_bitmap->data = &bits;
-	((unsigned char *)remove_bitmap)[
-		__builtin_offsetof(struct vfio_bitmap, data) + sizeof(remove_bitmap->data)] = 0x5a;
+	((unsigned char *)
+		 remove_bitmap)[__builtin_offsetof(struct vfio_bitmap, data) +
+				sizeof(remove_bitmap->data)] = 0x5a;
 	bits = 0;
 	CHECK(!ioctl_test(fd, VFIO_IOMMU_UNMAP_DMA, unmap_buffer) &&
-	      remove->size == 2 * native && bits == ((1ULL << (native >> 12)) - 1));
+	      remove->size == 2 * native &&
+	      bits == ((1ULL << (native >> 12)) - 1));
 	CHECK(!state(fd, &cmd) && !cmd.locked_bytes && !cmd.external_refs &&
 	      cmd.notifications == 1);
 	clear(&cmd, sizeof(cmd));
@@ -204,11 +230,13 @@ _Noreturn void probe(u32 *sp)
 	pid = call(2, 0, 0, 0, 0, 0, 0);
 	if (!pid)
 		finish(map(fd, data + 4096, length) ? 99 : 0);
-	CHECK(pid > 0 && call(114, pid, (long)&status, 0, 0, 0, 0) == pid && !status);
-	CHECK(!state(fd, &cmd) && !cmd.owner_users && cmd.locked_bytes == 2 * native &&
-	      cmd.mapped_bytes[0] == length);
+	CHECK(pid > 0 && call(114, pid, (long)&status, 0, 0, 0, 0) == pid &&
+	      !status);
+	CHECK(!state(fd, &cmd) && !cmd.owner_users &&
+	      cmd.locked_bytes == 2 * native && cmd.mapped_bytes[0] == length);
 	CHECK(rw(fd, bytes, 0) == -14);
-	CHECK(!rw(fd, bytes, VFIO_TYPE1_TEST_WORKER) && bytes[0] == 0x53 && bytes[15] == 0x53);
+	CHECK(!rw(fd, bytes, VFIO_TYPE1_TEST_WORKER) && bytes[0] == 0x53 &&
+	      bytes[15] == 0x53);
 	CHECK(!unmap(fd, length));
 	CHECK(!state(fd, &cmd) && !cmd.locked_bytes && !cmd.mapped_bytes[0]);
 	CHECK(!call(91, data, 2 * native, 0, 0, 0, 0));

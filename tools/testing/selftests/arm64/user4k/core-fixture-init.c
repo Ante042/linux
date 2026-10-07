@@ -47,10 +47,13 @@ static void write_text(const char *path, const char *text)
 	close(fd);
 }
 
-static void *map_at(unsigned long address, size_t len, int prot, int fd, off_t off)
+static void *map_at(unsigned long address, size_t len, int prot, int fd,
+		    off_t off)
 {
 	void *p = mmap((void *)address, len, prot,
-		MAP_PRIVATE | MAP_FIXED_NOREPLACE | (fd < 0 ? MAP_ANONYMOUS : 0), fd, off);
+		       MAP_PRIVATE | MAP_FIXED_NOREPLACE |
+			       (fd < 0 ? MAP_ANONYMOUS : 0),
+		       fd, off);
 
 	if (p == MAP_FAILED)
 		die("mmap");
@@ -65,8 +68,9 @@ static void crash(bool headers, int bounded)
 	unsigned char *p, *data;
 	int fd;
 
-	if (getppid() != 1 || stat("/proc/self/exe", &self) || stat("/proc/1/exe", &init) ||
-	    self.st_dev != init.st_dev || self.st_ino != init.st_ino)
+	if (getppid() != 1 || stat("/proc/self/exe", &self) ||
+	    stat("/proc/1/exe", &init) || self.st_dev != init.st_dev ||
+	    self.st_ino != init.st_ino)
 		_exit(121);
 	if (bounded)
 		limit.rlim_cur = limit.rlim_max = ps - (bounded < 0);
@@ -76,7 +80,8 @@ static void crash(bool headers, int bounded)
 	p = map_at(ANON, 4 * ps, PROT_READ | PROT_WRITE, -1, 0);
 	for (unsigned int i = 0; i < 4; i++)
 		memset(p + i * ps, 0x31 + i, ps);
-	if (mprotect(p + ps, ps, PROT_NONE) || mprotect(p + 2 * ps, ps, PROT_READ))
+	if (mprotect(p + ps, ps, PROT_NONE) ||
+	    mprotect(p + 2 * ps, ps, PROT_READ))
 		die("mprotect");
 	p = map_at(SPARSE, SPARSE_SIZE, PROT_READ | PROT_WRITE, -1, 0);
 	memset(p, 0x65, ps);
@@ -112,7 +117,8 @@ static void crash(bool headers, int bounded)
 		uint64_t entry;
 		int pm = open("/proc/self/pagemap", O_RDONLY);
 
-		p = map_at(SWAPPED, SWAPPED_SIZE, PROT_READ | PROT_WRITE, -1, 0);
+		p = map_at(SWAPPED, SWAPPED_SIZE, PROT_READ | PROT_WRITE, -1,
+			   0);
 		memset(p, 0xc4, SWAPPED_SIZE);
 		for (unsigned int tries = 0; tries < 200; tries++) {
 			if (madvise(p, SWAPPED_SIZE, MADV_COLD) ||
@@ -120,7 +126,8 @@ static void crash(bool headers, int bounded)
 				die("pageout");
 			missing = 0;
 			for (unsigned long i = 0; i < SWAPPED_SIZE / ps; i++) {
-				if (pread(pm, &entry, sizeof(entry), (SWAPPED / ps + i) * 8) != 8)
+				if (pread(pm, &entry, sizeof(entry),
+					  (SWAPPED / ps + i) * 8) != 8)
 					die("pagemap");
 				missing += !(entry & (1ULL << 62));
 			}
@@ -131,15 +138,16 @@ static void crash(bool headers, int bounded)
 		close(pm);
 		if (missing)
 			_exit(124);
-		printf("# %luK dump precondition: all %lu leaves swapped\n", ps / 1024,
-		       SWAPPED_SIZE / ps);
+		printf("# %luK dump precondition: all %lu leaves swapped\n",
+		       ps / 1024, SWAPPED_SIZE / ps);
 	}
 	/* The file VMAs remain unfaulted, so dumping must retrieve file data. */
 	raise(SIGABRT);
 	_exit(123);
 }
 
-static Elf64_Phdr *find_load(unsigned char *data, Elf64_Ehdr *elf, unsigned long addr)
+static Elf64_Phdr *find_load(unsigned char *data, Elf64_Ehdr *elf,
+			     unsigned long addr)
 {
 	Elf64_Phdr *ph = (void *)(data + elf->e_phoff);
 
@@ -188,14 +196,16 @@ static void inspect(pid_t pid, unsigned long ps, bool headers)
 		die("core read");
 	elf = (void *)data;
 	if (memcmp(elf->e_ident, ELFMAG, SELFMAG) || elf->e_type != ET_CORE ||
-	    elf->e_phentsize != sizeof(*ph) || elf->e_phoff > (uint64_t)st.st_size ||
+	    elf->e_phentsize != sizeof(*ph) ||
+	    elf->e_phoff > (uint64_t)st.st_size ||
 	    elf->e_phnum * sizeof(*ph) > (uint64_t)st.st_size - elf->e_phoff)
 		ksft_exit_fail_msg("invalid core ELF\n");
 	ph = (void *)(data + elf->e_phoff);
 	for (unsigned int i = 0; i < elf->e_phnum; i++) {
 		if (ph[i].p_type == PT_LOAD) {
-			geometry &= ph[i].p_align == ps && ph[i].p_filesz <= ph[i].p_memsz &&
-				ph[i].p_offset % ps == ph[i].p_vaddr % ps;
+			geometry &= ph[i].p_align == ps &&
+				    ph[i].p_filesz <= ph[i].p_memsz &&
+				    ph[i].p_offset % ps == ph[i].p_vaddr % ps;
 		} else if (ph[i].p_type == PT_NOTE) {
 			size_t at = ph[i].p_offset, end = at + ph[i].p_filesz;
 
@@ -203,30 +213,42 @@ static void inspect(pid_t pid, unsigned long ps, bool headers)
 				ksft_exit_fail_msg("invalid notes\n");
 			while (at + sizeof(Elf64_Nhdr) <= end) {
 				Elf64_Nhdr *n = (void *)(data + at);
-				size_t desc = at + sizeof(*n) + ((n->n_namesz + 3UL) & ~3UL);
+				size_t desc = at + sizeof(*n) +
+					      ((n->n_namesz + 3UL) & ~3UL);
 				uint64_t *words = (void *)(data + desc);
 
 				if (desc > end || n->n_descsz > end - desc)
-					ksft_exit_fail_msg("invalid note length\n");
+					ksft_exit_fail_msg(
+						"invalid note length\n");
 				if (n->n_type == NT_AUXV) {
-					for (size_t j = 0; j + 1 < n->n_descsz / 8; j += 2) {
+					for (size_t j = 0;
+					     j + 1 < n->n_descsz / 8; j += 2) {
 						if (words[j] == AT_PAGESZ)
-							aux = words[j + 1] == ps;
-						else if (words[j] == AT_SYSINFO_EHDR)
+							aux = words[j + 1] ==
+							      ps;
+						else if (words[j] ==
+							 AT_SYSINFO_EHDR)
 							vdso = words[j + 1];
 					}
 				}
 				if (n->n_type == NT_FILE && n->n_descsz >= 16 &&
-				    words[0] <= (n->n_descsz / 8 - 2) / 3 && words[1] == ps) {
+				    words[0] <= (n->n_descsz / 8 - 2) / 3 &&
+				    words[1] == ps) {
 					for (size_t j = 0; j < words[0]; j++) {
-						unsigned long addr = words[2 + 3 * j];
-						unsigned long offset = words[4 + 3 * j];
+						unsigned long addr =
+							words[2 + 3 * j];
+						unsigned long offset =
+							words[4 + 3 * j];
 
-						if (addr == FILEMAP && offset == (headers ? 0UL : 1UL))
+						if (addr == FILEMAP &&
+						    offset == (headers ? 0UL :
+									 1UL))
 							file |= 1;
-						if (addr == FILEMAP + 2 * ps && offset == 2)
+						if (addr == FILEMAP + 2 * ps &&
+						    offset == 2)
 							file |= 2;
-						if (addr == FILEMAP + 8 * ps && offset == 17)
+						if (addr == FILEMAP + 8 * ps &&
+						    offset == 17)
 							file |= 4;
 					}
 				}
@@ -234,52 +256,77 @@ static void inspect(pid_t pid, unsigned long ps, bool headers)
 			}
 		}
 	}
-	ksft_test_result(geometry, "%luK core PT_LOAD granule/alignment%s\n", ps / 1024,
-			headers ? " headers-only" : "");
-	ksft_test_result(aux && file == 7, "%luK core AUXV and NT_FILE offsets%s\n", ps / 1024,
-			headers ? " headers-only" : "");
+	ksft_test_result(geometry, "%luK core PT_LOAD granule/alignment%s\n",
+			 ps / 1024, headers ? " headers-only" : "");
+	ksft_test_result(aux && file == 7,
+			 "%luK core AUXV and NT_FILE offsets%s\n", ps / 1024,
+			 headers ? " headers-only" : "");
 	if (headers) {
 		bool skipped;
 
 		p = find_load(data, elf, FILEMAP + 2 * ps);
 		skipped = p && !p->p_filesz;
 		p = find_load(data, elf, FILEMAP + 8 * ps);
-		ksft_test_result(skipped && p && !p->p_filesz,
-			"%luK header filter excludes nonzero quarter/native file offsets\n", ps / 1024);
+		ksft_test_result(
+			skipped && p && !p->p_filesz,
+			"%luK header filter excludes nonzero quarter/native file offsets\n",
+			ps / 1024);
 		p = find_load(data, elf, FILEMAP + 12 * ps);
-		ksft_test_result(p && p->p_filesz == ps && p->p_offset + ps <= (uint64_t)st.st_size &&
-			!memcmp(data + p->p_offset, ELFMAG, SELFMAG),
-			"%luK header filter recognizes non-executable ELF file\n", ps / 1024);
+		ksft_test_result(
+			p && p->p_filesz == ps &&
+				p->p_offset + ps <= (uint64_t)st.st_size &&
+				!memcmp(data + p->p_offset, ELFMAG, SELFMAG),
+			"%luK header filter recognizes non-executable ELF file\n",
+			ps / 1024);
 		p = find_load(data, elf, FILEMAP);
-		ksft_test_result(p && p->p_filesz == ps && p->p_offset + ps <= (uint64_t)st.st_size &&
-			!memcmp(data + p->p_offset, ELFMAG, SELFMAG),
-			"%luK executable file header limited to one user page\n", ps / 1024);
+		ksft_test_result(
+			p && p->p_filesz == ps &&
+				p->p_offset + ps <= (uint64_t)st.st_size &&
+				!memcmp(data + p->p_offset, ELFMAG, SELFMAG),
+			"%luK executable file header limited to one user page\n",
+			ps / 1024);
 	} else {
 		bool anon = true, files = true;
 
 		p = find_load(data, elf, vdso);
 		ksft_test_result(p && p->p_filesz >= SELFMAG &&
-			p->p_offset + p->p_filesz <= (uint64_t)st.st_size &&
-			!memcmp(data + p->p_offset, ELFMAG, SELFMAG),
-			"%luK core vDSO ELF bytes\n", ps / 1024);
-		ksft_test_result(bytes_at(data, elf, st.st_size, SWAPPED, SWAPPED_SIZE, 0xc4),
-			"%luK core swapped anonymous bytes\n", ps / 1024);
+					 p->p_offset + p->p_filesz <=
+						 (uint64_t)st.st_size &&
+					 !memcmp(data + p->p_offset, ELFMAG,
+						 SELFMAG),
+				 "%luK core vDSO ELF bytes\n", ps / 1024);
+		ksft_test_result(bytes_at(data, elf, st.st_size, SWAPPED,
+					  SWAPPED_SIZE, 0xc4),
+				 "%luK core swapped anonymous bytes\n",
+				 ps / 1024);
 
 		for (unsigned int i = 0; i < 4; i++)
-			anon &= bytes_at(data, elf, st.st_size, ANON + i * ps, ps, 0x31 + i);
+			anon &= bytes_at(data, elf, st.st_size, ANON + i * ps,
+					 ps, 0x31 + i);
 		for (unsigned int i = 1; i < 4; i++)
 			files &= bytes_at(data, elf, st.st_size,
-				FILEMAP + (i == 1 ? 0 : i * ps), ps, 0x81 + i);
-		ksft_test_result(anon, "%luK core anonymous and PROT_NONE/READ bytes\n", ps / 1024);
-		files &= bytes_at(data, elf, st.st_size, FILEMAP + 8 * ps, ps, 0x81 + 17);
-		ksft_test_result(files, "%luK core unfaulted file quarters\n", ps / 1024);
-		ksft_test_result(bytes_at(data, elf, st.st_size, SPARSE, ps, 0x65) &&
-			bytes_at(data, elf, st.st_size, SPARSE + ps, SPARSE_SIZE - ps, 0),
+					  FILEMAP + (i == 1 ? 0 : i * ps), ps,
+					  0x81 + i);
+		ksft_test_result(
+			anon, "%luK core anonymous and PROT_NONE/READ bytes\n",
+			ps / 1024);
+		files &= bytes_at(data, elf, st.st_size, FILEMAP + 8 * ps, ps,
+				  0x81 + 17);
+		ksft_test_result(files, "%luK core unfaulted file quarters\n",
+				 ps / 1024);
+		ksft_test_result(
+			bytes_at(data, elf, st.st_size, SPARSE, ps, 0x65) &&
+				bytes_at(data, elf, st.st_size, SPARSE + ps,
+					 SPARSE_SIZE - ps, 0),
 			"%luK core sparse and zero-page bytes\n", ps / 1024);
-		ksft_test_result(st.st_blocks * 512 < st.st_size / 2,
-			"%luK core keeps untouched anonymous range sparse\n", ps / 1024);
+		ksft_test_result(
+			st.st_blocks * 512 < st.st_size / 2,
+			"%luK core keeps untouched anonymous range sparse\n",
+			ps / 1024);
 		p = find_load(data, elf, EXCLUDED);
-		ksft_test_result(p && !p->p_filesz, "%luK core DONTDUMP excludes data\n", ps / 1024);
+		ksft_test_result(p && !p->p_filesz,
+				 "%luK core DONTDUMP excludes data\n",
+				 ps / 1024);
 	}
 	munmap(data, st.st_size);
 	close(fd);
@@ -307,7 +354,8 @@ int main(int argc, char **argv)
 	}
 	if (mount("proc", "/proc", "proc", 0, NULL) && errno != EBUSY)
 		die("proc");
-	if (mount("devtmpfs", "/dev", "devtmpfs", 0, NULL) || swapon("/dev/vda", 0))
+	if (mount("devtmpfs", "/dev", "devtmpfs", 0, NULL) ||
+	    swapon("/dev/vda", 0))
 		die("VM swap setup");
 	write_text("/proc/sys/kernel/core_pattern", "/core.%p");
 	ksft_print_header();
@@ -319,16 +367,25 @@ int main(int argc, char **argv)
 			int status = 0;
 
 			if (!pid) {
-				if (prctl(PR_AURORA_SET_EXEC_PAGE_SIZE, ps == native_size ? 0UL : ps,
-					  0UL, 0UL, 0UL))
+				if (prctl(PR_AURORA_SET_EXEC_PAGE_SIZE,
+					  ps == native_size ? 0UL : ps, 0UL,
+					  0UL, 0UL))
 					die("exec size");
-				execl("/init", "/init", headers == 3 ? "--below-limit" : headers == 2 ? "--limit" :
-				      headers ? "--headers" : "--crash", NULL);
+				execl("/init", "/init",
+				      headers == 3 ? "--below-limit" :
+				      headers == 2 ? "--limit" :
+				      headers	   ? "--headers" :
+						     "--crash",
+				      NULL);
 				die("exec");
 			}
 			if (pid < 0 || waitpid(pid, &status, 0) != pid ||
-			    !WIFSIGNALED(status) || WTERMSIG(status) != SIGABRT || (headers < 3 && !WCOREDUMP(status)))
-				ksft_exit_fail_msg("child/core failure status=%#x\n", status);
+			    !WIFSIGNALED(status) ||
+			    WTERMSIG(status) != SIGABRT ||
+			    (headers < 3 && !WCOREDUMP(status)))
+				ksft_exit_fail_msg(
+					"child/core failure status=%#x\n",
+					status);
 			if (headers >= 2) {
 				char path[64];
 				struct stat st;
@@ -342,23 +399,39 @@ int main(int argc, char **argv)
 					uint64_t data_start = UINT64_MAX;
 					int fd = open(path, O_RDONLY);
 
-					if (fd < 0 || pread(fd, &elf, sizeof(elf), 0) != sizeof(elf))
+					if (fd < 0 ||
+					    pread(fd, &elf, sizeof(elf), 0) !=
+						    sizeof(elf))
 						die("limited core header");
-					for (unsigned int i = 0; i < elf.e_phnum; i++) {
-						if (pread(fd, &ph, sizeof(ph), elf.e_phoff + i * sizeof(ph)) != sizeof(ph))
+					for (unsigned int i = 0;
+					     i < elf.e_phnum; i++) {
+						if (pread(fd, &ph, sizeof(ph),
+							  elf.e_phoff +
+								  i * sizeof(ph)) !=
+						    sizeof(ph))
 							die("limited core phdr");
-						if (ph.p_type == PT_LOAD && ph.p_offset < data_start)
-							data_start = ph.p_offset;
+						if (ph.p_type == PT_LOAD &&
+						    ph.p_offset < data_start)
+							data_start =
+								ph.p_offset;
 					}
 					close(fd);
 					/* Sparse note padding is not charged to RLIMIT_CORE. */
-					no_data = data_start != UINT64_MAX && st.st_size <= (off_t)data_start;
+					no_data = data_start != UINT64_MAX &&
+						  st.st_size <=
+							  (off_t)data_start;
 					printf("# limited core: bytes=%lld first-data=%llu limit=%lu\n",
-					       (long long)st.st_size, (unsigned long long)data_start, ps);
+					       (long long)st.st_size,
+					       (unsigned long long)data_start,
+					       ps);
 				}
-				ksft_test_result(headers == 2 ? exists && st.st_size > 0 &&
-					no_data : !exists && errno == ENOENT,
-					"%luK core RLIMIT_CORE %s one user page\n", ps / 1024,
+				ksft_test_result(
+					headers == 2 ?
+						exists && st.st_size > 0 &&
+							no_data :
+						!exists && errno == ENOENT,
+					"%luK core RLIMIT_CORE %s one user page\n",
+					ps / 1024,
 					headers == 2 ? "at" : "below");
 				unlink(path);
 			} else {
@@ -367,7 +440,8 @@ int main(int argc, char **argv)
 		}
 	}
 	ksft_print_cnts();
-	printf("%s - core fixture complete\n", ksft_get_fail_cnt() ? "not ok" : "ok");
+	printf("%s - core fixture complete\n",
+	       ksft_get_fail_cnt() ? "not ok" : "ok");
 	reboot(RB_POWER_OFF);
 	return ksft_get_fail_cnt() ? 1 : 0;
 }

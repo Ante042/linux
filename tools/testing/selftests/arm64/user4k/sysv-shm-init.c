@@ -20,7 +20,8 @@
 static void check(int ok, const char *expression, int line)
 {
 	if (!ok) {
-		fprintf(stderr, "FAIL line %d: %s errno=%d\n", line, expression, errno);
+		fprintf(stderr, "FAIL line %d: %s errno=%d\n", line, expression,
+			errno);
 		exit(1);
 	}
 }
@@ -52,7 +53,8 @@ static int mapping_case(unsigned long native, int rounded, int split)
 	CHECK(!munmap(target, length));
 	id = shmget(IPC_PRIVATE, length - 1, 0600);
 	CHECK(id >= 0);
-	mapping = shmat(id, target + (rounded ? page - 1 : 0), rounded ? SHM_RND : 0);
+	mapping = shmat(id, target + (rounded ? page - 1 : 0),
+			rounded ? SHM_RND : 0);
 	if (mapping != target) {
 		int saved = errno;
 
@@ -66,7 +68,8 @@ static int mapping_case(unsigned long native, int rounded, int split)
 	mapping[0] = 0x31;
 	mapping[page + 7] = 0x49;
 	mapping[3 * page] = 0x63;
-	CHECK(alias[0] == 0x31 && alias[page + 7] == 0x49 && alias[3 * page] == 0x63);
+	CHECK(alias[0] == 0x31 && alias[page + 7] == 0x49 &&
+	      alias[3 * page] == 0x63);
 	if (split) {
 		CHECK(!mprotect(mapping + page, page, PROT_READ));
 		CHECK(!munmap(mapping + 2 * page, page));
@@ -80,7 +83,8 @@ static int mapping_case(unsigned long native, int rounded, int split)
 	CHECK(alias[page + 7] == 0x49 && alias[3 * page] == 0x63);
 	CHECK(!shmdt(alias));
 	errno = 0;
-	CHECK(shmctl(id, IPC_STAT, &info) == -1 && (errno == EINVAL || errno == EIDRM));
+	CHECK(shmctl(id, IPC_STAT, &info) == -1 &&
+	      (errno == EINVAL || errno == EIDRM));
 	CHECK(!munmap(reserve, 16 * native));
 	printf("ok - SysV page=%lu rounded=%d split=%d detach and alias lifetime\n",
 	       page, rounded, split);
@@ -141,7 +145,8 @@ static int sharing(unsigned long other, unsigned long native)
 	CHECK(!wait_child(pid));
 	CHECK(map[4096 + 9] == 0x78);
 	CHECK(!shmdt(map));
-	printf("ok - SysV shared object %lu -> %lu after IPC_RMID\n", page, other);
+	printf("ok - SysV shared object %lu -> %lu after IPC_RMID\n", page,
+	       other);
 	return 0;
 }
 
@@ -155,7 +160,7 @@ int main(int argc, char **argv)
 		return sharing_child(atoi(argv[2]), strtoul(argv[3], NULL, 10));
 	if (argc == 5 && !strcmp(argv[1], "--case")) {
 		unsigned long expected = strtoul(argv[3], NULL, 10);
-		unsigned long sizes[] = {4096, 16384, 65536};
+		unsigned long sizes[] = { 4096, 16384, 65536 };
 
 		native = strtoul(argv[2], NULL, 10);
 		CHECK(getauxval(AT_PAGESZ) == expected);
@@ -172,7 +177,7 @@ int main(int argc, char **argv)
 	CHECK(getpid() == 1);
 	CHECK(!mount("proc", "/proc", "proc", 0, NULL));
 	int no4k = argc == 2 && !strcmp(argv[1], "--no4k");
-	unsigned long sizes[] = {4096, 16384, 65536};
+	unsigned long sizes[] = { 4096, 16384, 65536 };
 
 	for (unsigned int i = 0; i < 3; i++) {
 		unsigned long page = sizes[i];
@@ -186,9 +191,11 @@ int main(int argc, char **argv)
 
 			snprintf(n, sizeof(n), "%lu", native);
 			snprintf(e, sizeof(e), "%lu", page);
-			if (prctl(PR_AURORA_SET_EXEC_PAGE_SIZE, page, 0UL, 0UL, 0UL))
+			if (prctl(PR_AURORA_SET_EXEC_PAGE_SIZE, page, 0UL, 0UL,
+				  0UL))
 				_exit(2);
-			execl("/init", "/init", "--case", n, e, no4k ? "1" : "0", NULL);
+			execl("/init", "/init", "--case", n, e,
+			      no4k ? "1" : "0", NULL);
 			_exit(3);
 		}
 		int bad = wait_child(pid);

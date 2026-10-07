@@ -587,7 +587,7 @@ static unsigned long vm_mmap_offset_internal(struct file *file, unsigned long ad
 	unsigned long len, unsigned long prot,
 	unsigned long flag, struct vm_page_offset pos)
 {
-	loff_t off = (loff_t)((pos.index << PAGE_SHIFT) | pos.offset);
+	loff_t off = ((loff_t)pos.index << PAGE_SHIFT) | pos.offset;
 	unsigned long ret;
 	struct mm_struct *mm = current->mm;
 	unsigned long populate;

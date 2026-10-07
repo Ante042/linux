@@ -30,8 +30,6 @@
 #define arch_mm_init_exec arch_mm_init_exec
 static inline void arch_mm_init_exec(struct mm_struct *mm, unsigned int page_shift)
 {
-	if (!page_shift)
-		page_shift = current->thread.exec_page_shift;
 	if (page_shift == 12)
 		mm->context.flags |= MMCF_USER_4K;
 	else if (page_shift == 14 && PAGE_SHIFT > 14)

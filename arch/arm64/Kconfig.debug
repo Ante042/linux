@@ -25,6 +25,7 @@ source "drivers/hwtracing/coresight/Kconfig"
 config ARM64_USER4K_EXPERIMENTAL
 	bool "Experimental mixed-granule userspace"
 	select ARCH_HAS_MM_PGTABLE
+	select ARCH_HAS_USER_PAGE_SIZE
 	select MM_SUBPAGE
 	select MM_ID
 	select HAVE_ARCH_TLB_REMOVE_TABLE

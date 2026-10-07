@@ -340,7 +340,7 @@ static inline struct folio *vma_alloc_zeroed_movable_folio_order(
 		return vma_alloc_zeroed_movable_folio(vma, addr);
 	folio = vma_alloc_folio(GFP_HIGHUSER_MOVABLE, order, vma, addr);
 	if (folio && user_alloc_needs_zeroing())
-		folio_zero_user(folio, addr);
+		clear_user_highpages(&folio->page, addr, folio_nr_pages(folio));
 	return folio;
 }
 #endif

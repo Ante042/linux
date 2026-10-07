@@ -30,7 +30,8 @@
 static void check(int good, const char *expr, int line)
 {
 	if (!good) {
-		fprintf(stderr, "FAIL line %d: %s errno=%d\n", line, expr, errno);
+		fprintf(stderr, "FAIL line %d: %s errno=%d\n", line, expr,
+			errno);
 		exit(1);
 	}
 }
@@ -84,11 +85,12 @@ static int node_at(void *address)
 	int node = -1;
 
 	CHECK(!syscall(SYS_get_mempolicy, &node, NULL, 0UL, address,
-		      MPOL_F_ADDR | MPOL_F_NODE));
+		       MPOL_F_ADDR | MPOL_F_NODE));
 	return node;
 }
 
-static unsigned long sample(unsigned char *map, unsigned long length, unsigned long page)
+static unsigned long sample(unsigned char *map, unsigned long length,
+			    unsigned long page)
 {
 	unsigned long moved = 0;
 
@@ -130,13 +132,15 @@ static void *read_local(void *arg)
 		for (unsigned long off = 0; off < r->length; off += r->page) {
 			if (off == 2 * r->page)
 				continue;
-			CHECK(*(volatile uint64_t *)(r->map + off) == 0x81720000 + off / r->page);
+			CHECK(*(volatile uint64_t *)(r->map + off) ==
+			      0x81720000 + off / r->page);
 		}
 	}
 	return NULL;
 }
 
-static void local_restore(unsigned char *map, unsigned long length, unsigned long page)
+static void local_restore(unsigned char *map, unsigned long length,
+			  unsigned long page)
 {
 	struct local_reader r = { .map = map, .length = length, .page = page };
 	unsigned long hints = counter("numa_hint_faults_local");
@@ -149,7 +153,8 @@ static void local_restore(unsigned char *map, unsigned long length, unsigned lon
 		for (unsigned long off = 0; off < length; off += page) {
 			if (off == 2 * page)
 				continue;
-			CHECK(*(volatile uint64_t *)(map + off) == 0x81720000 + off / page);
+			CHECK(*(volatile uint64_t *)(map + off) ==
+			      0x81720000 + off / page);
 		}
 	} while (now() < deadline);
 	atomic_store_explicit(&r.stop, 1, memory_order_relaxed);
@@ -167,10 +172,12 @@ static void exercise(void)
 	unsigned char *map;
 	int mode;
 
-	CHECK(!syscall(SYS_get_mempolicy, &mode, &allowed, 64UL, NULL, MPOL_F_MEMS_ALLOWED));
+	CHECK(!syscall(SYS_get_mempolicy, &mode, &allowed, 64UL, NULL,
+		       MPOL_F_MEMS_ALLOWED));
 	CHECK(allowed == 3);
 	cpu(0);
-	map = mmap(NULL, length, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	map = mmap(NULL, length, PROT_READ | PROT_WRITE,
+		   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	CHECK(map != MAP_FAILED);
 	CHECK(!madvise(map, length, MADV_NOHUGEPAGE));
 	CHECK(!syscall(SYS_mbind, map, length, MPOL_BIND, &mask, 64UL, 0));
@@ -210,7 +217,8 @@ static void exercise(void)
 	hints = counter("numa_hint_faults") - hints;
 	migrated = counter("numa_pages_migrated") - migrated;
 	printf("NUMAB page=%lu moved=%lu/%lu hints=%lu migrated=%lu loops=%lu seconds=%.3f\n",
-	       page, moved, total, hints, migrated, iterations, now() - started);
+	       page, moved, total, hints, migrated, iterations,
+	       now() - started);
 	CHECK(moved == total && hints > 0 && migrated > 0);
 	for (unsigned long off = 0; off < length; off += page) {
 		if (off != page && off != 2 * page)
@@ -222,12 +230,14 @@ static void exercise(void)
 	CHECK(!mprotect(map + 2 * page, page, PROT_READ));
 	CHECK(*(uint64_t *)(map + 2 * page) == 0x81720002);
 	CHECK(!munmap(map, length));
-	printf("ok - NUMAB page=%lu automatic placement, bytes and permissions\n", page);
+	printf("ok - NUMAB page=%lu automatic placement, bytes and permissions\n",
+	       page);
 }
 
 int main(int argc, char **argv)
 {
-	unsigned long native = getauxval(AT_PAGESZ), sizes[] = {4096, 16384, 65536};
+	unsigned long native = getauxval(AT_PAGESZ),
+		      sizes[] = { 4096, 16384, 65536 };
 	int failed = 0, compat_only = 0, no4k = 0;
 
 	setvbuf(stdout, NULL, _IONBF, 0);
@@ -256,7 +266,8 @@ int main(int argc, char **argv)
 		pid_t child;
 		int status;
 
-		if (compat_only || sizes[i] > native || (no4k && sizes[i] == 4096))
+		if (compat_only || sizes[i] > native ||
+		    (no4k && sizes[i] == 4096))
 			continue;
 		child = fork();
 		CHECK(child >= 0);
@@ -264,7 +275,8 @@ int main(int argc, char **argv)
 			char s[32];
 
 			snprintf(s, sizeof(s), "%lu", sizes[i]);
-			CHECK(!prctl(PR_AURORA_SET_EXEC_PAGE_SIZE, sizes[i], 0UL, 0UL, 0UL));
+			CHECK(!prctl(PR_AURORA_SET_EXEC_PAGE_SIZE, sizes[i],
+				     0UL, 0UL, 0UL));
 			execl("/init", "/init", "--case", s, NULL);
 			_exit(2);
 		}
@@ -280,12 +292,14 @@ int main(int argc, char **argv)
 		char s[32];
 
 		snprintf(s, sizeof(s), "%lu", no4k ? native : 4096UL);
-		execl("/compat-numa-balancing-probe", "/compat-numa-balancing-probe", s, NULL);
+		execl("/compat-numa-balancing-probe",
+		      "/compat-numa-balancing-probe", s, NULL);
 		_exit(2);
 	}
 	CHECK(waitpid(child, &status, 0) == child);
 	failed |= !WIFEXITED(status) || WEXITSTATUS(status);
-	printf("A32 NUMAB expected-page=%lu status=%d\n", no4k ? native : 4096UL, status);
+	printf("A32 NUMAB expected-page=%lu status=%d\n",
+	       no4k ? native : 4096UL, status);
 	printf("NUMA BALANCING %s\n", failed ? "FAIL" : "PASS");
 	reboot(RB_POWER_OFF);
 	for (;;)

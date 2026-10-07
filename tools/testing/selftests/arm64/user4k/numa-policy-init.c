@@ -20,13 +20,15 @@
 static void check(int good, const char *expr, int line)
 {
 	if (!good) {
-		fprintf(stderr, "FAIL line %d: %s errno=%d\n", line, expr, errno);
+		fprintf(stderr, "FAIL line %d: %s errno=%d\n", line, expr,
+			errno);
 		exit(1);
 	}
 }
 #define CHECK(x) check(!!(x), #x, __LINE__)
 
-static long bind_to(void *addr, unsigned long bytes, int node, unsigned int flags)
+static long bind_to(void *addr, unsigned long bytes, int node,
+		    unsigned int flags)
 {
 	unsigned long mask = 1UL << node;
 
@@ -38,7 +40,8 @@ static void policy_at(void *addr, int node)
 	unsigned long mask = 0;
 	int mode = -1;
 
-	CHECK(!syscall(SYS_get_mempolicy, &mode, &mask, 64UL, addr, MPOL_F_ADDR));
+	CHECK(!syscall(SYS_get_mempolicy, &mode, &mask, 64UL, addr,
+		       MPOL_F_ADDR));
 	CHECK(mode == MPOL_BIND && mask == (1UL << node));
 }
 
@@ -47,9 +50,10 @@ static void node_at(void *addr, int expected)
 	int node = -1;
 
 	CHECK(!syscall(SYS_get_mempolicy, &node, NULL, 0UL, addr,
-		      MPOL_F_NODE | MPOL_F_ADDR));
+		       MPOL_F_NODE | MPOL_F_ADDR));
 	if (node != expected)
-		fprintf(stderr, "node=%d expected=%d addr=%p\n", node, expected, addr);
+		fprintf(stderr, "node=%d expected=%d addr=%p\n", node, expected,
+			addr);
 	CHECK(node == expected);
 }
 
@@ -60,8 +64,9 @@ static void exercise(unsigned long native, int baseline)
 	int mode, fd;
 
 	CHECK(!syscall(SYS_get_mempolicy, &mode, &allowed, 64UL, NULL,
-		      MPOL_F_MEMS_ALLOWED));
-	CHECK(allowed == 3); /* Require two real memory nodes, not a silent skip. */
+		       MPOL_F_MEMS_ALLOWED));
+	CHECK(allowed ==
+	      3); /* Require two real memory nodes, not a silent skip. */
 	reserve = mmap(NULL, 4 * native, PROT_READ | PROT_WRITE,
 		       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	CHECK(reserve != MAP_FAILED);
@@ -82,7 +87,8 @@ static void exercise(unsigned long native, int baseline)
 	policy_at(base + page, 1);
 	if (page < native)
 		policy_at(base + 2 * page, 0);
-	CHECK(!syscall(SYS_set_mempolicy_home_node, base + page, 1UL, 1UL, 0UL));
+	CHECK(!syscall(SYS_set_mempolicy_home_node, base + page, 1UL, 1UL,
+		       0UL));
 	errno = 0;
 	CHECK(bind_to(base + 1, page, 1, 0) == -1 && errno == EINVAL);
 	for (unsigned long off = 0; off < 2 * native; off += page) {
@@ -91,7 +97,8 @@ static void exercise(unsigned long native, int baseline)
 	}
 	CHECK(!bind_to(base + page, page, 1, MPOL_MF_STRICT));
 	errno = 0;
-	CHECK(bind_to(base, 2 * native, 1, MPOL_MF_STRICT) == -1 && errno == EIO);
+	CHECK(bind_to(base, 2 * native, 1, MPOL_MF_STRICT) == -1 &&
+	      errno == EIO);
 	policy_at(base, 0);
 	CHECK(!munmap(reserve, 4 * native));
 
@@ -118,7 +125,8 @@ static void exercise(unsigned long native, int baseline)
 	CHECK(!bind_to(base, 2 * native, 0, 0));
 	for (unsigned long off = 0; off < 2 * native; off += page)
 		base[off + 17] = 0x51 + off / page;
-	CHECK(!bind_to(base + native - page, page, 1, MPOL_MF_MOVE_ALL | MPOL_MF_STRICT));
+	CHECK(!bind_to(base + native - page, page, 1,
+		       MPOL_MF_MOVE_ALL | MPOL_MF_STRICT));
 	for (unsigned long off = 0; off < 2 * native; off += page) {
 		CHECK(base[off + 17] == (unsigned char)(0x51 + off / page));
 		node_at(base + off + 17, off < native ? 1 : 0);
@@ -130,7 +138,8 @@ static void exercise(unsigned long native, int baseline)
 
 	fd = memfd_create("numa-shared", 0);
 	CHECK(fd >= 0 && !ftruncate(fd, 2 * native));
-	shared = mmap(NULL, 2 * native, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	shared = mmap(NULL, 2 * native, PROT_READ | PROT_WRITE, MAP_SHARED, fd,
+		      0);
 	CHECK(shared != MAP_FAILED);
 	CHECK(!bind_to(shared, native, 0, 0));
 	CHECK(!bind_to(shared + native, native, 1, 0));
@@ -145,7 +154,8 @@ static void exercise(unsigned long native, int baseline)
 		policy_at(alias, 0);
 		policy_at(shared, 0);
 		CHECK(!bind_to(alias + native - page, native, 1, 0));
-		for (unsigned long off = 0; off < 2 * native - page; off += page) {
+		for (unsigned long off = 0; off < 2 * native - page;
+		     off += page) {
 			alias[off + 17] = 0x72;
 			node_at(alias + off + 17, off + page < native ? 0 : 1);
 			CHECK(shared[off + page + 17] == 0x72);
@@ -159,7 +169,8 @@ static void exercise(unsigned long native, int baseline)
 
 int main(int argc, char **argv)
 {
-	unsigned long native = getauxval(AT_PAGESZ), sizes[] = {4096, 16384, 65536};
+	unsigned long native = getauxval(AT_PAGESZ),
+		      sizes[] = { 4096, 16384, 65536 };
 	int failed = 0, baseline = 0, no4;
 
 	setvbuf(stdout, NULL, _IONBF, 0);
@@ -191,7 +202,8 @@ int main(int argc, char **argv)
 			snprintf(n, sizeof(n), "%lu", native);
 			snprintf(s, sizeof(s), "%lu", sizes[i]);
 			snprintf(b, sizeof(b), "%d", baseline);
-			CHECK(!prctl(PR_AURORA_SET_EXEC_PAGE_SIZE, sizes[i], 0UL, 0UL, 0UL));
+			CHECK(!prctl(PR_AURORA_SET_EXEC_PAGE_SIZE, sizes[i],
+				     0UL, 0UL, 0UL));
 			execl("/init", "/init", "--case", n, s, b, NULL);
 			_exit(2);
 		}
@@ -208,12 +220,14 @@ int main(int argc, char **argv)
 
 			snprintf(n, sizeof(n), "%lu", native);
 			snprintf(s, sizeof(s), "%lu", no4 ? native : 4096UL);
-			execl("/compat-numa-probe", "/compat-numa-probe", n, s, NULL);
+			execl("/compat-numa-probe", "/compat-numa-probe", n, s,
+			      NULL);
 			_exit(2);
 		}
 		CHECK(waitpid(child, &status, 0) == child);
 		failed |= !WIFEXITED(status) || WEXITSTATUS(status);
-		printf("A32 NUMA expected-page=%lu status=%d\n", no4 ? native : 4096UL, status);
+		printf("A32 NUMA expected-page=%lu status=%d\n",
+		       no4 ? native : 4096UL, status);
 	}
 	printf("NUMA GRANULE %s\n", failed ? "FAIL" : "PASS");
 	reboot(RB_POWER_OFF);

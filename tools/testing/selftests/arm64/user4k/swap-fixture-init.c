@@ -96,11 +96,13 @@ static int run_swap_suite(void)
 		close(fd);
 		return -1;
 	}
-	while (used < capacity - 1 && (n = read(fd, log + used, capacity - 1 - used)) > 0)
+	while (used < capacity - 1 &&
+	       (n = read(fd, log + used, capacity - 1 - used)) > 0)
 		used += n;
 	close(fd);
 	fputs(log, stdout);
-	if (n == 0 && used < capacity - 1 && strstr(log, "\nok 1 arm64-user4k-swap\n") &&
+	if (n == 0 && used < capacity - 1 &&
+	    strstr(log, "\nok 1 arm64-user4k-swap\n") &&
 	    !strstr(log, "not ok") && !strstr(log, "# SKIP"))
 		ret = 0;
 	free(log);
@@ -113,12 +115,15 @@ static int swap_control_helper(const char *operation)
 	int ret;
 
 	/* A helper is allowed only when this same executable is the VM's PID 1. */
-	if (getpid() == 1 || stat("/proc/1/exe", &init) || stat("/proc/self/exe", &self) ||
-	    init.st_dev != self.st_dev || init.st_ino != self.st_ino) {
-		fprintf(stderr, "swap helper requires its fixture runner as PID 1\n");
+	if (getpid() == 1 || stat("/proc/1/exe", &init) ||
+	    stat("/proc/self/exe", &self) || init.st_dev != self.st_dev ||
+	    init.st_ino != self.st_ino) {
+		fprintf(stderr,
+			"swap helper requires its fixture runner as PID 1\n");
 		return 1;
 	}
-	ret = !strcmp(operation, "--swapoff-helper") ? swapoff("/dev/vda") : swapon("/dev/vda", 0);
+	ret = !strcmp(operation, "--swapoff-helper") ? swapoff("/dev/vda") :
+						       swapon("/dev/vda", 0);
 	if (ret)
 		perror(operation);
 	return ret ? 1 : 0;
@@ -130,14 +135,17 @@ static int pageout_exec(bool small)
 	int status = 0;
 
 	if (!pid) {
-		if (small && prctl(PR_AURORA_SET_EXEC_PAGE_SIZE, 4096UL, 0UL, 0UL, 0UL))
+		if (small &&
+		    prctl(PR_AURORA_SET_EXEC_PAGE_SIZE, 4096UL, 0UL, 0UL, 0UL))
 			_exit(125);
-		execl("/reclaim-advice", "/reclaim-advice", small ? "--expect-4k" : NULL, NULL);
+		execl("/reclaim-advice", "/reclaim-advice",
+		      small ? "--expect-4k" : NULL, NULL);
 		_exit(126);
 	}
 	if (pid <= 0 || waitpid(pid, &status, 0) != pid)
 		return -1;
-	printf("# EL0 pageout %s child status=%#x\n", small ? "4K" : "native", status);
+	printf("# EL0 pageout %s child status=%#x\n", small ? "4K" : "native",
+	       status);
 	return WIFEXITED(status) && !WEXITSTATUS(status) ? 0 : -1;
 }
 
@@ -156,8 +164,10 @@ int main(int argc, char **argv)
 			  !strcmp(argv[1], "--swapon-helper")))
 		return swap_control_helper(argv[1]);
 	/* This runner must never mount filesystems or enable swap on the host. */
-	if (getpid() != 1 || (argc != 1 && !smoke && !pageout && !native_only)) {
-		fprintf(stderr, "Use only as /init in the dedicated disposable test VM.\n");
+	if (getpid() != 1 ||
+	    (argc != 1 && !smoke && !pageout && !native_only)) {
+		fprintf(stderr,
+			"Use only as /init in the dedicated disposable test VM.\n");
 		return 1;
 	}
 	setvbuf(stdout, NULL, _IONBF, 0);
@@ -177,7 +187,8 @@ int main(int argc, char **argv)
 		goto out;
 	for (tries = 0; tries < 100 && stat("/dev/vda", &st); tries++)
 		usleep(20000);
-	if (stat("/dev/vda", &st) || !S_ISBLK(st.st_mode) || swapon("/dev/vda", 0))
+	if (stat("/dev/vda", &st) || !S_ISBLK(st.st_mode) ||
+	    swapon("/dev/vda", 0))
 		goto out;
 	active = true;
 	if (native_swap_smoke())
@@ -191,7 +202,8 @@ int main(int argc, char **argv)
 	ret = 0;
 out:
 	if (ret)
-		printf("not ok - swap fixture runner: errno=%d (%s)\n", errno, strerror(errno));
+		printf("not ok - swap fixture runner: errno=%d (%s)\n", errno,
+		       strerror(errno));
 	if (active && swapoff("/dev/vda")) {
 		perror("swapoff");
 		ret = 1;

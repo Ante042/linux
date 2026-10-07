@@ -29,7 +29,8 @@ static unsigned int number, failures;
 
 static void result(int ok, const char *name)
 {
-	printf("%s %u - %s (errno=%d)\n", ok ? "ok" : "not ok", ++number, name, errno);
+	printf("%s %u - %s (errno=%d)\n", ok ? "ok" : "not ok", ++number, name,
+	       errno);
 	failures += !ok;
 }
 
@@ -42,16 +43,25 @@ static int state(int fd, struct vfio_type1_test_cmd *cmd)
 static int domain(int fd, unsigned int which, int add, size_t page, size_t fail)
 {
 	struct vfio_type1_test_cmd cmd = {
-		.domain = which, .size = page, .fail_after = fail,
+		.domain = which,
+		.size = page,
+		.fail_after = fail,
 	};
 
-	return ioctl(fd, add ? VFIO_TYPE1_TEST_DOMAIN_ADD : VFIO_TYPE1_TEST_DOMAIN_DEL, &cmd);
+	return ioctl(fd,
+		     add ? VFIO_TYPE1_TEST_DOMAIN_ADD :
+			   VFIO_TYPE1_TEST_DOMAIN_DEL,
+		     &cmd);
 }
 
-static int rw(int fd, size_t offset, void *data, size_t size, unsigned int flags)
+static int rw(int fd, size_t offset, void *data, size_t size,
+	      unsigned int flags)
 {
 	struct vfio_type1_test_cmd cmd = {
-		.iova = IOVA + offset, .size = size, .buffer = (uintptr_t)data, .flags = flags,
+		.iova = IOVA + offset,
+		.size = size,
+		.buffer = (uintptr_t)data,
+		.flags = flags,
 	};
 
 	return ioctl(fd, VFIO_TYPE1_TEST_RW, &cmd);
@@ -60,8 +70,11 @@ static int rw(int fd, size_t offset, void *data, size_t size, unsigned int flags
 static int map(int fd, void *data, size_t size)
 {
 	struct vfio_iommu_type1_dma_map cmd = {
-		.argsz = sizeof(cmd), .flags = VFIO_DMA_MAP_FLAG_READ | VFIO_DMA_MAP_FLAG_WRITE,
-		.iova = IOVA, .vaddr = (uintptr_t)data, .size = size,
+		.argsz = sizeof(cmd),
+		.flags = VFIO_DMA_MAP_FLAG_READ | VFIO_DMA_MAP_FLAG_WRITE,
+		.iova = IOVA,
+		.vaddr = (uintptr_t)data,
+		.size = size,
 	};
 
 	return ioctl(fd, VFIO_IOMMU_MAP_DMA, &cmd);
@@ -70,7 +83,9 @@ static int map(int fd, void *data, size_t size)
 static int unmap(int fd, size_t size)
 {
 	struct vfio_iommu_type1_dma_unmap cmd = {
-		.argsz = sizeof(cmd), .iova = IOVA, .size = size,
+		.argsz = sizeof(cmd),
+		.iova = IOVA,
+		.size = size,
 	};
 	int ret = ioctl(fd, VFIO_IOMMU_UNMAP_DMA, &cmd);
 
@@ -79,15 +94,17 @@ static int unmap(int fd, size_t size)
 
 static int dirty(int fd, unsigned int flags)
 {
-	struct vfio_iommu_type1_dirty_bitmap cmd = { .argsz = sizeof(cmd), .flags = flags };
+	struct vfio_iommu_type1_dirty_bitmap cmd = { .argsz = sizeof(cmd),
+						     .flags = flags };
 
 	return ioctl(fd, VFIO_IOMMU_DIRTY_PAGES, &cmd);
 }
 
 static int bitmap(int fd, size_t size, uint64_t *bits)
 {
-	unsigned char buffer[sizeof(struct vfio_iommu_type1_dirty_bitmap) +
-			     sizeof(struct vfio_iommu_type1_dirty_bitmap_get)] = {};
+	unsigned char
+		buffer[sizeof(struct vfio_iommu_type1_dirty_bitmap) +
+		       sizeof(struct vfio_iommu_type1_dirty_bitmap_get)] = {};
 	struct vfio_iommu_type1_dirty_bitmap *cmd = (void *)buffer;
 	struct vfio_iommu_type1_dirty_bitmap_get *range = (void *)cmd->data;
 
@@ -102,7 +119,8 @@ static int bitmap(int fd, size_t size, uint64_t *bits)
 	return ioctl(fd, VFIO_IOMMU_DIRTY_PAGES, buffer);
 }
 
-static int all_bytes(const unsigned char *data, size_t size, unsigned char value)
+static int all_bytes(const unsigned char *data, size_t size,
+		     unsigned char value)
 {
 	for (size_t i = 0; i < size; i++)
 		if (data[i] != value)
@@ -118,7 +136,9 @@ static void external_span(int backing, size_t native)
 	for (unsigned int mapped = 0; mapped < 2; mapped++) {
 		struct vfio_type1_test_cmd cmd;
 		struct vfio_iommu_type1_dma_unmap remove = {
-			.argsz = sizeof(remove), .iova = IOVA, .size = fine,
+			.argsz = sizeof(remove),
+			.iova = IOVA,
+			.size = fine,
 		};
 		int fd = open("/dev/vfio-test", O_RDWR), status = 0;
 		pid_t child;
@@ -131,15 +151,17 @@ static void external_span(int backing, size_t native)
 		       "span dirty tracking starts before fine mappings");
 		child = fork();
 		if (!child) {
-			unsigned char *data = mmap(NULL, native, PROT_READ | PROT_WRITE,
-						  MAP_SHARED, backing, 0);
+			unsigned char *data = mmap(NULL, native,
+						   PROT_READ | PROT_WRITE,
+						   MAP_SHARED, backing, 0);
 
 			if (data == MAP_FAILED)
 				_exit(1);
 			for (size_t i = 0; i < count; i++) {
 				struct vfio_iommu_type1_dma_map area = {
 					.argsz = sizeof(area),
-					.flags = VFIO_DMA_MAP_FLAG_READ | VFIO_DMA_MAP_FLAG_WRITE,
+					.flags = VFIO_DMA_MAP_FLAG_READ |
+						 VFIO_DMA_MAP_FLAG_WRITE,
 					.iova = IOVA + i * fine,
 					.vaddr = (uintptr_t)data + i * fine,
 					.size = fine,
@@ -148,48 +170,62 @@ static void external_span(int backing, size_t native)
 				if (ioctl(fd, VFIO_IOMMU_MAP_DMA, &area))
 					_exit(2);
 			}
-			cmd = (struct vfio_type1_test_cmd) { .iova = IOVA + 17 };
+			cmd = (struct vfio_type1_test_cmd){ .iova = IOVA + 17 };
 			_exit(ioctl(fd, VFIO_TYPE1_TEST_PIN, &cmd) ? 3 : 0);
 		}
 		result(child > 0 && waitpid(child, &status, 0) == child &&
-		       WIFEXITED(status) && !WEXITSTATUS(status),
+			       WIFEXITED(status) && !WEXITSTATUS(status),
 		       "source pins native page across independent fine MAP ioctls");
-		result(!state(fd, &cmd) && !cmd.owner_users && cmd.external_refs == 1 &&
-		       cmd.locked_bytes == count * native &&
-		       cmd.owner_locked_bytes == count * native,
+		result(!state(fd, &cmd) && !cmd.owner_users &&
+			       cmd.external_refs == 1 &&
+			       cmd.locked_bytes == count * native &&
+			       cmd.owner_locked_bytes == count * native,
 		       "every fine DMA area retains its own charge after source exit");
-		cmd = (struct vfio_type1_test_cmd) { .iova = IOVA + 31 };
-		result(!ioctl(fd, VFIO_TYPE1_TEST_PIN, &cmd) && !state(fd, &cmd) &&
-		       cmd.external_refs == 2 && cmd.locked_bytes == count * native,
+		cmd = (struct vfio_type1_test_cmd){ .iova = IOVA + 31 };
+		result(!ioctl(fd, VFIO_TYPE1_TEST_PIN, &cmd) &&
+			       !state(fd, &cmd) && cmd.external_refs == 2 &&
+			       cmd.locked_bytes == count * native,
 		       "cross-area duplicate pin reuses all cached constituent pins");
-		result(!bitmap(fd, native, &bits) && bits == ((1ULL << count) - 1),
+		result(!bitmap(fd, native, &bits) &&
+			       bits == ((1ULL << count) - 1),
 		       "cross-area dirty bitmap marks only each mapping's fine extent");
-		result(!ioctl(fd, VFIO_IOMMU_UNMAP_DMA, &remove) && remove.size == fine &&
-		       !state(fd, &cmd) && !cmd.external_refs && cmd.notifications == 1 &&
-		       cmd.locked_bytes == (mapped ? (count - 1) * native : 0),
+		result(!ioctl(fd, VFIO_IOMMU_UNMAP_DMA, &remove) &&
+			       remove.size == fine && !state(fd, &cmd) &&
+			       !cmd.external_refs && cmd.notifications == 1 &&
+			       cmd.locked_bytes ==
+				       (mapped ? (count - 1) * native : 0),
 		       "unmapping one constituent drains references in all page constituents");
 		remove.iova = IOVA + fine;
 		remove.size = native - fine;
 		result(!ioctl(fd, VFIO_IOMMU_UNMAP_DMA, &remove) &&
-		       remove.size == native - fine && !state(fd, &cmd) &&
-		       !cmd.locked_bytes && !cmd.mapped_bytes[0],
+			       remove.size == native - fine &&
+			       !state(fd, &cmd) && !cmd.locked_bytes &&
+			       !cmd.mapped_bytes[0],
 		       "remaining fine mappings unmap without pins or translations");
 		close(fd);
 	}
 }
 
-static void native_owner(int fd, int backing, unsigned char *data, size_t native)
+static void native_owner(int fd, int backing, unsigned char *data,
+			 size_t native)
 {
 	struct vfio_type1_test_cmd cmd = {};
 	struct vfio_iommu_type1_dma_unmap invalidate = {
-		.argsz = sizeof(invalidate), .flags = VFIO_DMA_UNMAP_FLAG_VADDR,
-		.iova = IOVA, .size = 2 * native,
+		.argsz = sizeof(invalidate),
+		.flags = VFIO_DMA_UNMAP_FLAG_VADDR,
+		.iova = IOVA,
+		.size = 2 * native,
 	};
 	struct vfio_iommu_type1_dma_map update = {
-		.argsz = sizeof(update), .flags = VFIO_DMA_MAP_FLAG_VADDR,
-		.iova = IOVA, .size = 2 * native, .vaddr = (uintptr_t)data,
+		.argsz = sizeof(update),
+		.flags = VFIO_DMA_MAP_FLAG_VADDR,
+		.iova = IOVA,
+		.size = 2 * native,
+		.vaddr = (uintptr_t)data,
 	};
-	struct __user_cap_header_struct header = { .version = _LINUX_CAPABILITY_VERSION_3 };
+	struct __user_cap_header_struct header = {
+		.version = _LINUX_CAPABILITY_VERSION_3
+	};
 	struct __user_cap_data_struct saved[2], reduced[2];
 	struct rlimit limit, empty;
 	unsigned char bytes[64];
@@ -198,8 +234,10 @@ static void native_owner(int fd, int backing, unsigned char *data, size_t native
 	int budget_ready, budget_captured, transferred;
 
 	result(!ioctl(fd, VFIO_TYPE1_TEST_EMULATED, &cmd) &&
-	       !domain(fd, 0, 1, 4096, 0), "VADDR fixture retains production group restrictions");
-	result(file_flags >= 0 && !fcntl(backing, F_SETFD, file_flags & ~FD_CLOEXEC),
+		       !domain(fd, 0, 1, 4096, 0),
+	       "VADDR fixture retains production group restrictions");
+	result(file_flags >= 0 &&
+		       !fcntl(backing, F_SETFD, file_flags & ~FD_CLOEXEC),
 	       "native source inherits exact backing descriptor");
 	child = fork();
 	if (!child) {
@@ -210,59 +248,71 @@ static void native_owner(int fd, int backing, unsigned char *data, size_t native
 		snprintf(native_arg, sizeof(native_arg), "%zu", native);
 		if (prctl(PR_AURORA_SET_EXEC_PAGE_SIZE, 0UL, 0UL, 0UL, 0UL))
 			_exit(98);
-		execl("/init", "/init", "--native-source", fd_arg, file_arg, native_arg, NULL);
+		execl("/init", "/init", "--native-source", fd_arg, file_arg,
+		      native_arg, NULL);
 		_exit(99);
 	}
 	if (file_flags >= 0)
 		fcntl(backing, F_SETFD, file_flags);
 	result(child > 0 && waitpid(child, &status, 0) == child &&
-	       WIFEXITED(status) && !WEXITSTATUS(status) && !state(fd, &cmd) &&
-	       !cmd.owner_users && !(cmd.flags & VFIO_TYPE1_TEST_STATE_FRAGMENTS) &&
-	       cmd.locked_bytes == 2 * native && cmd.mapped_bytes[0] == 2 * native,
+		       WIFEXITED(status) && !WEXITSTATUS(status) &&
+		       !state(fd, &cmd) && !cmd.owner_users &&
+		       !(cmd.flags & VFIO_TYPE1_TEST_STATE_FRAGMENTS) &&
+		       cmd.locked_bytes == 2 * native &&
+		       cmd.mapped_bytes[0] == 2 * native,
 	       "exited native source owns legacy GUP pins before transfer");
 	result(!ioctl(fd, VFIO_IOMMU_UNMAP_DMA, &invalidate),
 	       "canonical VADDR invalidation leaves device translations alive");
 	budget_captured = !getrlimit(RLIMIT_MEMLOCK, &limit) &&
-		!syscall(SYS_capget, &header, saved);
+			  !syscall(SYS_capget, &header, saved);
 	budget_ready = budget_captured;
 	if (budget_ready) {
 		memcpy(reduced, saved, sizeof(saved));
-		reduced[CAP_IPC_LOCK / 32].effective &= ~(1U << (CAP_IPC_LOCK % 32));
-		empty = (struct rlimit) { .rlim_cur = 0, .rlim_max = limit.rlim_max };
+		reduced[CAP_IPC_LOCK / 32].effective &=
+			~(1U << (CAP_IPC_LOCK % 32));
+		empty = (struct rlimit){ .rlim_cur = 0,
+					 .rlim_max = limit.rlim_max };
 		budget_ready = !setrlimit(RLIMIT_MEMLOCK, &empty) &&
-			!syscall(SYS_capset, &header, reduced);
+			       !syscall(SYS_capset, &header, reduced);
 	}
 	errno = 0;
-	result(budget_ready && ioctl(fd, VFIO_IOMMU_MAP_DMA, &update) < 0 && errno == ENOMEM &&
-	       !state(fd, &cmd) && !cmd.owner_users &&
-	       !(cmd.flags & VFIO_TYPE1_TEST_STATE_FRAGMENTS) &&
-	       cmd.locked_bytes == 2 * native && cmd.mapped_bytes[0] == 2 * native,
+	result(budget_ready && ioctl(fd, VFIO_IOMMU_MAP_DMA, &update) < 0 &&
+		       errno == ENOMEM && !state(fd, &cmd) &&
+		       !cmd.owner_users &&
+		       !(cmd.flags & VFIO_TYPE1_TEST_STATE_FRAGMENTS) &&
+		       cmd.locked_bytes == 2 * native &&
+		       cmd.mapped_bytes[0] == 2 * native,
 	       "failed owner credit preserves native pins, metadata and charge");
 	if (budget_captured) {
-		result(!syscall(SYS_capset, &header, saved) && !setrlimit(RLIMIT_MEMLOCK, &limit),
+		result(!syscall(SYS_capset, &header, saved) &&
+			       !setrlimit(RLIMIT_MEMLOCK, &limit),
 		       "restore original memlock budget and effective capability");
 	} else {
 		result(0, "owner budget setup failed");
 	}
-	transferred = !ioctl(fd, VFIO_IOMMU_MAP_DMA, &update) && !state(fd, &cmd) &&
-		cmd.owner_users && (cmd.flags & VFIO_TYPE1_TEST_STATE_FRAGMENTS) &&
-		cmd.locked_bytes == 2 * native && cmd.owner_locked_bytes == 2 * native;
-	result(transferred, "canonical VADDR retry adopts native pins for alternative owner");
+	transferred = !ioctl(fd, VFIO_IOMMU_MAP_DMA, &update) &&
+		      !state(fd, &cmd) && cmd.owner_users &&
+		      (cmd.flags & VFIO_TYPE1_TEST_STATE_FRAGMENTS) &&
+		      cmd.locked_bytes == 2 * native &&
+		      cmd.owner_locked_bytes == 2 * native;
+	result(transferred,
+	       "canonical VADDR retry adopts native pins for alternative owner");
 	/* Dependent CPU access is prohibited while VADDR remains invalid. */
 	if (!transferred)
 		return;
-	result(!rw(fd, 0, bytes, sizeof(bytes), 0) && all_bytes(bytes, sizeof(bytes), 0x64),
+	result(!rw(fd, 0, bytes, sizeof(bytes), 0) &&
+		       all_bytes(bytes, sizeof(bytes), 0x64),
 	       "new owner accesses retained native buffer with its own mm authorization");
-	cmd = (struct vfio_type1_test_cmd) { .flags = 1 };
+	cmd = (struct vfio_type1_test_cmd){ .flags = 1 };
 	result(!ioctl(fd, VFIO_TYPE1_TEST_EMULATED, &cmd),
 	       "external consumer rejoins after VADDR update");
-	cmd = (struct vfio_type1_test_cmd) { .iova = IOVA + 17 };
+	cmd = (struct vfio_type1_test_cmd){ .iova = IOVA + 17 };
 	result(!ioctl(fd, VFIO_TYPE1_TEST_PIN, &cmd) && !state(fd, &cmd) &&
-	       cmd.locked_bytes == 2 * native && cmd.external_refs == 1,
+		       cmd.locked_bytes == 2 * native && cmd.external_refs == 1,
 	       "external page array reuses adopted pins without new charge");
 	result(!unmap(fd, 2 * native) && !state(fd, &cmd) &&
-	       !cmd.locked_bytes && !cmd.owner_locked_bytes && !cmd.external_refs &&
-	       !cmd.mapped_bytes[0],
+		       !cmd.locked_bytes && !cmd.owner_locked_bytes &&
+		       !cmd.external_refs && !cmd.mapped_bytes[0],
 	       "owner transfer final cleanup refunds recipient and clears domain");
 	result(!domain(fd, 0, 0, 0, 0), "owner transfer domain detaches");
 }
@@ -274,7 +324,8 @@ static int exercise(size_t native)
 	struct vfio_iommu_type1_dma_map bad = { .argsz = 8 };
 	unsigned char bytes[64], disk[64];
 	uint64_t bits = 0;
-	int fd = open("/dev/vfio-test", O_RDWR), backing = memfd_create("vfio", MFD_CLOEXEC);
+	int fd = open("/dev/vfio-test", O_RDWR),
+	    backing = memfd_create("vfio", MFD_CLOEXEC);
 	unsigned char *data = MAP_FAILED;
 	int status = 0;
 	pid_t child;
@@ -286,12 +337,15 @@ static int exercise(size_t native)
 	       "open privileged recording-domain fixture and backing");
 	if (fd < 0 || backing < 0 || failures)
 		goto out;
-	data = mmap(NULL, 2 * native, PROT_READ | PROT_WRITE, MAP_SHARED, backing, 0);
-	result(data != MAP_FAILED, "map native-sized shmem backing in actual process mm");
+	data = mmap(NULL, 2 * native, PROT_READ | PROT_WRITE, MAP_SHARED,
+		    backing, 0);
+	result(data != MAP_FAILED,
+	       "map native-sized shmem backing in actual process mm");
 	if (data == MAP_FAILED)
 		goto out;
 	memset(data, 0x64, 2 * native);
-	result(!ioctl(fd, VFIO_IOMMU_GET_INFO, &info) && (info.iova_pgsizes & 4096),
+	result(!ioctl(fd, VFIO_IOMMU_GET_INFO, &info) &&
+		       (info.iova_pgsizes & 4096),
 	       "type1 GET_INFO reports fine IOVA capability");
 	errno = 0;
 	result(ioctl(fd, VFIO_IOMMU_MAP_DMA, &bad) < 0 && errno == EINVAL,
@@ -302,64 +356,83 @@ static int exercise(size_t native)
 	result(!map(fd, data, 2 * native), "lazy full-range MAP from real EL0");
 	result(!state(fd, &cmd) && !cmd.locked_bytes && !cmd.mapped_bytes[0],
 	       "lazy MAP acquires no DMA pins or translations");
-	result(!rw(fd, 0, bytes, sizeof(bytes), 0) && all_bytes(bytes, sizeof(bytes), 0x64),
+	result(!rw(fd, 0, bytes, sizeof(bytes), 0) &&
+		       all_bytes(bytes, sizeof(bytes), 0x64),
 	       "CPU-only GET reads actual source bytes");
-	result(!state(fd, &cmd) && !cmd.locked_bytes, "CPU GET does not charge long-term pins");
-	result(!dirty(fd, VFIO_IOMMU_DIRTY_PAGES_FLAG_START), "canonical dirty tracking starts");
-	cmd = (struct vfio_type1_test_cmd) { .iova = IOVA + 17 };
+	result(!state(fd, &cmd) && !cmd.locked_bytes,
+	       "CPU GET does not charge long-term pins");
+	result(!dirty(fd, VFIO_IOMMU_DIRTY_PAGES_FLAG_START),
+	       "canonical dirty tracking starts");
+	cmd = (struct vfio_type1_test_cmd){ .iova = IOVA + 17 };
 	result(!ioctl(fd, VFIO_TYPE1_TEST_PIN, &cmd) && !state(fd, &cmd) &&
-	       cmd.locked_bytes == native && cmd.external_refs == 1,
+		       cmd.locked_bytes == native && cmd.external_refs == 1,
 	       "external page array preserves unaligned caller byte offset");
-	cmd = (struct vfio_type1_test_cmd) { .iova = IOVA + 31 };
+	cmd = (struct vfio_type1_test_cmd){ .iova = IOVA + 31 };
 	result(!ioctl(fd, VFIO_TYPE1_TEST_PIN, &cmd) && !state(fd, &cmd) &&
-	       cmd.locked_bytes == native && cmd.external_refs == 2,
+		       cmd.locked_bytes == native && cmd.external_refs == 2,
 	       "duplicate external pin charges physical native page once");
-	result(!bitmap(fd, 2 * native, &bits) && bits == ((1ULL << (native / 4096)) - 1),
+	result(!bitmap(fd, 2 * native, &bits) &&
+		       bits == ((1ULL << (native / 4096)) - 1),
 	       "dirty bitmap covers every fine unit in native external page");
-	result(!unmap(fd, 2 * native), "canonical UNMAP drains callback-held external refs");
+	result(!unmap(fd, 2 * native),
+	       "canonical UNMAP drains callback-held external refs");
 	result(!state(fd, &cmd) && !cmd.locked_bytes && !cmd.external_refs &&
-	       cmd.notifications == 1, "external-unpin callback refunds all pins");
-	result(!dirty(fd, VFIO_IOMMU_DIRTY_PAGES_FLAG_STOP), "dirty tracking stops");
-	result(!domain(fd, 0, 1, 4096, 0), "recording4K domain attaches before child MAP");
+		       cmd.notifications == 1,
+	       "external-unpin callback refunds all pins");
+	result(!dirty(fd, VFIO_IOMMU_DIRTY_PAGES_FLAG_STOP),
+	       "dirty tracking stops");
+	result(!domain(fd, 0, 1, 4096, 0),
+	       "recording4K domain attaches before child MAP");
 	child = fork();
 	if (!child) {
-		unsigned char *source = mmap(NULL, 2 * native, PROT_READ | PROT_WRITE,
-					    MAP_SHARED, backing, 0);
-		int ret = source == MAP_FAILED ? -1 : map(fd, source + 4096, length);
+		unsigned char *source = mmap(NULL, 2 * native,
+					     PROT_READ | PROT_WRITE, MAP_SHARED,
+					     backing, 0);
+		int ret = source == MAP_FAILED ? -1 :
+						 map(fd, source + 4096, length);
 
 		_exit(ret ? 1 : 0);
 	}
-	result(child > 0 && waitpid(child, &status, 0) == child && WIFEXITED(status) &&
-	       !WEXITSTATUS(status), "fine-offset MAP retains real child pins after exit");
-	result(!state(fd, &cmd) && !cmd.owner_users && cmd.locked_bytes == 2 * native &&
-	       cmd.owner_locked_bytes == 2 * native && cmd.mapped_bytes[0] == length,
+	result(child > 0 && waitpid(child, &status, 0) == child &&
+		       WIFEXITED(status) && !WEXITSTATUS(status),
+	       "fine-offset MAP retains real child pins after exit");
+	result(!state(fd, &cmd) && !cmd.owner_users &&
+		       cmd.locked_bytes == 2 * native &&
+		       cmd.owner_locked_bytes == 2 * native &&
+		       cmd.mapped_bytes[0] == length,
 	       "exited source mm retains exact physical-page charge and translation length");
 	errno = 0;
 	result(rw(fd, 0, bytes, sizeof(bytes), 0) < 0 && errno == EFAULT,
 	       "foreign process CPU access preserves source-mm authorization");
 	result(!rw(fd, 0, bytes, sizeof(bytes), VFIO_TYPE1_TEST_WORKER) &&
-	       all_bytes(bytes, sizeof(bytes), 0x64), "kernel consumer reads exited source pins");
+		       all_bytes(bytes, sizeof(bytes), 0x64),
+	       "kernel consumer reads exited source pins");
 	errno = 0;
 	result(domain(fd, 1, 1, 4096, 4096) < 0 && errno == ENOMEM &&
-	       !state(fd, &cmd) && !cmd.mapped_bytes[1] && cmd.mapped_bytes[0] == length &&
-	       cmd.locked_bytes == 2 * native,
+		       !state(fd, &cmd) && !cmd.mapped_bytes[1] &&
+		       cmd.mapped_bytes[0] == length &&
+		       cmd.locked_bytes == 2 * native,
 	       "failed replay leaves existing domain and pins intact");
 	result(!domain(fd, 1, 1, 4096, 0) && !state(fd, &cmd) &&
-	       cmd.mapped_bytes[0] == length && cmd.mapped_bytes[1] == length &&
-	       cmd.locked_bytes == 2 * native,
+		       cmd.mapped_bytes[0] == length &&
+		       cmd.mapped_bytes[1] == length &&
+		       cmd.locked_bytes == 2 * native,
 	       "retry replays cached pins without resurrecting source mm");
-	result(!dirty(fd, VFIO_IOMMU_DIRTY_PAGES_FLAG_START), "fine DMA dirty tracking starts");
+	result(!dirty(fd, VFIO_IOMMU_DIRTY_PAGES_FLAG_START),
+	       "fine DMA dirty tracking starts");
 	memset(bytes, 0x9a, sizeof(bytes));
 	result(!rw(fd, 4096 - 32, bytes, sizeof(bytes),
 		   VFIO_TYPE1_TEST_WRITE | VFIO_TYPE1_TEST_WORKER) &&
-	       pread(backing, disk, sizeof(disk), 8192 - 32) == sizeof(disk) &&
-	       all_bytes(disk, sizeof(disk), 0x9a),
+		       pread(backing, disk, sizeof(disk), 8192 - 32) ==
+			       sizeof(disk) &&
+		       all_bytes(disk, sizeof(disk), 0x9a),
 	       "cached worker write dirties original shmem bytes");
 	result(!bitmap(fd, length, &bits) && bits == 3,
 	       "canonical bitmap returns exact two4K units touched by worker write");
-	result(!unmap(fd, length), "fine UNMAP synchronizes both recording domains");
+	result(!unmap(fd, length),
+	       "fine UNMAP synchronizes both recording domains");
 	result(!state(fd, &cmd) && !cmd.locked_bytes && !cmd.mapped_bytes[0] &&
-	       !cmd.mapped_bytes[1],
+		       !cmd.mapped_bytes[1],
 	       "source-exit cleanup refunds pins and clears all translations");
 	result(!domain(fd, 1, 0, 0, 0) && !domain(fd, 0, 0, 0, 0),
 	       "both domains detach after complete cleanup");
@@ -387,7 +460,8 @@ int main(int argc, char **argv)
 
 		if (getauxval(AT_PAGESZ) != native)
 			return 2;
-		data = mmap(NULL, 2 * native, PROT_READ | PROT_WRITE, MAP_SHARED, backing, 0);
+		data = mmap(NULL, 2 * native, PROT_READ | PROT_WRITE,
+			    MAP_SHARED, backing, 0);
 		return data == MAP_FAILED || map(fd, data, 2 * native) ? 1 : 0;
 	}
 	if (argc == 4 && !strcmp(argv[1], "--test") && getppid() == 1) {
@@ -410,7 +484,8 @@ int main(int argc, char **argv)
 	fclose(dev);
 	if (mknod("/dev/vfio-test", S_IFCHR | 0600, makedev(major, minor)))
 		return 5;
-	size_t native = getauxval(AT_PAGESZ), targets[] = { native, 4096, 16384 };
+	size_t native = getauxval(AT_PAGESZ),
+	       targets[] = { native, 4096, 16384 };
 	int ok = 1;
 
 	int compat_only = getenv("VFIO_COMPAT_ONLY") != NULL;
@@ -430,15 +505,18 @@ int main(int argc, char **argv)
 
 			snprintf(native_arg, sizeof(native_arg), "%zu", native);
 			snprintf(target_arg, sizeof(target_arg), "%zu", target);
-			if (prctl(PR_AURORA_SET_EXEC_PAGE_SIZE, target == native ? 0UL : target,
-				  0UL, 0UL, 0UL))
+			if (prctl(PR_AURORA_SET_EXEC_PAGE_SIZE,
+				  target == native ? 0UL : target, 0UL, 0UL,
+				  0UL))
 				_exit(3);
-			execl("/init", "/init", "--test", native_arg, target_arg, NULL);
+			execl("/init", "/init", "--test", native_arg,
+			      target_arg, NULL);
 			_exit(4);
 		}
 		ok &= child > 0 && waitpid(child, &status, 0) == child &&
-			WIFEXITED(status) && !WEXITSTATUS(status);
-		printf("# actual ABI=%zuK child_status=%d\n", target / 1024, status);
+		      WIFEXITED(status) && !WEXITSTATUS(status);
+		printf("# actual ABI=%zuK child_status=%d\n", target / 1024,
+		       status);
 	}
 	const char *expected_arg = getenv("VFIO_COMPAT_PAGES");
 	size_t expected = expected_arg ? strtoul(expected_arg, NULL, 10) : 4096;
@@ -450,12 +528,14 @@ int main(int argc, char **argv)
 
 		snprintf(native_arg, sizeof(native_arg), "%zu", native);
 		snprintf(page_arg, sizeof(page_arg), "%zu", expected);
-		execl("/compat-vfio", "/compat-vfio", native_arg, page_arg, NULL);
+		execl("/compat-vfio", "/compat-vfio", native_arg, page_arg,
+		      NULL);
 		_exit(98);
 	}
 	ok &= compat > 0 && waitpid(compat, &compat_status, 0) == compat &&
-		WIFEXITED(compat_status) && !WEXITSTATUS(compat_status);
-	printf("# AArch32 expected=%zuK child_status=%d\n", expected / 1024, compat_status);
+	      WIFEXITED(compat_status) && !WEXITSTATUS(compat_status);
+	printf("# AArch32 expected=%zuK child_status=%d\n", expected / 1024,
+	       compat_status);
 	printf("VFIO TYPE1 IOCTL %s\n", ok ? "PASS" : "FAIL");
 	reboot(RB_POWER_OFF);
 	return !ok;

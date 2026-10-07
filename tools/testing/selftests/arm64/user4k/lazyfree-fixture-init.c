@@ -29,7 +29,8 @@ static unsigned long stat_value(const char *path, const char *key)
 	if (!f)
 		return 0;
 	while (fgets(line, sizeof(line), f))
-		if (sscanf(line, "%99s %lu", name, &value) == 2 && !strcmp(name, key))
+		if (sscanf(line, "%99s %lu", name, &value) == 2 &&
+		    !strcmp(name, key))
 			break;
 	fclose(f);
 	return value;
@@ -56,8 +57,10 @@ static unsigned long lazy_kb(void *address)
 		if (sscanf(line, "%lx-%lx", &first, &last) == 2) {
 			if (found)
 				break;
-			found = (uintptr_t)address >= first && (uintptr_t)address < last;
-		} else if (found && sscanf(line, "LazyFree: %lu", &value) == 1) {
+			found = (uintptr_t)address >= first &&
+				(uintptr_t)address < last;
+		} else if (found &&
+			   sscanf(line, "LazyFree: %lu", &value) == 1) {
 			break;
 		}
 	}
@@ -70,7 +73,8 @@ static uint64_t pagemap(void *p, size_t ps)
 	uint64_t entry = 0;
 	int fd = open("/proc/self/pagemap", O_RDONLY);
 
-	if (fd < 0 || pread(fd, &entry, sizeof(entry), (uintptr_t)p / ps * 8) != 8)
+	if (fd < 0 ||
+	    pread(fd, &entry, sizeof(entry), (uintptr_t)p / ps * 8) != 8)
 		ksft_exit_fail_msg("pagemap: %s\n", strerror(errno));
 	close(fd);
 	return entry;
@@ -118,13 +122,15 @@ static int exercise(unsigned long native)
 {
 	const size_t ps = getauxval(AT_PAGESZ), len = 4 * ps;
 	unsigned char *reservation = mmap(NULL, len + 2 * native, PROT_NONE,
-					 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-	unsigned char *p = (void *)(((uintptr_t)reservation + native - 1) & ~(native - 1));
+					  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	unsigned char *p =
+		(void *)(((uintptr_t)reservation + native - 1) & ~(native - 1));
 	bool ok;
 	unsigned long writes;
 	uint64_t entry;
 
-	if (reservation == MAP_FAILED || mprotect(p, len, PROT_READ | PROT_WRITE))
+	if (reservation == MAP_FAILED ||
+	    mprotect(p, len, PROT_READ | PROT_WRITE))
 		ksft_exit_fail_msg("mapping\n");
 	ksft_print_header();
 	ksft_set_plan(8);
@@ -132,38 +138,51 @@ static int exercise(unsigned long native)
 		memset(p + i * ps, 0x40 + i, ps);
 	ok = mark_free(p + ps, ps);
 	if (!ok)
-		ksft_exit_fail_msg("%zuK MADV_FREE: %s\n", ps / 1024, strerror(errno));
+		ksft_exit_fail_msg("%zuK MADV_FREE: %s\n", ps / 1024,
+				   strerror(errno));
 	ksft_test_result(all_bytes(p + ps, ps, 0x41),
-		"%zuK FREE retains bytes before reclaim\n", ps / 1024);
-	ksft_test_result(lazy_kb(p) == ps / 1024, "%zuK partial LazyFree accounting\n", ps / 1024);
+			 "%zuK FREE retains bytes before reclaim\n", ps / 1024);
+	ksft_test_result(lazy_kb(p) == ps / 1024,
+			 "%zuK partial LazyFree accounting\n", ps / 1024);
 	ok = pageout(p, len);
 	entry = pagemap(p + ps, ps);
 	ok &= !(entry & ((1ULL << 63) | (1ULL << 62)));
 	ok &= all_bytes(p + ps, ps, 0) && all_bytes(p, ps, 0x40) &&
-		all_bytes(p + 2 * ps, ps, 0x42) && all_bytes(p + 3 * ps, ps, 0x43);
-	ksft_test_result(ok, "%zuK partial FREE reclaims only advised bytes\n", ps / 1024);
+	      all_bytes(p + 2 * ps, ps, 0x42) &&
+	      all_bytes(p + 3 * ps, ps, 0x43);
+	ksft_test_result(ok, "%zuK partial FREE reclaims only advised bytes\n",
+			 ps / 1024);
 	/* Drop old swap/cache state, then test cancellation by a real EL0 write. */
 	ok = !madvise(p, len, MADV_DONTNEED);
 	memset(p, 0x62, len);
 	ok &= mark_free(p + ps, ps);
 	memset(p + ps, 0xa5, ps);
-	ksft_test_result(lazy_kb(p) == 0, "%zuK dirty leaf no longer reported LazyFree\n", ps / 1024);
+	ksft_test_result(lazy_kb(p) == 0,
+			 "%zuK dirty leaf no longer reported LazyFree\n",
+			 ps / 1024);
 	ok &= pageout(p, len);
 	ok &= all_bytes(p + ps, ps, 0xa5) && all_bytes(p, ps, 0x62) &&
-		all_bytes(p + 2 * ps, 2 * ps, 0x62);
-	ksft_test_result(ok, "%zuK write after FREE cancels quarter discard\n", ps / 1024);
+	      all_bytes(p + 2 * ps, 2 * ps, 0x62);
+	ksft_test_result(ok, "%zuK write after FREE cancels quarter discard\n",
+			 ps / 1024);
 	ok = !madvise(p, len, MADV_DONTNEED);
 	memset(p, 0x83, len);
 	writes = stat_value("/proc/vmstat", "pswpout");
 	ok &= mark_free(p, len) && pageout(p, len);
 	for (unsigned int i = 0; i < 4; i++)
-		ok &= !(pagemap(p + i * ps, ps) & ((1ULL << 63) | (1ULL << 62)));
+		ok &= !(pagemap(p + i * ps, ps) &
+			((1ULL << 63) | (1ULL << 62)));
 	printf("# full FREE pswpout=%lu->%lu, entries=%#llx %#llx %#llx %#llx\n",
 	       writes, stat_value("/proc/vmstat", "pswpout"),
-	       (unsigned long long)pagemap(p, ps), (unsigned long long)pagemap(p + ps, ps),
-	       (unsigned long long)pagemap(p + 2 * ps, ps), (unsigned long long)pagemap(p + 3 * ps, ps));
-	ok &= stat_value("/proc/vmstat", "pswpout") == writes && all_bytes(p, len, 0);
-	ksft_test_result(ok, "%zuK fully free backing reclaimed without swap writes\n", ps / 1024);
+	       (unsigned long long)pagemap(p, ps),
+	       (unsigned long long)pagemap(p + ps, ps),
+	       (unsigned long long)pagemap(p + 2 * ps, ps),
+	       (unsigned long long)pagemap(p + 3 * ps, ps));
+	ok &= stat_value("/proc/vmstat", "pswpout") == writes &&
+	      all_bytes(p, len, 0);
+	ksft_test_result(
+		ok, "%zuK fully free backing reclaimed without swap writes\n",
+		ps / 1024);
 	ok = !madvise(p, len, MADV_DONTNEED);
 	memset(p, 0xb7, len);
 	ok &= pageout(p, len);
@@ -171,8 +190,11 @@ static int exercise(unsigned long native)
 	ok &= mark_free(p + ps, ps);
 	ok &= !(pagemap(p + ps, ps) & ((1ULL << 63) | (1ULL << 62)));
 	ok &= all_bytes(p + ps, ps, 0) && all_bytes(p, ps, 0xb7) &&
-		all_bytes(p + 2 * ps, 2 * ps, 0xb7);
-	ksft_test_result(ok, "%zuK FREE drops selected swap entry without neighbor loss\n", ps / 1024);
+	      all_bytes(p + 2 * ps, 2 * ps, 0xb7);
+	ksft_test_result(
+		ok,
+		"%zuK FREE drops selected swap entry without neighbor loss\n",
+		ps / 1024);
 	{
 		int gate[2], status = 0;
 		pid_t pid;
@@ -185,7 +207,8 @@ static int exercise(unsigned long native)
 		pid = fork();
 		if (!pid) {
 			close(gate[1]);
-			if (read(gate[0], &ready, 1) != 1 || !all_bytes(p, len, 0xc8))
+			if (read(gate[0], &ready, 1) != 1 ||
+			    !all_bytes(p, len, 0xc8))
 				_exit(2);
 			_exit(0);
 		}
@@ -194,8 +217,11 @@ static int exercise(unsigned long native)
 		ok &= write(gate[1], "x", 1) == 1;
 		close(gate[1]);
 		ok &= pid > 0 && waitpid(pid, &status, 0) == pid &&
-			WIFEXITED(status) && !WEXITSTATUS(status);
-		ksft_test_result(ok, "%zuK FREE after fork preserves other process data\n", ps / 1024);
+		      WIFEXITED(status) && !WEXITSTATUS(status);
+		ksft_test_result(
+			ok,
+			"%zuK FREE after fork preserves other process data\n",
+			ps / 1024);
 	}
 	munmap(reservation, len + 2 * native);
 	ksft_print_cnts();
@@ -220,7 +246,8 @@ int main(int argc, char **argv)
 		return 2;
 	}
 	if (mount("proc", "/proc", "proc", 0, NULL) ||
-	    mount("devtmpfs", "/dev", "devtmpfs", 0, NULL) || swapon("/dev/vda", 0))
+	    mount("devtmpfs", "/dev", "devtmpfs", 0, NULL) ||
+	    swapon("/dev/vda", 0))
 		return 3;
 	for (unsigned int small = 0; small < nr; small++) {
 		pid_t pid = fork();
@@ -234,11 +261,12 @@ int main(int argc, char **argv)
 			if (prctl(PR_AURORA_SET_EXEC_PAGE_SIZE, granules[small],
 				  0UL, 0UL, 0UL))
 				_exit(3);
-			execl("/init", "/init", "--test", size, host_size, NULL);
+			execl("/init", "/init", "--test", size, host_size,
+			      NULL);
 			_exit(4);
 		}
 		ok &= pid > 0 && waitpid(pid, &status, 0) == pid &&
-			WIFEXITED(status) && !WEXITSTATUS(status);
+		      WIFEXITED(status) && !WEXITSTATUS(status);
 	}
 	printf("%s - lazyfree fixture complete\n", ok ? "ok" : "not ok");
 	reboot(RB_POWER_OFF);

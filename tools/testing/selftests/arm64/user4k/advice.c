@@ -28,7 +28,8 @@ static bool wait_child(pid_t pid, int sig)
 
 static void *anon(size_t length, int prot, int extra)
 {
-	void *p = mmap(NULL, length, prot, MAP_PRIVATE | MAP_ANONYMOUS | extra, -1, 0);
+	void *p = mmap(NULL, length, prot, MAP_PRIVATE | MAP_ANONYMOUS | extra,
+		       -1, 0);
 
 	if (p == MAP_FAILED)
 		ksft_exit_fail_msg("anonymous mmap\n");
@@ -44,15 +45,17 @@ static void discard_and_guards(void)
 	memset(p, 0x61, 3 * page);
 	ok = madvise(p + page, 1, MADV_DONTNEED) == 0;
 	ok &= p[0] == 0x61 && p[page] == 0 && p[2 * page] == 0x61;
-	ksft_test_result(ok, "DONTNEED discards exactly one rounded user page\n");
+	ksft_test_result(ok,
+			 "DONTNEED discards exactly one rounded user page\n");
 	memset(p + page, 0x71, page);
 	child = fork();
 	if (!child) {
 		ok = madvise(p + page, page, MADV_DONTNEED) == 0;
 		_exit(!(ok && p[page] == 0 && p[0] == 0x61));
 	}
-	ksft_test_result(wait_child(child, 0) && p[page] == 0x71,
-			 "discard in a fork child leaves the parent quarter intact\n");
+	ksft_test_result(
+		wait_child(child, 0) && p[page] == 0x71,
+		"discard in a fork child leaves the parent quarter intact\n");
 	ok = madvise(p + page, 1, MADV_GUARD_INSTALL) == 0;
 	ok &= madvise(p + page, page, MADV_DONTNEED) == 0;
 	child = fork();
@@ -66,7 +69,8 @@ static void discard_and_guards(void)
 			 "a user-page guard survives discard and fork\n");
 	ok = madvise(p + page, 1, MADV_GUARD_REMOVE) == 0;
 	ok &= p[page] == 0 && p[0] == 0x61 && p[2 * page] == 0x61;
-	ksft_test_result(ok, "guard removal restores only the requested page\n");
+	ksft_test_result(ok,
+			 "guard removal restores only the requested page\n");
 	munmap(p, 3 * page);
 }
 
@@ -81,18 +85,22 @@ static void population(void)
 	ok &= mincore(p, 5 * page, vec) == 0;
 	for (i = 0; i < 5; i++)
 		ok &= vec[i] == (i == 2);
-	ksft_test_result(ok, "POPULATE_WRITE faults only the selected user-page VMA\n");
+	ksft_test_result(
+		ok, "POPULATE_WRITE faults only the selected user-page VMA\n");
 	ok = madvise(p + page, 1, MADV_POPULATE_READ) == 0;
 	ok &= mincore(p + page, page, vec) == 0 && vec[0] == 1;
 	errno = 0;
 	ok &= madvise(p, page, MADV_POPULATE_WRITE) == -1 && errno == EINVAL;
 	ok &= mprotect(p + 3 * page, page, PROT_NONE) == 0;
 	errno = 0;
-	ok &= madvise(p + 3 * page, page, MADV_POPULATE_READ) == -1 && errno == EINVAL;
+	ok &= madvise(p + 3 * page, page, MADV_POPULATE_READ) == -1 &&
+	      errno == EINVAL;
 	ok &= munmap(p + 3 * page, page) == 0;
 	errno = 0;
-	ok &= madvise(p + 3 * page, page, MADV_POPULATE_READ) == -1 && errno == ENOMEM;
-	ksft_test_result(ok, "POPULATE_READ honors permissions and reports holes\n");
+	ok &= madvise(p + 3 * page, page, MADV_POPULATE_READ) == -1 &&
+	      errno == ENOMEM;
+	ksft_test_result(
+		ok, "POPULATE_READ honors permissions and reports holes\n");
 	munmap(p, 5 * page);
 	p = anon(5 * page, PROT_READ | PROT_WRITE, MAP_POPULATE);
 	ok = mincore(p, 5 * page, vec) == 0;
@@ -114,7 +122,9 @@ static void fork_advice(void)
 	if (!child)
 		_exit(!(p[page] == 0 && p[0] == 0x58 && p[2 * page] == 0x58));
 	ok &= wait_child(child, 0) && p[page] == 0x58;
-	ksft_test_result(ok, "WIPEONFORK clears a single child page and preserves neighbors\n");
+	ksft_test_result(
+		ok,
+		"WIPEONFORK clears a single child page and preserves neighbors\n");
 	ok = madvise(p + page, 1, MADV_KEEPONFORK) == 0;
 	ok &= madvise(p + page, 1, MADV_DONTFORK) == 0;
 	child = fork();
@@ -122,8 +132,9 @@ static void fork_advice(void)
 		unsigned char vec;
 
 		errno = 0;
-		_exit(!(mincore(p + page, page, &vec) == -1 && errno == ENOMEM &&
-			p[0] == 0x58 && p[2 * page] == 0x58));
+		_exit(!(mincore(p + page, page, &vec) == -1 &&
+			errno == ENOMEM && p[0] == 0x58 &&
+			p[2 * page] == 0x58));
 	}
 	ok &= wait_child(child, 0);
 	ksft_test_result(ok, "DONTFORK omits only its selected user page\n");
@@ -139,10 +150,14 @@ static void remove_file(void)
 
 	if (fd < 0 || ftruncate(fd, 5 * page))
 		ksft_exit_fail_msg("memfd setup\n");
-	shared = mmap(NULL, 5 * page, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-	alias = mmap(NULL, 3 * page, PROT_READ | PROT_WRITE, MAP_SHARED, fd, page);
-	private = mmap(NULL, 3 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, page);
-	if (shared == MAP_FAILED || alias == MAP_FAILED || private == MAP_FAILED)
+	shared =
+		mmap(NULL, 5 * page, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	alias = mmap(NULL, 3 * page, PROT_READ | PROT_WRITE, MAP_SHARED, fd,
+		     page);
+	private = mmap(NULL, 3 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd,
+		       page);
+	if (shared == MAP_FAILED || alias == MAP_FAILED ||
+	    private == MAP_FAILED)
 		ksft_exit_fail_msg("file mmap\n");
 	for (i = 0; i < 5 * page; i++)
 		shared[i] = 0x40 + i / page;
@@ -151,9 +166,12 @@ static void remove_file(void)
 	for (i = 0; i < 5 * page; i++)
 		ok &= shared[i] == (i / page == 2 ? 0 : 0x40 + i / page);
 	ok &= private[page] == 0x79;
-	ksft_test_result(ok, "REMOVE uses the file byte offset and preserves private COW\n");
+	ksft_test_result(
+		ok,
+		"REMOVE uses the file byte offset and preserves private COW\n");
 	ok = madvise(alias, 3 * page, MADV_WILLNEED) == 0;
-	ksft_test_result(ok, "WILLNEED accepts a file range with the process granule\n");
+	ksft_test_result(
+		ok, "WILLNEED accepts a file range with the process granule\n");
 	munmap(shared, 5 * page);
 	munmap(alias, 3 * page);
 	munmap(private, 3 * page);

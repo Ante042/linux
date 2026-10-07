@@ -123,7 +123,7 @@ bool path_noexec(const struct path *path)
 	       (path->mnt->mnt_sb->s_iflags & SB_I_NOEXEC);
 }
 
-/* A temporary argument mapping owns either a page or an exact 4K slot. */
+/* A temporary argument mapping owns one native page or an exact subpage slot. */
 struct arg_page {
 	struct page *page;
 #ifdef CONFIG_MM_SUBPAGE
@@ -141,9 +141,15 @@ static unsigned long bprm_page_size(const struct linux_binprm *bprm)
 #endif
 }
 
-static unsigned long bprm_page_mask(const struct linux_binprm *bprm)
+/* kmap_local_page() maps one native page, even for a larger user leaf. */
+static unsigned long bprm_copy_size(const struct linux_binprm *bprm)
 {
-	return ~(bprm_page_size(bprm) - 1);
+	return min(bprm_page_size(bprm), PAGE_SIZE);
+}
+
+static unsigned long bprm_copy_mask(const struct linux_binprm *bprm)
+{
+	return ~(bprm_copy_size(bprm) - 1);
 }
 
 static unsigned long bprm_max_arg_strlen(const struct linux_binprm *bprm)
@@ -362,7 +368,7 @@ int bprm_set_page_shift(struct linux_binprm *bprm, unsigned int page_shift)
 	struct linux_binprm replacement = {};
 	struct mm_struct *old_mm;
 	unsigned long pos, end, new_top, string_len = 0;
-	unsigned long old_size = mm_page_size(bprm->mm), new_size;
+	unsigned long old_size = mm_user_fragment_size(bprm->mm), new_size;
 	int ret;
 
 	if (mm_page_shift(bprm->mm) == page_shift)
@@ -376,7 +382,7 @@ int bprm_set_page_shift(struct linux_binprm *bprm, unsigned int page_shift)
 	ret = -EINVAL;
 	if (mm_page_shift(replacement.mm) != page_shift)
 		goto out;
-	new_size = mm_page_size(replacement.mm);
+	new_size = mm_user_fragment_size(replacement.mm);
 	ret = create_init_stack_vma(replacement.mm, &replacement.vma, &new_top);
 	if (ret)
 		goto out;
@@ -646,9 +652,9 @@ static int copy_strings(int argc, struct user_arg_ptr argv,
 			}
 			cond_resched();
 
-			offset = pos & ~bprm_page_mask(bprm);
+			offset = pos & ~bprm_copy_mask(bprm);
 			if (offset == 0)
-				offset = bprm_page_size(bprm);
+				offset = bprm_copy_size(bprm);
 
 			bytes_to_copy = offset;
 			if (bytes_to_copy > len)
@@ -659,7 +665,7 @@ static int copy_strings(int argc, struct user_arg_ptr argv,
 			str -= bytes_to_copy;
 			len -= bytes_to_copy;
 
-			if (!kmapped_page.page || kpos != (pos & bprm_page_mask(bprm))) {
+			if (!kmapped_page.page || kpos != (pos & bprm_copy_mask(bprm))) {
 				struct arg_page page;
 
 				page = get_arg_page(bprm, pos, 1);
@@ -675,7 +681,7 @@ static int copy_strings(int argc, struct user_arg_ptr argv,
 				}
 				kmapped_page = page;
 				kaddr = map_arg_page(kmapped_page);
-				kpos = pos & bprm_page_mask(bprm);
+				kpos = pos & bprm_copy_mask(bprm);
 				flush_arg_page(bprm, kpos, kmapped_page);
 			}
 			if (copy_from_user(kaddr+offset, str, bytes_to_copy)) {
@@ -715,7 +721,7 @@ int copy_string_kernel(const char *arg, struct linux_binprm *bprm)
 
 	while (len > 0) {
 		unsigned int bytes_to_copy = min(len,
-				min_not_zero(pos & ~bprm_page_mask(bprm), bprm_page_size(bprm)));
+				min_not_zero(pos & ~bprm_copy_mask(bprm), bprm_copy_size(bprm)));
 		struct arg_page page;
 
 		pos -= bytes_to_copy;
@@ -725,9 +731,9 @@ int copy_string_kernel(const char *arg, struct linux_binprm *bprm)
 		page = get_arg_page(bprm, pos, 1);
 		if (!page.page)
 			return -E2BIG;
-		flush_arg_page(bprm, pos & bprm_page_mask(bprm), page);
+		flush_arg_page(bprm, pos & bprm_copy_mask(bprm), page);
 		memcpy_to_page(page.page, arg_page_offset(page) +
-			       (pos & ~bprm_page_mask(bprm)), arg, bytes_to_copy);
+			       (pos & ~bprm_copy_mask(bprm)), arg, bytes_to_copy);
 		put_arg_page(page);
 	}
 
@@ -1482,6 +1488,10 @@ void setup_new_exec(struct linux_binprm * bprm)
 
 	arch_pick_mmap_layout(me->mm, &bprm->rlim_stack);
 
+	/* Consume the one-shot request only after committing to the new image. */
+#ifdef CONFIG_ARCH_HAS_USER_PAGE_SIZE
+	me->exec_page_shift = 0;
+#endif
 	arch_setup_new_exec();
 
 	/* Set the new mm task size. We have to do that late because it may
@@ -1781,19 +1791,19 @@ int remove_arg_zero(struct linux_binprm *bprm)
 		return 0;
 
 	do {
-		offset = bprm->p & ~bprm_page_mask(bprm);
+		offset = bprm->p & ~bprm_copy_mask(bprm);
 		page = get_arg_page(bprm, bprm->p, 0);
 		if (!page.page)
 			return -EFAULT;
 		kaddr = map_arg_page(page);
 
-		for (; offset < bprm_page_size(bprm) && kaddr[offset];
+		for (; offset < bprm_copy_size(bprm) && kaddr[offset];
 				offset++, bprm->p++)
 			;
 
 		kunmap_local(kaddr);
 		put_arg_page(page);
-	} while (offset == bprm_page_size(bprm));
+	} while (offset == bprm_copy_size(bprm));
 
 	bprm->p++;
 	bprm->argc--;

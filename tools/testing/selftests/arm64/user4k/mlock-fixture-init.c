@@ -36,7 +36,8 @@ static bool wait_ok(pid_t pid)
 {
 	int status = 0;
 
-	return pid > 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) && !WEXITSTATUS(status);
+	return pid > 0 && waitpid(pid, &status, 0) == pid &&
+	       WIFEXITED(status) && !WEXITSTATUS(status);
 }
 
 static bool remap_locked(unsigned long ps)
@@ -59,7 +60,8 @@ static bool remap_locked(unsigned long ps)
 		ok &= q[i] == (i < 2 * ps ? 0x37 : 0);
 	p = mremap(q, 4 * ps, 3 * ps, 0);
 	if (p == MAP_FAILED)
-		ksft_exit_fail_msg("locked remap shrink: %s\n", strerror(errno));
+		ksft_exit_fail_msg("locked remap shrink: %s\n",
+				   strerror(errno));
 	ok &= locked_kb() == (long)(3 * kb);
 	p[2 * ps] = 0xb6;
 	ok &= !munmap(p + ps, ps) && locked_kb() == (long)(2 * kb);
@@ -88,30 +90,35 @@ static int exercise(void)
 
 	ksft_print_header();
 	ksft_set_plan(9);
-	p = mmap(NULL, 32 * ps, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	p = mmap(NULL, 32 * ps, PROT_READ | PROT_WRITE,
+		 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	if (p == MAP_FAILED || locked_kb() != 0)
 		ksft_exit_fail_msg("initial mapping/accounting\n");
 	ok = !mlock(p + ps + 17, ps - 32) && locked_kb() == (long)kb;
 	ok &= !mincore(p + ps, ps, residency) && residency[0] & 1;
 	p[ps] = 0x51;
-	ksft_test_result(ok, "%luK unaligned mlock uses exactly one user leaf\n", kb);
+	ksft_test_result(
+		ok, "%luK unaligned mlock uses exactly one user leaf\n", kb);
 	ok = !mlock(p + ps, ps) && locked_kb() == (long)kb;
 	ok &= !mlock(p + 2 * ps, ps) && locked_kb() == (long)(2 * kb);
 	ok &= !munlock(p + ps, ps) && locked_kb() == (long)kb;
 	p[2 * ps] = 0x62;
 	errno = 0;
 	ok &= madvise(p + 2 * ps, ps, MADV_PAGEOUT) == -1 && errno == EINVAL &&
-		p[2 * ps] == 0x62;
+	      p[2 * ps] == 0x62;
 	ok &= !munlock(p + 2 * ps, ps) && locked_kb() == 0;
-	ksft_test_result(ok, "%luK repeat lock and independent adjacent unlock\n", kb);
-	ok = !mlock2(p + 4 * ps, 4 * ps, MLOCK_ONFAULT) && locked_kb() == (long)(4 * kb);
+	ksft_test_result(
+		ok, "%luK repeat lock and independent adjacent unlock\n", kb);
+	ok = !mlock2(p + 4 * ps, 4 * ps, MLOCK_ONFAULT) &&
+	     locked_kb() == (long)(4 * kb);
 	ok &= !mincore(p + 4 * ps, 4 * ps, residency);
 	for (unsigned int i = 0; i < 4; i++)
 		ok &= !(residency[i] & 1);
 	p[4 * ps] = 0x74;
 	ok &= !mincore(p + 4 * ps, ps, residency) && residency[0] & 1;
 	ok &= !munlock(p + 4 * ps, 4 * ps) && locked_kb() == 0;
-	ksft_test_result(ok, "%luK MLOCK_ONFAULT accounting and deferred faults\n", kb);
+	ksft_test_result(
+		ok, "%luK MLOCK_ONFAULT accounting and deferred faults\n", kb);
 	q = mmap(NULL, 4 * ps, PROT_READ | PROT_WRITE,
 		 MAP_PRIVATE | MAP_ANONYMOUS | MAP_LOCKED, -1, 0);
 	ok = q != MAP_FAILED && locked_kb() == (long)(4 * kb);
@@ -136,9 +143,12 @@ static int exercise(void)
 	close(gate[1]);
 	ok &= wait_ok(pid) && locked_kb() == (long)(4 * kb);
 	ok &= !munmap(q, 4 * ps) && locked_kb() == 0;
-	ksft_test_result(ok, "%luK MAP_LOCKED, fork noninheritance and parent COW\n", kb);
+	ksft_test_result(
+		ok, "%luK MAP_LOCKED, fork noninheritance and parent COW\n",
+		kb);
 	ok = !mlockall(MCL_FUTURE | MCL_ONFAULT);
-	q = mmap(NULL, ps, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	q = mmap(NULL, ps, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS,
+		 -1, 0);
 	ok &= q != MAP_FAILED && locked_kb() == (long)kb;
 	if (q != MAP_FAILED)
 		*q = 0xaf;
@@ -150,14 +160,18 @@ static int exercise(void)
 	if (!pid) {
 		struct rlimit limit = { ps, ps };
 
-		if (setrlimit(RLIMIT_MEMLOCK, &limit) || setuid(1000) || mlock(p, ps))
+		if (setrlimit(RLIMIT_MEMLOCK, &limit) || setuid(1000) ||
+		    mlock(p, ps))
 			_exit(4);
 		errno = 0;
-		if (mlock(p + ps, ps) != -1 || errno != ENOMEM || locked_kb() != (long)kb)
+		if (mlock(p + ps, ps) != -1 || errno != ENOMEM ||
+		    locked_kb() != (long)kb)
 			_exit(5);
 		_exit(0);
 	}
-	ksft_test_result(wait_ok(pid), "%luK unprivileged RLIMIT_MEMLOCK in user-page units\n", kb);
+	ksft_test_result(
+		wait_ok(pid),
+		"%luK unprivileged RLIMIT_MEMLOCK in user-page units\n", kb);
 	pid = fork();
 	if (!pid) {
 		if (mlockall(MCL_CURRENT) || locked_kb() <= (long)kb ||
@@ -165,20 +179,29 @@ static int exercise(void)
 			_exit(6);
 		_exit(0);
 	}
-	ksft_test_result(wait_ok(pid), "%luK lock/unlock current mappings\n", kb);
+	ksft_test_result(wait_ok(pid), "%luK lock/unlock current mappings\n",
+			 kb);
 	{
 		unsigned long huge = ((1UL << 31) + 1) * ps;
 
-		q = mmap(NULL, huge, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+		q = mmap(NULL, huge, PROT_NONE,
+			 MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
 		ok = q != MAP_FAILED;
 		if (q != MAP_FAILED) {
-			ok &= !mlock2(q, huge, MLOCK_ONFAULT) && locked_kb() == (long)(huge / 1024);
+			ok &= !mlock2(q, huge, MLOCK_ONFAULT) &&
+			      locked_kb() == (long)(huge / 1024);
 			ok &= !munlock(q, huge) && locked_kb() == 0;
 			munmap(q, huge);
 		}
-		ksft_test_result(ok, "%luK deferred lock count beyond signed 32-bit leaves\n", kb);
+		ksft_test_result(
+			ok,
+			"%luK deferred lock count beyond signed 32-bit leaves\n",
+			kb);
 	}
-	ksft_test_result(remap_locked(ps), "%luK locked grow/shrink/move and partial unmap accounting\n", kb);
+	ksft_test_result(
+		remap_locked(ps),
+		"%luK locked grow/shrink/move and partial unmap accounting\n",
+		kb);
 	munmap(p, 32 * ps);
 	ksft_print_cnts();
 	return ksft_get_fail_cnt() ? 1 : 0;
@@ -214,7 +237,8 @@ int main(int argc, char **argv)
 			if (prctl(PR_AURORA_SET_EXEC_PAGE_SIZE, granules[small],
 				  0UL, 0UL, 0UL))
 				_exit(7);
-			execl("/init", "/init", "--test", size, host_size, NULL);
+			execl("/init", "/init", "--test", size, host_size,
+			      NULL);
 			_exit(8);
 		}
 		ok &= wait_ok(pid);

@@ -1225,14 +1225,20 @@ void mm_subpage_get(struct mm_subpage *subpage)
 
 void mm_subpage_put(struct mm_subpage *subpage)
 {
-	struct mm_subpage_pool *pool = subpage->owner->pool;
+	struct mm_subpage_owner *owner = subpage->owner;
+	struct mm_subpage_pool *pool = owner->pool;
+	struct folio *folio = owner->folio;
 	unsigned long flags;
 
-	/* Retire zero-reference state atomically with its used bit. */
+	/*
+	 * Snapshot the backing while our slot reference still retains owner.
+	 * A non-final decrement can race the final put and metadata reclamation;
+	 * only our physical folio reference survives that decrement.
+	 */
 	if (refcount_dec_and_lock_irqsave(&subpage->refs, &pool->lock, &flags))
 		subpage_release_locked(subpage, flags);
 	else
-		folio_put(subpage->owner->folio);
+		folio_put(folio);
 }
 
 void mm_subpage_set_exclusive(struct mm_subpage *subpage)

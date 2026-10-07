@@ -48,7 +48,8 @@ static int advise(void *addr, size_t length, int operation, const char *name)
 	int ret = madvise(addr, length, operation);
 
 	if (ret)
-		printf("# %s failed: errno=%d (%s)\n", name, errno, strerror(errno));
+		printf("# %s failed: errno=%d (%s)\n", name, errno,
+		       strerror(errno));
 	return ret;
 }
 
@@ -63,12 +64,15 @@ static size_t swapped_pages(unsigned char *p, size_t length, size_t page)
 	int fd = open("/proc/self/pagemap", O_RDONLY);
 	size_t i, count = length / page, swapped = 0;
 
-	if (!values || fd < 0 || pread(fd, values, count * sizeof(*values),
-			(uintptr_t)p / page * sizeof(*values)) != (ssize_t)(count * sizeof(*values))) {
+	if (!values || fd < 0 ||
+	    pread(fd, values, count * sizeof(*values),
+		  (uintptr_t)p / page * sizeof(*values)) !=
+		    (ssize_t)(count * sizeof(*values))) {
 		swapped = SIZE_MAX;
 	} else {
 		for (i = 0; i < count; i++)
-			swapped += !!(values[i] & (1ULL << 62)) && !(values[i] & (1ULL << 63));
+			swapped += !!(values[i] & (1ULL << 62)) &&
+				   !(values[i] & (1ULL << 63));
 	}
 	if (fd >= 0)
 		close(fd);
@@ -92,9 +96,11 @@ static void diagnose_resident(unsigned char *p, size_t length, size_t page)
 		native_pfn = (entry & ((1ULL << 55) - 1)) * page / 16384;
 		if (pread(flags, &state, 8, native_pfn * 8) != 8 ||
 		    pread(count, &maps, 8, native_pfn * 8) != 8)
-			printf("# resident metadata read failed: errno=%d\n", errno);
+			printf("# resident metadata read failed: errno=%d\n",
+			       errno);
 		printf("# resident leaf=%zu native_pfn=%#lx flags=%#llx maps=%llu\n",
-		       i, native_pfn, (unsigned long long)state, (unsigned long long)maps);
+		       i, native_pfn, (unsigned long long)state,
+		       (unsigned long long)maps);
 	}
 	close(pm);
 	close(flags);
@@ -135,16 +141,19 @@ static bool swapped_pagemap(unsigned char *p, size_t length, size_t page)
 	if (ok)
 		ok = pread(fd, values, count * sizeof(*values),
 			   (uintptr_t)p / page * sizeof(*values)) ==
-			(ssize_t)(count * sizeof(*values));
+		     (ssize_t)(count * sizeof(*values));
 	for (i = 0; ok && i < count; i++) {
 		uint64_t frame = values[i] & ((1ULL << 55) - 1);
 
-		ok &= !!(values[i] & (1ULL << 62)) && !(values[i] & (1ULL << 63));
+		ok &= !!(values[i] & (1ULL << 62)) &&
+		      !(values[i] & (1ULL << 63));
 		if (page == 4096) {
-			ok &= ((frame >> 5) & 3) == (((uintptr_t)p / page + i) & 3);
+			ok &= ((frame >> 5) & 3) ==
+			      (((uintptr_t)p / page + i) & 3);
 			if (i && (((uintptr_t)p / page + i) & 3))
 				ok &= (values[i] & ((1ULL << 55) - 1)) ==
-					(values[i - 1] & ((1ULL << 55) - 1)) + (1U << 5);
+				      (values[i - 1] & ((1ULL << 55) - 1)) +
+					      (1U << 5);
 		}
 	}
 	if (fd >= 0)
@@ -156,7 +165,8 @@ static bool swapped_pagemap(unsigned char *p, size_t length, size_t page)
 }
 
 static bool check_swap_pss(pid_t pid, void *p, size_t length,
-			   unsigned long expected_swap, unsigned long expected_pss)
+			   unsigned long expected_swap,
+			   unsigned long expected_pss)
 {
 	char path[64], line[512];
 	unsigned long start, end, swap = 0, pss = 0;
@@ -172,7 +182,8 @@ static bool check_swap_pss(pid_t pid, void *p, size_t length,
 		if (sscanf(line, "%lx-%lx", &start, &end) == 2) {
 			if (found)
 				break;
-			found = start == (uintptr_t)p && end == (uintptr_t)p + length;
+			found = start == (uintptr_t)p &&
+				end == (uintptr_t)p + length;
 			continue;
 		}
 		if (!found)
@@ -183,19 +194,22 @@ static bool check_swap_pss(pid_t pid, void *p, size_t length,
 			fields |= 2;
 	}
 	fclose(f);
-	ok = found && fields == 3 && swap == expected_swap && pss == expected_pss;
+	ok = found && fields == 3 && swap == expected_swap &&
+	     pss == expected_pss;
 	if (!ok)
 		printf("# swap stats found=%d fields=%u Swap=%lu/%lu SwapPss=%lu/%lu\n",
 		       found, fields, swap, expected_swap, pss, expected_pss);
 	return ok;
 }
 
-static bool swapped_accounting(unsigned char *p, size_t length, size_t page, bool forked)
+static bool swapped_accounting(unsigned char *p, size_t length, size_t page,
+			       bool forked)
 {
 	int ready[2], go[2], status;
 	pid_t child;
 	char byte;
-	bool ok = check_swap_pss(getpid(), p, length, length / 1024, length / 1024);
+	bool ok = check_swap_pss(getpid(), p, length, length / 1024,
+				 length / 1024);
 
 	if (!forked || !ok)
 		goto out;
@@ -219,16 +233,20 @@ static bool swapped_accounting(unsigned char *p, size_t length, size_t page, boo
 	ok &= check_swap_pss(getpid(), p, length, length / 1024, length / 2048);
 	ok &= check_swap_pss(child, p, length, length / 1024, length / 2048);
 	ok &= write(go[1], "x", 1) == 1 && read(ready[0], &byte, 1) == 1;
-	ok &= check_swap_pss(getpid(), p, length, length / 1024, (length + page) / 2048);
-	ok &= check_swap_pss(child, p, length, (length - page) / 1024, (length - page) / 2048);
+	ok &= check_swap_pss(getpid(), p, length, length / 1024,
+			     (length + page) / 2048);
+	ok &= check_swap_pss(child, p, length, (length - page) / 1024,
+			     (length - page) / 2048);
 	write(go[1], "x", 1);
 	close(go[1]);
 	close(ready[0]);
-	ok &= waitpid(child, &status, 0) == child && WIFEXITED(status) && !WEXITSTATUS(status);
+	ok &= waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+	      !WEXITSTATUS(status);
 	ok &= check_swap_pss(getpid(), p, length, length / 1024, length / 1024);
 out:
 	printf("%s - %zuK SwapPss %s\n", ok ? "ok" : "not ok", page / 1024,
-	       forked ? "fork, one-leaf swap-in/COW and child exit" : "exclusive quarters");
+	       forked ? "fork, one-leaf swap-in/COW and child exit" :
+			"exclusive quarters");
 	return ok;
 }
 
@@ -272,7 +290,8 @@ int main(int argc, char **argv)
 			for (i = 0; i < count; i++)
 				absent += !(vec[i] & 1);
 			after = swapouts();
-			if (after > before && swapped_pages(p, length, page) == count)
+			if (after > before &&
+			    swapped_pages(p, length, page) == count)
 				break;
 			if (tries == 32) {
 				printf("# checking pending remote LRU additions before CPU sweep\n");
@@ -284,7 +303,8 @@ int main(int argc, char **argv)
 			/* PAGEOUT may skip busy folios; establish the full-swap fixture. */
 			usleep(10000);
 			ok &= advise(p, length, MADV_COLD, "retry COLD") == 0;
-			ok &= advise(p, length, MADV_PAGEOUT, "retry PAGEOUT") == 0;
+			ok &= advise(p, length, MADV_PAGEOUT,
+				     "retry PAGEOUT") == 0;
 		}
 		printf("# pageout setup attempts=%u\n", tries + 1);
 		if (tries == 200)
@@ -296,19 +316,22 @@ int main(int argc, char **argv)
 		ok &= swapped_pagemap(p, length, page);
 		ok &= swapped_accounting(p, length, page, round == 1);
 		if (!round)
-			ok &= advise(p + page, page, MADV_WILLNEED, "WILLNEED") == 0;
+			ok &= advise(p + page, page, MADV_WILLNEED,
+				     "WILLNEED") == 0;
 		else {
 			if (round == 3) {
 				ok &= mlock(p, length) == 0;
 				ok &= swapped_pages(p, length, page) == 0;
 			} else {
-				ok &= advise(p, length, MADV_POPULATE_READ, "POPULATE_READ") == 0;
+				ok &= advise(p, length, MADV_POPULATE_READ,
+					     "POPULATE_READ") == 0;
 			}
 			ok &= mincore(p, length, vec) == 0;
 			bad_residency = 0;
 			for (i = 0; i < count; i++)
 				bad_residency += !(vec[i] & 1);
-			printf("# after %s: absent=%zu/%zu\n", round == 3 ? "mlock" : "POPULATE_READ",
+			printf("# after %s: absent=%zu/%zu\n",
+			       round == 3 ? "mlock" : "POPULATE_READ",
 			       bad_residency, count);
 			ok &= bad_residency == 0;
 		}
@@ -321,7 +344,8 @@ int main(int argc, char **argv)
 				if (p[j] != pattern(j, round)) {
 					if (!bad_bytes)
 						printf("# first bad byte at %#zx: got=%#x expected=%#x\n",
-						       j, p[j], pattern(j, round));
+						       j, p[j],
+						       pattern(j, round));
 					bad_bytes++;
 					ok = false;
 				}
@@ -331,7 +355,10 @@ int main(int argc, char **argv)
 		printf("# bad bytes=%zu\n", bad_bytes);
 		printf("%s - %zuK EL0 pageout round %u: pswpout=%lu->%lu VmSwap=%lu->%lu kB absent=%zu/%zu %s\n",
 		       ok ? "ok" : "not ok", page / 1024, round, before, after,
-		       swapped_before, swapped_after, absent, count, round == 3 ? "mlock/readback" : round ? "prefault/readback" : "willneed/readback");
+		       swapped_before, swapped_after, absent, count,
+		       round == 3 ? "mlock/readback" :
+		       round	  ? "prefault/readback" :
+				    "willneed/readback");
 	}
 	munmap(reservation, length + 2 * page);
 	free(vec);

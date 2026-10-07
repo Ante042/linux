@@ -26,7 +26,8 @@ struct aio_ring_header {
 static void check(int good, const char *expression, int line)
 {
 	if (!good) {
-		fprintf(stderr, "FAIL line %d: %s errno=%d\n", line, expression, errno);
+		fprintf(stderr, "FAIL line %d: %s errno=%d\n", line, expression,
+			errno);
 		exit(1);
 	}
 }
@@ -53,9 +54,11 @@ static void complete(aio_context_t context, struct iocb *request,
 	uint64_t notifications;
 
 	CHECK(syscall(SYS_io_getevents, context, 1, 1, &event, &timeout) == 1);
-	CHECK(event.data == request->aio_data && event.obj == (uintptr_t)request);
+	CHECK(event.data == request->aio_data &&
+	      event.obj == (uintptr_t)request);
 	CHECK(event.res == (long long)bytes && event.res2 == 0);
-	CHECK(read(event_fd, &notifications, sizeof(notifications)) == sizeof(notifications));
+	CHECK(read(event_fd, &notifications, sizeof(notifications)) ==
+	      sizeof(notifications));
 	CHECK(notifications == 1);
 }
 
@@ -68,7 +71,7 @@ static void exercise(unsigned long native, unsigned int requested)
 	unsigned char *source, *destination, *reserve, *target;
 	struct aio_ring_header *header;
 	unsigned long ring_size;
-	struct iocb request = {0}, *requests[] = { &request };
+	struct iocb request = { 0 }, *requests[] = { &request };
 	unsigned char residency;
 
 	CHECK(file >= 0 && event_fd >= 0);
@@ -82,9 +85,11 @@ static void exercise(unsigned long native, unsigned int requested)
 		source[page - 19 + i] = i * 17 + i / page;
 	CHECK(!syscall(SYS_io_setup, requested, &context));
 	header = (void *)(uintptr_t)context;
-	CHECK(header->magic == 0xa10a10a1 && header->header_length == sizeof(*header));
+	CHECK(header->magic == 0xa10a10a1 &&
+	      header->header_length == sizeof(*header));
 	CHECK(header->nr >= requested);
-	ring_size = header->header_length + header->nr * sizeof(struct io_event);
+	ring_size =
+		header->header_length + header->nr * sizeof(struct io_event);
 	CHECK(ring_size && !(ring_size % native));
 	reserve = mmap(NULL, ring_size + 4 * native, PROT_READ | PROT_WRITE,
 		       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -143,7 +148,7 @@ int main(int argc, char **argv)
 	}
 	CHECK(getpid() == 1);
 	CHECK(!mount("proc", "/proc", "proc", 0, NULL));
-	unsigned long sizes[] = {4096, 16384, 65536};
+	unsigned long sizes[] = { 4096, 16384, 65536 };
 
 	for (unsigned int i = 0; i < 3; i++) {
 		if (sizes[i] > native)
@@ -155,7 +160,8 @@ int main(int argc, char **argv)
 
 			snprintf(n, sizeof(n), "%lu", native);
 			snprintf(s, sizeof(s), "%lu", sizes[i]);
-			CHECK(!prctl(PR_AURORA_SET_EXEC_PAGE_SIZE, sizes[i], 0UL, 0UL, 0UL));
+			CHECK(!prctl(PR_AURORA_SET_EXEC_PAGE_SIZE, sizes[i],
+				     0UL, 0UL, 0UL));
 			execl("/init", "/init", "--case", n, s, NULL);
 			_exit(2);
 		}
