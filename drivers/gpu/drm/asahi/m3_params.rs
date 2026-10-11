@@ -162,6 +162,15 @@ pub(crate) fn render_stamp_coalesce()->bool {
     M3_RENDER_STAMP_COALESCE.load(Ordering::Relaxed)!=0
 }
 
+/// T6030 cross-engine publications retain GPU ordering with firmware barriers.
+/// Zero preserves the existing host retirement between engine groups.
+static M3_MIXED_BATCH: AtomicU64 = AtomicU64::new(0);
+m3_param!("m3_mixed_batch", M3_MIXED_BATCH,
+    parse_render_stamp_coalesce, 0o644, Some(get_atomic_param));
+pub(crate) fn mixed_batch()->bool {
+    M3_MIXED_BATCH.load(Ordering::Relaxed)!=0
+}
+
 /// Snapshot once per batch. A live change affects later publications, never the
 /// storage, ordering or retirement checks of work already on the firmware queues.
 pub(crate) fn render_batch_size() -> usize {

@@ -36,6 +36,8 @@ pub(crate) struct Compute {
     slot: usize,
     batch_count: usize,
     checkpoint: (u64,u16,usize),
+    /// Firmware-only barrier storage, allocated only for mixed publications.
+    barriers: Option<Buffer>,
     /// The register lists of the SoC's GPU (`m3_soc::Soc::registers`).
     registers: command::RegisterSet,
 }
@@ -99,7 +101,7 @@ impl Compute {
         // the invalidation.
         crate::mem::sync();crate::mem::tlbi_all();crate::mem::sync();
         unsafe {core::arch::asm!("isb",options(nostack,preserves_flags))};
-        Ok(Self {_client_command:client_command.ok_or(EINVAL)?,objects,command_bytes,sequence_bytes,_binding:binding,stats,last_progress_ns:0,sequence:1,head:1,cached_views:KVec::new(),slot:0,batch_count:1,checkpoint:(0,0,0),registers})
+        Ok(Self {_client_command:client_command.ok_or(EINVAL)?,objects,command_bytes,sequence_bytes,_binding:binding,stats,last_progress_ns:0,sequence:1,head:1,cached_views:KVec::new(),slot:0,batch_count:1,checkpoint:(0,0,0),barriers:None,registers})
     }
     fn encode_command(objects: &mut [Buffer], bytes: &mut [u8], context: u32,
         control: crate::agx_compute::Control, sequence: u64, slot: usize,
@@ -273,6 +275,43 @@ impl Compute {
         agx_memory::publish();Ok(())
     }
     fn stamp(&self) -> u32 { timeline::stamp(0xc1000000,self.sequence) }
+    pub(crate) fn completion_dependency(&self)->Result<crate::m3_sync_layout::CompletionDependency> {
+        Ok(crate::m3_sync_layout::CompletionDependency {
+            stamp:queue::FirmwareVa::new(self.objects[storage::FW_STAMP].va()).map_err(|_|EINVAL)?,
+            value:self.stamp(),event:2,
+        })
+    }
+    pub(crate) fn reserve_barriers(&mut self,dev:&driver::AsahiDevice,uat:&mmu::Uat)->Result {
+        if self.barriers.is_none() {
+            self.barriers=Some(Buffer::at(dev,uat.kernel_vm(),None,None,storage::SLOTS*64,false)?);
+        }
+        Ok(())
+    }
+    /// Insert a dependency before the last appended, still unpublished CDM.
+    /// Its command ordinal and timestamp slot are unchanged; only the ring
+    /// gains an entry. The whole batch must retire before this storage is reused.
+    pub(crate) fn insert_dependency(&mut self,dependency:crate::m3_sync_layout::CompletionDependency)->Result {
+        if self.batch_count==0 || self.slot>=storage::SLOTS || dependency.event!=1 {
+            return Err(EINVAL);
+        }
+        let value=self.stamp();
+        let barriers=self.barriers.as_mut().ok_or(EINVAL)?;
+        let offset=self.slot*64;
+        let mut bytes=[0;crate::m3_sync_layout::BARRIER_SIZE];
+        crate::m3_sync_layout::Barrier {
+            stamp:dependency.stamp,wait_value:dependency.value,event:dependency.event,
+            self_value:value,uuid:0xc10000,dependency:crate::m3_sync_layout::Dependency::PreviousPass,
+        }.encode(&mut bytes).map_err(|_|EINVAL)?;
+        barriers.write(offset,&bytes)?;
+        let address=barriers.va()+offset as u64;
+        let (slots,next)=queue::insert_before_last(self.head,queue::QUALIFIED_CAPACITY).map_err(|_|EINVAL)?;
+        let command=self.objects[storage::COMMAND].va()+self.offset(storage::COMMAND)? as u64;
+        self.objects[storage::RING].u64(usize::from(slots[0])*8,address)?;
+        self.objects[storage::RING].u64(usize::from(slots[1])*8,command)?;
+        self.head=next;
+        self.objects[storage::QUEUE_STATE].u32(queue::WRITE,u32::from(self.head))?;
+        agx_memory::publish();crate::mem::sync();Ok(())
+    }
     pub(crate) fn gpu_ns(&mut self)->Result<u64> {
         let mut total=0;
         for slot in 0..self.batch_count {total+=self.slot_gpu_ns(slot)?;}

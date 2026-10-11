@@ -189,7 +189,8 @@ impl Render {
     // Construct synchronization from the actual owners after resetting a pass,
     // before publishing its ring entries. InitBM is shared and dispatched only
     // for draw one; rewriting its bytes after retirement preserves the old path.
-    fn prepare_sync(&mut self, early: bool, draw: u64) -> Result {
+    fn prepare_sync(&mut self, early: bool, draw: u64,
+        predecessor:Option<sync::CompletionDependency>) -> Result {
         let address = |owner: usize| queue::FirmwareVa::new(self.objects[owner].va()).map_err(|_| EINVAL);
         let manager = address(BUFFER_MANAGER)?;
         let ta_stamp = address(s::TA_FW_STAMP)?;
@@ -201,13 +202,17 @@ impl Render {
         self.init_bm.write(0, &init)?;
         let ta_value = timeline::stamp(s::STAMP_TA - 256, draw);
         let fs_value = timeline::stamp(s::STAMP_FRAGMENT - 256, draw);
+        let previous=predecessor.unwrap_or(sync::CompletionDependency {
+            stamp:if early {ta_stamp} else {fs_stamp},
+            value:timeline::stamp((if early {s::STAMP_TA} else {s::STAMP_FRAGMENT})-256,draw-1),
+            event:u32::from(!early),
+        });
         self.write_barrier(P::TilerToFragment, sync::Barrier {
             stamp: ta_stamp, wait_value: ta_value, event: 0, self_value: fs_value,
             uuid: 0x3d0000, dependency: sync::Dependency::TilerToFragment })?;
         self.write_barrier(P::TilerDependency, sync::Barrier {
-            stamp: if early { ta_stamp } else { fs_stamp },
-            wait_value: timeline::stamp((if early {s::STAMP_TA} else {s::STAMP_FRAGMENT}) - 256, draw - 1),
-            event: u32::from(!early), self_value: ta_value,
+            stamp: previous.stamp, wait_value: previous.value,
+            event: previous.event, self_value: ta_value,
             uuid: DEPENDENCY_UUID, dependency: sync::Dependency::PreviousPass })?;
         self.write_barrier(P::FragmentDependency, sync::Barrier {
             stamp: fs_stamp, wait_value: timeline::stamp(s::STAMP_FRAGMENT - 256, draw - 1), event: 1, self_value: fs_value,
@@ -501,6 +506,17 @@ impl Render {
     /// Each append selects disjoint host-mutated pass storage. A TA dependency
     /// retains full fragment-to-next-TA ordering for arbitrary resource hazards.
     pub(crate) fn append(&mut self,r:agx_uapi::UapiRenderCommand,usc:u64,coalesce_stamps:bool)->Result {
+        self.append_after(r,usc,coalesce_stamps,None)
+    }
+    pub(crate) fn completion_dependency(&self)->Result<sync::CompletionDependency> {
+        Ok(sync::CompletionDependency {
+            stamp:queue::FirmwareVa::new(self.objects[s::FRAGMENT_FW_STAMP].va()).map_err(|_|EINVAL)?,
+            value:timeline::stamp(s::STAMP_FRAGMENT-256,self.draw),event:1,
+        })
+    }
+    pub(crate) fn append_after(&mut self,r:agx_uapi::UapiRenderCommand,usc:u64,
+        coalesce_stamps:bool,predecessor:Option<sync::CompletionDependency>)->Result {
+        if predecessor.is_some_and(|p|p.event!=2) {return Err(EINVAL);}
         if self.batch_count>=pass_layout::SLOTS {
             pr_err!("M3 render batch limit: batch={} slots={}\n",
                 self.batch_count,pass_layout::SLOTS);
@@ -510,7 +526,7 @@ impl Render {
         // Retain the conservative stage-scope permission. Only a pass after the
         // first of its batch may overlap its predecessor's stages. Explicit
         // start timestamps keep the original full-order execution boundary.
-        let early=self.batch_count>0 && *crate::module_parameters::m3_early_tiling.value()!=0
+        let early=predecessor.is_none() && self.batch_count>0 && *crate::module_parameters::m3_early_tiling.value()!=0
             && r.flags&(1<<5)!=0 && r.vertex_timestamps.start.handle==0
             && r.fragment_timestamps.start.handle==0;
         if early {self.early_count+=1;}
@@ -538,7 +554,7 @@ impl Render {
         self.patch_context()?;
         self.prepare_fragment(r,usc,draw)?;
         self.prepare_sequences(draw)?;
-        self.prepare_sync(early, draw)?;
+        self.prepare_sync(early, draw, predecessor)?;
         // Encode before either ring WRITE exposes the command to firmware.
         // The caller retains every pass owner until the final flushed stamps,
         // queues, events and engine-idle checks retire this entire batch.
