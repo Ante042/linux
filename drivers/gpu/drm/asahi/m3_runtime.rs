@@ -21,6 +21,7 @@ struct Batch {
     base: usize, last_draw: u64, publication_tick:u64,
     polling_ns: i64, polls: u64, stamp_ns: i64, first_event_ns: i64, events_ns: i64,
     completion_ns: [i64;4],
+    coalesced_stamps: u64,
 }
 #[derive(Clone, Copy, Default)]
 struct GeometryTiming {
@@ -58,6 +59,7 @@ struct Inner {
     boot_step: crate::t8122_start::BootStep,
     /// Packets that joined a batch started by an earlier packet (debug summary).
     coalesced_packets: u64,
+    coalesced_render_stamps: u64,
     /// Recent measured render GPU time per pass by VM. Smoothed over batches;
     /// replacing the least recently measured VM does not retain its mappings.
     pass_cost: policy::PassCosts,
@@ -366,15 +368,22 @@ impl Inner {
                 return Err(early(error));
             }
         }
+        let mut coalesced_stamps=0;
+        let coalesce_render=crate::m3_params::render_stamp_coalesce();
+        let chip=self.device.soc().chip_id;
         if let NativeJob::Render(j)=&mut self.jobs[index] {
             let mut commands=KVec::with_capacity(batch_count,GFP_KERNEL).map_err(|_|early(ENOMEM))?;
             for (p,next) in entries {commands.push(p.commands[*next],GFP_KERNEL).map_err(|_|early(ENOMEM))?;}
             j.begin_batch(&self.drm,&self.uat,&packet.vm,&commands,base,overlap).map_err(early)?;
             let prepared=(||->Result {
-                for (p,next) in entries {
+                for (slot,(p,next)) in entries.iter().enumerate() {
                     let crate::m3_submit::Command::Render{command,usc}=p.commands[*next] else {return Err(EINVAL);};
-                    j.append(command,usc)?;
-                    j.set_user_timestamps(p.render_timestamp_addresses(*next))?;
+                    let timestamps=p.render_timestamp_addresses(*next);
+                    let coalesce=policy::coalesce_render_stamps(coalesce_render,chip,
+                        overlap,slot,batch_count,timestamps);
+                    j.append(command,usc,coalesce)?;
+                    j.set_user_timestamps(timestamps)?;
+                    coalesced_stamps+=u64::from(coalesce);
                 }
                 Ok(())
             })();
@@ -414,7 +423,7 @@ impl Inner {
         Ok(Batch { entries:owned, index, kind:usize::from(matches!(control,crate::m3_submit::Command::Compute(_))),
             first:control, preparation_ns, previous_events, expected_events,
             start:Instant::<Monotonic>::now(), measure, doorbell_counter_ns:if measure {physical_counter() as i64 * 1000 / 24} else {0},
-            polling_ns:0, polls:0, stamp_ns:-1, first_event_ns:-1, events_ns:-1, completion_ns:[-1;4], base, last_draw, publication_tick })
+            polling_ns:0, polls:0, stamp_ns:-1, first_event_ns:-1, events_ns:-1, completion_ns:[-1;4], coalesced_stamps, base, last_draw, publication_tick })
     }
     /// Check the active batch once. Ok(true): retired (its packets are signalled).
     fn poll_active(&mut self)->Result<bool> {
@@ -544,6 +553,14 @@ impl Inner {
         };
         if kind==0 {
             self.render_batches[batch_count-1]+=1;
+            if batch.measure && batch.coalesced_stamps>0 && self.coalesced_render_stamps==0 {
+                if let NativeJob::Render(j)=&mut self.jobs[index] {
+                    let masks=j.stamp_flush_masks(batch.base,batch_count)?;
+                    dev_info!(self.drm.as_ref(),"M3_RENDER_STAMP_FLUSH vm={} batch={} ta_mask={:#x} fs_mask={:#x} coalesced={}\n",
+                        batch.entries[0].0.vm.id(),batch_count,masks[0],masks[1],batch.coalesced_stamps);
+                }
+            }
+            self.coalesced_render_stamps+=batch.coalesced_stamps;
             let vm=batch.entries[0].0.vm.id();
             self.pass_cost.record(vm,gpu_ns/batch_count as u64);
             self.render_initialized=true;
@@ -627,7 +644,7 @@ impl Inner {
         if kind==0 && t[0]%512==0 &&
             crate::debug::debug_enabled(crate::debug::DebugFlags::M3SubmitSummary) {
             let early=match &self.jobs[index] {NativeJob::Render(j)=>j.early_count(),_=>0};
-            dev_info!(self.drm.as_ref(),"M3_ORDERED_BATCHES depths={:?} early={} packets={}\n", self.render_batches,early,self.coalesced_packets);
+            dev_info!(self.drm.as_ref(),"M3_ORDERED_BATCHES depths={:?} early={} packets={} coalesced_stamps={}\n", self.render_batches,early,self.coalesced_packets,self.coalesced_render_stamps);
             let now=<Monotonic as kernel::time::ClockSource>::ktime_get();
             dev_info!(self.drm.as_ref(),"M3_GEOMETRY_BATCH ns={} render_count={} overflow={}\n",
                 now,t[0],self.geometry_overflow);
@@ -704,7 +721,7 @@ impl Runtime {
         };
         Ok(Self { inner: ManuallyDrop::new(owner.write(Inner { transport, state, config, uat, drm, device,
             jobs:KVec::new(),packets:KVec::new(),pending:KVec::new(),active:KVec::new(),gpu_pending:false,fault_captured:false,timing:[[0;7];2],render_batches:[0;crate::m3_pass_layout::SLOTS],
-            geometry:[GeometryTiming::default();32],geometry_overflow:0,coalesced_packets:0,pass_cost:policy::PassCosts::default(),render_initialized:false,t8122_verdict:false,
+            geometry:[GeometryTiming::default();32],geometry_overflow:0,coalesced_packets:0,coalesced_render_stamps:0,pass_cost:policy::PassCosts::default(),render_initialized:false,t8122_verdict:false,
             boot_step:crate::t8122_start::BootStep::Publish })) })
     }
     pub(crate) fn drm(&self) -> driver::AsahiDevRef { self.inner.drm.clone() }

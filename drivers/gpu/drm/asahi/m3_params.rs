@@ -149,6 +149,19 @@ static M3_RENDER_BATCH_OVERRIDE: AtomicU64 = AtomicU64::new(0);
 m3_param!("m3_render_batch_override", M3_RENDER_BATCH_OVERRIDE,
     parse_render_batch_override, 0o644, Some(get_atomic_param));
 
+fn parse_render_stamp_coalesce(text:&str)->Option<u64> {
+    parse_u64(text).filter(|value| *value<=1)
+}
+
+/// Root-only T6030 render stamp-flush coalescing; zero retains per-pass flushes.
+/// Each publication snapshots the setting before encoding any pass.
+static M3_RENDER_STAMP_COALESCE: AtomicU64 = AtomicU64::new(0);
+m3_param!("m3_render_stamp_coalesce", M3_RENDER_STAMP_COALESCE,
+    parse_render_stamp_coalesce, 0o644, Some(get_atomic_param));
+pub(crate) fn render_stamp_coalesce()->bool {
+    M3_RENDER_STAMP_COALESCE.load(Ordering::Relaxed)!=0
+}
+
 /// Snapshot once per batch. A live change affects later publications, never the
 /// storage, ordering or retirement checks of work already on the firmware queues.
 pub(crate) fn render_batch_size() -> usize {

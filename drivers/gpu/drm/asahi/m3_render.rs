@@ -500,7 +500,7 @@ impl Render {
     /// are immediately visible to running firmware, even before a new doorbell.
     /// Each append selects disjoint host-mutated pass storage. A TA dependency
     /// retains full fragment-to-next-TA ordering for arbitrary resource hazards.
-    pub(crate) fn append(&mut self,r:agx_uapi::UapiRenderCommand,usc:u64)->Result {
+    pub(crate) fn append(&mut self,r:agx_uapi::UapiRenderCommand,usc:u64,coalesce_stamps:bool)->Result {
         if self.batch_count>=pass_layout::SLOTS {
             pr_err!("M3 render batch limit: batch={} slots={}\n",
                 self.batch_count,pass_layout::SLOTS);
@@ -539,6 +539,13 @@ impl Render {
         self.prepare_fragment(r,usc,draw)?;
         self.prepare_sequences(draw)?;
         self.prepare_sync(early, draw)?;
+        // Encode before either ring WRITE exposes the command to firmware.
+        // The caller retains every pass owner until the final flushed stamps,
+        // queues, events and engine-idle checks retire this entire batch.
+        if coalesce_stamps {
+            self.passes[self.slot].get_mut(P::TilerCommand).u32(tiler::FLUSH_STAMPS,0)?;
+            self.passes[self.slot].get_mut(P::FragmentCommand).u32(fragment::FLUSH_STAMPS,0)?;
+        }
         let dep=P::TilerDependency;
         let fs_dep=P::FragmentDependency;
         let ta=self.passes[self.slot].get_mut(P::TilerCommand).va();
@@ -585,6 +592,19 @@ impl Render {
         Ok(())
     }
     pub(crate) fn queues(&self)->[u64;2] {[self.objects[s::TA_QUEUE].va(),self.objects[s::FRAGMENT_QUEUE].va()]}
+    /// Read retained command bytes only after exact batch retirement.
+    pub(crate) fn stamp_flush_masks(&mut self,base:usize,count:usize)->Result<[u16;2]> {
+        if base>=pass_layout::SLOTS || count==0 || count>pass_layout::SLOTS {return Err(EINVAL);}
+        let mut masks=[0;2];
+        for slot in 0..count {
+            let pass=&mut self.passes[Self::at(base,slot)];
+            for (stage,field,offset) in [(0,P::TilerCommand,tiler::FLUSH_STAMPS),
+                (1,P::FragmentCommand,fragment::FLUSH_STAMPS)] {
+                if pass.get_mut(field).read_u32(offset)?!=0 {masks[stage]|=1u16<<slot;}
+            }
+        }
+        Ok(masks)
+    }
     /// Observe each completion condition across both render queues independently.
     pub(crate) fn completion_parts(&mut self)->Result<[bool;4]> {
         let mut done=[true;4];
