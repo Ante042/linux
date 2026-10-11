@@ -276,7 +276,7 @@ impl Render {
                 sequence::Fragment{owners,scratch,queue_command_count:timeline::previous(draw)}.encode_timestamps(&mut self.sequence_bytes,timed).map_err(|_|EINVAL)?
             }else{sequence::Tiler{owners,scratch:fw(P::TilerScratch)?}.encode_timestamps(&mut self.sequence_bytes,timed).map_err(|_|EINVAL)?};
             self.passes[self.slot].get_mut(target).write(0,&self.sequence_bytes)?;
-            self.passes[self.slot].get_mut(if fs{P::FragmentCommand}else{P::TilerCommand}).u32(0x1c,length as u32)?;
+            self.passes[self.slot].get_mut(if fs{P::FragmentCommand}else{P::TilerCommand}).u32(sequence::command_length_offset(fs),length as u32)?;
         }
         Ok(())
     }

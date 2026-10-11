@@ -38,6 +38,11 @@ pub(crate) mod fragment {
 }
 fn word(out: &mut [u8], off: usize, value: u32) { out[off..off+4].copy_from_slice(&value.to_le_bytes()); }
 fn pointer(out: &mut [u8], off: usize, value: u64) { out[off..off+8].copy_from_slice(&value.to_le_bytes()); }
+/// The stage's work command owns its sequence-length field.
+pub(crate) fn command_length_offset(fragment:bool)->usize {
+    if fragment {crate::m3_fragment_command::SEQUENCE_LENGTH}
+    else {crate::m3_tiler_command::SEQUENCE_LENGTH}
+}
 /// Omit measurement packets while retaining engine-idle, finalization and End.
 /// Finalize's relative restart displacement follows its compacted location.
 fn without_timestamps(out:&mut[u8],start:usize,finalize:usize,length:usize,restart:usize)->usize {
