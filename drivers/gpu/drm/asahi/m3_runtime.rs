@@ -383,6 +383,7 @@ impl Inner {
         }
         let mut coalesced_stamps=0;
         let coalesce_render=crate::m3_params::render_stamp_coalesce();
+        let internal_timestamps=crate::m3_params::render_internal_timestamps();
         let chip=self.device.soc().chip_id;
         if let NativeJob::Render(j)=&mut self.jobs[index] {
             let mut commands=KVec::with_capacity(batch_count,GFP_KERNEL).map_err(|_|early(ENOMEM))?;
@@ -394,7 +395,8 @@ impl Inner {
                     let timestamps=p.render_timestamp_addresses(*next);
                     let coalesce=policy::coalesce_render_stamps(coalesce_render,chip,
                         overlap,slot,batch_count,timestamps);
-                    j.append(command,usc,coalesce)?;
+                    let timed=timestamps.map(|pair|policy::stage_timestamps(internal_timestamps,chip,pair));
+                    j.append(command,usc,coalesce,timed)?;
                     j.set_user_timestamps(timestamps)?;
                     coalesced_stamps+=u64::from(coalesce);
                 }
@@ -449,6 +451,7 @@ impl Inner {
         let packet=&entries[0].0;
         if entries.iter().any(|(p,_)|!Arc::ptr_eq(packet,p)) {return Err(early(EINVAL));}
         let prepare=Instant::<Monotonic>::now();
+        let internal_timestamps=crate::m3_params::render_internal_timestamps();
         self.active.reserve(1,GFP_KERNEL).map_err(|_|early(ENOMEM))?;
         self.jobs.reserve(1,GFP_KERNEL).map_err(|_|early(ENOMEM))?;
         self.packets.reserve(1,GFP_KERNEL).map_err(|_|early(ENOMEM))?;
@@ -498,8 +501,10 @@ impl Inner {
                     crate::m3_submit::Command::Render{command,usc}=>{
                         let predecessor=previous.filter(|(render,_)|!*render).map(|(_,d)|d);
                         let NativeJob::Render(j)=&mut self.jobs[index] else {return Err(EINVAL);};
-                        j.append_after(command,usc,false,predecessor)?;
-                        j.set_user_timestamps(p.render_timestamp_addresses(*i))?;
+                        let timestamps=p.render_timestamp_addresses(*i);
+                        let timed=timestamps.map(|pair|policy::stage_timestamps(internal_timestamps,self.device.soc().chip_id,pair));
+                        j.append_after(command,usc,false,predecessor,timed)?;
+                        j.set_user_timestamps(timestamps)?;
                         dependencies+=usize::from(predecessor.is_some());
                         previous=Some((true,j.completion_dependency()?));
                     },

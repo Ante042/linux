@@ -171,6 +171,15 @@ pub(crate) fn mixed_batch()->bool {
     M3_MIXED_BATCH.load(Ordering::Relaxed)!=0
 }
 
+/// One preserves internal render measurements. Application timestamp requests
+/// remain recorded when zero omits measurements on T6030.
+static M3_RENDER_INTERNAL_TIMESTAMPS: AtomicU64 = AtomicU64::new(1);
+m3_param!("m3_render_internal_timestamps", M3_RENDER_INTERNAL_TIMESTAMPS,
+    parse_render_stamp_coalesce, 0o644, Some(get_atomic_param));
+pub(crate) fn render_internal_timestamps()->bool {
+    M3_RENDER_INTERNAL_TIMESTAMPS.load(Ordering::Relaxed)!=0
+}
+
 /// Snapshot once per batch. A live change affects later publications, never the
 /// storage, ordering or retirement checks of work already on the firmware queues.
 pub(crate) fn render_batch_size() -> usize {

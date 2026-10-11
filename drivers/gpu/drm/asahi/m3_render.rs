@@ -30,6 +30,8 @@ pub(crate) struct Render {
     last_progress_ns:i64,
     draw:u64, heads:[u16;2], cached_views:KVec<CachedViews>,
     slot:usize, batch_count:usize, early_count:u32,
+    /// Measurement packets in the pass most recently appended to its queues.
+    stage_timestamps:[bool;2],
     /// First pass slot of the current batch; its passes use base..base+batch_count mod SLOTS.
     base:usize,
     checkpoint:(u64,[u16;2],usize,usize,u32,usize),
@@ -89,7 +91,7 @@ impl Render {
         tiler_bytes.resize(tiler::SIZE,0u8,GFP_KERNEL)?;
         let mut fragment_bytes=KVec::new();
         fragment_bytes.resize(fragment::SIZE,0u8,GFP_KERNEL)?;
-        let mut job=Self{passes,init_bm,stats,sequence_bytes,tiler_bytes,fragment_bytes,objects,_aliases:aliases,_binding:binding,last_progress_ns:0,draw:0,heads:[0;2],cached_views:KVec::new(),slot:0,batch_count:0,early_count:0,base:0,checkpoint:(0,[0;2],0,0,0,0),clusters,registers};
+        let mut job=Self{passes,init_bm,stats,sequence_bytes,tiler_bytes,fragment_bytes,objects,_aliases:aliases,_binding:binding,last_progress_ns:0,draw:0,heads:[0;2],cached_views:KVec::new(),slot:0,batch_count:0,early_count:0,stage_timestamps:[true;2],base:0,checkpoint:(0,[0;2],0,0,0,0),clusters,registers};
         // Lists and the matching manager are built before InitBM publication.
         job.initialize_parameter_buffer()?;
         for pool in &UMA_POOLS { pool.initialize(&mut job.objects)?; }
@@ -267,12 +269,14 @@ impl Render {
                 fw_stamp:shared(if fs{s::FRAGMENT_FW_STAMP}else{s::TA_FW_STAMP})?,
                 context:self._binding.slot(),stamp:timeline::stamp((if fs{s::STAMP_FRAGMENT}else{s::STAMP_TA}) - 256, draw),
             };
-            if fs {
+            let timed=self.stage_timestamps[usize::from(fs)];
+            let length=if fs {
                 let b=pass.get(P::FragmentScratch);
                 let scratch=GpuRegion::new(b.gpu_va()?,b.size()).map_err(|_|EINVAL)?;
-                sequence::Fragment{owners,scratch,queue_command_count:timeline::previous(draw)}.encode(&mut self.sequence_bytes).map_err(|_|EINVAL)?;
-            }else{sequence::Tiler{owners,scratch:fw(P::TilerScratch)?}.encode(&mut self.sequence_bytes).map_err(|_|EINVAL)?;}
+                sequence::Fragment{owners,scratch,queue_command_count:timeline::previous(draw)}.encode_timestamps(&mut self.sequence_bytes,timed).map_err(|_|EINVAL)?
+            }else{sequence::Tiler{owners,scratch:fw(P::TilerScratch)?}.encode_timestamps(&mut self.sequence_bytes,timed).map_err(|_|EINVAL)?};
             self.passes[self.slot].get_mut(target).write(0,&self.sequence_bytes)?;
+            self.passes[self.slot].get_mut(if fs{P::FragmentCommand}else{P::TilerCommand}).u32(0x1c,length as u32)?;
         }
         Ok(())
     }
@@ -338,11 +342,13 @@ impl Render {
         self.passes[self.slot].get_mut(P::FragmentCommand).write(0,&self.fragment_bytes)
     }
     pub(crate) fn set_user_timestamps(&mut self,addresses:[[u64;2];2])->Result {
+        if addresses.iter().enumerate().any(|(stage,pair)|*pair!=[0;2] && !self.stage_timestamps[stage]) {return Err(EINVAL);}
         for (stage,(command,sequence,offset,start,end)) in [
             (P::TilerCommand,P::TilerSequence,sequence::ta::USER_PAIR,sequence::ta::TIMESTAMP_START,sequence::ta::TIMESTAMP_END),
             (P::FragmentCommand,P::FragmentSequence,sequence::fragment::USER_PAIR,sequence::fragment::TIMESTAMP_START,sequence::fragment::TIMESTAMP_END)
         ].into_iter().enumerate() {
             let pair=addresses[stage];
+            if !self.stage_timestamps[stage] {continue;}
             self.passes[self.slot].get_mut(command).u64(offset,pair[0])?;
             self.passes[self.slot].get_mut(command).u64(offset+8,pair[1])?;
             let pointer=if pair==[0,0] {0} else {self.passes[self.slot].get_mut(command).va()+offset as u64};
@@ -505,8 +511,8 @@ impl Render {
     /// are immediately visible to running firmware, even before a new doorbell.
     /// Each append selects disjoint host-mutated pass storage. A TA dependency
     /// retains full fragment-to-next-TA ordering for arbitrary resource hazards.
-    pub(crate) fn append(&mut self,r:agx_uapi::UapiRenderCommand,usc:u64,coalesce_stamps:bool)->Result {
-        self.append_after(r,usc,coalesce_stamps,None)
+    pub(crate) fn append(&mut self,r:agx_uapi::UapiRenderCommand,usc:u64,coalesce_stamps:bool,timestamps:[bool;2])->Result {
+        self.append_after(r,usc,coalesce_stamps,None,timestamps)
     }
     pub(crate) fn completion_dependency(&self)->Result<sync::CompletionDependency> {
         Ok(sync::CompletionDependency {
@@ -515,7 +521,7 @@ impl Render {
         })
     }
     pub(crate) fn append_after(&mut self,r:agx_uapi::UapiRenderCommand,usc:u64,
-        coalesce_stamps:bool,predecessor:Option<sync::CompletionDependency>)->Result {
+        coalesce_stamps:bool,predecessor:Option<sync::CompletionDependency>,timestamps:[bool;2])->Result {
         if predecessor.is_some_and(|p|p.event!=2) {return Err(EINVAL);}
         if self.batch_count>=pass_layout::SLOTS {
             pr_err!("M3 render batch limit: batch={} slots={}\n",
@@ -523,6 +529,7 @@ impl Render {
             return Err(E2BIG);
         }
         self.slot=Self::at(self.base,self.batch_count);
+        self.stage_timestamps=timestamps;
         // Retain the conservative stage-scope permission. Only a pass after the
         // first of its batch may overlap its predecessor's stages. Explicit
         // start timestamps keep the original full-order execution boundary.
