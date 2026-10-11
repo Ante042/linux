@@ -585,6 +585,18 @@ impl Render {
         Ok(())
     }
     pub(crate) fn queues(&self)->[u64;2] {[self.objects[s::TA_QUEUE].va(),self.objects[s::FRAGMENT_QUEUE].va()]}
+    /// Observe each completion condition across both render queues independently.
+    pub(crate) fn completion_parts(&mut self)->Result<[bool;4]> {
+        let mut done=[true;4];
+        for (stamp,fw,pointers,value,head) in [(s::TA_STAMP,s::TA_FW_STAMP,s::TA_POINTERS,timeline::stamp(s::STAMP_TA - 256, self.draw),self.heads[0]),
+            (s::FRAGMENT_STAMP,s::FRAGMENT_FW_STAMP,s::FRAGMENT_POINTERS,timeline::stamp(s::STAMP_FRAGMENT - 256, self.draw),self.heads[1])] {
+            done[0]&=self.objects[stamp].read_u32(0)?==value;
+            done[1]&=self.objects[fw].read_u32(0)?==value;
+            done[2]&=self.objects[pointers].read_u32(queue::DONE)?==u32::from(head);
+            done[3]&=self.objects[pointers].read_u32(queue::READ)?==u32::from(head);
+        }
+        Ok(done)
+    }
     pub(crate) fn complete(&mut self)->Result<bool> {
         for (stamp,fw,pointers,value,head) in [(s::TA_STAMP,s::TA_FW_STAMP,s::TA_POINTERS,timeline::stamp(s::STAMP_TA - 256, self.draw),self.heads[0]),
             (s::FRAGMENT_STAMP,s::FRAGMENT_FW_STAMP,s::FRAGMENT_POINTERS,timeline::stamp(s::STAMP_FRAGMENT - 256, self.draw),self.heads[1])] {

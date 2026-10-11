@@ -20,6 +20,7 @@ struct Batch {
     /// Render: first pass slot and the batch's last draw number.
     base: usize, last_draw: u64, publication_tick:u64,
     polling_ns: i64, polls: u64, stamp_ns: i64, first_event_ns: i64, events_ns: i64,
+    completion_ns: [i64;4],
 }
 #[derive(Clone, Copy, Default)]
 struct GeometryTiming {
@@ -28,6 +29,7 @@ struct GeometryTiming {
     tiling_ns: u64, fragment_ns: u64, max_fragment_ns: u64,
     polling_ns: i64, retirement_ns: i64, sleeping_ns: i64, polls: u64,
     stamp_ns:i64, first_event_ns:i64, events_ns:i64, pickup_ns:i64, tail_ns:i64,
+    completion_ns: [i64;4],
 }
 impl NativeJob {
     fn complete(&mut self)->Result<bool> {match self {Self::Compute(j)=>j.complete(),Self::Render(j)=>j.complete()}}
@@ -412,7 +414,7 @@ impl Inner {
         Ok(Batch { entries:owned, index, kind:usize::from(matches!(control,crate::m3_submit::Command::Compute(_))),
             first:control, preparation_ns, previous_events, expected_events,
             start:Instant::<Monotonic>::now(), measure, doorbell_counter_ns:if measure {physical_counter() as i64 * 1000 / 24} else {0},
-            polling_ns:0, polls:0, stamp_ns:-1, first_event_ns:-1, events_ns:-1, base, last_draw, publication_tick })
+            polling_ns:0, polls:0, stamp_ns:-1, first_event_ns:-1, events_ns:-1, completion_ns:[-1;4], base, last_draw, publication_tick })
     }
     /// Check the active batch once. Ok(true): retired (its packets are signalled).
     fn poll_active(&mut self)->Result<bool> {
@@ -447,6 +449,14 @@ impl Inner {
             }
         }
         let stamped=match self.jobs[index].complete() {Ok(v)=>v,Err(e)=>{self.fail_active(e);return Err(e);}};
+        let completion_parts=if measure {
+            match &mut self.jobs[index] {
+                NativeJob::Render(j)=>Some(if stamped {[true;4]} else {
+                    match j.completion_parts() {Ok(v)=>v,Err(e)=>{self.fail_active(e);return Err(e);}}
+                }),
+                _=>None,
+            }
+        } else {None};
         let completed=self.config.completed_events;
         let (evented,expired,previous)={
             let batch=self.active.first_mut().ok_or(EIO)?;
@@ -454,6 +464,11 @@ impl Inner {
             if batch.measure {
                 let at=batch.start.elapsed().as_nanos();
                 if stamped && batch.stamp_ns<0 {batch.stamp_ns=at;}
+                if let Some(parts)=completion_parts {
+                    for (part,done) in parts.iter().enumerate() {
+                        if *done && batch.completion_ns[part]<0 {batch.completion_ns[part]=at;}
+                    }
+                }
                 if completed>batch.previous_events && batch.first_event_ns<0 {batch.first_event_ns=at;}
                 if evented && batch.events_ns<0 {batch.events_ns=at;}
             }
@@ -575,6 +590,7 @@ impl Inner {
                     g.polling_ns+=batch.polling_ns;g.retirement_ns+=retirement_ns;
                     g.polls+=batch.polls;
                     g.stamp_ns+=batch.stamp_ns;g.first_event_ns+=batch.first_event_ns;g.events_ns+=batch.events_ns;
+                    for (total,observed) in g.completion_ns.iter_mut().zip(batch.completion_ns) {*total+=observed;}
                     if let Some((ta,fe))=ticks {
                         g.pickup_ns+=(ta as i64)*1000/24-batch.doorbell_counter_ns;
                         g.tail_ns+=retired_counter_ns-(fe as i64)*1000/24;
@@ -618,8 +634,8 @@ impl Inner {
             self.geometry_overflow=0;
             for g in &mut self.geometry {
                 if g.count==0 {continue;}
-                dev_info!(self.drm.as_ref(),"M3_GEOMETRY ns={} width={} height={} samples={} count={} prepare_ns={} active_ns={} gpu_ns={} tiling_ns={} fragment_ns={} max_fragment_ns={} polling_ns={} retirement_ns={} sleeping_ns={} polls={} stamp_ns={} first_event_ns={} events_ns={} pickup_ns={} tail_ns={}\n",
-                    now,g.width,g.height,g.samples,g.count,g.prepare_ns,g.active_ns,g.gpu_ns,g.tiling_ns,g.fragment_ns,g.max_fragment_ns,g.polling_ns,g.retirement_ns,g.sleeping_ns,g.polls,g.stamp_ns,g.first_event_ns,g.events_ns,g.pickup_ns,g.tail_ns);
+                dev_info!(self.drm.as_ref(),"M3_GEOMETRY ns={} width={} height={} samples={} count={} prepare_ns={} active_ns={} gpu_ns={} tiling_ns={} fragment_ns={} max_fragment_ns={} polling_ns={} retirement_ns={} sleeping_ns={} polls={} stamp_ns={} first_event_ns={} events_ns={} pickup_ns={} tail_ns={} gpu_stamp_ns={} fw_stamp_ns={} queue_done_ns={} queue_read_ns={}\n",
+                    now,g.width,g.height,g.samples,g.count,g.prepare_ns,g.active_ns,g.gpu_ns,g.tiling_ns,g.fragment_ns,g.max_fragment_ns,g.polling_ns,g.retirement_ns,g.sleeping_ns,g.polls,g.stamp_ns,g.first_event_ns,g.events_ns,g.pickup_ns,g.tail_ns,g.completion_ns[0],g.completion_ns[1],g.completion_ns[2],g.completion_ns[3]);
                 *g=GeometryTiming::default();
             }
         }
