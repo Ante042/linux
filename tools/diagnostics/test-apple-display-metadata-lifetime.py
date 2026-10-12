@@ -57,6 +57,12 @@ typedef uint8_t u8;
 typedef uint16_t u16;
 typedef uint32_t u32;
 typedef uint64_t u64;
+#define BIT(n) (1u << (n))
+static unsigned int trace_observations;
+#define trace_iomfb_metadata(d,p,g,t,f,r,l) do { \
+    (void)(d); (void)(p); (void)(g); (void)(t); (void)(f); (void)(r); (void)(l); \
+    trace_observations++; \
+} while (0)
 #define READ_ONCE(x) (x)
 #define WRITE_ONCE(x,v) ((x)=(v))
 #define xchg(p,v) __atomic_exchange_n(p,v,__ATOMIC_SEQ_CST)
@@ -380,7 +386,7 @@ int main(void)
     assert(!pthread_create(&b,NULL,hotplug_thread,NULL));
     assert(!pthread_create(&reader,NULL,reader_thread,NULL));
     assert(!pthread_join(a,NULL) && !pthread_join(b,NULL) && !pthread_join(reader,NULL));
-    initial(); assert(!blob_allocations);
+    initial(); assert(!blob_allocations && trace_observations);
     puts("PASS: mutex-serialized EDID/blob get_modes, hotplug, sysfs reader and same-epoch publication, first-connection scope, raw precedence, invalidation, no added modes");
     return 0;
 }
