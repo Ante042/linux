@@ -120,13 +120,25 @@ int main(void)
 
 			if (group == 0 && command == 3)
 				expected = -EOPNOTSUPP;
-			if ((group == 1 && command == 3) ||
+			if ((group == 1 && (command == 3 || command == 4)) ||
 			    (group == 0 && (command == 4 || command == 26)))
 				expected = 0;
 			assert(dptxport_group_call(&service, group, command,
 						   request, 80, reply, 80) == expected);
 		}
 	}
+	put_unaligned_le32(2, request);
+	unsigned int before_readback = calls;
+
+	memset(reply, 0xff, 80);
+	assert(!dptxport_group_call(&service, 1, 4, request, 56, reply, 56));
+	assert(calls == before_readback);
+	assert(get_unaligned_le32(reply) == 2 && !get_unaligned_le32(reply + 16));
+	assert(get_unaligned_le32(reply + 36) == port.trained_voltage[0]);
+	assert(get_unaligned_le32(reply + 52) == port.trained_pre[1]);
+	assert(reply[56] == 0xff);
+	assert(dptxport_group_call(&service, 1, 4, request, 56, reply, 55) == -EINVAL);
+	assert(calls == before_readback);
 	assert(dptxport_group_call(&service, 0, 26, request, 80, reply, 31) == -EINVAL);
 	memset(reply, 0xff, 80);
 	assert(!dptxport_group_call(&service, 0, 26, request, 80, reply, 80));
