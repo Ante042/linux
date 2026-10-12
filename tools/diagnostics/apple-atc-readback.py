@@ -8,9 +8,11 @@ without hardware access; --read-hardware requires permission to read /dev/mem.
 """
 import argparse
 import json
+import mmap
 import os
 from pathlib import Path
 import struct
+import tempfile
 import unittest
 
 ROOT = Path('/sys/firmware/devicetree/base')
@@ -44,6 +46,15 @@ def compose(groups):
     return expected
 
 
+def read_word(fd, address):
+    if address % 4:
+        raise ValueError('unaligned word address')
+    page = address - address % mmap.PAGESIZE
+    with mmap.mmap(fd, mmap.PAGESIZE, flags=mmap.MAP_SHARED,
+                   prot=mmap.PROT_READ, offset=page) as view:
+        return struct.unpack_from('<I', view, address - page)[0]
+
+
 def acquire():
     if b'apple,j700' not in (ROOT / 'compatible').read_bytes().split(b'\0'):
         raise ValueError('requires J700')
@@ -67,10 +78,7 @@ def acquire():
     fd = os.open('/dev/mem', os.O_RDONLY | os.O_CLOEXEC)
     try:
         for address, (mask, value) in sorted(expected.items()):
-            data = os.pread(fd, 4, address)
-            if len(data) != 4:
-                raise OSError('short register read')
-            mismatch = (int.from_bytes(data, 'little') ^ value) & mask
+            mismatch = (read_word(fd, address) ^ value) & mask
             if mismatch:
                 region = 'core' if address < regs['lpdptx'][0] else 'lpdptx'
                 failures.append({'region': region,
@@ -82,6 +90,16 @@ def acquire():
 
 
 class CodecTests(unittest.TestCase):
+    def test_read_mapping(self):
+        with tempfile.TemporaryFile() as stream:
+            stream.truncate(2 * mmap.PAGESIZE)
+            stream.seek(mmap.PAGESIZE + 4)
+            stream.write(struct.pack('<I', 0x1234abcd))
+            stream.flush()
+            self.assertEqual(read_word(stream.fileno(), mmap.PAGESIZE + 4), 0x1234abcd)
+            with self.assertRaises(ValueError):
+                read_word(stream.fileno(), 1)
+
     def test_overlap(self):
         self.assertEqual(compose([(16, [(0, 15, 5), (0, 3, 2)])]), {16: (15, 6)})
 
