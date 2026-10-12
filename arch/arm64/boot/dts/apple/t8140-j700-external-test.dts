@@ -22,3 +22,8 @@
 &{/soc/dcp@416e00000/typec-routes/route@0} {
 	status = "okay";
 };
+
+/* Match the external firmware buffer window rather than allocating below it. */
+&dcpext0_dart {
+	apple,dma-range = <0x100 0x0 0x10 0x0>;
+};
