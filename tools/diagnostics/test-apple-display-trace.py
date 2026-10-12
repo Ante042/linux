@@ -13,6 +13,7 @@ args = parser.parse_args()
 root = args.source_root / 'drivers/gpu/drm/apple'
 trace = (root / 'trace.h').read_text()
 template = (root / 'iomfb_template.c').read_text()
+afk = (root / 'afk.c').read_text()
 
 def trace_assignment(name):
     start = trace.index('TRACE_EVENT(' + name + ',')
@@ -44,7 +45,19 @@ typedef uint8_t u8; typedef uint32_t u32; typedef uint64_t u64;
 #define __assign_str(x) ((void)0)
 #define min_t(t,a,b) ((t)(a)<(t)(b)?(t)(a):(t)(b))
 struct apple_dcp { int unused; };
-struct apple_dcp_afkep { u8 endpoint; };
+struct ring { bool ready; u32 *rptr,*wptr,bufsz; };
+struct apple_dcp_afkep { u8 endpoint; bool inline_v2,stopping; int lock; struct ring rxbfr,txbfr; };
+#define READ_ONCE(x) (x)
+#define le32_to_cpu(x) (x)
+#define spin_lock_irqsave(l,f) ((void)(l),(f)=0)
+#define spin_unlock_irqrestore(l,f) ((void)(l),(void)(f))
+#define dma_rmb() do {} while(0)
+static bool enabled;
+static unsigned int snapshots;
+static u32 rx_seen,rx_write_seen,tx_seen,tx_write_seen;
+static bool trace_afk_ring_snapshot_enabled(void) { return enabled; }
+static void trace_afk_ring_snapshot(struct apple_dcp_afkep *ep,bool rr,u32 rp,u32 wp,u32 rs,bool tr,u32 tp,u32 tw,u32 ts)
+{ (void)ep;(void)rr;(void)rs;(void)tr;(void)ts;snapshots++;rx_seen=rp;rx_write_seen=wp;tx_seen=tp;tx_write_seen=tw; }
 struct header_entry { u8 endpoint;u32 channel,type;size_t data_size;u8 captured,header[32]; };
 struct ctm_entry { u32 location;u8 matrix_null;u64 matrix[9]; };
 static unsigned int calls, swapped;static u32 methods[2],results[2];static bool valids[2];
@@ -58,7 +71,13 @@ static void dcp_pipe_set_428(struct apple_dcp *d,bool oob,const u32 *identity,
  void (*cb)(struct apple_dcp*,void*,void*),void *cookie)
 { assert(!oob && *identity==0x10000);cb(d,null_ack?NULL:ack+1,cookie); }
 '''
-code = prefix
+match = re.search(r"void afk_trace_ring_snapshot\([^;]*?\)\n\{", afk)
+assert match
+end, depth = match.end(), 1
+while depth:
+    depth += (afk[end] == '{') - (afk[end] == '}')
+    end += 1
+code = prefix + afk[match.start():end] + '\n'
 code += 'static void capture(struct header_entry *__entry,struct apple_dcp_afkep *ep,u32 channel,u32 type,size_t data_size,const void *data) {\n' + trace_assignment('afk_recv_header') + '\n}\n'
 code += 'static void capture_ctm(struct ctm_entry *__entry,u32 location,const void *matrix,u8 matrix_null) {\n' + trace_assignment('iomfb_ctm') + '\n}\n'
 code += function('dcp_post_swap_a428') + '\n' + function('dcp_pre_swap_a428')
@@ -95,7 +114,20 @@ int main(void)
   assert(calls==2 && !valids[0] && !valids[1] && !results[0] && !results[1]);
   assert(swapped==2 && swap_cookie==&cookie && reply_data==NULL);
  }
- puts("PASS: actual trace assignments bounded/null-safe; CTM nine coefficients; A423/A428 callback flow preserved");
+ {
+  u32 r=128,w=256,tr=64,tw=192;ep.inline_v2=true;
+  afk_trace_ring_snapshot(&ep);assert(!snapshots);
+  enabled=true;ep.rxbfr.rptr=(u32*)1;ep.txbfr.rptr=(u32*)1;
+  afk_trace_ring_snapshot(&ep);assert(snapshots==1 && !rx_seen && !tx_seen);
+  ep.rxbfr=(struct ring){.ready=true,.rptr=&r,.wptr=&w,.bufsz=8192};
+  ep.txbfr=(struct ring){.ready=true,.rptr=&tr,.wptr=&tw,.bufsz=8192};
+  afk_trace_ring_snapshot(&ep);assert(snapshots==2 && rx_seen==128 && rx_write_seen==256 && tx_seen==64 && tx_write_seen==192);
+  assert(r==128 && w==256 && tr==64 && tw==192);
+  ep.stopping=true;afk_trace_ring_snapshot(&ep);assert(snapshots==2);
+  ep.stopping=false;ep.inline_v2=false;afk_trace_ring_snapshot(&ep);assert(snapshots==2);
+  afk_trace_ring_snapshot(NULL);assert(snapshots==2);
+ }
+ puts("PASS: bounded trace/callback flow and read-only ring snapshot enable/ready/stop guards");
 }
 '''
 with tempfile.TemporaryDirectory(prefix='apple-display-trace-') as tmp:
