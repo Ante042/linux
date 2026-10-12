@@ -24,6 +24,10 @@ assert re.search(r'dcp->hw\.iomfb_method_profile\s*==\s*DCP_IOMFB_METHODS_H17P_E
 print('Production mode parser SHA256:', hashlib.sha256((header + body).encode()).hexdigest())
 
 
+class Pairs(list):
+    """A wire dictionary which preserves duplicate keys for rejection tests."""
+
+
 def wire(value, out):
     out += b'\0' * (-len(out) % 4)
     if isinstance(value, bool):
@@ -35,6 +39,11 @@ def wire(value, out):
         out += struct.pack('<I', (9 << 24) | len(raw)) + raw
     elif isinstance(value, bytes):
         out += struct.pack('<I', (10 << 24) | len(value)) + value
+    elif isinstance(value, Pairs):
+        out += struct.pack('<I', (1 << 24) | len(value))
+        for key, child in value:
+            wire(key, out)
+            wire(child, out)
     elif isinstance(value, list):
         out += struct.pack('<I', (2 << 24) | len(value))
         for child in value:
@@ -105,6 +114,58 @@ for key, invalid in [('Colorimetry', 'sRGB'), ('Depth', True), ('DynamicRange', 
     case('wrong type ' + key, [timing([malformed])], count=0)
     case('recover after wrong type ' + key, [timing([malformed]), timing([srgb])])
 case('skip unsuitable timing without poisoning later mode', [timing([wide]), timing([srgb], rate=120)], clock=297000)
+
+# Per-timing restriction shapes and IDs reflect the public runtime schema;
+# pixel data and device-specific property blobs are not included.
+color80 = color(80, 242999)
+color85 = color(85, 442999, Depth=10)
+
+
+def restricted(rate=60, unsafe=None, dsc=None, colors=None, before=False):
+    item = timing(colors if colors is not None else [color80, color85], rate=rate)
+    limits = {}
+    if unsafe is not None:
+        limits['UnsafeColorElementIDs'] = unsafe
+    if dsc is not None:
+        limits['DSCRequiredColorElementIDs'] = dsc
+    return {**limits, **item} if before else {**item, **limits}
+
+
+case('R30 60Hz keeps safe 10bit', [restricted(60, [], [])], identity=85, depth=10)
+case('R30 120Hz rejects unsafe 10bit', [restricted(120, [85], [])], identity=80, clock=297000)
+case('R30 144Hz no eligible color', [restricted(144, [85], [], [color85])], count=0)
+case('R30 180Hz all colors unsafe', [restricted(180, [80, 85], [])], count=0)
+case('DSC required rejects higher score', [restricted(60, [], [85])], identity=80)
+case('DSC required all colors rejected', [restricted(60, [], [80, 85])], count=0)
+case('unsafe plus DSC union', [restricted(60, [80], [85])], count=0)
+case('swapped unsafe plus DSC union', [restricted(60, [85], [80])], count=0)
+case('safe no lists', [restricted()], identity=85, depth=10)
+case('no promoted blanket', [dict(restricted(240, [85], []), IsPromoted=False)], identity=80, clock=594000)
+for before in (False, True):
+    case('restriction order ' + str(before), [restricted(120, [85], [], before=before)], identity=80, clock=297000)
+for field in ('UnsafeColorElementIDs', 'DSCRequiredColorElementIDs'):
+    for label, invalid in [('string', '85'), ('integer', 85), ('bool', True),
+                           ('blob', b'\x55'), ('dictionary', {'ID': 85}),
+                           ('negative', [-1]), ('u32 overflow', [1 << 32]),
+                           ('mixed string', [85, '80']), ('mixed bool', [True]),
+                           ('duplicate ID', [85, 85]), ('over limit', list(range(65)))]:
+        item = restricted()
+        item[field] = invalid
+        case('malformed ' + field + ' ' + label, [item], count=0)
+        # Neither legacy nor internal modes interpret these new restrictions.
+        case('legacy ignores ' + field + ' ' + label, [item], False, identity=85, depth=10)
+        case('internal ignores ' + field + ' ' + label, [item], False, identity=85, depth=10)
+    duplicate = Pairs(list(restricted().items()) + [(field, []), (field, [85])])
+    case('duplicate field ' + field, [duplicate], count=0)
+    case('legacy duplicate field ' + field, [duplicate], False, identity=85, depth=10)
+    item = restricted()
+    item[field] = list(range(1000, 1064))
+    case('exact limit ' + field, [item], identity=85, depth=10)
+    item[field] = [0xffffffff]
+    case('u32 max accepted ' + field, [item], identity=85, depth=10)
+duplicate_colors = Pairs(list(restricted().items()) + [('ColorModes', [color80])])
+case('duplicate ColorModes fail closed', [duplicate_colors], count=0)
+case('bad restriction skips only its timing', [restricted(180, [80, 85], []), restricted(60, [], [])], identity=85, depth=10)
 
 prefix = r'''
 #include <assert.h>
