@@ -513,6 +513,7 @@ impl File {
         )?;
 
         mod_dev_dbg!(device, "[File {} VM {}]: VM created\n", file_id, id);
+        let profile_vm_id = vm.id();
         resv.fill(KBox::new(
             Vm {
                 ualloc,
@@ -526,6 +527,10 @@ impl File {
         )?)?;
 
         data.vm_id = id;
+        if crate::debug::debug_enabled(crate::debug::DebugFlags::M3PassTiming) {
+            dev_info!(device, "M3_VM_PROFILE pid={} file={} handle={} vm={}\n",
+                kernel::current!().group_leader().pid(), file_id, id, profile_vm_id);
+        }
 
         Ok(0)
     }
