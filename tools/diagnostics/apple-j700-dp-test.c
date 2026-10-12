@@ -16,6 +16,7 @@ static void test_guard_mutex(void *p) { (void)p; }
 #define guard(kind) test_guard_##kind
 static void report(void *p, const char *s, ...) { (void)p; (void)s; }
 #define dev_err report
+#define dev_dbg report
 #define ndelay(n) ((void)(n))
 #define udelay(n) ((void)(n))
 
@@ -181,6 +182,24 @@ int main(void)
 				assert(!p.dp_owned_pmas && p.dp_link_rate == -1);
 				cases++;
 			}
+		}
+	}
+	for (unsigned int full = 0; full < 2; full++) {
+		for (unsigned int swap = 0; swap < 2; swap++) {
+			struct apple_atcphy p = device();
+			u32 old_selector = registers[0x64 / 4];
+			u32 old_misc = registers[4 / 4];
+			u32 mask = full ? 0x3ffff : 0x1ffff;
+
+			p.swap_lanes = swap;
+			assert(!j700_dp_route(&p, full));
+			assert(!((registers[0x64 / 4] ^ old_selector) & ~mask));
+			assert(registers[4 / 4] == old_misc);
+			assert((registers[0x60 / 4] & 0xfff) ==
+			       (full ? 0x492 : (swap ? 0x252 : 0x489)));
+			assert((registers[0x64 / 4] & mask) ==
+			       (full ? (swap ? 0x114 : 0x22014) : (0x110 | swap)));
+			cases++;
 		}
 	}
 	pin_mask = 2;
