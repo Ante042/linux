@@ -427,6 +427,7 @@ struct cd321x {
 	bool tbt_notifier_registered;
 	atomic_t link_event;
 	atomic_t ready_event;
+	atomic_t restore_event;
 	bool display_route_active;
 	bool dp_sink_reported;
 	bool dp_irq_hpd;
