@@ -179,6 +179,15 @@ pub(crate) fn active_power()->bool {
     M3_ACTIVE_POWER.load(Ordering::Relaxed)==1
 }
 
+/// T6030-only request while work is pending or active. Zero leaves firmware
+/// performance selection unchanged; three requests the top published state.
+static M3_CONSISTENT_PERF: AtomicU64 = AtomicU64::new(0);
+fn parse_consistent_perf(text: &str)->Option<u64> {
+    parse_u64(text).filter(|v| matches!(*v,0|3))
+}
+m3_param!("m3_consistent_perf",M3_CONSISTENT_PERF,parse_consistent_perf,0o644,Some(get_atomic_param));
+pub(crate) fn consistent_perf()->u64 {M3_CONSISTENT_PERF.load(Ordering::Relaxed)}
+
 /// One preserves internal render measurements. Application timestamp requests
 /// remain recorded when zero omits measurements on T6030.
 static M3_RENDER_INTERNAL_TIMESTAMPS: AtomicU64 = AtomicU64::new(1);

@@ -165,6 +165,7 @@ impl Inner {
     /// packets. The packets stay retained (with their VM job guards) until teardown, because
     /// the firmware has not provably stopped using their memory.
     fn fail_active(&mut self, error: Error) {
+        let _=self.config.performance_request(self.device.soc().chip_id,false);
         if let Some((index,vm))=self.active.first().map(|b|(b.index,b.entries[0].0.vm.clone())) {
             self.fail(index,&vm,error);
         } else {self.capture_fault(error);}
@@ -972,6 +973,21 @@ impl Runtime {
     /// One completion-worker step: retire the active batch if it has completed, then publish
     /// the next one. The worker drops the runtime lock between steps.
     pub(crate) fn service_job(&mut self)->Service {
+        let chip=self.inner.device.soc().chip_id;
+        let busy=self.inner.state.healthy() &&
+            (!self.inner.active.is_empty() || !self.inner.pending.is_empty());
+        if let Err(error)=self.inner.config.performance_request(chip,busy) {
+            self.inner.fail_active(error);
+            return Service::Idle;
+        }
+        let result=self.service_job_inner();
+        if matches!(result,Service::Idle) || !self.inner.state.healthy() ||
+            (self.inner.active.is_empty() && self.inner.pending.is_empty()) {
+            let _=self.inner.config.performance_request(chip,false);
+        }
+        result
+    }
+    fn service_job_inner(&mut self)->Service {
         let inner: &mut Inner=&mut *self.inner;
         if inner.active.is_empty() {
             if inner.fault_captured || !inner.state.healthy() {inner.fail_pending(EIO);return Service::Idle;}
@@ -1070,6 +1086,7 @@ impl Runtime {
 }
 impl Drop for Runtime {
     fn drop(&mut self) {
+        let _=self.inner.config.performance_request(self.inner.device.soc().chip_id,false);
         self.inner.state.health.mark_failed();
         // Unpublished packets never reach the firmware; a published batch's packets stay
         // retained below if the GPU may still use them, but their fences must not hang.

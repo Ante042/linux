@@ -119,6 +119,14 @@ impl Buffer {
         unsafe {ptr.add(start).cast::<u32>().write_volatile(value.to_le())};Ok(())
     }
     pub(crate) fn u64(&mut self,offset:usize,value:u64)->Result {self.write(offset,&value.to_le_bytes())}
+    /// Publish the unaligned performance-request word with bounded byte stores.
+    pub(crate) fn packed_request(&mut self,offset:usize,value:u32)->Result {
+        if offset.checked_add(4).ok_or(EOVERFLOW)?>self.size {return Err(ERANGE);}
+        let ptr=self.cpu_ptr()?;
+        // SAFETY: checked span in retained CPU storage; no aligned access is required.
+        unsafe {crate::m3_consistent_perf::store_packed(ptr.add(self.offset+offset),value)};
+        Ok(())
+    }
     pub(crate) fn read(&mut self,offset:usize,data:&mut[u8])->Result {
         if offset.checked_add(data.len()).ok_or(EOVERFLOW)?>self.size {return Err(ERANGE);}
         let ptr=self.cpu_ptr()?;
