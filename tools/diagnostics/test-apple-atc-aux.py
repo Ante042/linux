@@ -10,8 +10,8 @@ import tempfile
 
 source = Path(__file__).resolve().parents[2] / 'drivers/phy/apple/atc.c'
 text = source.read_text()
-parts = [line for line in text.splitlines() if line.startswith('#define J700_AUX_')]
-for name in ('j700_aux_update', 'j700_aux_enable', 'j700_aux_disable'):
+parts = [line for line in text.splitlines() if line.startswith(('#define J700_AUX_', '#define J700_PMA_'))]
+for name in ('j700_field_update', 'j700_pma_idle', 'j700_aux_enable', 'j700_aux_disable'):
     start = text.index('static int ' + name + '(')
     begin = text.index('{', start)
     depth = 1
@@ -24,6 +24,7 @@ production = '\n'.join(parts)
 print('Production transition SHA256:', hashlib.sha256(production.encode()).hexdigest())
 prefix = r'''
 #include <assert.h>
+#include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -90,6 +91,24 @@ int main(void)
         writes = 0;
         reject = fault;
         assert(j700_aux_disable(&phy) == -110 && phy.aux_power_requested);
+    }
+    initial(&phy);
+    assert(j700_pma_idle(&phy, 2) == -EINVAL && writes == 0);
+    for (unsigned int lane = 0; lane < 2; lane++) {
+        initial(&phy);
+        registers[J700_PMA_POWER_CONTROL / 4] = 0x800000ee;
+        registers[J700_PMA_RECEIVER_CONTROL / 4] = 0x5000;
+        assert(j700_pma_idle(&phy, lane) == 0 && writes == 6);
+        assert(((registers[J700_PMA_POWER_CONTROL / 4] >> (4 * lane)) & 15) == 1);
+        assert(((registers[J700_PMA_POWER_CONTROL / 4] >> (4 * (1 - lane))) & 15) == 14);
+        assert(registers[J700_PMA_POWER_CONTROL / 4] & 0x80000000);
+        assert(registers[J700_PMA_RECEIVER_CONTROL / 4] == (0x5000U | (0x44U << lane)));
+        for (unsigned int fault = 1; fault <= 6; fault++) {
+            initial(&phy);
+            registers[J700_PMA_POWER_CONTROL / 4] = 0xee;
+            reject = fault;
+            assert(j700_pma_idle(&phy, lane) == -110);
+        }
     }
     puts("PASS: sequencing, unrelated bits, every failed phase, retained cleanup ownership");
     return 0;
