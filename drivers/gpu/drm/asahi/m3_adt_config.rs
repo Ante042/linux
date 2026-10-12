@@ -931,6 +931,10 @@ fn build_images(
             if given { " (asahi.m3_ut_engagement)" } else { "" }
         );
     }
+    if crate::m3_globals_debug::apply(soc.chip_id,m3_params::globals_debug_off(),&mut globals)
+        .map_err(|_|EINVAL)? {
+        dev_info!(dev,"M3: T6030 Globals debug word cleared at +0x2c\n");
+    }
     images[GLOBALS] = Some(globals);
 
     let mut power = zeroed(GLOBALS_POWER)?;

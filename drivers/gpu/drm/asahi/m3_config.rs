@@ -203,6 +203,12 @@ impl Config {
         objects[CONTROL_REGION].write(0, &records.control)
     }
     pub(crate) fn root(&self) -> u64 { self.objects[storage::ROOT].va() }
+    pub(crate) fn log_globals_debug(&mut self,dev:&driver::AsahiDevice)->Result {
+        let value=self.objects[GLOBALS].read_u32(crate::m3_globals_debug::OFFSET)?;
+        dev_info!(dev.as_ref(),"M3_GLOBALS_DEBUG off={} value={} request_level={}\n",
+            u8::from(crate::m3_params::globals_debug_off()),value,crate::m3_params::consistent_perf());
+        Ok(())
+    }
     pub(crate) fn performance_request(&mut self,chip:u32,busy:bool)->Result {
         let Some(value)=crate::m3_consistent_perf::request(chip,
             crate::m3_params::consistent_perf(),busy,self.request_top) else {return Ok(());};

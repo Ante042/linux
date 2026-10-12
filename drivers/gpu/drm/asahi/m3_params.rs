@@ -179,6 +179,11 @@ pub(crate) fn active_power()->bool {
     M3_ACTIVE_POWER.load(Ordering::Relaxed)==1
 }
 
+/// Boot-only T6030 Globals debug-word experiment. Zero preserves the runtime word.
+static M3_GLOBALS_DEBUG_OFF: AtomicU64 = AtomicU64::new(0);
+m3_param!("m3_globals_debug_off",M3_GLOBALS_DEBUG_OFF,parse_render_stamp_coalesce);
+pub(crate) fn globals_debug_off()->bool {M3_GLOBALS_DEBUG_OFF.load(Ordering::Relaxed)==1}
+
 /// T6030-only request while work is pending or active. Zero leaves firmware
 /// performance selection unchanged; three requests the top published state.
 static M3_CONSISTENT_PERF: AtomicU64 = AtomicU64::new(0);

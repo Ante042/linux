@@ -84,6 +84,7 @@ mod m3_thermal;
 mod m3_thermal_policy;
 mod m3_active_power;
 mod m3_consistent_perf;
+mod m3_globals_debug;
 mod m3_client;
 mod g15_boot;
 mod g15_initdata;

@@ -2413,6 +2413,7 @@ mod g15_layout {
     static_assert!(size_of::<GlobalsG15V14_8_3>() == 0xe00);
     static_assert!(size_of::<RegisterOverride>() == 0x18);
     static_assert!(offset_of!(GlobalsG15V14_8_3, unk_28) == 0x28);
+    static_assert!(offset_of!(GlobalsG15V14_8_3, debug) == crate::m3_globals_debug::OFFSET);
     static_assert!(offset_of!(GlobalsG15V14_8_3, unk_38) == 0x38);
     static_assert!(offset_of!(GlobalsG15V14_8_3, unk_50) == 0x50);
     static_assert!(offset_of!(GlobalsG15V14_8_3, unk_56) == 0x56);

@@ -1050,6 +1050,10 @@ impl Runtime {
         let inner: &mut Inner = &mut *self.inner;
         inner.config.drain(&inner.drm)?;
         inner.config.log_ready(&inner.drm)?;
+        if inner.device.soc().chip_id==0x6030 &&
+            (crate::m3_params::active_power() || crate::m3_params::globals_debug_off()) {
+            inner.config.log_globals_debug(&inner.drm)?;
+        }
         inner.config.check_pstate(&inner.drm, &inner.device, "after boot")?;
         inner.state.health.set_gpu_pending(false);
         dev_info!(pdev.as_ref(), "M3: firmware accepted owned initdata and device controls\n");
