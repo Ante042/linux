@@ -17,6 +17,8 @@ args = argparse.ArgumentParser(description=__doc__)
 args.add_argument('--attributes-json', type=Path,
                   default=Path(__file__).with_name('display-attributes-fixture.json'))
 args.add_argument('--timings-bin', type=Path, help='Optional captured TimingElements binary (not embedded in public fixtures)')
+args.add_argument('--property-bin', type=Path, action='append', default=[],
+                  help='Optional captured property to validate against delivered extent')
 args = args.parse_args()
 fixture = json.loads(args.attributes_json.read_text())
 
@@ -219,7 +221,23 @@ static void epochs(void)
 }
 int main(int argc, char **argv)
 {
+    if (argc == 3 && !strcmp(argv[1], "--property")) {
+        FILE *f=fopen(argv[2],"rb"); assert(f && !fseek(f,0,SEEK_END));
+        long n=ftell(f); assert(n>20 && !fseek(f,0,SEEK_SET));
+        unsigned char *b=malloc(n); assert(fread(b,n,1,f)==1); fclose(f);
+        assert(dcp_property_complete(b,n-1,n));
+        assert(dcp_property_complete(b,n-1,n-1));
+        for(unsigned int cut=1;cut<=16;cut++)
+            assert(!dcp_property_complete(b,n-1-cut,n-cut));
+        assert(!dcp_property_complete(b,n-1,n+1));
+        free(b); return 0;
+    }
     assert(argc == 4 || argc == 5);
+    /* A missing final string byte must not be supplied by zero allocation. */
+    unsigned char incomplete[]={0xd3,0,0,0,1,0,0,0x82,1,0,0,0x89,0x42};
+    assert(dcp_property_complete(incomplete,sizeof(incomplete),sizeof(incomplete)));
+    assert(!dcp_property_complete(incomplete,12,13));
+    assert(!dcp_property_complete(NULL,0,0));
     epochs();
     timing_proof();
     FILE *f = fopen(argv[1], "rb");
@@ -239,6 +257,16 @@ int main(int argc, char **argv)
         free(data); return 0;
     }
     assert(!ret);
+    assert(dcp_property_complete(data,length,length));
+    size_t aligned=round_up((size_t)length,4);
+    unsigned char *padded=malloc(aligned+4);
+    memset(padded,0xa5,aligned+4); memcpy(padded,data,length);
+    assert(dcp_property_complete(padded,aligned,aligned+1));
+    assert(!dcp_property_complete(data,length-1,length));
+    assert(!dcp_property_complete(padded,aligned,aligned+2));
+    assert(!dcp_property_complete(padded,aligned+4,aligned+5));
+    assert(!dcp_property_complete(padded,aligned-1,aligned+1));
+    free(padded);
     struct dcp_parse_ctx timing_ctx;
     unsigned int count = 0;
     assert(!parse(timing_blob, sizeof(timing_blob), &timing_ctx));
@@ -331,6 +359,8 @@ with tempfile.TemporaryDirectory(prefix='dcp-display-metadata-') as tmp:
         raw = bytearray(struct.pack('<I', 0xd3)); wire(fixture, raw)
         (tmp / 'input').write_bytes(raw)
         subprocess.run([str(tmp / 'test'), str(tmp / 'input'), '0', str(tmp / 'edid'), str(args.timings_bin)], check=True)
+    for property_bin in args.property_bin:
+        subprocess.run([str(tmp / 'test'), '--property', str(property_bin)], check=True)
     raw = (tmp / 'edid').read_bytes()
     assert len(raw) == 128 and sum(raw) % 256 == 0 and raw[126] == 0
     assert raw[:8] == bytes.fromhex('00ffffffffffff00')

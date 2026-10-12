@@ -43,6 +43,7 @@ assert 'dcp_firmware_metadata_begin(dcp);' in template
 assert 'dcp_firmware_metadata_hotplug(dcp, !!(*connected));' in template
 assert 'dcp_firmware_metadata_attributes(dcp, ret ? NULL : &metadata);' in template
 assert 'dcp->chunks.received += req->length;' in template
+assert 'dcp_property_complete(dcp->chunks.data, dcp->chunks.received,' in template
 prefix = r'''
 #include <assert.h>
 #include <stdbool.h>
@@ -124,7 +125,7 @@ struct apple_dcp {
     void *dev;
     struct { int iomfb_method_profile; } hw;
     struct apple_connector *connector;
-    struct { void *data; size_t length, received; bool contiguous; struct dcp_metadata_ticket metadata_ticket; } chunks;
+    struct { void *data; size_t length, received; bool contiguous, payload_complete; struct dcp_metadata_ticket metadata_ticket; } chunks;
     struct {
         spinlock_t lock;
         struct dcp_metadata_epoch epoch;
@@ -239,6 +240,7 @@ static void begin(bool complete)
 {
     dcp_firmware_metadata_begin(&p);
     p.chunks.length=100; p.chunks.received=complete ? 100 : 99;
+    p.chunks.payload_complete=complete;
 }
 static bool eligible(void)
 {
@@ -344,6 +346,7 @@ int main(void)
     assert(p.chunks.received==32 && p.chunks.contiguous);
     dcp_firmware_metadata_attributes(&p,&attrs); assert(!p.metadata.attributes_valid);
     chunk.offset=32; assert(dcpep_cb_prop_chunk(&p,&chunk));
+    p.chunks.payload_complete=true; /* Structural validator tested separately. */
     dcp_firmware_metadata_attributes(&p,&attrs); assert(p.metadata.attributes_valid);
     initial(); dcp_firmware_metadata_connection(&p,1,true);
     assert(dcpep_cb_prop_start(&p,&length));
