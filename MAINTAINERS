@@ -1952,6 +1952,7 @@ L:	dri-devel@lists.freedesktop.org
 S:	Maintained
 T:	git git://anongit.freedesktop.org/drm/drm-misc
 F:	drivers/gpu/drm/apple/
+F:	tools/testing/selftests/drivers/gpu/apple-afkv2/
 
 APPLE PCIE CONTROLLER DRIVER
 M:	Marc Zyngier <maz@kernel.org>
@@ -2005,6 +2006,7 @@ F:	arch/arm64/include/asm/apple-idle.h
 F:	arch/arm64/kernel/idle-apple.S
 F:	drivers/hid/dockchannel-hid/dockchannel-hid-protocol*
 F:	drivers/iio/common/aop_sensors/
+F:	drivers/phy/apple/atc-j700-dp.h
 F:	drivers/rtc/rtc-apple-pmu.c
 F:	drivers/soc/apple/aop.rs
 F:	drivers/soc/apple/mcc.c
@@ -2014,6 +2016,24 @@ F:	include/linux/soc/apple/pci-apple-piodma.h
 F:	rust/kernel/iio/common/aop_sensors.rs
 F:	rust/kernel/soc/apple/aop.rs
 F:	sound/soc/apple/t8140_aop_audio.rs
+F:	tools/diagnostics/apple-dptx-training-test.c
+F:	tools/diagnostics/apple-j700-dp-test.c
+F:	tools/diagnostics/display-attributes-fixture.json
+F:	tools/diagnostics/test-apple-afk-admission.py
+F:	tools/diagnostics/test-apple-atc-unwind.py
+F:	tools/diagnostics/test-apple-dcp-readiness.py
+F:	tools/diagnostics/test-apple-dptx-readiness.py
+F:	tools/diagnostics/test-apple-external-lifecycle.py
+F:	tools/diagnostics/test-apple-display-metadata*.py
+F:	tools/diagnostics/test-apple-display-trace.py
+F:	tools/diagnostics/test-apple-external-sdr.py
+F:	tools/diagnostics/test-apple-j700-crossbar.py
+F:	tools/diagnostics/test-apple-j700-d134.py
+F:	tools/diagnostics/test-apple-j700-dp.py
+F:	tools/diagnostics/test-apple-j700-opaque-scope.py
+F:	tools/diagnostics/test-apple-j700-provider.py
+F:	tools/diagnostics/test-apple-j700-tuning.py
+F:	tools/diagnostics/wayland-output-frame-test.py
 F:	tools/testing/apple/
 
 APPLETALK NETWORK LAYER
@@ -2635,6 +2655,8 @@ F:	drivers/nvme/host/apple.c
 F:	drivers/nvmem/apple-efuses.c
 F:	drivers/nvmem/apple-spmi-nvmem.c
 F:	drivers/phy/apple/
+F:	tools/diagnostics/apple-atc-readback.py
+F:	tools/diagnostics/test-apple-atc-aux.py
 F:	drivers/pinctrl/pinctrl-apple-gpio.c
 F:	drivers/pmdomain/apple/
 F:	drivers/power/reset/macsmc-reboot.c

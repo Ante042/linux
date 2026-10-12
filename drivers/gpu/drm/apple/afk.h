@@ -25,6 +25,8 @@ struct apple_dcp_afkep;
 
 struct epic_cmd_info {
 	u16 tag;
+	u8 type;
+	size_t reply_length;
 
 	void *rxbuf;
 	void *txbuf;
@@ -69,11 +71,19 @@ struct apple_epic_service_ops {
 	/* All retained pointers must be pinned before enabling slot reuse. */
 	bool reusable;
 
+	/*
+	 * Optional admission, before OPEN/publication. Must not retain service
+	 * on failure; teardown must accept a failed/partial preparation.
+	 */
+	int (*prepare)(struct apple_epic_service *service, const char *name,
+		       const char *class, s64 unit);
 	void (*init)(struct apple_epic_service *service, const char *name,
 			      const char *class, s64 unit);
 	int (*call)(struct apple_epic_service *service, u32 idx,
 		    const void *data, size_t data_size, void *reply,
 		    size_t reply_size);
+	int (*call_v2)(struct apple_epic_service *service, u16 group, u32 command,
+		       const void *data, size_t size, void *reply, size_t room);
 	int (*report)(struct apple_epic_service *service, enum epic_subtype type,
 		      const void *data, size_t data_size);
 	void (*teardown)(struct apple_epic_service *service);
@@ -173,7 +183,7 @@ afk_service_reinit(struct apple_epic_service *service,
 	spin_lock_irqsave(&service->lock, flags);
 	reusable = afk_service_reclaimable(service);
 	if (reusable) {
-		service->enabled = true;
+		service->enabled = !ops->prepare;
 		service->torndown = false;
 		service->ops = ops;
 		service->ep = ep;
@@ -183,6 +193,30 @@ afk_service_reinit(struct apple_epic_service *service,
 	}
 	spin_unlock_irqrestore(&service->lock, flags);
 	return reusable;
+}
+
+/* Only used before a prepared service has been published to callers. */
+static inline void afk_service_discard(struct apple_epic_service *service)
+{
+	unsigned long flags;
+
+	if (service->ops->teardown)
+		service->ops->teardown(service);
+	spin_lock_irqsave(&service->lock, flags);
+	service->enabled = false;
+	service->torndown = true;
+	service->cookie = NULL;
+	service->ops = NULL;
+	spin_unlock_irqrestore(&service->lock, flags);
+}
+
+static inline void afk_service_publish(struct apple_epic_service *service)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&service->lock, flags);
+	service->enabled = true;
+	spin_unlock_irqrestore(&service->lock, flags);
 }
 
 struct afk_ringbuffer_header {
@@ -293,6 +327,10 @@ struct apple_dcp_afkep {
 	struct apple_dcp *dcp;
 
 	u32 endpoint;
+	/* Set before afk_start; protocol selection is per endpoint. */
+	bool wire_v2;
+	/* External H17P DPAV only; other endpoints retain owned-DMA commands. */
+	bool inline_v2;
 	struct workqueue_struct *wq;
 
 	struct completion started;
@@ -323,7 +361,10 @@ struct apple_dcp_afkep {
 
 struct apple_dcp_afkep *afk_init(struct apple_dcp *dcp, u32 endpoint,
 				 const struct apple_epic_service_ops *ops);
+int afk_v2_copy_owned(struct apple_epic_service *service, u64 dva,
+		      void *buffer, size_t size, bool to_peer);
 int afk_start(struct apple_dcp_afkep *ep);
+void afk_trace_ring_snapshot(struct apple_dcp_afkep *ep);
 void afk_shutdown(struct apple_dcp_afkep *ep);
 void afk_quiesce(struct apple_dcp_afkep *ep);
 int afk_receive_message(struct apple_dcp_afkep *ep, u64 message);
@@ -344,4 +385,9 @@ int afk_service_call_timeout(struct apple_epic_service *service, u16 group,
 			     u32 command, const void *data, size_t data_len,
 			     size_t data_pad, void *output, size_t output_len,
 			     size_t output_pad, unsigned int timeout_ms);
+int afk_service_call_len(struct apple_epic_service *service, u16 group,
+			 u32 command, const void *data, size_t data_len,
+			 size_t data_pad, void *output, size_t output_len,
+			 size_t output_pad, size_t *received);
+
 #endif

@@ -18,6 +18,8 @@
 
 #include "dptxep.h"
 #include "dcp_backlight.h"
+#include "dcp-display-metadata.h"
+#include "dcp-metadata-epoch.h"
 #include "iomfb.h"
 #include "iomfb_h17p.h"
 #include "iomfb-state.h"
@@ -46,6 +48,7 @@ struct iomfb_transaction {
 	bool backlight_reserved;
 	bool backlight_failed;
 	bool brightness_only;
+	bool presentation;
 	bool completed;
 };
 struct apple_dcp_typec_port;
@@ -89,9 +92,11 @@ enum {
 	TEST_ENDPOINT = 0x21,
 	DCP_EXPERT_ENDPOINT = 0x22,
 	DISP0_ENDPOINT = 0x23,
+	DPTX_CONTROLLER_ENDPOINT = 0x24,
 	DPAVSERV_ENDPOINT = 0x28,
 	AV_ENDPOINT = 0x29,
 	DPTX_ENDPOINT = 0x2a,
+	DPTX_ENDPOINT_V2 = 0x2c,
 	HDCP_ENDPOINT = 0x2b,
 	REMOTE_ALLOC_ENDPOINT = 0x2d,
 	IOMFB_ENDPOINT = 0x37,
@@ -101,6 +106,10 @@ enum {
 struct dcp_chunks {
 	size_t length;
 	void *data;
+	size_t received;
+	bool contiguous;
+	bool payload_complete;
+	struct dcp_metadata_ticket metadata_ticket;
 };
 
 #define DCP_MAX_MAPPINGS (128) /* should be enough */
@@ -174,6 +183,7 @@ struct dcp_panel {
 enum dcp_iomfb_method_profile {
 	DCP_IOMFB_METHODS_DEFAULT,
 	DCP_IOMFB_METHODS_H17G,
+	DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL,
 };
 
 struct apple_dcp_hw_data {
@@ -187,6 +197,7 @@ struct apple_dcp_hw_data {
 	enum dcp_firmware_version firmware_compat;
 	/* Firmware-visible clock aperture, independent of the AP PMGR window. */
 	const struct resource *firmware_clock;
+	u32 firmware_display_windows;
 	u32 firmware_scratch;
 	u32 firmware_request;
 };
@@ -208,6 +219,26 @@ struct apple_dcp {
 	struct apple_connector *connector;
 
 	struct apple_dcp_hw_data hw;
+	bool external_prepared;
+	/* Serializes external connection, power, and CRTC generation changes. */
+	struct mutex external_lock;
+	u64 external_generation;
+	u64 external_crtc_generation;
+	/* iomfb.lock: epoch used by receive-side deferred stop requests. */
+	u64 external_rx_generation;
+	u64 external_stop_generation;
+	bool external_cable;
+	bool external_running;
+	bool external_power_attempted;
+	/* iomfb.lock: replay the latest callback after activation succeeds. */
+	bool external_hotplug_pending;
+	bool external_hotplug_connected;
+	bool external_stopped;
+	int external_error;
+	u64 external_power_reply;
+	bool external_power_reply_valid;
+	struct work_struct external_stop_work;
+
 
 	/* firmware version and compatible firmware version */
 	enum dcp_firmware_version fw_compat;
@@ -259,6 +290,15 @@ struct apple_dcp {
 
 	/* Active chunked transfer. There can only be one at a time. */
 	struct dcp_chunks chunks;
+	struct {
+		/* Protects connection tickets and cached metadata snapshots. */
+		spinlock_t lock;
+		struct dcp_metadata_epoch epoch;
+		struct dcp_display_metadata attributes;
+		struct drm_display_mode preferred;
+		struct dcp_metadata_ticket attributes_ticket, timing_ticket;
+		bool attributes_valid, timing_valid, hpd_seen;
+	} metadata;
 
 	/* Queued swap. Owned by the DCP to avoid per-swap memory allocation */
 	union {
@@ -352,6 +392,8 @@ struct apple_dcp {
 	struct audiosrv_data *audiosrv;
 
 	struct apple_dcp_afkep *dptxep;
+	struct apple_dcp_afkep *dptx_controller_ep;
+	struct completion dptx_controller_ready;
 
 	struct dptx_port dptxport[2];
 
@@ -438,12 +480,22 @@ struct apple_dcp {
 		unsigned long deadline;
 		unsigned int queued;
 		bool stopped;
+		bool presentation_paused;
 		bool backlight_queued;
 		atomic_t opaque_x_state;
 		struct iomfb_scanout_h17p *scanout;
 		struct iomfb_scanout_h17p *next_scanout;
 	} iomfb;
 };
+
+void dcp_firmware_metadata_connection(struct apple_dcp *dcp, u64 generation, bool connected);
+void dcp_firmware_metadata_hotplug(struct apple_dcp *dcp, bool connected);
+void dcp_firmware_metadata_begin(struct apple_dcp *dcp);
+void dcp_firmware_metadata_attributes(struct apple_dcp *dcp,
+				      const struct dcp_display_metadata *attributes);
+void dcp_firmware_metadata_timing(struct apple_dcp *dcp);
+bool dcp_firmware_metadata_current(struct apple_dcp *dcp, u64 generation);
+const struct drm_edid *dcp_firmware_edid(struct apple_dcp *dcp, u64 *generation);
 
 void iomfb_scanout_complete_h17p(struct apple_dcp *dcp);
 void iomfb_present_backlight_h17p(struct apple_dcp *dcp);
@@ -462,11 +514,15 @@ int iomfb_configure_backlight_h17p(struct apple_dcp *dcp, u32 maximum,
 void iomfb_queue_init(struct apple_dcp *dcp);
 void iomfb_queue_stop(struct apple_dcp *dcp);
 bool iomfb_queue_drain(struct apple_dcp *dcp, unsigned long timeout);
+int iomfb_queue_settle(struct apple_dcp *dcp, unsigned long timeout);
+void iomfb_pause_presentation(struct apple_dcp *dcp, bool pause);
+int iomfb_external_power_h17p(struct apple_dcp *dcp, bool on);
 int iomfb_queue(struct apple_dcp *dcp, struct iomfb_transaction *transaction);
 void iomfb_queue_crc_h17p(struct apple_dcp *dcp, u32 swap_id);
 
 void dcp_drm_crtc_page_flip(struct apple_dcp *dcp, ktime_t now);
 void dcp_handle_hotplug_actions(struct apple_dcp *dcp, unsigned int action);
+bool dcp_external_hotplug(struct apple_dcp *dcp, bool connected);
 
 int dcp_backlight_init(struct apple_dcp *dcp, struct device *dev);
 void dcp_backlight_stop(struct apple_dcp *dcp);

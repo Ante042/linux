@@ -193,6 +193,10 @@ static int iomfb_enqueue_opaque_x(struct apple_dcp *dcp)
 	struct iomfb_opaque_x_transaction *opaque;
 
 	lockdep_assert_held(&dcp->iomfb.lock);
+	/* DCPEXT rejects enableGPAlphaDiv; retain the panel-only workaround. */
+	if (dcp->hw.iomfb_method_profile ==
+	    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL)
+		return 0;
 	if (atomic_read(&dcp->iomfb.opaque_x_state) != IOMFB_OPAQUE_X_NEEDED)
 		return 0;
 	if (dcp->iomfb.queued >= 32)
@@ -312,7 +316,19 @@ static void iomfb_queue_timeout(struct work_struct *work)
 				 dcp->iomfb.deadline - jiffies);
 	} else if (dcp->iomfb.active) {
 		WRITE_ONCE(dcp->crashed, true);
-		dev_err(dcp->dev, "IOMFB transaction timed out\n");
+		dev_err(dcp->dev,
+			"IOMFB transaction timed out: cmd=%u oob=%u present=%u accepted=%u swap=%u\n",
+			dcp->ch_cmd.depth, dcp->ch_oobcmd.depth,
+			dcp->present_state_h17p.pending, dcp->present_state_h17p.accepted,
+			dcp->present_state_h17p.swap_id);
+		if (dcp->ch_cmd.depth && dcp->ch_cmd.depth <= DCP_MAX_CALL_DEPTH) {
+			const struct dcp_packet_header *h =
+				&dcp->ch_cmd.header[dcp->ch_cmd.depth - 1];
+
+			dev_err(dcp->dev, "pending IOMFB %c%c%c%c in=%u out=%u\n",
+				h->tag[3], h->tag[2], h->tag[1], h->tag[0],
+				h->in_len, h->out_len);
+		}
 		iomfb_discard_pending(dcp);
 		schedule_work(&dcp->vblank_wq);
 	}
@@ -414,6 +430,45 @@ bool iomfb_queue_drain(struct apple_dcp *dcp, unsigned long timeout)
 	}
 }
 
+/* Admission is independent of transport: replies and control RPCs remain live. */
+void iomfb_pause_presentation(struct apple_dcp *dcp, bool pause)
+{
+	guard(mutex)(&dcp->iomfb.lock);
+	dcp->iomfb.presentation_paused = pause;
+	if (!pause && dcp->external_hotplug_pending) {
+		unsigned int action;
+
+		dcp->external_hotplug_pending = false;
+		action = dcp_mode_hotplug(&dcp->mode_state, dcp->external_hotplug_connected,
+					  dcp->connector ? &dcp->connector->connected : NULL);
+		dcp_handle_hotplug_actions(dcp, action);
+	}
+}
+
+/* A dead transport is not proof that DMA or a pending present has stopped. */
+int iomfb_queue_settle(struct apple_dcp *dcp, unsigned long timeout)
+{
+	unsigned long deadline = jiffies + timeout;
+	bool idle;
+
+	for (;;) {
+		mutex_lock(&dcp->iomfb.lock);
+		if (READ_ONCE(dcp->crashed) || dcp->iomfb.stopped) {
+			mutex_unlock(&dcp->iomfb.lock);
+			return -EIO;
+		}
+		idle = !dcp->iomfb.active && !dcp->iomfb.queued &&
+		       list_empty(&dcp->iomfb.pending) &&
+		       !dcp->present_state_h17p.pending && iomfb_channels_idle(dcp);
+		mutex_unlock(&dcp->iomfb.lock);
+		if (idle)
+			return 0;
+		if (time_after_eq(jiffies, deadline))
+			return -ETIMEDOUT;
+		usleep_range(2000, 4000);
+	}
+}
+
 int iomfb_queue(struct apple_dcp *dcp, struct iomfb_transaction *transaction)
 {
 	int ret = 0;
@@ -421,6 +476,8 @@ int iomfb_queue(struct apple_dcp *dcp, struct iomfb_transaction *transaction)
 	mutex_lock(&dcp->iomfb.lock);
 	if (READ_ONCE(dcp->crashed) || dcp->iomfb.stopped) {
 		ret = -EIO;
+	} else if (transaction->presentation && dcp->iomfb.presentation_paused) {
+		ret = -EAGAIN;
 	} else if (transaction->brightness_only && dcp->iomfb.backlight_queued) {
 		ret = -EALREADY;
 	} else if (dcp->iomfb.queued >= 32) {
@@ -490,7 +547,7 @@ void iomfb_queue_crc_h17p(struct apple_dcp *dcp, u32 swap_id)
 
 	lockdep_assert_held(&dcp->iomfb.lock);
 	if (!READ_ONCE(dcp->crc_enabled) || READ_ONCE(dcp->crashed) ||
-	    dcp->iomfb.stopped || dcp->iomfb.queued >= 32)
+	    dcp->iomfb.stopped || dcp->iomfb.presentation_paused || dcp->iomfb.queued >= 32)
 		return;
 	crc = kzalloc_obj(*crc);
 	if (!crc)
@@ -720,6 +777,23 @@ void dcp_retrain_oob(struct apple_connector *connector)
 	schedule_work(&connector->hotplug_wq);
 }
 
+static void dcp_clear_connector_edid(struct apple_connector *connector)
+{
+	lockdep_assert_held(&connector->base.dev->mode_config.mutex);
+	drm_edid_connector_update(&connector->base, NULL);
+	drm_edid_free(connector->drm_edid);
+	connector->drm_edid = NULL;
+	connector->drm_edid_firmware_derived = false;
+}
+
+static void dcp_consume_edid_invalidation(struct apple_connector *connector)
+{
+	lockdep_assert_held(&connector->base.dev->mode_config.mutex);
+	/* Preserve a disconnect even if the port reconnected before probing. */
+	if (xchg(&connector->edid_invalidation_pending, false))
+		dcp_clear_connector_edid(connector);
+}
+
 void dcp_hotplug(struct work_struct *work)
 {
 	struct apple_connector *connector;
@@ -728,9 +802,17 @@ void dcp_hotplug(struct work_struct *work)
 	int ret;
 
 	connector = container_of(work, struct apple_connector, hotplug_wq);
+	scoped_guard(mutex, &connector->base.dev->mode_config.mutex)
+		dcp_consume_edid_invalidation(connector);
 
 	pdev = READ_ONCE(connector->dcp);
 	if (!pdev) {	/* a Type-C port unrouted after this was queued */
+		scoped_guard(mutex, &connector->base.dev->mode_config.mutex) {
+			if (!READ_ONCE(connector->dcp) && connector->drm_edid_firmware_derived) {
+				drm_edid_connector_update(&connector->base, NULL);
+				connector->drm_edid_firmware_derived = false;
+			}
+		}
 		drm_kms_helper_connector_hotplug_event(&connector->base);
 		return;
 	}
@@ -738,9 +820,9 @@ void dcp_hotplug(struct work_struct *work)
 	dev_info(dcp->dev, "%s() connected:%d valid_mode:%d nr_modes:%u\n", __func__,
 		 connector->connected, READ_ONCE(dcp->mode_state.valid), dcp->nr_modes);
 
-	if (!connector->connected) {
-		drm_edid_free(connector->drm_edid);
-		connector->drm_edid = NULL;
+	scoped_guard(mutex, &connector->base.dev->mode_config.mutex) {
+		if (!READ_ONCE(connector->connected))
+			dcp_clear_connector_edid(connector);
 	}
 
 	/*
@@ -770,6 +852,23 @@ void dcp_hotplug(struct work_struct *work)
 	drm_kms_helper_connector_hotplug_event(&connector->base);
 }
 
+/*
+ * J700/25G83 asks D134 after publishing its external video interface.
+ * The observed async record has no input and a four-byte result. Use the
+ * existing zero reply for this record only; its feature remains unsupported.
+ */
+static bool dcp_external_zero_reply(struct apple_dcp *dcp, int tag,
+				    enum dcp_context_id context,
+				    u32 in_len, u32 out_len)
+{
+	return tag == 134 && context == DCP_CONTEXT_ASYNC &&
+	       in_len == 0 && out_len == sizeof(u32) &&
+	       dcp->hw.iomfb_method_profile ==
+	       DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL &&
+	       of_machine_is_compatible("apple,j700") &&
+	       of_device_is_compatible(dcp->dev->of_node, "apple,t8140-dcpext");
+}
+
 static void dcpep_handle_cb(struct apple_dcp *dcp, enum dcp_context_id context,
 			    void *data, u32 length, u16 offset)
 {
@@ -779,7 +878,7 @@ static void dcpep_handle_cb(struct apple_dcp *dcp, enum dcp_context_id context,
 	int tag;
 	struct dcp_channel *ch = dcp_get_channel(dcp, context);
 	u8 depth;
-	bool handled;
+	bool handled, zero_reply;
 
 	if (dcp->fw_compat == DCP_FIRMWARE_H17P &&
 	    (length < sizeof(*hdr) || !ch || ch->depth >= DCP_MAX_CALL_DEPTH ||
@@ -790,6 +889,8 @@ static void dcpep_handle_cb(struct apple_dcp *dcp, enum dcp_context_id context,
 	}
 
 	tag = dcp_parse_tag(hdr->tag);
+
+
 	handled = tag >= 0 && tag < IOMFB_MAX_CB && dcp->cb_handlers &&
 		  dcp->cb_handlers[tag];
 	if (dcp->fw_compat == DCP_FIRMWARE_H17P &&
@@ -808,10 +909,21 @@ static void dcpep_handle_cb(struct apple_dcp *dcp, enum dcp_context_id context,
 	out = in + hdr->in_len;
 
 	if (!handled) {
-		if (!iomfb_uses_queue(dcp) ||
-		    !test_and_set_bit(tag, dcp->unknown_callbacks))
-			dev_warn(dev, "received unknown callback %c%c%c%c\n",
-				 hdr->tag[3], hdr->tag[2], hdr->tag[1], hdr->tag[0]);
+		zero_reply = dcp_external_zero_reply(dcp, tag, context,
+						     hdr->in_len, hdr->out_len);
+		if (!zero_reply &&
+		    (!iomfb_uses_queue(dcp) ||
+		     !test_and_set_bit(tag, dcp->unknown_callbacks)))
+			dev_warn(dev, "received unknown callback %c%c%c%c (%u, %u) context=%u\n",
+				 hdr->tag[3], hdr->tag[2], hdr->tag[1], hdr->tag[0],
+				 hdr->in_len, hdr->out_len, context);
+		if (dcp->hw.iomfb_method_profile ==
+		    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL && !zero_reply) {
+			/* Retain the failed session without inventing a successful reply. */
+			dcp->crashed = true;
+			complete(&dcp->start_done);
+			return;
+		}
 		/*
 		 * Leaving a callback unanswered wedges the coprocessor: it
 		 * waits for the ack forever and the outer call never returns.
@@ -944,9 +1056,16 @@ int dcp_get_modes(struct drm_connector *connector)
 	bool vrr_capable = false;
 	int i;
 
+	dcp_consume_edid_invalidation(apple_connector);
+
 	/* A Type-C port has no pipeline while the fabric is moving it. */
-	if (!pdev)
+	if (!pdev) {
+		if (apple_connector->drm_edid_firmware_derived) {
+			drm_edid_connector_update(connector, NULL);
+			apple_connector->drm_edid_firmware_derived = false;
+		}
 		return 0;
+	}
 	dcp = platform_get_drvdata(pdev);
 
 	for (i = 0; i < dcp->nr_modes; ++i) {
@@ -971,9 +1090,10 @@ int dcp_get_modes(struct drm_connector *connector)
 	}
 	drm_connector_set_vrr_capable_property(connector, vrr_capable);
 
-	/* H17P sends no EPIC commands; see afk_send_epic(). */
-	if (dcp->nr_modes && dcp->fw_compat != DCP_FIRMWARE_H17P &&
-	    !apple_connector->drm_edid) {
+	/* Internal H17P still has no supported EDID command transport. */
+	if (dcp->nr_modes && !apple_connector->drm_edid &&
+	    (dcp->fw_compat != DCP_FIRMWARE_H17P ||
+	     (dcp->dcpavservep && dcp->dcpavservep->inline_v2))) {
 		const struct drm_edid *edid;
 		edid = dcpavserv_copy_edid(dcp);
 		if (IS_ERR_OR_NULL(edid)) {
@@ -991,8 +1111,34 @@ int dcp_get_modes(struct drm_connector *connector)
 		}
 	}
 	if (dcp->nr_modes && apple_connector->drm_edid) {
+		apple_connector->drm_edid_firmware_derived = false;
 		drm_edid_connector_update(connector, apple_connector->drm_edid);
 		dcp_retry_placeholder_edid(dcp, apple_connector->drm_edid);
+	} else {
+		u64 generation = 0;
+		const struct drm_edid *derived = dcp->nr_modes ?
+			dcp_firmware_edid(dcp, &generation) : ERR_PTR(-ENODATA);
+
+		if (!IS_ERR(derived)) {
+			bool log = !apple_connector->drm_edid_firmware_derived ||
+				apple_connector->drm_edid_generation != generation;
+			int update;
+
+			apple_connector->drm_edid_firmware_derived = true;
+			apple_connector->drm_edid_generation = generation;
+			update = drm_edid_connector_update(connector, derived);
+			drm_edid_free(derived);
+			if (update || !dcp_firmware_metadata_current(dcp, generation)) {
+				drm_edid_connector_update(connector, NULL);
+				apple_connector->drm_edid_firmware_derived = false;
+			} else if (log) {
+				dev_info(dcp->dev, "using firmware-derived EDID metadata for connection %llu\n",
+					 generation);
+			}
+		} else if (apple_connector->drm_edid_firmware_derived) {
+			drm_edid_connector_update(connector, NULL);
+			apple_connector->drm_edid_firmware_derived = false;
+		}
 	}
 
 	/*
@@ -1041,7 +1187,9 @@ static bool dcp_mode_settable(struct apple_dcp *dcp,
 	if (!dcp_mode)
 		return false;
 
-	if (dcp->fw_compat == DCP_FIRMWARE_H17P)
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P &&
+	    dcp->hw.iomfb_method_profile !=
+	    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL)
 		return dcp_mode->mode.type & DRM_MODE_TYPE_PREFERRED;
 
 	return true;
@@ -1070,6 +1218,13 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 	unsigned int action;
 	int ret = -EIO;
 	bool modeset;
+
+	/* Disconnect cannot pass the admission check before these RPCs finish. */
+	guard(mutex)(&dcp->external_lock);
+	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL &&
+	    (!dcp->external_running || dcp->external_error || READ_ONCE(dcp->quiescing) ||
+	     READ_ONCE(dcp->crashed) || READ_ONCE(dcp->iomfb.presentation_paused)))
+		return -EPIPE;
 
 	crtc_state = drm_atomic_get_new_crtc_state(state, crtc);
 	if (!crtc_state)
@@ -1326,6 +1481,7 @@ static void iomfb_backlight_kick(struct apple_dcp *dcp)
 	transaction->start = iomfb_backlight_start;
 	transaction->release = iomfb_backlight_release;
 	transaction->brightness_only = true;
+	transaction->presentation = true;
 	if (iomfb_queue(dcp, transaction))
 		kfree(transaction);
 }
@@ -1386,18 +1542,29 @@ static void iomfb_queue_atomic(struct apple_dcp *dcp, struct drm_crtc *crtc,
 			       struct drm_atomic_state *state)
 {
 	struct iomfb_atomic_transaction *atomic;
+	int ret;
 
+	if (READ_ONCE(dcp->iomfb.presentation_paused)) {
+		schedule_work(&dcp->vblank_wq);
+		return;
+	}
 	atomic = kzalloc_obj(*atomic);
 	if (!atomic)
 		goto failed;
 	atomic->transaction.start = iomfb_atomic_start;
+	atomic->transaction.presentation = true;
 	atomic->transaction.release = iomfb_atomic_release;
 	atomic->state = drm_atomic_state_get(state);
 	atomic->crtc = crtc;
 	atomic->dcp = dcp;
-	if (!iomfb_queue(dcp, &atomic->transaction))
+	ret = iomfb_queue(dcp, &atomic->transaction);
+	if (!ret)
 		return;
 	iomfb_atomic_release(&atomic->transaction);
+	if (ret == -EAGAIN) {
+		schedule_work(&dcp->vblank_wq);
+		return;
+	}
 failed:
 	WRITE_ONCE(dcp->crashed, true);
 	schedule_work(&dcp->vblank_wq);
@@ -1546,7 +1713,8 @@ int iomfb_start_rtkit(struct apple_dcp *dcp)
 	 * has nothing answering it on the AP side, and without this one the
 	 * display DART faults.
 	 */
-	if (dcp->fw_compat == DCP_FIRMWARE_H17P) {
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P &&
+	    dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL) {
 		ret = apple_rtkit_start_ep(dcp->rtk, REMOTE_ALLOC_ENDPOINT);
 		if (ret)
 			return ret;
