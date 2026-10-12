@@ -36,8 +36,8 @@ struct apple_atcphy {
 	struct { void *core; } regs;
 	void *dev;
 	int lock, mode, dp_link_rate;
-	unsigned int dp_owned_pmas;
-	bool dp_spread_spectrum, swap_lanes, dp_presets_valid[5];
+	unsigned int dp_owned_pmas, dp_idle_pmas;
+	bool dp_spread_spectrum, swap_lanes, mode_dirty, dp_presets_valid[5];
 	u32 dp_presets[5][16];
 };
 
