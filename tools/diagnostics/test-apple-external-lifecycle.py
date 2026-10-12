@@ -475,15 +475,27 @@ int main(void)
     assert(dcp_dptx_connect_oob(&dev,0)==-EAGAIN && p.typec_generation==1);
     assert(dcp_metadata_matches(&p.metadata_epoch,first));
 
-    /* Link hookup alone never powers the pipe. A first activation preserves DA1 order. */
+    /* Discovery publishes physical HPD before DRM activation, without unpausing the pipe. */
     initial(&p);
     p.external_power_attempted = p.external_running = false;
     p.iomfb.presentation_paused = true;
-    p.dptxport[0].connected = false;
+    p.dptxport[0].connected = false; connector.connected=false;
     assert(dcp_dptx_connect_oob(&dev, 0) == 0 && connects == 1 && !power1);
+    assert(connector.connected && p.iomfb.presentation_paused);
     dcp_external_recover(&dev);
     assert(strstr(events, "DA1") && p.external_running && power1 == 1);
     owned(&p);
+
+    /* Discovery cannot publish a missing cable, a sticky error, or an OFF/restart callback. */
+    for(unsigned int reason=0;reason<3;reason++) {
+        initial(&p); connector.connected=false; p.iomfb.presentation_paused=true;
+        p.external_power_attempted=false;
+        if(reason==0)p.external_cable=false;
+        if(reason==1)p.external_error=-EIO;
+        if(reason==2)p.external_power_attempted=true;
+        mutex_lock(&p.iomfb.lock); assert(dcp_external_hotplug(&p,true)); mutex_unlock(&p.iomfb.lock);
+        assert(!connector.connected && p.iomfb.presentation_paused && !power1);
+    }
 
     /* Exact ON requires the 64-bit reply 1; all-zero must not activate modesets. */
     initial(&p);
