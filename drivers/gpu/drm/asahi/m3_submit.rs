@@ -48,6 +48,7 @@ pub(crate) struct Packet {
     vm_job:Pin<KBox<Mutex<Option<mmu::M3VmJobGuard>>>>,
 }
 impl Packet {
+    pub(crate) fn profile_id(&self)->usize {self as *const Self as usize}
     pub(crate) fn timestamp_addresses(&self,index:usize)->[u64;2] {
         core::array::from_fn(|i|self.timestamps[index][i].as_ref().map_or(0,Destination::firmware_address))
     }
@@ -69,7 +70,16 @@ impl Packet {
         // nonzero: GEM closes otherwise accumulate across completed frames.
         // On failure the runtime quarantines this guard with the packet until
         // firmware has provably stopped; signalling an error is not retirement.
-        crate::agx_memory::publish();self.completion.signal();
+        crate::agx_memory::publish();
+        let profile=crate::debug::debug_enabled(crate::debug::DebugFlags::M3PassTiming);
+        let before=if profile {crate::m3_runtime::physical_counter()} else {0};
+        self.completion.signal();
+        if profile {
+            let after=crate::m3_runtime::physical_counter();
+            let status=match result {Ok(())=>0,Err(e)=>e.to_errno()};
+            pr_info!("M3_PACKET_FENCE vm={} packet={:#x} commands={} signal_before_tick={} signal_after_tick={} status={} counter_hz=24000000\n",
+                self.vm.id(),self.profile_id(),self.commands.len(),before,after,status);
+        }
     }
 }
 pub(crate) struct Job {shared:Shared,packet:Arc<Packet>}

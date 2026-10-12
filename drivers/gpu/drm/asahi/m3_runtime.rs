@@ -21,6 +21,10 @@ struct Batch {
     base: usize, last_draw: u64, publication_tick:u64,
     polling_ns: i64, polls: u64, stamp_ns: i64, first_event_ns: i64, events_ns: i64,
     completion_ns: [i64;4],
+    /// First successful stamp observations and the preceding incomplete reads, in 24 MHz ticks.
+    fragment_host_tick:u64, fragment_fw_tick:u64,
+    fragment_host_pending_tick:u64, fragment_fw_pending_tick:u64,
+    pipes_idle_tick:u64,
     coalesced_stamps: u64,
     mixed: Option<MixedBatch>,
 }
@@ -441,7 +445,7 @@ impl Inner {
         Ok(Batch { entries:owned, index, kind:usize::from(matches!(control,crate::m3_submit::Command::Compute(_))),
             first:control, preparation_ns, previous_events, expected_events,
             start:Instant::<Monotonic>::now(), measure, doorbell_counter_ns:if measure {physical_counter() as i64 * 1000 / 24} else {0},
-            polling_ns:0, polls:0, stamp_ns:-1, first_event_ns:-1, events_ns:-1, completion_ns:[-1;4], coalesced_stamps, base, last_draw, publication_tick, mixed:None })
+            polling_ns:0, polls:0, stamp_ns:-1, first_event_ns:-1, events_ns:-1, completion_ns:[-1;4],fragment_host_tick:0,fragment_fw_tick:0,fragment_host_pending_tick:0,fragment_fw_pending_tick:0,pipes_idle_tick:0, coalesced_stamps, base, last_draw, publication_tick, mixed:None })
     }
     /// Prepare both idle queues from one packet. Cross-engine changes wait on
     /// the preceding command's firmware stamp; all commands remain GPU ordered.
@@ -564,7 +568,7 @@ impl Inner {
             preparation_ns,previous_events,expected_events:3,start:Instant::<Monotonic>::now(),
             measure:crate::debug::debug_enabled(crate::debug::DebugFlags::M3SubmitSummary),
             doorbell_counter_ns:0,polling_ns:0,polls:0,stamp_ns:-1,first_event_ns:-1,
-            events_ns:-1,completion_ns:[-1;4],coalesced_stamps:0,base:0,last_draw,publication_tick,
+            events_ns:-1,completion_ns:[-1;4],fragment_host_tick:0,fragment_fw_tick:0,fragment_host_pending_tick:0,fragment_fw_pending_tick:0,pipes_idle_tick:0,coalesced_stamps:0,base:0,last_draw,publication_tick,
             mixed:Some(MixedBatch {compute_index,renders,computes,dependencies})})
     }
     /// A mixed publication retires only after both jobs, all three queue
@@ -590,6 +594,7 @@ impl Inner {
             let valid=batch.publication_tick!=0 && start>=batch.publication_tick && end>=start && observed_tick>=end;
             dev_info!(self.drm.as_ref(),"M3_BATCH_BOUNDARY vm={} mixed=1 batch={} publication_tick={} gpu_start_tick={} gpu_end_tick={} observed_tick={} counter_hz=24000000 valid={}\n",
                 vm,batch.entries.len(),batch.publication_tick,start,end,observed_tick,u32::from(valid));
+            self.log_batch_milestones(batch,render_span.0,render_span.1,render_ns,stages[1]);
             // Render and compute have separate slot sequences in one mixed batch.
             let mut render_slot=0;
             let mut compute_slot=0;
@@ -665,6 +670,26 @@ impl Inner {
             Ok(primary && other)
         })();
         let stamped=match completion {Ok(v)=>v,Err(e)=>{self.fail_active(e);return Err(e);}};
+        if crate::debug::debug_enabled(crate::debug::DebugFlags::M3PassTiming) {
+            let before=physical_counter();
+            let parts=match &mut self.jobs[index] {
+                NativeJob::Render(j)=>j.fragment_stamp_parts().ok(),
+                _=>None,
+            };
+            let after=physical_counter();
+            if let Some(parts)=parts {
+                if let Some(batch)=self.active.first_mut() {
+                    if batch.fragment_host_tick==0 {
+                        if parts[0] {batch.fragment_host_tick=after;}
+                        else {batch.fragment_host_pending_tick=before;}
+                    }
+                    if batch.fragment_fw_tick==0 {
+                        if parts[1] {batch.fragment_fw_tick=after;}
+                        else {batch.fragment_fw_pending_tick=before;}
+                    }
+                }
+            }
+        }
         let power_enabled=crate::m3_params::active_power();
         if power_enabled {
             let since_last=self.active_power_last.map(|last|last.elapsed().as_nanos());
@@ -713,6 +738,10 @@ impl Inner {
                 retire_mmio&crate::m3_params::RETIRE_MMIO_FAULTS!=0) {
                 Ok(())=>match self.config.pipes_idle() {
                     Ok(true)=>{
+                        if crate::debug::debug_enabled(crate::debug::DebugFlags::M3PassTiming) {
+                            let tick=physical_counter();
+                            if let Some(batch)=self.active.first_mut() {batch.pipes_idle_tick=tick;}
+                        }
                         if retire_mmio&crate::m3_params::RETIRE_MMIO_PSTATE!=0 {
                             if let Err(e)=self.config.check_pstate(&self.drm,&self.device,"after a job") {
                                 if crate::t8122_start::is_t8122(self.device.soc()) {
@@ -748,6 +777,17 @@ impl Inner {
             self.fail_active(ETIMEDOUT);return Err(ETIMEDOUT);
         }
         Ok(false)
+    }
+    fn log_batch_milestones(&self,batch:&Batch,render_start:u64,render_end:u64,
+        render_gpu_ns:u64,fragment_sum_ns:u64) {
+        dev_info!(self.drm.as_ref(),"M3_BATCH_MILESTONE vm={} publication_tick={} draw={} mixed={} render_start_tick={} render_end_tick={} render_gpu_ns={} fragment_sum_ns={} fragment_host_tick={} fragment_fw_tick={} fragment_host_pending_tick={} fragment_fw_pending_tick={} pipes_idle_tick={} counter_hz=24000000\n",
+            batch.entries[0].0.vm.id(),batch.publication_tick,batch.last_draw,u32::from(batch.mixed.is_some()),
+            render_start,render_end,render_gpu_ns,fragment_sum_ns,batch.fragment_host_tick,batch.fragment_fw_tick,
+            batch.fragment_host_pending_tick,batch.fragment_fw_pending_tick,batch.pipes_idle_tick);
+        for (packet,command) in batch.entries.iter() {
+            dev_info!(self.drm.as_ref(),"M3_BATCH_PACKET vm={} publication_tick={} packet={:#x} command={}\n",
+                packet.vm.id(),batch.publication_tick,packet.profile_id(),command);
+        }
     }
     /// Bookkeeping for a retired batch, then signal its completed packets.
     fn retire(&mut self,batch:&Batch)->Result {
@@ -798,6 +838,9 @@ impl Inner {
             let valid=batch.publication_tick!=0 && span[0]>=batch.publication_tick && span[1]>=span[0] && observed_tick>=span[1];
             dev_info!(self.drm.as_ref(),"M3_BATCH_BOUNDARY vm={} cs={:#x} batch={} publication_tick={} gpu_start_tick={} gpu_end_tick={} observed_tick={} counter_hz=24000000 valid={}\n",
                 batch.entries[0].0.vm.id(),cs,batch_count,batch.publication_tick,span[0],span[1],observed_tick,u32::from(valid));
+            self.log_batch_milestones(batch,
+                if kind==0 {span[0]} else {0},if kind==0 {span[1]} else {0},
+                if kind==0 {gpu_ns} else {0},stages[1]);
             if let NativeJob::Compute(j)=&mut self.jobs[index] {
                 for (slot,(p,next)) in batch.entries.iter().enumerate() {
                     let crate::m3_submit::Command::Compute(c)=p.commands[*next] else {return Err(EINVAL);};
@@ -1144,7 +1187,7 @@ impl Drop for Runtime {
 
 /// Same scaling contract as G16's qualified publication profiler. AP counter
 /// rates may differ between SoCs; firmware command timestamps use 24 MHz.
-fn physical_counter() -> u64 {
+pub(crate) fn physical_counter() -> u64 {
     let tick: u64;
     let frequency: u64;
     // SAFETY: Read architectural counters only; no device state is modified.

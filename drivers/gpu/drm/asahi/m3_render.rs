@@ -628,6 +628,12 @@ impl Render {
         }
         Ok(masks)
     }
+    /// Read the fragment host and firmware stamps without changing retirement.
+    pub(crate) fn fragment_stamp_parts(&mut self)->Result<[bool;2]> {
+        let value=timeline::stamp(s::STAMP_FRAGMENT - 256,self.draw);
+        Ok([self.objects[s::FRAGMENT_STAMP].read_u32(0)?==value,
+            self.objects[s::FRAGMENT_FW_STAMP].read_u32(0)?==value])
+    }
     /// Observe each completion condition across both render queues independently.
     pub(crate) fn completion_parts(&mut self)->Result<[bool;4]> {
         let mut done=[true;4];
