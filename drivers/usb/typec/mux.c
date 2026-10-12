@@ -388,7 +388,6 @@ int typec_mux_set(struct typec_mux *mux, struct typec_mux_state *state)
 		mux_dev = mux->mux_devs[i];
 
 		ret = mux_dev->set(mux_dev, state);
-		dev_dbg(&mux_dev->dev, "mode=%lu callback result=%d\n", state->mode, ret);
 		if (ret && ret != -EOPNOTSUPP)
 			return ret;
 	}
