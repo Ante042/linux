@@ -226,8 +226,9 @@ static int dptxport_release_display(void *s)
 { (void)s; event('R'); releases++; return release_error; }
 
 static void av_service_disconnect(struct apple_dcp *p) { (void)p; }
-static int dcp_dptx_connect_raw(struct apple_dcp *p, u32 port)
+static int dcp_dptx_connect_raw(struct apple_dcp *p, u32 port, bool *waiting_service)
 {
+    if (waiting_service) *waiting_service = false;
     assert(!port && p->external_lock.held);
     if (p->dptxport[0].connected) return 0;
     event('C'); connects++;

@@ -52,7 +52,7 @@ struct apple_epic_service {
  struct apple_dcp_afkep *ep; unsigned long cmd_map[1];
 };
 struct dptx_port {
- bool enabled, connected; int enable_completion; u32 unit;
+ bool enabled, connected, closed; int enable_completion; u32 unit;
  struct apple_epic_service *service;
 };
 static void reinit_completion(int *p) { *p = 0; }
