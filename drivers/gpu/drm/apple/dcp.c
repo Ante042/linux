@@ -3827,7 +3827,6 @@ static int dcp_platform_probe(struct platform_device *pdev)
 		ret = dcp_comp_bind(dev, NULL, NULL);
 		if (ret) {
 			dcp_disable_typec_work(dcp, true);
-			disable_delayed_work_sync(&dcp->typec_fabric_retrain_wq);
 			return ret;
 		}
 		WRITE_ONCE(dcp->external_prepared, true);
@@ -3836,7 +3835,6 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	ret = component_add(&pdev->dev, &dcp_comp_ops);
 	if (ret && dcp->external_prepared) {
 		dcp_disable_typec_work(dcp, true);
-		disable_delayed_work_sync(&dcp->typec_fabric_retrain_wq);
 	}
 	return ret;
 }
