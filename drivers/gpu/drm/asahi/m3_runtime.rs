@@ -1086,7 +1086,8 @@ impl Runtime {
 }
 impl Drop for Runtime {
     fn drop(&mut self) {
-        let _=self.inner.config.performance_request(self.inner.device.soc().chip_id,false);
+        let chip=self.inner.device.soc().chip_id;
+        let _=self.inner.config.performance_request(chip,false);
         self.inner.state.health.mark_failed();
         // Unpublished packets never reach the firmware; a published batch's packets stay
         // retained below if the GPU may still use them, but their fences must not hang.
