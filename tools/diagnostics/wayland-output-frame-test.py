@@ -3,6 +3,8 @@
 """Show a bounded animation on one Wayland output and report frame feedback."""
 import argparse
 import json
+import os
+import tempfile
 import time
 
 import gi
@@ -65,11 +67,46 @@ def finish():
     return GLib.SOURCE_REMOVE
 
 
+def save_widget_pixels():
+    try:
+        if stats["actual_connector"] != args.connector or not stats["draws"]:
+            raise RuntimeError("test widget not ready on requested connector")
+        width, height = area.get_width(), area.get_height()
+        if width <= 0 or height <= 0 or width > 8192 or height > 8192:
+            raise RuntimeError("widget dimensions out of diagnostic bounds")
+        paintable = Gtk.WidgetPaintable.new(area)
+        snapshot = Gtk.Snapshot.new()
+        paintable.snapshot(snapshot, width, height)
+        node = snapshot.to_node()
+        if node is None:
+            raise RuntimeError("widget snapshot empty")
+        renderer = window.get_renderer()
+        texture = renderer.render_texture(node, None)
+        directory = tempfile.mkdtemp(prefix="aurora-widget-pixels-", dir="/var/tmp")
+        path = os.path.join(directory, "widget.png")
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "wb") as output:
+            output.write(texture.save_to_png_bytes().get_data())
+            output.flush()
+            os.fsync(output.fileno())
+        stats["widget_png"] = path
+        stats["widget_dimensions"] = [width, height]
+        stats["renderer_type"] = renderer.__gtype__.name
+        stats["widget_pixels_pass"] = True
+        stats["widget_scope"] = "owned test widget only; before compositor and physical scanout"
+    except Exception as error:
+        stats["widget_pixels_pass"] = False
+        stats["widget_error_type"] = type(error).__name__
+    return GLib.SOURCE_REMOVE
+
+
 area.set_draw_func(draw)
 area.add_tick_callback(tick)
 window.connect("close-request", lambda _window: finish())
 window.fullscreen_on_monitor(matches[0])
 window.present()
+if args.widget_pixels:
+    GLib.timeout_add_seconds(2, save_widget_pixels)
 GLib.timeout_add_seconds(args.seconds, finish)
 loop.run()
 stats["elapsed_s"] = round(time.monotonic() - started, 3)

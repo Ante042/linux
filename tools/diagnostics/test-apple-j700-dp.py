@@ -10,11 +10,14 @@ import tempfile
 
 root = Path(__file__).resolve().parents[2]
 source = (root / "drivers/gpu/drm/apple/dptxep.c").read_text()
-start = source.index("static int dptxport_group_call(")
-end = source.index("\n}\n", start) + 3
+functions = []
+for name in ("dptxport_v2_group_call", "dptxport_call_group1", "dptxport_group_call"):
+    start = source.index("static int " + name + "(")
+    end = source.index("\n}\n", start) + 3
+    functions.append(source[start:end])
 with tempfile.TemporaryDirectory(prefix="j700-dp-") as work:
     work = Path(work)
-    (work / "group-call.h").write_text(source[start:end])
+    (work / "group-call.h").write_text("\n\n".join(functions))
     for name in ("apple-j700-dp-test", "apple-dptx-training-test"):
         command = shlex.split(os.environ.get("CC", "clang"))
         command += ["-std=gnu11", "-O1", "-g", "-Wall", "-Wextra", "-Werror"]

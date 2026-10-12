@@ -23,11 +23,19 @@ struct dptx_port {
 	u32 trained_voltage[4], trained_pre[4];
 };
 
-struct apple_epic_service { struct dptx_port *cookie; };
+struct endpoint { bool wire_v2; };
+struct apple_epic_service { struct dptx_port *cookie; struct endpoint *ep; };
 static unsigned int calls;
 static int failure;
 #define PHY_MODE_DP 1
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#define min(a, b) ((a) < (b) ? (a) : (b))
+#define min_t(t, a, b) min((t)(a), (t)(b))
+#define trace_dptxport_apcall(port, ...) ((void)(port))
+#define dev_dbg(...) ((void)0)
+#define dev_warn_ratelimited(...) ((void)0)
+#define print_hex_dump_debug(...) ((void)0)
+#define DUMP_PREFIX_OFFSET 0
 
 static u32 get_unaligned_le32(const void *p)
 {
@@ -82,7 +90,8 @@ int main(void)
 {
 	struct phy phy = {};
 	struct dptx_port port = { .atcphy = &phy };
-	struct apple_epic_service service = { .cookie = &port };
+	struct endpoint ep = { .wire_v2 = true };
+	struct apple_epic_service service = { .cookie = &port, .ep = &ep };
 	u8 input[81] = {}, output[81];
 	u8 *request = input + 1, *reply = output + 1;
 	unsigned int cases = 0;
@@ -127,6 +136,28 @@ int main(void)
 						   request, 80, reply, 80) == expected);
 		}
 	}
+	/* Real unified dispatcher: legacy replies retain fields/canaries and
+	 * never enter native PHY training. All original v2 cases above stay.
+	 */
+	ep.wire_v2 = false;
+	for (unsigned int command = 3; command <= 4; command++) {
+		for (unsigned int length = 48; length <= 64; length += 16) {
+			unsigned int before = calls;
+			memset(request, 0xa5, 80);
+			memset(output, 0xc3, sizeof(output));
+			assert(!dptxport_group_call(&service, 1, command,
+						   request, length, reply, length));
+			for (unsigned int i = 0; i < length; i++) {
+				bool cleared = command == 3 ? i < 4 :
+					(i >= 16 && i < 20) || i >= 32;
+				assert(reply[i] == (cleared ? 0 : 0xa5));
+			}
+			assert(output[0] == 0xc3 && output[length + 1] == 0xc3);
+			assert(calls == before);
+		}
+	}
+	assert(dptxport_group_call(&service, 0, 3, request, 80, reply, 80) == 7);
+	ep.wire_v2 = true;
 	put_unaligned_le32(2, request);
 	unsigned int before_readback = calls;
 
