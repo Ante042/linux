@@ -61,6 +61,8 @@ static int phy_configure(struct phy *p, union phy_configure_opts *o)
 #ifdef DPTX_GROUP_TEST
 #define DPTX_APCALL_SET_DRIVE_SETTINGS 3
 #define DPTX_APCALL_GET_DRIVE_SETTINGS 4
+#define DPTX_APCALL_GET_VIRTUAL_DEVICE_MODE 26
+struct dptxport_apcall_get_support { u8 bytes[32]; };
 static int dptxport_call(struct apple_epic_service *service, u32 command,
 			 const void *data, size_t size, void *reply, size_t room)
 {
@@ -113,17 +115,22 @@ int main(void)
 
 #ifdef DPTX_GROUP_TEST
 	for (unsigned int group = 0; group < 4; group++) {
-		for (unsigned int command = 0; command < 25; command++) {
+		for (unsigned int command = 0; command < 27; command++) {
 			int expected = group ? -EOPNOTSUPP : 7;
 
 			if (group == 0 && command == 3)
 				expected = -EOPNOTSUPP;
-			if ((group == 1 && command == 3) || (group == 0 && command == 4))
+			if ((group == 1 && command == 3) ||
+			    (group == 0 && (command == 4 || command == 26)))
 				expected = 0;
 			assert(dptxport_group_call(&service, group, command,
 						   request, 80, reply, 80) == expected);
 		}
 	}
+	assert(dptxport_group_call(&service, 0, 26, request, 80, reply, 31) == -EINVAL);
+	memset(reply, 0xff, 80);
+	assert(!dptxport_group_call(&service, 0, 26, request, 80, reply, 80));
+	assert(!get_unaligned_le32(reply + 16));
 #endif
 	const unsigned int transitions[] = { 0, 2, 0, 2, 1, 2 };
 
