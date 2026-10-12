@@ -43,6 +43,7 @@ struct apple_atcphy {
 
 static u32 registers[0x20000 / 4];
 static unsigned int writes, polls, fail_poll, pin_mask = 2;
+static u32 transactions[2048], transaction_masks[2048];
 static bool fail_all;
 
 static void core_mask32(struct apple_atcphy *p, u32 off, u32 mask, u32 value)
@@ -51,7 +52,9 @@ static void core_mask32(struct apple_atcphy *p, u32 off, u32 mask, u32 value)
 	assert(!(off % 4) && off / 4 < ARRAY_SIZE(registers));
 	assert(!(value & ~mask));
 	registers[off / 4] = (registers[off / 4] & ~mask) | value;
-	writes++;
+	assert(writes < ARRAY_SIZE(transactions));
+	transaction_masks[writes] = mask;
+	transactions[writes++] = off;
 	if (off == 0x2000) {
 		if (value == 0x10000001) {
 			registers[off / 4] |= BIT(1);
@@ -131,6 +134,33 @@ static struct apple_atcphy device(void)
 	return p;
 }
 
+static void check_transmitter_order(unsigned int pmas)
+{
+	for (unsigned int lane = 0; lane < 2; lane++) {
+		u32 base = 0xd000 + lane * 0x7000;
+		bool found_rate = false, found_power = false;
+
+		if (!(pmas & BIT(lane)))
+			continue;
+		for (unsigned int t = 0; t + 4 < writes; t++) {
+			if (transactions[t] == base + 4 && transactions[t + 1] == base + 4) {
+				assert(transactions[t + 2] == base + 0xc);
+				assert(transactions[t + 3] == base + 0x10);
+				assert(transactions[t + 4] == base + 0x1c);
+				found_rate = true;
+			}
+			if (transactions[t] == 0x10c && transaction_masks[t] == BIT(4 + lane)) {
+				assert(transactions[t + 1] == 0x10c);
+				assert(transaction_masks[t + 1] == BIT(6 + lane));
+				assert(transaction_masks[t + 2] == BIT(lane));
+				assert(transaction_masks[t + 3] == BIT(2 + lane));
+				found_power = true;
+			}
+		}
+		assert(found_rate && found_power);
+	}
+}
+
 int main(void)
 {
 	const unsigned int rates[] = { 1620, 2700, 5400, 8100 };
@@ -147,6 +177,7 @@ int main(void)
 
 				assert(!j700_dp_configure(&p, &o));
 				assert(p.dp_owned_pmas == pin_mask && p.dp_link_rate == (int)rate);
+				check_transmitter_order(pin_mask);
 				if (pin_mask != 3) {
 					u32 other = pin_mask == 1 ? 0xf0 : 0xf;
 
