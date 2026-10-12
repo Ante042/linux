@@ -12,6 +12,9 @@
 #include "dcp-internal.h"
 #include "parser.h"
 
+bool dcp_h17p_external_enabled(void);
+bool dcp_h17p_external_ready(struct device_node *np);
+
 struct apple_crtc {
 	struct drm_crtc base;
 	struct drm_pending_vblank_event *event;
@@ -31,6 +34,7 @@ struct apple_encoder {
 
 void dcp_poweroff(struct platform_device *pdev);
 void dcp_poweron(struct platform_device *pdev);
+void dcp_external_recover(struct platform_device *pdev);
 int dcp_set_crc(struct drm_crtc *crtc, bool enabled);
 int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state *state);
 int dcp_get_connector_type(struct platform_device *pdev);
@@ -94,6 +98,7 @@ void iomfb_recv_msg(struct apple_dcp *dcp, u64 message);
 
 int systemep_init(struct apple_dcp *dcp);
 int dptxep_init(struct apple_dcp *dcp);
+int dptx_controller_init(struct apple_dcp *dcp);
 int ibootep_init(struct apple_dcp *dcp);
 int dpavservep_init(struct apple_dcp *dcp);
 int avep_init(struct apple_dcp *dcp);

@@ -152,6 +152,9 @@ static void apple_crtc_atomic_enable(struct drm_crtc *crtc,
 		dcp_poweron(apple_crtc->dcp);
 		/* Force the CTM to be set on first swap */
 		crtc_state->color_mgmt_changed = true;
+	} else if (crtc_state->active && drm_atomic_crtc_needs_modeset(crtc_state)) {
+		/* A cable generation can change while the CRTC stays active. */
+		dcp_external_recover(to_apple_crtc(crtc)->dcp);
 	}
 
 	if (crtc_state->active)
@@ -640,15 +643,12 @@ static const struct of_device_id apple_dcp_id_tbl[] = {
 	{},
 };
 
-/*
- * The T8140 external display coprocessor needs firmware support this driver
- * does not have yet.  Leave it out of the display subsystem, so that an
- * enabled node cannot hold back the internal panel's component master.
- */
+/* An explicitly enabled external provider participates in component matching. */
 static bool apple_dcp_usable(struct device_node *np)
 {
 	return of_device_is_available(np) &&
-	       !of_device_is_compatible(np, "apple,t8140-dcpext");
+	       (!of_device_is_compatible(np, "apple,t8140-dcpext") ||
+		dcp_h17p_external_enabled());
 }
 
 static int apple_drm_init_dcp(struct device *dev)
@@ -666,7 +666,15 @@ static int apple_drm_init_dcp(struct device *dev)
 		if (!apple_dcp_usable(np))
 			continue;
 		dcp_ext = of_device_is_compatible(np, "apple,dcpext") ||
+		          of_device_is_compatible(np, "apple,t8140-dcpext") ||
 		          of_property_present(np, "phys");
+
+		/* component_bind_all() established the matched provider lifetime. */
+		if (of_device_is_compatible(np, "apple,t8140-dcpext") &&
+		    !dcp_h17p_external_ready(np)) {
+			of_node_put(np);
+			return -ENODEV;
+		}
 
 		dcp[num_dcp] = of_find_device_by_node(np);
 		if (!dcp[num_dcp])
@@ -677,8 +685,14 @@ static int apple_drm_init_dcp(struct device *dev)
 		ret = apple_probe_per_dcp(dev, &apple->drm, dcp[num_dcp],
 					  num_dcp, dcp_ext, &encoder[num_dcp],
 					  &crtc_mask[num_dcp]);
-		if (ret)
+		if (ret) {
+			if (of_device_is_compatible(np, "apple,t8140-dcpext")) {
+				put_device(&dcp[num_dcp]->dev);
+				of_node_put(np);
+				return ret;
+			}
 			continue;
+		}
 
 		num_dcp++;
 	}
