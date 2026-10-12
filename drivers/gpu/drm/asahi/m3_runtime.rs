@@ -578,6 +578,40 @@ impl Inner {
         let NativeJob::Compute(j)=&mut self.jobs[mixed.compute_index] else {return Err(EINVAL);};
         let compute_ns=j.gpu_ns()?;
         j.progress(&self.drm)?;
+        if crate::debug::debug_enabled(crate::debug::DebugFlags::M3PassTiming) {
+            let vm=batch.entries[0].0.vm.id();
+            let observed_tick=physical_counter();
+            let NativeJob::Render(j)=&mut self.jobs[batch.index] else {return Err(EINVAL);};
+            let render_span=j.gpu_ticks(0,mixed.renders)?;
+            let NativeJob::Compute(j)=&mut self.jobs[mixed.compute_index] else {return Err(EINVAL);};
+            let compute_span=j.batch_gpu_span()?;
+            let start=render_span.0.min(compute_span[0]);
+            let end=render_span.1.max(compute_span[1]);
+            let valid=batch.publication_tick!=0 && start>=batch.publication_tick && end>=start && observed_tick>=end;
+            dev_info!(self.drm.as_ref(),"M3_BATCH_BOUNDARY vm={} mixed=1 batch={} publication_tick={} gpu_start_tick={} gpu_end_tick={} observed_tick={} counter_hz=24000000 valid={}\n",
+                vm,batch.entries.len(),batch.publication_tick,start,end,observed_tick,u32::from(valid));
+            // Render and compute have separate slot sequences in one mixed batch.
+            let mut render_slot=0;
+            let mut compute_slot=0;
+            for (packet,next) in batch.entries.iter() {
+                match packet.commands[*next] {
+                    crate::m3_submit::Command::Render{command:r,..}=>{
+                        let NativeJob::Render(j)=&mut self.jobs[batch.index] else {return Err(EINVAL);};
+                        let s=j.slot_stage_ns(0,mixed.renders,render_slot)?;
+                        dev_info!(self.drm.as_ref(),"M3_PASS_SLOT vm={} mixed=1 slot={} batch={} vdm={:#x} width={} height={} samples={} ta_ns={} fragment_ns={} gap_ns={}\n",
+                            vm,render_slot,mixed.renders,r.vdm_base,r.width,r.height,r.samples,s[0],s[1],s[2]);
+                        render_slot+=1;
+                    },
+                    crate::m3_submit::Command::Compute(c)=>{
+                        let NativeJob::Compute(j)=&mut self.jobs[mixed.compute_index] else {return Err(EINVAL);};
+                        let ns=j.slot_gpu_ns(compute_slot)?;
+                        dev_info!(self.drm.as_ref(),"M3_COMPUTE_SLOT vm={} mixed=1 slot={} batch={} cdm={:#x} end={:#x} usc={:#x} gpu_ns={}\n",
+                            vm,compute_slot,mixed.computes,c.base,c.end,c.usc_base,ns);
+                        compute_slot+=1;
+                    },
+                }
+            }
+        }
         self.state.health.record_completion();
         self.render_batches[mixed.renders-1]+=1;
         self.pass_cost.record(batch.entries[0].0.vm.id(),render_ns/mixed.renders as u64);
@@ -762,20 +796,20 @@ impl Inner {
                 _=>return Err(EINVAL),
             };
             let valid=batch.publication_tick!=0 && span[0]>=batch.publication_tick && span[1]>=span[0] && observed_tick>=span[1];
-            dev_info!(self.drm.as_ref(),"M3_BATCH_BOUNDARY cs={:#x} batch={} publication_tick={} gpu_start_tick={} gpu_end_tick={} observed_tick={} counter_hz=24000000 valid={}\n",
-                cs,batch_count,batch.publication_tick,span[0],span[1],observed_tick,u32::from(valid));
+            dev_info!(self.drm.as_ref(),"M3_BATCH_BOUNDARY vm={} cs={:#x} batch={} publication_tick={} gpu_start_tick={} gpu_end_tick={} observed_tick={} counter_hz=24000000 valid={}\n",
+                batch.entries[0].0.vm.id(),cs,batch_count,batch.publication_tick,span[0],span[1],observed_tick,u32::from(valid));
             if let NativeJob::Compute(j)=&mut self.jobs[index] {
                 for (slot,(p,next)) in batch.entries.iter().enumerate() {
                     let crate::m3_submit::Command::Compute(c)=p.commands[*next] else {return Err(EINVAL);};
                     let ns=j.slot_gpu_ns(slot)?;
-                    dev_info!(self.drm.as_ref(),"M3_COMPUTE_SLOT slot={} batch={} cdm={:#x} end={:#x} usc={:#x} gpu_ns={}\n",slot,batch_count,c.base,c.end,c.usc_base,ns);
+                    dev_info!(self.drm.as_ref(),"M3_COMPUTE_SLOT vm={} slot={} batch={} cdm={:#x} end={:#x} usc={:#x} gpu_ns={}\n",p.vm.id(),slot,batch_count,c.base,c.end,c.usc_base,ns);
                 }
             }
             if let NativeJob::Render(j)=&mut self.jobs[index] {
                 for (slot,(p,next)) in batch.entries.iter().enumerate() {
                     let crate::m3_submit::Command::Render{command:r,..}=p.commands[*next] else {return Err(EINVAL);};
                     let s=j.slot_stage_ns(batch.base,batch_count,slot)?;
-                    dev_info!(self.drm.as_ref(),"M3_PASS_SLOT slot={} batch={} vdm={:#x} width={} height={} samples={} ta_ns={} fragment_ns={} gap_ns={}\n",slot,batch_count,r.vdm_base,r.width,r.height,r.samples,s[0],s[1],s[2]);
+                    dev_info!(self.drm.as_ref(),"M3_PASS_SLOT vm={} slot={} batch={} vdm={:#x} width={} height={} samples={} ta_ns={} fragment_ns={} gap_ns={}\n",p.vm.id(),slot,batch_count,r.vdm_base,r.width,r.height,r.samples,s[0],s[1],s[2]);
                 }
             }
         }
