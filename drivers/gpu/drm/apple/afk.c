@@ -894,6 +894,8 @@ static void afk_recv_handle(struct apple_dcp_afkep *ep, u32 channel, u32 type,
 	u8 *payload;
 	size_t payload_size;
 
+	trace_afk_recv_header(ep, channel, type, data_size, data);
+
 	if (ep->wire_v2) {
 		afk_v2_receive(ep, channel, type, data, data_size);
 		return;
