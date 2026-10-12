@@ -201,10 +201,14 @@ typedef int64_t s64;
 #define trace_iomfb_parse_mode_fail(...) ((void)0)
 #define trace_iomfb_parse_mode_success(...) ((void)0)
 #define trace_iomfb_timing_mode(...) ((void)0)
+#define DRM_MODE_FLAG_PHSYNC 1
+#define DRM_MODE_FLAG_NHSYNC 2
+#define DRM_MODE_FLAG_PVSYNC 4
+#define DRM_MODE_FLAG_NVSYNC 8
 #define DRM_MODE_TYPE_DRIVER 1
 #define DRM_MODE_TYPE_PREFERRED 2
 struct drm_display_mode {
-    unsigned int type;
+    unsigned int type, flags;
     int clock, vdisplay, vsync_start, vsync_end, vtotal;
     int hdisplay, hsync_start, hsync_end, htotal, width_mm, height_mm;
 };
