@@ -32,6 +32,7 @@ window.set_child(area)
 started = time.monotonic()
 stats = {"connector": args.connector, "ticks": 0, "draws": 0}
 feedback = set()
+complete_frames = set()
 
 
 def draw(_area, context, width, height):
@@ -46,11 +47,14 @@ def draw(_area, context, width, height):
 
 def tick(widget, clock):
     stats["ticks"] += 1
-    previous = clock.get_timings(clock.get_frame_counter() - 1)
-    if previous is not None and previous.get_complete():
-        presented = previous.get_presentation_time()
-        if presented:
-            feedback.add(presented)
+    counter = clock.get_frame_counter()
+    for frame in range(max(0, counter - 16), counter):
+        previous = clock.get_timings(frame)
+        if previous is not None and previous.get_complete():
+            complete_frames.add(frame)
+            presented = previous.get_presentation_time()
+            if presented:
+                feedback.add(presented)
     widget.queue_draw()
     return GLib.SOURCE_CONTINUE
 
@@ -70,6 +74,7 @@ GLib.timeout_add_seconds(args.seconds, finish)
 loop.run()
 stats["elapsed_s"] = round(time.monotonic() - started, 3)
 stats["presentation_feedback_frames"] = len(feedback)
+stats["complete_timings"] = len(complete_frames)
 stats["callback_pass"] = stats["ticks"] >= args.seconds * 15
 stats["draw_pass"] = stats["draws"] >= args.seconds * 15
 stats["presentation_pass"] = len(feedback) >= args.seconds * 10
