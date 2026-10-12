@@ -3040,6 +3040,9 @@ static int atcphy_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *sta
 	int ret;
 
 	guard(mutex)(&atcphy->lock);
+	dev_dbg(atcphy->dev, "mux mode=%lu svid=%04x current=%u fixed=%u dp=%u ss=%u\n",
+		state->mode, state->alt ? state->alt->svid : 0, atcphy->mode,
+		atcphy->fixed_usb2, atcphy->dp_tunables, atcphy->ss_tunables);
 
 	if (state->mode == TYPEC_STATE_SAFE) {
 		target_mode = APPLE_ATCPHY_MODE_OFF;
@@ -3100,6 +3103,7 @@ static int atcphy_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *sta
 	if (atcphy->fixed_usb2 && target_mode == APPLE_ATCPHY_MODE_OFF)
 		target_mode = APPLE_ATCPHY_MODE_USB2;
 
+	dev_dbg(atcphy->dev, "mux target=%u\n", target_mode);
 	if (atcphy->mode == target_mode)
 		return 0;
 
