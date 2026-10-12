@@ -10,6 +10,7 @@
 typedef uint8_t u8;
 typedef uint32_t u32;
 typedef uint16_t u16;
+typedef uint64_t u64;
 struct phy { int unused; };
 struct settings {
 	unsigned int lanes, voltage[4], pre[4];
@@ -26,6 +27,7 @@ struct apple_epic_service { struct dptx_port *cookie; };
 static unsigned int calls;
 static int failure;
 #define PHY_MODE_DP 1
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 
 static u32 get_unaligned_le32(const void *p)
 {
@@ -123,7 +125,15 @@ int main(void)
 		}
 	}
 #endif
+	const unsigned int transitions[] = { 0, 2, 0, 2, 1, 2 };
+
+	for (unsigned int i = 0; i < ARRAY_SIZE(transitions); i++)
+		assert(!dptx_j700_validate_lanes(&port, transitions[i]));
+	assert(dptx_j700_validate_lanes(&port, 3) == -EINVAL);
+	assert(dptx_j700_validate_lanes(&port, 4) == -EINVAL);
+	assert(dptx_j700_validate_lanes(&port, UINT64_MAX) == -EINVAL);
 	port.atcphy = NULL;
+	assert(dptx_j700_validate_lanes(&port, 2) == -ENODEV);
 	assert(dptx_j700_training(&service, true, request, 80, reply, 80) == -ENODEV);
 	printf("DPTX training: %u boundary cases plus failure/cache/readback checks passed\n",
 	       cases);
