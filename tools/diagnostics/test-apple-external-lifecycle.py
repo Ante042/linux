@@ -123,7 +123,7 @@ struct dcp_packet_header { char tag[4]; u32 in_len, out_len; };
 struct dcp_set_power_state_req_h17p { u64 unklong; u32 unkint; unsigned char null, padding[3]; } __attribute__((packed));
 struct dcp_set_power_state_resp { u32 unknown, ret; } __attribute__((packed));
 struct device { int unused; };
-struct apple_connector { bool connected; struct work_struct hotplug_wq; };
+struct apple_connector { bool connected, edid_invalidation_pending; struct work_struct hotplug_wq; };
 struct dptx_port { bool connected; void *service; };
 struct iomfb_transaction { struct list_head link; void (*start)(void *,void *), (*release)(void *); bool brightness_only, presentation; };
 struct platform_device;
@@ -145,6 +145,7 @@ struct iomfb_atomic_transaction { struct iomfb_transaction transaction; struct d
 struct iomfb_crc_transaction { struct iomfb_transaction transaction; u32 swap_id; };
 struct apple_dcp {
     struct device *dev;
+    struct dcp_metadata_epoch metadata_epoch;
     struct { int iomfb_method_profile; } hw;
     struct mutex external_lock, hpd_mutex;
     u64 external_generation, external_crtc_generation, typec_generation, external_rx_generation, external_stop_generation, external_power_reply;
@@ -176,6 +177,8 @@ struct platform_device { struct apple_dcp *data; };
 struct mux_control { int unused; };
 struct apple_dcp_typec_route { struct apple_dcp *dcp; struct mux_control *active_xbar; bool tunnel; };
 #define platform_get_drvdata(p) ((p)->data)
+static void dcp_firmware_metadata_connection(struct apple_dcp *p, u64 generation, bool connected)
+{ dcp_metadata_epoch_connection(&p->metadata_epoch,generation,connected); }
 static struct apple_dcp *current_dcp;
 static unsigned long jiffies;
 static unsigned int sleeps, power0, power1, drops, releases, connects, allocations;
@@ -316,6 +319,7 @@ static void initial(struct apple_dcp *p)
     p->external_prepared = p->external_cable = p->external_running = p->external_power_attempted = true;
     p->fw_compat = DCP_FIRMWARE_H17P;
     p->external_generation = p->external_crtc_generation = p->external_rx_generation = 1;
+    p->typec_generation=1; dcp_metadata_epoch_connection(&p->metadata_epoch,1,true);
     p->hw.iomfb_method_profile = DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL;
     p->dptxport[0] = (struct dptx_port){ .connected = true, .service = p };
     p->retained_dma = 7; p->retained_fb = 11;
@@ -409,8 +413,11 @@ int main(void)
     initial(&p);
     assert(dcp_external_disconnect(&p, true) == 0);
     assert(!p.external_cable && !connector.connected && p.external_generation == 2);
+    assert(p.metadata_epoch.invalidated && !p.metadata_epoch.connected && connector.edid_invalidation_pending);
     assert(dcp_dptx_connect_oob(&dev, 0) == 0);
     assert(p.external_generation == 3 && !p.external_running && !connector.connected);
+    assert(p.metadata_epoch.connected && p.metadata_epoch.invalidated && p.metadata_epoch.generation==3);
+    assert(dcp_dptx_connect_oob(&dev,0)==0 && p.typec_generation==3);
     assert(p.iomfb.presentation_paused && power1 == 0);
     dcp_poweroff(&dev);
     assert(power0 == 1 && !p.external_running); /* token still belongs to generation 1 */
@@ -457,6 +464,16 @@ int main(void)
     assert(stop(&p, 1) == 0 && !power0 && !power1 && !releases);
     assert(dcp_dptx_connect_oob(&dev, 0) == -EAGAIN && !connects);
     owned(&p);
+
+    /* Initial physical association precedes service discovery; duplicate HPD keeps its ticket. */
+    initial(&p); p.external_prepared=false; p.external_cable=false;
+    p.external_power_attempted=p.external_running=false;
+    p.typec_generation=0; memset(&p.metadata_epoch,0,sizeof(p.metadata_epoch));
+    assert(dcp_dptx_connect_oob(&dev,0)==-EAGAIN);
+    assert(p.metadata_epoch.connected && !p.metadata_epoch.invalidated && p.metadata_epoch.generation==1);
+    struct dcp_metadata_ticket first=dcp_metadata_begin(&p.metadata_epoch);
+    assert(dcp_dptx_connect_oob(&dev,0)==-EAGAIN && p.typec_generation==1);
+    assert(dcp_metadata_matches(&p.metadata_epoch,first));
 
     /* Link hookup alone never powers the pipe. A first activation preserves DA1 order. */
     initial(&p);
@@ -521,6 +538,8 @@ int main(void)
 with tempfile.TemporaryDirectory(prefix='apple-external-lifecycle-') as tmp:
     tmp = Path(tmp)
     unit = tmp / 'test.c'
+    epoch = (base / 'dcp-metadata-epoch.h').read_text().replace('#include <linux/types.h>', '')
+    prefix = prefix.replace('typedef uint64_t u64;', 'typedef uint64_t u64;\n' + epoch)
     unit.write_text(prefix + production + suffix)
     command = shlex.split(os.environ.get('CC', 'clang'))
     command += ['-std=gnu11', '-Wall', '-Wextra', '-Werror',

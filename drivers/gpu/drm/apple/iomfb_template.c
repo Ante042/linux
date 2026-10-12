@@ -18,6 +18,7 @@
 #include <linux/overflow.h>
 #include <linux/pm_runtime.h>
 #include <linux/slab.h>
+#include <linux/unaligned.h>
 
 #include <drm/drm_fb_dma_helper.h>
 #include <drm/drm_fourcc.h>
@@ -68,8 +69,16 @@ static void dcp_swap_submit(struct apple_dcp *dcp, bool oob,
 			    dcp_callback_t cb, void *cookie)
 {
 	const void *data = request;
+	unsigned int i;
 
 	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) {
+		for (i = 0; i < SWAP_SURFACES; i++) {
+			const struct dcp_surface *surface = &request->surf[i].base;
+
+			if (!request->surf_null[i])
+				trace_iomfb_surface(dcp, i, surface->format, surface->xfer_func,
+						    surface->colorspace, surface->is_premultiplied);
+		}
 		iomfb_serialize_present_h17p(&dcp->present_h17p, request);
 		if (!iomfb_apply_backlight_h17p(dcp, request, &dcp->present_h17p)) {
 			if (cb)
@@ -932,6 +941,7 @@ static u8 dcpep_cb_prop_start(struct apple_dcp *dcp, u32 *length)
 #endif
 
 	dcp->chunks.length = *length;
+	dcp_firmware_metadata_begin(dcp);
 	dcp->chunks.data = kzalloc(*length, GFP_KERNEL);
 
 	if (!dcp->chunks.data) {
@@ -950,11 +960,17 @@ static u8 dcpep_cb_prop_chunk(struct apple_dcp *dcp,
 		return false;
 	}
 
-	if (req->offset + req->length > dcp->chunks.length) {
+	if (req->offset > dcp->chunks.length || req->length > sizeof(req->data) ||
+	    req->length > dcp->chunks.length - req->offset) {
+		dcp->chunks.contiguous = false;
 		dev_warn(dcp->dev, "ignoring overflowing chunk\n");
 		return false;
 	}
 
+	if (req->offset != dcp->chunks.received)
+		dcp->chunks.contiguous = false;
+	if (dcp->chunks.contiguous)
+		dcp->chunks.received += req->length;
 	memcpy(dcp->chunks.data + req->offset, req->data, req->length);
 	return true;
 }
@@ -969,6 +985,12 @@ static bool dcpep_process_chunks(struct apple_dcp *dcp,
 		dev_warn(dcp->dev, "ignoring spurious end\n");
 		return false;
 	}
+
+	/* Validate serialized extent outside the metadata spinlock. */
+	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL)
+		dcp->chunks.payload_complete = dcp->chunks.contiguous &&
+			dcp_property_complete(dcp->chunks.data, dcp->chunks.received,
+					      dcp->chunks.length);
 
 	/* used just as opaque pointer for tracing */
 	ctx.dcp = dcp;
@@ -993,11 +1015,15 @@ static bool dcpep_process_chunks(struct apple_dcp *dcp,
 			dev_warn(dcp->dev, "failed to parse modes\n");
 			dcp->modes = NULL;
 			dcp->nr_modes = 0;
+			dcp_firmware_metadata_timing(dcp);
 			return false;
 		}
 		if (dcp->nr_modes == 0)
 			dev_warn(dcp->dev, "TimingElements without valid modes!\n");
+		dcp_firmware_metadata_timing(dcp);
 	} else if (!strcmp(req->key, "DisplayAttributes")) {
+		struct dcp_parse_ctx metadata_ctx = ctx;
+
 		ret = parse_display_attributes(&ctx, &dcp->width_mm,
 					&dcp->height_mm);
 
@@ -1007,6 +1033,12 @@ static bool dcpep_process_chunks(struct apple_dcp *dcp,
 		}
 
 		dcp_set_dimensions(dcp);
+		if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL) {
+			struct dcp_display_metadata metadata;
+
+			ret = parse_display_metadata(&metadata_ctx, &metadata);
+			dcp_firmware_metadata_attributes(dcp, ret ? NULL : &metadata);
+		}
 	}
 
 	return true;
@@ -1865,6 +1897,7 @@ static void dcpep_cb_hotplug(struct apple_dcp *dcp, u64 *connected)
 	if (dcp_external_hotplug(dcp, !!(*connected)))
 		return;
 
+	dcp_firmware_metadata_hotplug(dcp, !!(*connected));
 	action = dcp_mode_hotplug(&dcp->mode_state, !!(*connected),
 				  connector ? &connector->connected : NULL);
 	/*
@@ -2096,11 +2129,18 @@ void iomfb_present_backlight_h17p(struct apple_dcp *dcp)
 }
 #endif
 
+static void dcp_post_swap_a428(struct apple_dcp *dcp, void *out, void *cookie)
+{
+	trace_iomfb_control_result(dcp, 428, !!out, out ? get_unaligned_le32(out) : 0);
+	do_swap(dcp, out, cookie);
+}
+
 static void dcp_pre_swap_a428(struct apple_dcp *dcp, void *out, void *cookie)
 {
 	u32 identity = 0x10000;
 
-	dcp_pipe_set_428(dcp, false, &identity, do_swap, cookie);
+	trace_iomfb_control_result(dcp, 423, !!out, out ? get_unaligned_le32(out) : 0);
+	dcp_pipe_set_428(dcp, false, &identity, dcp_post_swap_a428, cookie);
 }
 #endif
 
@@ -2378,6 +2418,7 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 			mat.matrix[0] = mat.matrix[4] = mat.matrix[8] = 1LLU << 32;
 		}
 
+		trace_iomfb_ctm(dcp, mat.location, mat.matrix, mat.matrix_null);
 #if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
 		iomfb_set_matrix(dcp, false, &mat, dcp_pre_swap_a428, NULL);
 #else
