@@ -46,17 +46,7 @@ parts.append(block(h17p, 'struct dcp_external_power_cookie {') + ';')
 for name in ('iomfb_external_power_complete', 'iomfb_external_reply_size',
              'iomfb_external_parameter_complete', 'iomfb_external_device_complete'):
     parts.append(function(h17p, name))
-parts.append(function(h17p, 'iomfb_external_power_h17p').replace(
-    'int iomfb_external_power_h17p(', 'static int test_wire_power('))
-# Model a future qualified OFF policy only in this harness. The production
-# decoder is also tested directly and currently MUST reject every OFF reply.
-parts.append(r'''
-static int iomfb_external_power_h17p(struct apple_dcp *p, bool on)
-{
-    int ret = test_wire_power(p, on);
-    return test_qualified_off && !on && ret == -EOPNOTSUPP && !p->external_power_reply ? 0 : ret;
-}
-''')
+parts.append(function(h17p, 'iomfb_external_power_h17p'))
 for name in ('dcp_is_external_h17p', 'dcp_external_report_disconnected',
              'dcp_external_publish_generation', 'dcp_external_link_locked',
              'dcp_external_start_locked', 'dcp_external_stop_locked',
@@ -183,9 +173,9 @@ static struct apple_dcp *current_dcp;
 static unsigned long jiffies;
 static unsigned int sleeps, power0, power1, drops, releases, connects, allocations;
 static int connect_error, hpd_error, release_error, wire_error;
-static bool drain_callback, timeout_reply, absent_reply, test_qualified_off;
+static bool drain_callback, timeout_reply, absent_reply;
 static int prep_error;
-static bool on_zero_reply;
+static bool on_zero_reply, off_one_reply;
 static u32 wire_in, wire_out;
 static char events[256];
 static unsigned int event_count;
@@ -267,7 +257,7 @@ static void dcp_set_power_state(struct apple_dcp *p, bool oob,
     if (req->unklong) power1++; else power0++;
     packet.header.in_len = wire_in;
     packet.header.out_len = wire_out;
-    packet.resp.unknown = req->unklong && !on_zero_reply ? 1 : 0;
+    packet.resp.unknown = ((req->unklong && !on_zero_reply) || (!req->unklong && off_one_reply)) ? 1 : 0;
     packet.resp.ret = wire_error;
     if (timeout_reply) { late_cookie = cookie; return; }
     mutex_lock(&p->iomfb.lock);
@@ -328,7 +318,7 @@ static void initial(struct apple_dcp *p)
     connect_error = hpd_error = release_error = wire_error = 0;
     drain_callback = timeout_reply = absent_reply = false;
     wire_in = 16; wire_out = 8;
-    late_cookie = NULL; test_qualified_off = true; prep_error = 0; on_zero_reply = false;
+    late_cookie = NULL; prep_error = 0; on_zero_reply = off_one_reply = false;
     memset(events, 0, sizeof(events));
 }
 static int stop(struct apple_dcp *p, u64 generation)
@@ -349,6 +339,34 @@ int main(void)
     assert(stop(&p, 1) == 0 && power0 == 1 && releases == 1);
     owned(&p);
 
+    /* A new physical cable epoch publishes HPD before the CRTC powers on. */
+    initial(&p);
+    assert(dcp_external_disconnect(&p, true) == 0);
+    assert(!connector.connected && p.external_stopped && power0 == 1);
+    assert(dcp_dptx_connect_oob(&dev, 0) == 0);
+    assert(connector.connected && p.iomfb.presentation_paused && !power1);
+    assert(p.external_power_attempted && p.external_stopped);
+    dcp_external_recover(&dev);
+    assert(p.external_running && !p.iomfb.presentation_paused && power1 == 1);
+    assert(p.external_crtc_generation == p.external_rx_generation);
+    owned(&p);
+
+    /* Replug/unplug before CRTC activation releases the new link without a second OFF. */
+    initial(&p);
+    assert(dcp_external_disconnect(&p, true) == 0);
+    assert(dcp_dptx_connect_oob(&dev, 0) == 0 && releases == 1);
+    assert(dcp_external_disconnect(&p, true) == 0);
+    assert(releases == 2 && power0 == 1 && !power1);
+    assert(!p.dptxport[0].connected && !connector.connected);
+    owned(&p);
+
+    /* Same-cable DPMS OFF must not publish a synthetic wake. */
+    initial(&p); assert(stop(&p, 1) == 0); connector.connected = false;
+    assert(dcp_dptx_connect_oob(&dev, 0) == 0);
+    assert(!connector.connected && p.iomfb.presentation_paused && !power1);
+    owned(&p);
+
+    initial(&p); assert(stop(&p, 1) == 0);
     /* Atomic, backlight and CRC are rejected; control transactions remain admissible. */
     iomfb_queue_atomic(&p, NULL, NULL);
     iomfb_backlight_kick(&p);
@@ -394,7 +412,7 @@ int main(void)
         if (fault == 1) p.iomfb.stopped = true;
         if (fault == 2) wire_out = 12;
         if (fault == 3) wire_in = 12;
-        if (fault == 4) { wire_error = 5; test_qualified_off = false; }
+        if (fault == 4) { wire_error = 5; }
         if (fault == 5) hpd_error = -EIO;
         if (fault == 6) release_error = -EIO;
         assert(stop(&p, 1) < 0 && p.external_error && p.iomfb.presentation_paused);
@@ -415,7 +433,7 @@ int main(void)
     assert(!p.external_cable && !connector.connected && p.external_generation == 2);
     assert(p.metadata_epoch.invalidated && !p.metadata_epoch.connected && connector.edid_invalidation_pending);
     assert(dcp_dptx_connect_oob(&dev, 0) == 0);
-    assert(p.external_generation == 3 && !p.external_running && !connector.connected);
+    assert(p.external_generation == 3 && !p.external_running && connector.connected);
     assert(p.metadata_epoch.connected && p.metadata_epoch.invalidated && p.metadata_epoch.generation==3);
     assert(dcp_dptx_connect_oob(&dev,0)==0 && p.typec_generation==3);
     assert(p.iomfb.presentation_paused && power1 == 0);
@@ -440,10 +458,10 @@ int main(void)
     owned(&p);
 
     /* Uncertain physical stop reports cable loss but keeps the resource and blocks restart. */
-    initial(&p); test_qualified_off = false;
-    assert(dcp_external_disconnect(&p, true) == -EOPNOTSUPP);
+    initial(&p); wire_error = 5;
+    assert(dcp_external_disconnect(&p, true) == -EREMOTEIO);
     assert(!connector.connected && p.dptxport[0].connected && !releases);
-    assert(dcp_dptx_connect_oob(&dev, 0) == -EOPNOTSUPP && !power1);
+    assert(dcp_dptx_connect_oob(&dev, 0) == -EREMOTEIO && !power1);
     assert(p.external_crtc_generation == 1 && p.iomfb.presentation_paused);
     owned(&p);
     /* A deferred old RX disconnect cannot stop a later connection epoch. */
@@ -510,9 +528,17 @@ int main(void)
     assert(modesets == previous_modesets && power1 == 1);
     owned(&p);
 
-    /* Production OFF policy always records but refuses to qualify its 8-byte reply. */
+    /* Production accepts only an exact echoed OFF state with zero status. */
+    initial(&p); p.iomfb.presentation_paused = true;
+    assert(iomfb_external_power_h17p(&p, false) == 0);
+    assert(p.external_power_reply_valid && p.external_power_reply == 0);
+    owned(&p);
+    initial(&p); p.iomfb.presentation_paused = true; off_one_reply = true;
+    assert(iomfb_external_power_h17p(&p, false) == -EREMOTEIO);
+    assert(p.external_power_reply_valid && p.external_power_reply == 1);
+    owned(&p);
     initial(&p); p.iomfb.presentation_paused = true; wire_error = 0x1234;
-    assert(test_wire_power(&p, false) == -EOPNOTSUPP);
+    assert(iomfb_external_power_h17p(&p, false) == -EREMOTEIO);
     assert(p.external_power_reply_valid && p.external_power_reply == (0x1234ULL << 32));
     assert(!drops && !releases);
     owned(&p);
@@ -534,7 +560,7 @@ int main(void)
 
     /* Missing replies and malformed first-start preparation fail closed. */
     initial(&p); p.iomfb.presentation_paused = true; absent_reply = true;
-    assert(test_wire_power(&p, false) == -EPROTO && !p.external_power_reply_valid);
+    assert(iomfb_external_power_h17p(&p, false) == -EPROTO && !p.external_power_reply_valid);
     owned(&p);
     for (int stage = 1; stage <= 2; stage++) {
         initial(&p); p.external_running = false; p.iomfb.presentation_paused = true;
