@@ -14,7 +14,7 @@
 	phy-names = "typec0";
 	mux-controls = <&dpxbar0 0>;
 	mux-control-names = "typec0";
-	apple,typec-mux-indices = <0>;
+	apple,typec-mux-indices = <2>;
 	apple,typec-dptx-phys = <0>;
 	apple,dcp-index = <1>;
 };
