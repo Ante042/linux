@@ -49,6 +49,8 @@ struct Inner {
     /// Published batches, oldest first. More than one only with asahi.m3_pipeline_depth > 1.
     active: KVec<Batch>,
     gpu_pending: bool,
+    active_power_last: Option<Instant<Monotonic>>,
+    active_power_samples: u32,
     fault_captured: bool,
     timing: [[i64;7];2],
     render_batches: [u64;crate::m3_pass_layout::SLOTS],
@@ -628,6 +630,21 @@ impl Inner {
             Ok(primary && other)
         })();
         let stamped=match completion {Ok(v)=>v,Err(e)=>{self.fail_active(e);return Err(e);}};
+        let power_enabled=crate::m3_params::active_power();
+        if power_enabled {
+            let since_last=self.active_power_last.map(|last|last.elapsed().as_nanos());
+            if crate::m3_active_power::due(power_enabled,self.device.soc().chip_id,
+                                          stamped,self.active_power_samples,since_last) {
+                self.active_power_last=Some(Instant::<Monotonic>::now());
+                self.active_power_samples+=1;
+                // Diagnostic read errors do not change job completion or recovery.
+                if let Err(e)=self.config.log_active_power(&self.drm,&self.device,
+                                                          self.active_power_samples) {
+                    dev_info!(self.drm.as_ref(),"M3_ACTIVE_POWER sample={} unavailable={:?}\n",
+                              self.active_power_samples,e);
+                }
+            }
+        }
         let completion_parts=if measure && secondary.is_none() {
             match &mut self.jobs[index] {
                 NativeJob::Render(j)=>Some(if stamped {[true;4]} else {
@@ -891,7 +908,7 @@ impl Runtime {
             }
         };
         Ok(Self { inner: ManuallyDrop::new(owner.write(Inner { transport, state, config, uat, drm, device,
-            jobs:KVec::new(),packets:KVec::new(),pending:KVec::new(),active:KVec::new(),gpu_pending:false,fault_captured:false,timing:[[0;7];2],render_batches:[0;crate::m3_pass_layout::SLOTS],
+            jobs:KVec::new(),packets:KVec::new(),pending:KVec::new(),active:KVec::new(),gpu_pending:false,active_power_last:None,active_power_samples:0,fault_captured:false,timing:[[0;7];2],render_batches:[0;crate::m3_pass_layout::SLOTS],
             geometry:[GeometryTiming::default();32],geometry_overflow:0,coalesced_packets:0,coalesced_render_stamps:0,mixed_batches:0,pass_cost:policy::PassCosts::default(),render_initialized:false,t8122_verdict:false,
             boot_step:crate::t8122_start::BootStep::Publish })) })
     }

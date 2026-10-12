@@ -214,6 +214,14 @@ impl Config {
         init::Region::new(owner.va(), owner.size()).map_err(|_| EINVAL)
     }
 
+    pub(crate) fn log_active_power(&mut self, dev: &driver::AsahiDevice,
+                                  device: &crate::m3_device::Device,
+                                  sequence: u32) -> Result {
+        let cap = self.thermal.allowed(kernel::time::Instant::<kernel::time::Monotonic>::now());
+        self.pstates.log_active(dev.as_ref(), &mut self.objects[HARDWARE_DATA],
+                               device.pstate_register()?, cap, sequence)
+    }
+
     pub(crate) fn render_pb(&mut self) -> Result {
         self.objects[UNKNOWN_C1].write(0,&storage::parameter_buffer(crate::m3_render::PB_PAGES).map_err(|_|EINVAL)?)
     }

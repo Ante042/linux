@@ -1257,6 +1257,17 @@ impl PstateWatch {
         );
     }
 
+    /// Read the existing firmware state words and SGX state register without
+    /// requesting a state, publishing a cap, or enforcing a sample.
+    pub(crate) fn log_active(&self, dev: &device::Device, hwdata: &mut Buffer,
+                            register: u32, cap: u32, sequence: u32) -> Result {
+        let s = Self::sample(hwdata, register)?;
+        dev_info!(dev,
+            "M3_ACTIVE_POWER sample={} actual={} current={} freq_bits={:#x} sgx={:#x} cap={} cap_mhz={}\n",
+            sequence, s.actual, s.current, s.freq_bits, s.register, cap, self.mhz(cap));
+        Ok(())
+    }
+
     /// Check the reported performance state. `register` reads SGX+0xe01000; `what` names the
     /// point of the check for the log; `cap` is the runtime cap the firmware may use now
     /// (clamped to the ceiling). Returns ERANGE when the firmware stays above the ceiling;

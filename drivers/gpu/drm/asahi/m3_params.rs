@@ -171,6 +171,14 @@ pub(crate) fn mixed_batch()->bool {
     M3_MIXED_BATCH.load(Ordering::Relaxed)!=0
 }
 
+/// Boot-only T6030 power-state sampling while GPU stamps are outstanding.
+/// Zero preserves the completion path without additional register reads.
+static M3_ACTIVE_POWER: AtomicU64 = AtomicU64::new(0);
+m3_param!("m3_active_power", M3_ACTIVE_POWER, parse_render_stamp_coalesce);
+pub(crate) fn active_power()->bool {
+    M3_ACTIVE_POWER.load(Ordering::Relaxed)==1
+}
+
 /// One preserves internal render measurements. Application timestamp requests
 /// remain recorded when zero omits measurements on T6030.
 static M3_RENDER_INTERNAL_TIMESTAMPS: AtomicU64 = AtomicU64::new(1);
