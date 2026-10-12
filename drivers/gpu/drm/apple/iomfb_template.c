@@ -470,6 +470,32 @@ static u64 dcpep_cb_get_frequency(struct apple_dcp *dcp)
 	return clk_get_rate(dcp->clk);
 }
 
+#if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
+/* The DVA that map_reg hands out for display register range @index. */
+static dma_addr_t dcpep_map_reg_dva(struct apple_dcp *dcp, u32 index,
+				    struct resource *rsrc)
+{
+#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
+	/*
+	 * T8122 dcpext (the only 14.7 template user): with the PMGR bandwidth
+	 * page mapped, the DART faults at display power-off and the DCP
+	 * crashes. Give it a RAM page instead.
+	 */
+	if (dcp->disp_bw_scratch_index && !dcp->disp_bw_doorbell_index &&
+	    index == dcp->disp_bw_scratch_index) {
+		dma_addr_t dva;
+
+		if (!dmam_alloc_coherent(dcp->dev, resource_size(rsrc), &dva,
+					 GFP_KERNEL))
+			return DMA_MAPPING_ERROR;
+		return dva;
+	}
+#endif
+	return dma_map_resource(dcp->dev, rsrc->start, resource_size(rsrc),
+				DMA_BIDIRECTIONAL, 0);
+}
+#endif
+
 static struct DCP_FW_NAME(dcp_map_reg_resp) dcpep_cb_map_reg(struct apple_dcp *dcp,
 						struct DCP_FW_NAME(dcp_map_reg_req) *req)
 {
@@ -481,8 +507,7 @@ static struct DCP_FW_NAME(dcp_map_reg_resp) dcpep_cb_map_reg(struct apple_dcp *d
 	} else {
 		struct resource *rsrc = dcp->disp_registers[req->index];
 #if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
-		dma_addr_t dva = dma_map_resource(dcp->dev, rsrc->start, resource_size(rsrc),
-						  DMA_BIDIRECTIONAL, 0);
+		dma_addr_t dva = dcpep_map_reg_dva(dcp, req->index, rsrc);
 		WARN_ON(dva == DMA_MAPPING_ERROR);
 #endif
 
