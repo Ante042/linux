@@ -55,6 +55,18 @@ def read_word(fd, address):
         return struct.unpack_from('<I', view, address - page)[0]
 
 
+def aux_state(analog, supply):
+    return {
+        'analog_power_down': bool(analog & 1),
+        'small_supply': bool(supply & 1),
+        'small_override': bool(supply & 2),
+        'large_supply': bool(supply & 4),
+        'large_override': bool(supply & 8),
+        'clamp_override': bool(supply & 256),
+        'clamped': bool(supply & 512),
+    }
+
+
 def acquire():
     if b'apple,j700' not in (ROOT / 'compatible').read_bytes().split(b'\0'):
         raise ValueError('requires J700')
@@ -75,6 +87,7 @@ def acquire():
         groups.append((base, decode((PHY / prop).read_bytes(), size)))
     expected = compose(groups)
     failures = []
+    power = None
     fd = os.open('/dev/mem', os.O_RDONLY | os.O_CLOEXEC)
     try:
         for address, (mask, value) in sorted(expected.items()):
@@ -84,12 +97,18 @@ def acquire():
                 failures.append({'region': region,
                                  'offset': hex(address - regs[region][0]),
                                  'mismatch_mask': hex(mismatch)})
+        power = aux_state(read_word(fd, regs['core'][0] + 0x16000),
+                          read_word(fd, regs['core'][0] + 0x16400))
     finally:
         os.close(fd)
-    print(json.dumps({'checked_words': len(expected), 'mismatches': failures}))
+    print(json.dumps({'checked_words': len(expected), 'mismatches': failures, 'aux_state': power}))
 
 
 class CodecTests(unittest.TestCase):
+    def test_aux_state(self):
+        self.assertTrue(all(aux_state(1, 0x30f).values()))
+        self.assertFalse(any(aux_state(0, 0).values()))
+
     def test_read_mapping(self):
         with tempfile.TemporaryFile() as stream:
             stream.truncate(2 * mmap.PAGESIZE)
