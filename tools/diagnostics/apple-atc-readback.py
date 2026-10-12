@@ -67,6 +67,16 @@ def aux_state(analog, supply):
     }
 
 
+def lane_state(protocol, power, receiver):
+    return [{'lane': lane,
+             'rx_protocol': (protocol >> (6 * lane)) & 7,
+             'tx_protocol': (protocol >> (6 * lane + 3)) & 7,
+             'power_control': (power >> (4 * lane)) & 15,
+             'receiver_small_override': bool(receiver & (1 << (2 + lane))),
+             'receiver_large_override': bool(receiver & (1 << (6 + lane)))}
+            for lane in range(2)]
+
+
 def acquire():
     if b'apple,j700' not in (ROOT / 'compatible').read_bytes().split(b'\0'):
         raise ValueError('requires J700')
@@ -88,6 +98,7 @@ def acquire():
     expected = compose(groups)
     failures = []
     power = None
+    lanes = None
     fd = os.open('/dev/mem', os.O_RDONLY | os.O_CLOEXEC)
     try:
         for address, (mask, value) in sorted(expected.items()):
@@ -99,12 +110,23 @@ def acquire():
                                  'mismatch_mask': hex(mismatch)})
         power = aux_state(read_word(fd, regs['core'][0] + 0x16000),
                           read_word(fd, regs['core'][0] + 0x16400))
+        lanes = lane_state(read_word(fd, regs['core'][0] + 0x60),
+                           read_word(fd, regs['core'][0] + 0x200),
+                           read_word(fd, regs['core'][0] + 0xc))
     finally:
         os.close(fd)
-    print(json.dumps({'checked_words': len(expected), 'mismatches': failures, 'aux_state': power}))
+    print(json.dumps({'checked_words': len(expected), 'mismatches': failures, 'aux_state': power, 'lanes': lanes}))
 
 
 class CodecTests(unittest.TestCase):
+    def test_lane_state(self):
+        lanes = lane_state(0x489, 0x10, 0x88)
+        self.assertEqual((lanes[0]['rx_protocol'], lanes[0]['tx_protocol']), (1, 1))
+        self.assertEqual((lanes[1]['rx_protocol'], lanes[1]['tx_protocol']), (2, 2))
+        self.assertEqual(lanes[1]['power_control'], 1)
+        self.assertTrue(lanes[1]['receiver_small_override'])
+        self.assertTrue(lanes[1]['receiver_large_override'])
+
     def test_aux_state(self):
         self.assertTrue(all(aux_state(1, 0x30f).values()))
         self.assertFalse(any(aux_state(0, 0).values()))
