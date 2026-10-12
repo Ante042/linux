@@ -13,6 +13,7 @@ mod bio;
 mod catacomb;
 mod control;
 mod der;
+mod diag;
 mod dt;
 mod fv;
 mod hwrng;
@@ -894,7 +895,7 @@ impl SepData {
     fn attach(&self, sep_node: &dt::DtNode) -> Result<()> {
         match self.profile.bootstrap {
             profile::Bootstrap::WarmRegister => self.attach_warm(sep_node),
-            profile::Bootstrap::Boot => self.attach_m1(),
+            profile::Bootstrap::Boot => self.attach_m1(sep_node),
         }
     }
 
@@ -932,7 +933,19 @@ impl SepData {
 
     /// Cold boot: send TZ0 and let the boot-endpoint acknowledgements drive the
     /// firmware and shared-memory handoff.
-    fn attach_m1(&self) -> Result<()> {
+    fn attach_m1(&self, sep_node: &dt::DtNode) -> Result<()> {
+        // The SEP stays booted after rmmod and Linux cannot reset it, so a
+        // reload's TZ0 would go unanswered. Record the boot first, as the warm
+        // path does, so a reload stops at probe and says to reboot instead.
+        let iova = self.shmem.lock().as_ref().map_or(0, |buf| buf.dma_handle());
+        if let Err(e) = dt::mark_registration_sent(sep_node, iova) {
+            dev_err!(
+                self.dev,
+                "could not record the boot marker ({:?}); refusing to boot the SEP, since a reload could not tell it is already running\n",
+                e
+            );
+            return Err(e);
+        }
         let msg = Message {
             msg0: u64::from(proto::EP_BOOT) | (proto::MSG_BOOT_TZ0 << proto::MSG_TYPE_SHIFT),
             msg1: 0,
@@ -1896,6 +1909,8 @@ impl SepData {
                 "attach: {} messages received but no endpoint advertised; xART and key store cannot run\n",
                 now
             );
+            diag::attach(false);
+            diag::bringup_ended();
             this.phase.store(PHASE_READY, Relaxed);
             return;
         }
@@ -1905,6 +1920,7 @@ impl SepData {
             this.endpoint_count(),
             now
         );
+        diag::attach(true);
 
         this.prepare_os_uuid();
 
@@ -1916,6 +1932,7 @@ impl SepData {
                 "xarm: out-of-line buffer registration failed ({:?}); the persistent-state exchange cannot run\n",
                 e
             );
+            diag::bringup_ended();
             this.phase.store(PHASE_READY, Relaxed);
             return;
         }
@@ -1956,6 +1973,7 @@ impl SepData {
         }
 
         this.run_bringup();
+        diag::bringup_ended();
         this.phase.store(PHASE_READY, Relaxed);
         Self::arm_settle(this);
     }
@@ -2014,6 +2032,7 @@ impl SepData {
         match f.ty {
             proto::DISCOVER_TYPE_DESCRIPTOR | proto::DISCOVER_TYPE_CONFIG => {
                 let _ = table.slot(f.param);
+                diag::endpoints(table.eps.len());
                 dev_info!(
                     self.dev,
                     "discover: endpoint {:#04x} (type {}, msg0 {:#018x}); {} known\n",
@@ -2281,7 +2300,7 @@ impl platform::Driver for SepDriver {
         if dt::registration_already_sent(&sep_node) {
             dev_err!(
                 dev,
-                "the shared-memory registration was already sent on this boot (marker property present). It is one-shot per AP reset and cannot be repeated or withdrawn: reboot to attach again. Not probing.\n"
+                "the SEP was already booted or registered on this boot by an earlier load (marker property present). Linux cannot reset it and the handoff cannot be repeated, so reloading the driver is not supported: reboot to attach again. Not probing.\n"
             );
             return Err(EBUSY);
         }
@@ -2292,6 +2311,12 @@ impl platform::Driver for SepDriver {
         }
 
         let data = SepData::new(pdev)?;
+
+        // As soon as the fixed facts are known, so a tool can watch the attach
+        // from "pending" on. Diagnostics are not worth failing the probe for.
+        if let Err(e) = diag::register(dev, data.profile, data.xart_writable()) {
+            dev_warn!(dev, "diag: could not add the sysfs attributes ({:?})\n", e);
+        }
 
         *data.mbox.lock() = Some(Mailbox::new_byname(dev, c"mbox", data.clone())?);
 

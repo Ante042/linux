@@ -512,7 +512,11 @@ apple_cio_pcie_tunnel_is_preinitialized(struct device_node *parent)
 					  &status) && status == 1)
 			return true;
 		/* t8103 brings the port up itself. */
-		return of_property_read_bool(child, "apple,pciec-kernel-init");
+		if (of_device_is_compatible(child, "apple,t8103-pciec") &&
+		    of_property_read_bool(child, "apple,pciec-kernel-init"))
+			return true;
+		/* T600x/T602x without a handoff, when opted in. */
+		return apple_pcie_tunnel_needs_cold_init(child);
 	}
 
 	return false;
@@ -933,12 +937,14 @@ static int apple_cio_activate_pcie_tunnel_locked(struct apple_cio *acio)
 					 "failed to restore PCIe-C after tunnel activation: %d\n",
 					 ret);
 			put_device(&pcie_pdev->dev);
+		} else {
+			ret = -EAGAIN;
 		}
 		return ret;
 	}
 	if (!acio->pcie_tunnel_preinitialized)
 		return dev_err_probe(acio->dev, -ENODEV,
-				     "PCIe-C requires a successful m1n1 preinit handoff\n");
+				     "PCIe-C is not initialized by m1n1 or the kernel\n");
 
 	if (acio->pd_list->num_pds < 4 || !acio->pd_list->pd_links[3])
 		return dev_err_probe(acio->dev, -ENODEV,
@@ -976,6 +982,7 @@ static void apple_cio_pcie_tunnel_work(struct work_struct *work)
 	struct apple_cio *acio =
 		container_of(to_delayed_work(work), struct apple_cio,
 			     pcie_tunnel_work);
+	bool activated = false;
 	int ret = 0;
 
 	mutex_lock(&acio->pcie_tunnel_lock);
@@ -986,10 +993,15 @@ static void apple_cio_pcie_tunnel_work(struct work_struct *work)
 		if (ret)
 			goto unlock;
 	}
-	if (READ_ONCE(acio->pcie_tunnel_requested))
+	if (READ_ONCE(acio->pcie_tunnel_requested)) {
 		ret = apple_cio_activate_pcie_tunnel_locked(acio);
+		activated = !ret;
+	}
 unlock:
 	mutex_unlock(&acio->pcie_tunnel_lock);
+	/* Wake a deferred Type-C check after asynchronous PCIe setup finishes. */
+	if (activated)
+		typec_thunderbolt_switch_notify(acio->tbt_switch);
 	if (ret && ret != -EAGAIN)
 		dev_err(acio->dev, "deferred PCIe-C transition failed: %d\n", ret);
 }
@@ -2284,7 +2296,7 @@ static int apple_cio_probe(struct platform_device *pdev)
 				acio->pcie_tunnel_np);
 		if (!acio->pcie_tunnel_preinitialized) {
 			dev_warn(dev,
-				 "PCIe-C tunnel disabled: m1n1 handoff is not initialized\n");
+				 "PCIe-C tunnel disabled: not initialized by m1n1 or the kernel\n");
 		} else {
 			ret = apple_cio_map_pcie_intr2axi(acio);
 			if (ret)
@@ -2416,10 +2428,11 @@ static void apple_cio_remove(struct platform_device *pdev)
 	struct apple_cio *acio = platform_get_drvdata(pdev);
 
 	apple_pcie_tunnel_unregister_notifier(&acio->pcie_notifier);
-	typec_thunderbolt_switch_unregister(acio->tbt_switch);
-	cancel_delayed_work_sync(&acio->pcie_tunnel_work);
 
 	guard(mutex)(&acio->lock);
+	/* The worker can notify this switch; stop current and future enqueues. */
+	disable_delayed_work_sync(&acio->pcie_tunnel_work);
+	typec_thunderbolt_switch_unregister(acio->tbt_switch);
 	if (acio->current_cable_info)
 		apple_cio_stop(acio);
 }
