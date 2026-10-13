@@ -490,8 +490,13 @@ static int dwc3_usb_role_switch_set(struct usb_role_switch *sw, enum usb_role ro
 	guard(mutex)(&appledwc->lock);
 
 	/* A controller behind a fixed hub is a host regardless of the connectors */
-	if (appledwc->fixed_hub)
+	if (appledwc->fixed_hub) {
+		/* The HOST state owns the powered core; debug-only control readback. */
+		if (appledwc->state == DWC3_APPLE_HOST)
+			dev_dbg(appledwc->dev, "fixed host role=%u USB3PIPECTL=%#x\n", role,
+				dwc3_readl(appledwc->dwc.regs, DWC3_GUSB3PIPECTL(0)));
 		return 0;
+	}
 
 	/*
 	 * Skip role switches if appledwc is already in the desired state. The

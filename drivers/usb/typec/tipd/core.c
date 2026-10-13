@@ -775,6 +775,10 @@ static void cd321x_update_work(struct work_struct *work)
 
 	/* A different dock must release the old routing before reconfiguration. */
 	was_disconnected |= partner_changed;
+	dev_dbg(tps->dev,
+		"handoff: live=%u changed=%u valid=%u mode=%lu route=%u dp=%u hpd=%u role=%u->%u\n",
+		new_connected, was_disconnected, cd321x->state_valid, cd321x->state.mode,
+		dp_route_was_active, dp_connected, dp_hpd, old_role, new_role);
 
 	/*
 	 * ACIO carries the tunneled PCIe reset handshake over the still-live

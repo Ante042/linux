@@ -1083,8 +1083,12 @@ static int atcphy_pipehandler_lock(struct apple_atcphy *atcphy)
 {
 	int ret;
 	u32 reg;
+	u32 requested = readl(atcphy->regs.pipehandler + PIPEHANDLER_LOCK_REQ);
 
-	if (readl(atcphy->regs.pipehandler + PIPEHANDLER_LOCK_REQ) & PIPEHANDLER_LOCK_EN) {
+	dev_dbg(atcphy->dev, "PIPE request: req=%#x mode=%u pipe=%u host=%u dirty=%u\n",
+		requested, atcphy->mode, atcphy->pipe_state,
+		atcphy->host_active, atcphy->mode_dirty);
+	if (requested & PIPEHANDLER_LOCK_EN) {
 		dev_warn(atcphy->dev, "Pipehandler lock already requested\n");
 	} else {
 		set32(atcphy->regs.pipehandler + PIPEHANDLER_LOCK_REQ, PIPEHANDLER_LOCK_EN);
@@ -1093,6 +1097,8 @@ static int atcphy_pipehandler_lock(struct apple_atcphy *atcphy)
 	ret = readl_poll_timeout(atcphy->regs.pipehandler + PIPEHANDLER_LOCK_ACK, reg,
 				 reg & PIPEHANDLER_LOCK_EN, 10, PIPEHANDLER_LOCK_ACK_TIMEOUT_US);
 	if (ret) {
+		dev_dbg(atcphy->dev, "PIPE lock timeout: ack=%#x mode=%u pipe=%u dirty=%u\n",
+			reg, atcphy->mode, atcphy->pipe_state, atcphy->mode_dirty);
 		clear32(atcphy->regs.pipehandler + PIPEHANDLER_LOCK_REQ, 1);
 		dev_warn(atcphy->dev, "Pipehandler lock not acked.\n");
 	}
@@ -1108,8 +1114,11 @@ static int atcphy_pipehandler_unlock(struct apple_atcphy *atcphy)
 	clear32(atcphy->regs.pipehandler + PIPEHANDLER_LOCK_REQ, PIPEHANDLER_LOCK_EN);
 	ret = readl_poll_timeout(atcphy->regs.pipehandler + PIPEHANDLER_LOCK_ACK, reg,
 				 !(reg & PIPEHANDLER_LOCK_EN), 10, PIPEHANDLER_LOCK_ACK_TIMEOUT_US);
-	if (ret)
+	if (ret) {
+		dev_dbg(atcphy->dev, "PIPE unlock timeout: ack=%#x mode=%u pipe=%u dirty=%u\n",
+			reg, atcphy->mode, atcphy->pipe_state, atcphy->mode_dirty);
 		dev_warn(atcphy->dev, "Pipehandler lock release not acked.\n");
+	}
 
 	return ret;
 }
@@ -1170,15 +1179,21 @@ static void atcphy_configure_pipehandler_usb3_host_t8122(struct apple_atcphy *at
 	core_set32(atcphy, ACIOPHY_BIST_CFG1, ACIOPHY_BIST_CFG1_USB_EN);
 	ret = readl_poll_timeout(atcphy->regs.core + ACIOPHY_BIST_CFG1, reg,
 				 (reg & ACIOPHY_BIST_CFG1_USB_EN), 10, 10000);
-	if (ret)
+	if (ret) {
+		dev_dbg(atcphy->dev, "BIST USB_EN phase=1 value=%#x mode=%u pipe=%u\n",
+			reg, atcphy->mode, atcphy->pipe_state);
 		dev_warn(atcphy->dev,
 			 "Timed out waiting for ACIOPHY_BIST_CFG1_USB_EN\n");
+	}
 	core_clear32(atcphy, ACIOPHY_BIST_CFG1, ACIOPHY_BIST_CFG1_USB_EN);
 	ret = readl_poll_timeout(atcphy->regs.core + ACIOPHY_BIST_MAC_USBPHY_STATUS2, reg,
 				 !(reg & ACIOPHY_BIST_MAC_USBPHY_STATUS2_LN0_PHY_STATUS2), 10, 10000);
-	if (ret)
+	if (ret) {
+		dev_dbg(atcphy->dev, "BIST STATUS2 phase=1 value=%#x swap=%u mode=%u pipe=%u\n",
+			reg, atcphy->swap_lanes, atcphy->mode, atcphy->pipe_state);
 		dev_warn(atcphy->dev,
 			 "Timed out waiting for ACIOPHY_BIST_MAC_USBPHY_STATUS2_LN0_PHY_STATUS2\n");
+	}
 
 	core_set32(atcphy, ACIOPHY_BIST_CFG2, ACIOPHY_BIST_CFG2_LN0_PHY_STATUS_RE);
 	udelay(10);
@@ -1191,15 +1206,21 @@ static void atcphy_configure_pipehandler_usb3_host_t8122(struct apple_atcphy *at
 	core_set32(atcphy, ACIOPHY_BIST_CFG1, ACIOPHY_BIST_CFG1_USB_EN);
 	ret = readl_poll_timeout(atcphy->regs.core + ACIOPHY_BIST_CFG1, reg,
 				 (reg & ACIOPHY_BIST_CFG1_USB_EN), 10, 10000);
-	if (ret)
+	if (ret) {
+		dev_dbg(atcphy->dev, "BIST USB_EN phase=2 value=%#x mode=%u pipe=%u\n",
+			reg, atcphy->mode, atcphy->pipe_state);
 		dev_warn(atcphy->dev,
 			 "Timed out waiting for ACIOPHY_BIST_CFG1_USB_EN 2nd toggle\n");
+	}
 	core_clear32(atcphy, ACIOPHY_BIST_CFG1, ACIOPHY_BIST_CFG1_USB_EN);
 	ret = readl_poll_timeout(atcphy->regs.core + ACIOPHY_BIST_MAC_USBPHY_STATUS2, reg,
 				 !(reg & ACIOPHY_BIST_MAC_USBPHY_STATUS2_LN0_PHY_STATUS2), 10, 10000);
-	if (ret)
+	if (ret) {
+		dev_dbg(atcphy->dev, "BIST STATUS2 phase=2 value=%#x swap=%u mode=%u pipe=%u\n",
+			reg, atcphy->swap_lanes, atcphy->mode, atcphy->pipe_state);
 		dev_warn(atcphy->dev,
 			 "Timed out waiting for ACIOPHY_BIST_MAC_USBPHY_STATUS2_LN0_PHY_STATUS2 2nd time\n");
+	}
 	core_set32(atcphy, ACIOPHY_BIST_CFG2, ACIOPHY_BIST_CFG2_LN0_PHY_STATUS_RE);
 	udelay(10);
 	core_clear32(atcphy, ACIOPHY_BIST_CFG2, ACIOPHY_BIST_CFG2_LN0_PHY_STATUS_RE);
@@ -1211,9 +1232,12 @@ static void atcphy_configure_pipehandler_usb3_host_t8122(struct apple_atcphy *at
 	core_set32(atcphy, ACIOPHY_BIST_CFG1, ACIOPHY_BIST_CFG1_USB_EN);
 	ret = readl_poll_timeout(atcphy->regs.core + ACIOPHY_BIST_CFG1, reg,
 				 (reg & ACIOPHY_BIST_CFG1_USB_EN), 10, 10000);
-	if (ret)
+	if (ret) {
+		dev_dbg(atcphy->dev, "BIST USB_EN phase=3 value=%#x mode=%u pipe=%u\n",
+			reg, atcphy->mode, atcphy->pipe_state);
 		dev_warn(atcphy->dev,
 			 "Timed out waiting for ACIOPHY_BIST_CFG1_USB_EN 3rd toggle\n");
+	}
 	core_clear32(atcphy, ACIOPHY_BIST_CFG1, ACIOPHY_BIST_CFG1_USB_EN);
 	core_clear32(atcphy, ACIOPHY_BIST_CFG1, ACIOPHY_BIST_CFG1_CLOCK_EN);
 }
@@ -1462,6 +1486,9 @@ static int atcphy_park_pipehandler(struct apple_atcphy *atcphy)
 
 	lockdep_assert_held(&atcphy->lock);
 
+	dev_dbg(atcphy->dev, "PIPE park: mode=%u pipe=%u host=%u dirty=%u owned=%u idle=%u\n",
+		atcphy->mode, atcphy->pipe_state, atcphy->host_active, atcphy->mode_dirty,
+		atcphy->dp_owned_pmas, atcphy->dp_idle_pmas);
 	if (atcphy->pipe_state == ATCPHY_PIPEHANDLER_STATE_DUMMY)
 		return 0;
 
