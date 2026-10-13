@@ -657,6 +657,54 @@ static void backend_change(void)
     check_route(&p, APPLE_ATCPHY_MODE_USB3_DP, false);
     puts("PASS: a live fixed-hub USB3 backend parks before same-orientation protocol changes");
 }
+static void sticky_safe_roundtrip(void)
+{
+    struct apple_atcphy p;
+    struct phy_configure_opts_dp rate = {
+        .set_rate = true, .set_lanes = true, .link_rate = 8100, .lanes = 2,
+    };
+    struct phy_configure_opts_dp training = { .set_voltages = true, .lanes = 2 };
+
+    for (unsigned int parking = 0; parking < 2; parking++) {
+        orientation_initial(&p, true);
+        assert(select_mode(&p, APPLE_ATCPHY_MODE_USB3_DP) == 0);
+        assert(j700_dp_configure(&p, &rate) == 0 && p.dp_owned_pmas == 2);
+        if (!parking)
+            assert(atcphy_park_pipehandler(&p) == 0);
+        orient(&p, true);
+        if (parking)
+            inject_parking(0); /* Sticky PIPE ACK check failure. */
+        else
+            fail_poll = 1; /* Sticky DP shutdown readiness failure. */
+        polls = 0;
+        assert(select_mode(&p, APPLE_ATCPHY_MODE_USB3_DP) == -ETIMEDOUT);
+        assert(p.mode_dirty && p.dp_owned_pmas == 2 && p.aux_power_requested);
+        /* The Type-C update callback retries SAFE before publishing normal. */
+        for (unsigned int retry = 0; retry < 3; retry++) {
+            polls = 0;
+            if (!parking)
+                fail_poll = 1;
+            assert(select_mode(&p, APPLE_ATCPHY_MODE_OFF) == -ETIMEDOUT);
+            assert(p.mode_dirty && p.swap_lanes && p.dp_owned_pmas == 2);
+            assert(p.aux_power_requested && p.host_active && !usb2_writes && !reset_writes);
+            assert(p.pipe_state == (parking ? ATCPHY_PIPEHANDLER_STATE_USB3 :
+                                             ATCPHY_PIPEHANDLER_STATE_DUMMY));
+            unsigned int before = writes;
+            assert(j700_dp_configure(&p, &training) == -EBUSY && writes == before);
+        }
+        recover();
+        assert(select_mode(&p, APPLE_ATCPHY_MODE_OFF) == 0);
+        assert(p.mode == APPLE_ATCPHY_MODE_USB2 && !p.mode_dirty && p.host_active);
+        assert(!p.dp_owned_pmas && !p.dp_idle_pmas && !p.aux_power_requested);
+        assert(p.pipe_state == ATCPHY_PIPEHANDLER_STATE_DUMMY);
+        orient(&p, false);
+        assert(select_mode(&p, APPLE_ATCPHY_MODE_USB3_DP) == 0);
+        check_route(&p, APPLE_ATCPHY_MODE_USB3_DP, false);
+        assert(j700_dp_configure(&p, &rate) == 0 && p.dp_owned_pmas == 2);
+        assert(j700_dp_configure(&p, &training) == 0);
+    }
+    puts("PASS: reverse failure, three sticky SAFE failures, then normal recovery after PIPE/DP fault clears");
+}
 int main(int argc, char **argv)
 {
     assert(argc == 2);
@@ -667,6 +715,7 @@ int main(int argc, char **argv)
     else if (!strcmp(argv[1], "orientation")) orientation_roundtrip();
     else if (!strcmp(argv[1], "orientation-faults")) orientation_faults();
     else if (!strcmp(argv[1], "backend-change")) backend_change();
+    else if (!strcmp(argv[1], "sticky-safe")) sticky_safe_roundtrip();
     else assert(false);
     return 0;
 }
@@ -681,7 +730,7 @@ with tempfile.TemporaryDirectory(prefix='apple-atc-parking-') as directory:
     subprocess.run(command + [str(unit), '-o', str(path / 'test')], check=True)
     failed = False
     for case in ('mux', 'power', 'reset', 'cleanup', 'orientation', 'orientation-faults',
-                 'backend-change'):
+                 'backend-change', 'sticky-safe'):
         result = subprocess.run([str(path / 'test'), case])
         if result.returncode:
             print('FAIL:', case, 'exit', result.returncode, flush=True)
