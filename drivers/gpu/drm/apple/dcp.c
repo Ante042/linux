@@ -139,10 +139,10 @@ static void dcp_release_rtkit(void *data)
 
 #define DCP_BOOT_TIMEOUT msecs_to_jiffies(1000)
 
-static bool experimental_h17p_av_discovery;
-module_param(experimental_h17p_av_discovery, bool, 0444);
+static unsigned int experimental_h17p_av_discovery;
+module_param(experimental_h17p_av_discovery, uint, 0444);
 MODULE_PARM_DESC(experimental_h17p_av_discovery,
-		 "Observe external H17P AV announcements without opening services");
+		 "H17P AV discovery: 1 observes; 2 opens only the observed DP device transport");
 
 static bool experimental_h17p_external;
 module_param(experimental_h17p_external, bool, 0444);
@@ -2994,12 +2994,21 @@ unsigned long* dcp_get_iomfb_surfaces(struct platform_device *pdev)
 static int dcp_av_discovery_prepare(struct apple_epic_service *service,
 				  const char *name, const char *class, s64 unit)
 {
+	bool open_device = experimental_h17p_av_discovery == 2 && name && class &&
+		!strcmp(name, "dcpdp-device-epic") && !strcmp(class, "DCPDPDevice");
+
 	dev_info(service->ep->dcp->dev,
-		 "AV discovery ep:%02x channel:%u name:%s class:%s unit:%lld; no OPEN\n",
+		 "AV discovery ep:%02x channel:%u name:%s class:%s unit:%lld; %s\n",
 		 service->ep->endpoint, service->channel,
-		 name ?: "(none)", class ?: "(none)", unit);
-	/* Decline before AFKV2_OPEN; no audio or unverified service command. */
-	return -ECANCELED;
+		 name ?: "(none)", class ?: "(none)", unit,
+		 open_device ? "transport OPEN only" : "no OPEN");
+	/* The observed device may be opened, but no service command is sent. */
+	return open_device ? 0 : -ECANCELED;
+}
+
+static void dcp_av_discovery_teardown(struct apple_epic_service *service)
+{
+	afk_service_disable(service);
 }
 
 static const struct apple_epic_service_ops dcp_av_discovery_ops[] = {
@@ -3007,6 +3016,12 @@ static const struct apple_epic_service_ops dcp_av_discovery_ops[] = {
 		.name = "dcpav-video-interface-epic",
 		.reusable = true,
 		.prepare = dcp_av_discovery_prepare,
+	},
+	{
+		.name = "dcpdp-device-epic",
+		.reusable = true,
+		.prepare = dcp_av_discovery_prepare,
+		.teardown = dcp_av_discovery_teardown,
 	},
 	{},
 };
@@ -3016,7 +3031,8 @@ static void dcp_start_av_discovery(struct apple_dcp *dcp)
 	struct apple_dcp_afkep *ep;
 	int ret;
 
-	if (!experimental_h17p_av_discovery || dcp->av_discovery ||
+	if (!experimental_h17p_av_discovery || experimental_h17p_av_discovery > 2 ||
+	    dcp->av_discovery ||
 	    dcp->fw_compat != DCP_FIRMWARE_H17P ||
 	    dcp->hw.iomfb_method_profile !=
 		    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL)
