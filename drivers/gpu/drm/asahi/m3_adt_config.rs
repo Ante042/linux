@@ -931,6 +931,10 @@ fn build_images(
             if given { " (asahi.m3_ut_engagement)" } else { "" }
         );
     }
+    if crate::m3_globals_debug::apply(soc.chip_id,m3_params::globals_debug_off(),&mut globals)
+        .map_err(|_|EINVAL)? {
+        dev_info!(dev,"M3: T6030 Globals debug word cleared at +0x2c\n");
+    }
     images[GLOBALS] = Some(globals);
 
     let mut power = zeroed(GLOBALS_POWER)?;
@@ -1255,6 +1259,17 @@ impl PstateWatch {
             cap,
             self.mhz(cap)
         );
+    }
+
+    /// Read the existing firmware state words and SGX state register without
+    /// requesting a state, publishing a cap, or enforcing a sample.
+    pub(crate) fn log_active(&self, dev: &device::Device, hwdata: &mut Buffer,
+                            register: u32, cap: u32, sequence: u32) -> Result {
+        let s = Self::sample(hwdata, register)?;
+        dev_info!(dev,
+            "M3_ACTIVE_POWER sample={} actual={} current={} freq_bits={:#x} sgx={:#x} cap={} cap_mhz={}\n",
+            sequence, s.actual, s.current, s.freq_bits, s.register, cap, self.mhz(cap));
+        Ok(())
     }
 
     /// Check the reported performance state. `register` reads SGX+0xe01000; `what` names the

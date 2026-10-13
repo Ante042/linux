@@ -4,6 +4,36 @@
 pub(crate) const SLOTS: usize = 16;
 pub(crate) const MAX_PACKETS: usize = 8;
 
+/// T6030 may omit internal measurements; application queries always record.
+/// Other chips retain their existing microsequences regardless of the switch.
+pub(crate) fn stage_timestamps(internal:bool,chip:u32,queries:[u64;2])->bool {
+    internal || chip!=0x6030 || queries!=[0;2]
+}
+
+/// One packet's bounded prefix may use both engines only after InitBM retired
+/// and while every prior batch is idle. Zero selects the single-engine policy.
+pub(crate) fn mixed_prefix(enabled:bool, chip:u32, initialized:bool, idle:bool,
+    kinds:impl Iterator<Item=bool>) -> usize {
+    if !enabled || chip!=0x6030 || !initialized || !idle {return 0;}
+    let mut count=0;
+    let mut render=false;
+    let mut compute=false;
+    for is_render in kinds.take(SLOTS) {
+        count+=1;
+        render|=is_render;
+        compute|=!is_render;
+    }
+    if render && compute {count} else {0}
+}
+
+/// Only an unpublished T6030 batch may defer an intermediate stamp flush.
+/// Its final pass and every pass with firmware-written user timestamps flush.
+pub(crate) fn coalesce_render_stamps(enabled:bool, chip:u32, overlap:bool,
+    slot:usize, count:usize, timestamps:[[u64;2];2]) -> bool {
+    enabled && chip==0x6030 && !overlap && count>1 && count<=SLOTS
+        && slot<count-1 && timestamps==[[0;2];2]
+}
+
 pub(crate) fn pending_position(urgencies: impl Iterator<Item=u8>, incoming:u8) -> usize {
     let mut len=0;
     for queued in urgencies {

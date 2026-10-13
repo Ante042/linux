@@ -20,7 +20,15 @@ struct Batch {
     /// Render: first pass slot and the batch's last draw number.
     base: usize, last_draw: u64, publication_tick:u64,
     polling_ns: i64, polls: u64, stamp_ns: i64, first_event_ns: i64, events_ns: i64,
+    completion_ns: [i64;4],
+    /// First successful stamp observations and the preceding incomplete reads, in 24 MHz ticks.
+    fragment_host_tick:u64, fragment_fw_tick:u64,
+    fragment_host_pending_tick:u64, fragment_fw_pending_tick:u64,
+    pipes_idle_tick:u64,
+    coalesced_stamps: u64,
+    mixed: Option<MixedBatch>,
 }
+struct MixedBatch {compute_index:usize, renders:usize, computes:usize, dependencies:usize}
 #[derive(Clone, Copy, Default)]
 struct GeometryTiming {
     width: u16, height: u16, samples: u8, count: u64,
@@ -28,6 +36,7 @@ struct GeometryTiming {
     tiling_ns: u64, fragment_ns: u64, max_fragment_ns: u64,
     polling_ns: i64, retirement_ns: i64, sleeping_ns: i64, polls: u64,
     stamp_ns:i64, first_event_ns:i64, events_ns:i64, pickup_ns:i64, tail_ns:i64,
+    completion_ns: [i64;4],
 }
 impl NativeJob {
     fn complete(&mut self)->Result<bool> {match self {Self::Compute(j)=>j.complete(),Self::Render(j)=>j.complete()}}
@@ -44,6 +53,8 @@ struct Inner {
     /// Published batches, oldest first. More than one only with asahi.m3_pipeline_depth > 1.
     active: KVec<Batch>,
     gpu_pending: bool,
+    active_power_last: Option<Instant<Monotonic>>,
+    active_power_samples: u32,
     fault_captured: bool,
     timing: [[i64;7];2],
     render_batches: [u64;crate::m3_pass_layout::SLOTS],
@@ -56,6 +67,8 @@ struct Inner {
     boot_step: crate::t8122_start::BootStep,
     /// Packets that joined a batch started by an earlier packet (debug summary).
     coalesced_packets: u64,
+    coalesced_render_stamps: u64,
+    mixed_batches:u64,
     /// Recent measured render GPU time per pass by VM. Smoothed over batches;
     /// replacing the least recently measured VM does not retain its mappings.
     pass_cost: policy::PassCosts,
@@ -156,6 +169,7 @@ impl Inner {
     /// packets. The packets stay retained (with their VM job guards) until teardown, because
     /// the firmware has not provably stopped using their memory.
     fn fail_active(&mut self, error: Error) {
+        let _=self.config.performance_request(self.device.soc().chip_id,false);
         if let Some((index,vm))=self.active.first().map(|b|(b.index,b.entries[0].0.vm.clone())) {
             self.fail(index,&vm,error);
         } else {self.capture_fault(error);}
@@ -191,6 +205,13 @@ impl Inner {
     fn next_batch(&self,max:usize)->Result<KVec<(Arc<crate::m3_submit::Packet>,usize)>> {
         let mut entries=KVec::new();
         let Some((packet,next))=self.pending.first() else {return Ok(entries);};
+        let mixed=policy::mixed_prefix(crate::m3_params::mixed_batch(),
+            self.device.soc().chip_id,self.render_initialized,self.active.is_empty(),
+            packet.commands[*next..].iter().map(|c|matches!(c,crate::m3_submit::Command::Render{..})));
+        if mixed>0 {
+            for index in *next..*next+mixed {entries.push((packet.clone(),index),GFP_KERNEL)?;}
+            return Ok(entries);
+        }
         let render=matches!(packet.commands[*next],crate::m3_submit::Command::Render{..});
         let limit=if render {
             // The first render draw initializes the shared buffer manager (InitBM) and opens
@@ -307,6 +328,9 @@ impl Inner {
     }
     /// Prepare and publish one batch. On error, reports whether firmware may see its writes.
     fn publish(&mut self,entries:&[(Arc<crate::m3_submit::Packet>,usize)],base:usize,overlap:bool)->core::result::Result<Batch,(Error,bool)> {
+        let render=entries.iter().any(|(p,i)|matches!(p.commands[*i],crate::m3_submit::Command::Render{..}));
+        let compute=entries.iter().any(|(p,i)|matches!(p.commands[*i],crate::m3_submit::Command::Compute(_)));
+        if render && compute {return self.publish_mixed(entries,base,overlap);}
         let early=|e:Error|(e,false);
         let (packet,first_index)=(&entries[0].0,entries[0].1);
         let control=packet.commands[first_index];
@@ -364,15 +388,24 @@ impl Inner {
                 return Err(early(error));
             }
         }
+        let mut coalesced_stamps=0;
+        let coalesce_render=crate::m3_params::render_stamp_coalesce();
+        let internal_timestamps=crate::m3_params::render_internal_timestamps();
+        let chip=self.device.soc().chip_id;
         if let NativeJob::Render(j)=&mut self.jobs[index] {
             let mut commands=KVec::with_capacity(batch_count,GFP_KERNEL).map_err(|_|early(ENOMEM))?;
             for (p,next) in entries {commands.push(p.commands[*next],GFP_KERNEL).map_err(|_|early(ENOMEM))?;}
             j.begin_batch(&self.drm,&self.uat,&packet.vm,&commands,base,overlap).map_err(early)?;
             let prepared=(||->Result {
-                for (p,next) in entries {
+                for (slot,(p,next)) in entries.iter().enumerate() {
                     let crate::m3_submit::Command::Render{command,usc}=p.commands[*next] else {return Err(EINVAL);};
-                    j.append(command,usc)?;
-                    j.set_user_timestamps(p.render_timestamp_addresses(*next))?;
+                    let timestamps=p.render_timestamp_addresses(*next);
+                    let coalesce=policy::coalesce_render_stamps(coalesce_render,chip,
+                        overlap,slot,batch_count,timestamps);
+                    let timed=timestamps.map(|pair|policy::stage_timestamps(internal_timestamps,chip,pair));
+                    j.append(command,usc,coalesce,timed)?;
+                    j.set_user_timestamps(timestamps)?;
+                    coalesced_stamps+=u64::from(coalesce);
                 }
                 Ok(())
             })();
@@ -412,7 +445,191 @@ impl Inner {
         Ok(Batch { entries:owned, index, kind:usize::from(matches!(control,crate::m3_submit::Command::Compute(_))),
             first:control, preparation_ns, previous_events, expected_events,
             start:Instant::<Monotonic>::now(), measure, doorbell_counter_ns:if measure {physical_counter() as i64 * 1000 / 24} else {0},
-            polling_ns:0, polls:0, stamp_ns:-1, first_event_ns:-1, events_ns:-1, base, last_draw, publication_tick })
+            polling_ns:0, polls:0, stamp_ns:-1, first_event_ns:-1, events_ns:-1, completion_ns:[-1;4],fragment_host_tick:0,fragment_fw_tick:0,fragment_host_pending_tick:0,fragment_fw_pending_tick:0,pipes_idle_tick:0, coalesced_stamps, base, last_draw, publication_tick, mixed:None })
+    }
+    /// Prepare both idle queues from one packet. Cross-engine changes wait on
+    /// the preceding command's firmware stamp; all commands remain GPU ordered.
+    /// Producer storage and DMA guards survive every partial publication error.
+    fn publish_mixed(&mut self,entries:&[(Arc<crate::m3_submit::Packet>,usize)],
+        base:usize,overlap:bool)->core::result::Result<Batch,(Error,bool)> {
+        let early=|e:Error|(e,false);
+        if overlap || base!=0 || self.device.soc().chip_id!=0x6030
+            || !self.render_initialized || entries.len()>policy::SLOTS {return Err(early(EINVAL));}
+        let packet=&entries[0].0;
+        if entries.iter().any(|(p,_)|!Arc::ptr_eq(packet,p)) {return Err(early(EINVAL));}
+        let prepare=Instant::<Monotonic>::now();
+        let internal_timestamps=crate::m3_params::render_internal_timestamps();
+        self.active.reserve(1,GFP_KERNEL).map_err(|_|early(ENOMEM))?;
+        self.jobs.reserve(1,GFP_KERNEL).map_err(|_|early(ENOMEM))?;
+        self.packets.reserve(1,GFP_KERNEL).map_err(|_|early(ENOMEM))?;
+        let mut owned=KVec::with_capacity(entries.len(),GFP_KERNEL).map_err(|_|early(ENOMEM))?;
+        let mut render_commands=KVec::with_capacity(entries.len(),GFP_KERNEL).map_err(|_|early(ENOMEM))?;
+        let mut first_compute=None;
+        let mut computes=0;
+        for (p,i) in entries {
+            owned.push((p.clone(),*i),GFP_KERNEL).map_err(|_|early(ENOMEM))?;
+            match p.commands[*i] {
+                c@crate::m3_submit::Command::Render{..}=>render_commands.push(c,GFP_KERNEL).map_err(|_|early(ENOMEM))?,
+                crate::m3_submit::Command::Compute(c)=>{computes+=1;first_compute.get_or_insert(c);},
+            }
+        }
+        let renders=render_commands.len();
+        if renders==0 || computes==0 {return Err(early(EINVAL));}
+        let index=self.jobs.iter().position(|j|matches!(j,NativeJob::Render(r) if r.started())).ok_or(early(EINVAL))?;
+        let existing=self.jobs.iter().position(|j|matches!(j,NativeJob::Compute(_)));
+        let compute_index=existing.unwrap_or(self.jobs.len());
+        // Keep the packet before any producer mutation. No other batch is live.
+        self.packets.clear();
+        self.packets.push(packet.clone(),GFP_KERNEL).map_err(|_|early(ENOMEM))?;
+        let mut render_prepared=false;
+        let mut compute_prepared=false;
+        let prepared=(||->Result<usize> {
+            let control=first_compute.ok_or(EINVAL)?;
+            if existing.is_none() {
+                let job=crate::m3_compute::Compute::new(&self.drm,&self.uat,&packet.vm,
+                    self.config.stats_region()?,control,self.device.soc().registers)?;
+                self.jobs.push(NativeJob::Compute(job),GFP_KERNEL)?;
+            } else {
+                let NativeJob::Compute(j)=&mut self.jobs[compute_index] else {return Err(EINVAL);};
+                j.replay(&self.uat,&packet.vm,control)?;
+            }
+            compute_prepared=true;
+            if let NativeJob::Compute(j)=&mut self.jobs[compute_index] {
+                j.reserve_barriers(&self.drm,&self.uat)?;
+            }
+            let NativeJob::Render(j)=&mut self.jobs[index] else {return Err(EINVAL);};
+            j.begin_batch(&self.drm,&self.uat,&packet.vm,&render_commands,0,false)?;
+            render_prepared=true;
+            let mut previous:Option<(bool,crate::m3_sync_layout::CompletionDependency)>=None;
+            let mut compute_slot=0;
+            let mut dependencies=0;
+            for (p,i) in entries {
+                match p.commands[*i] {
+                    crate::m3_submit::Command::Render{command,usc}=>{
+                        let predecessor=previous.filter(|(render,_)|!*render).map(|(_,d)|d);
+                        let NativeJob::Render(j)=&mut self.jobs[index] else {return Err(EINVAL);};
+                        let timestamps=p.render_timestamp_addresses(*i);
+                        let timed=timestamps.map(|pair|policy::stage_timestamps(internal_timestamps,self.device.soc().chip_id,pair));
+                        j.append_after(command,usc,false,predecessor,timed)?;
+                        j.set_user_timestamps(timestamps)?;
+                        dependencies+=usize::from(predecessor.is_some());
+                        previous=Some((true,j.completion_dependency()?));
+                    },
+                    crate::m3_submit::Command::Compute(c)=>{
+                        let NativeJob::Compute(j)=&mut self.jobs[compute_index] else {return Err(EINVAL);};
+                        if compute_slot!=0 {j.append(c)?;}
+                        if let Some((true,dependency))=previous {
+                            j.insert_dependency(dependency)?;
+                            dependencies+=1;
+                        }
+                        // Every cross-engine predecessor flushes its stamp.
+                        // Final queue, timestamp and cache visibility are unchanged.
+                        j.prepare_completion(false)?;
+                        j.set_user_timestamps(p.timestamp_addresses(*i))?;
+                        j.set_attachments(&p.attachments[*i])?;
+                        previous=Some((false,j.completion_dependency()?));
+                        compute_slot+=1;
+                    },
+                }
+            }
+            Ok(dependencies)
+        })();
+        let dependencies=match prepared {
+            Ok(n)=>n,
+            Err(error)=>{
+                if render_prepared {
+                    let NativeJob::Render(j)=&mut self.jobs[index] else {return Err((EIO,true));};
+                    j.abort_batch().map_err(|e|(e,true))?;
+                }
+                if compute_prepared {
+                    if existing.is_none() {drop(self.jobs.remove(compute_index).map_err(|_|(EIO,true))?);}
+                    else if let NativeJob::Compute(j)=&mut self.jobs[compute_index] {
+                        j.abort_batch().map_err(|e|(e,true))?;
+                    }
+                }
+                return Err(early(error));
+            },
+        };
+        let preparation_ns=prepare.elapsed().as_nanos();
+        let previous_events=self.config.completed_events;
+        let publication_tick=if crate::debug::debug_enabled(crate::debug::DebugFlags::M3PassTiming) {physical_counter()} else {0};
+        self.state.health.set_gpu_pending(true);self.gpu_pending=true;
+        let late=|e:Error|(e,true);
+        let NativeJob::Render(j)=&self.jobs[index] else {return Err(late(EIO));};
+        let queues=j.queues();let heads=j.heads();let (_,_,last_draw)=j.batch();
+        self.config.submit_queue(1,queues[1],heads[1],1,false).map_err(late)?;
+        Pin::new(&mut self.transport).send_message(0x21,0x0083000000000001).map_err(late)?;
+        self.config.submit_queue(0,queues[0],heads[0],0,false).map_err(late)?;
+        Pin::new(&mut self.transport).send_message(0x21,0x0083000000000000).map_err(late)?;
+        let NativeJob::Compute(j)=&self.jobs[compute_index] else {return Err(late(EIO));};
+        self.config.submit_queue(2,j.queue(),j.head(),2,j.first()).map_err(late)?;
+        Pin::new(&mut self.transport).send_message(0x21,0x0083000000000002).map_err(late)?;
+        Ok(Batch {entries:owned,index,kind:2,first:packet.commands[entries[0].1],
+            preparation_ns,previous_events,expected_events:3,start:Instant::<Monotonic>::now(),
+            measure:crate::debug::debug_enabled(crate::debug::DebugFlags::M3SubmitSummary),
+            doorbell_counter_ns:0,polling_ns:0,polls:0,stamp_ns:-1,first_event_ns:-1,
+            events_ns:-1,completion_ns:[-1;4],fragment_host_tick:0,fragment_fw_tick:0,fragment_host_pending_tick:0,fragment_fw_pending_tick:0,pipes_idle_tick:0,coalesced_stamps:0,base:0,last_draw,publication_tick,
+            mixed:Some(MixedBatch {compute_index,renders,computes,dependencies})})
+    }
+    /// A mixed publication retires only after both jobs, all three queue
+    /// messages, firmware health and engine idle passed the ordinary checks.
+    /// Its wall time is reported once rather than charged to both engines.
+    fn retire_mixed(&mut self,batch:&Batch,mixed:&MixedBatch)->Result {
+        let NativeJob::Render(j)=&mut self.jobs[batch.index] else {return Err(EINVAL);};
+        let render_ns=j.gpu_ns(0,mixed.renders)?;
+        let stages=j.stage_ns(0,mixed.renders)?;
+        j.progress(&self.drm)?;
+        let NativeJob::Compute(j)=&mut self.jobs[mixed.compute_index] else {return Err(EINVAL);};
+        let compute_ns=j.gpu_ns()?;
+        j.progress(&self.drm)?;
+        if crate::debug::debug_enabled(crate::debug::DebugFlags::M3PassTiming) {
+            let vm=batch.entries[0].0.vm.id();
+            let observed_tick=physical_counter();
+            let NativeJob::Render(j)=&mut self.jobs[batch.index] else {return Err(EINVAL);};
+            let render_span=j.gpu_ticks(0,mixed.renders)?;
+            let NativeJob::Compute(j)=&mut self.jobs[mixed.compute_index] else {return Err(EINVAL);};
+            let compute_span=j.batch_gpu_span()?;
+            let start=render_span.0.min(compute_span[0]);
+            let end=render_span.1.max(compute_span[1]);
+            let valid=batch.publication_tick!=0 && start>=batch.publication_tick && end>=start && observed_tick>=end;
+            dev_info!(self.drm.as_ref(),"M3_BATCH_BOUNDARY vm={} mixed=1 batch={} publication_tick={} gpu_start_tick={} gpu_end_tick={} observed_tick={} counter_hz=24000000 valid={}\n",
+                vm,batch.entries.len(),batch.publication_tick,start,end,observed_tick,u32::from(valid));
+            self.log_batch_milestones(batch,render_span.0,render_span.1,render_ns,stages[1]);
+            // Render and compute have separate slot sequences in one mixed batch.
+            let mut render_slot=0;
+            let mut compute_slot=0;
+            for (packet,next) in batch.entries.iter() {
+                match packet.commands[*next] {
+                    crate::m3_submit::Command::Render{command:r,..}=>{
+                        let NativeJob::Render(j)=&mut self.jobs[batch.index] else {return Err(EINVAL);};
+                        let s=j.slot_stage_ns(0,mixed.renders,render_slot)?;
+                        dev_info!(self.drm.as_ref(),"M3_PASS_SLOT vm={} mixed=1 slot={} batch={} vdm={:#x} width={} height={} samples={} ta_ns={} fragment_ns={} gap_ns={}\n",
+                            vm,render_slot,mixed.renders,r.vdm_base,r.width,r.height,r.samples,s[0],s[1],s[2]);
+                        render_slot+=1;
+                    },
+                    crate::m3_submit::Command::Compute(c)=>{
+                        let NativeJob::Compute(j)=&mut self.jobs[mixed.compute_index] else {return Err(EINVAL);};
+                        let ns=j.slot_gpu_ns(compute_slot)?;
+                        dev_info!(self.drm.as_ref(),"M3_COMPUTE_SLOT vm={} mixed=1 slot={} batch={} cdm={:#x} end={:#x} usc={:#x} gpu_ns={}\n",
+                            vm,compute_slot,mixed.computes,c.base,c.end,c.usc_base,ns);
+                        compute_slot+=1;
+                    },
+                }
+            }
+        }
+        self.state.health.record_completion();
+        self.render_batches[mixed.renders-1]+=1;
+        self.pass_cost.record(batch.entries[0].0.vm.id(),render_ns/mixed.renders as u64);
+        self.mixed_batches+=1;
+        if (self.mixed_batches==1 || self.mixed_batches%128==0) && batch.measure {
+            dev_info!(self.drm.as_ref(),"M3_MIXED_BATCH_RETIRED count={} commands={} render={} compute={} barriers={} prepare_ns={} active_ns={} render_gpu_ns={} compute_gpu_ns={} ta_ns={} fragment_ns={} gap_ns={} stamps=1 queues=1 events=3 idle=1\n",
+                self.mixed_batches,batch.entries.len(),mixed.renders,mixed.computes,mixed.dependencies,
+                batch.preparation_ns,batch.start.elapsed().as_nanos(),render_ns,compute_ns,stages[0],stages[1],stages[2]);
+        }
+        if self.active.is_empty() {
+            self.gpu_pending=false;self.state.health.set_gpu_pending(false);
+        }
+        Ok(())
     }
     /// Check the active batch once. Ok(true): retired (its packets are signalled).
     fn poll_active(&mut self)->Result<bool> {
@@ -446,7 +663,56 @@ impl Inner {
                 Err(e)=>{self.fail_active(e);return Err(e);}
             }
         }
-        let stamped=match self.jobs[index].complete() {Ok(v)=>v,Err(e)=>{self.fail_active(e);return Err(e);}};
+        let secondary=self.active.first().and_then(|b|b.mixed.as_ref().map(|m|m.compute_index));
+        let completion=(||->Result<bool> {
+            let primary=self.jobs[index].complete()?;
+            let other=match secondary {Some(i)=>self.jobs[i].complete()?,None=>true};
+            Ok(primary && other)
+        })();
+        let stamped=match completion {Ok(v)=>v,Err(e)=>{self.fail_active(e);return Err(e);}};
+        if crate::debug::debug_enabled(crate::debug::DebugFlags::M3PassTiming) {
+            let before=physical_counter();
+            let parts=match &mut self.jobs[index] {
+                NativeJob::Render(j)=>j.fragment_stamp_parts().ok(),
+                _=>None,
+            };
+            let after=physical_counter();
+            if let Some(parts)=parts {
+                if let Some(batch)=self.active.first_mut() {
+                    if batch.fragment_host_tick==0 {
+                        if parts[0] {batch.fragment_host_tick=after;}
+                        else {batch.fragment_host_pending_tick=before;}
+                    }
+                    if batch.fragment_fw_tick==0 {
+                        if parts[1] {batch.fragment_fw_tick=after;}
+                        else {batch.fragment_fw_pending_tick=before;}
+                    }
+                }
+            }
+        }
+        let power_enabled=crate::m3_params::active_power();
+        if power_enabled {
+            let since_last=self.active_power_last.map(|last|last.elapsed().as_nanos());
+            if crate::m3_active_power::due(power_enabled,self.device.soc().chip_id,
+                                          stamped,self.active_power_samples,since_last) {
+                self.active_power_last=Some(Instant::<Monotonic>::now());
+                self.active_power_samples+=1;
+                // Diagnostic read errors do not change job completion or recovery.
+                if let Err(e)=self.config.log_active_power(&self.drm,&self.device,
+                                                          self.active_power_samples) {
+                    dev_info!(self.drm.as_ref(),"M3_ACTIVE_POWER sample={} unavailable={:?}\n",
+                              self.active_power_samples,e);
+                }
+            }
+        }
+        let completion_parts=if measure && secondary.is_none() {
+            match &mut self.jobs[index] {
+                NativeJob::Render(j)=>Some(if stamped {[true;4]} else {
+                    match j.completion_parts() {Ok(v)=>v,Err(e)=>{self.fail_active(e);return Err(e);}}
+                }),
+                _=>None,
+            }
+        } else {None};
         let completed=self.config.completed_events;
         let (evented,expired,previous)={
             let batch=self.active.first_mut().ok_or(EIO)?;
@@ -454,6 +720,11 @@ impl Inner {
             if batch.measure {
                 let at=batch.start.elapsed().as_nanos();
                 if stamped && batch.stamp_ns<0 {batch.stamp_ns=at;}
+                if let Some(parts)=completion_parts {
+                    for (part,done) in parts.iter().enumerate() {
+                        if *done && batch.completion_ns[part]<0 {batch.completion_ns[part]=at;}
+                    }
+                }
                 if completed>batch.previous_events && batch.first_event_ns<0 {batch.first_event_ns=at;}
                 if evented && batch.events_ns<0 {batch.events_ns=at;}
             }
@@ -467,6 +738,10 @@ impl Inner {
                 retire_mmio&crate::m3_params::RETIRE_MMIO_FAULTS!=0) {
                 Ok(())=>match self.config.pipes_idle() {
                     Ok(true)=>{
+                        if crate::debug::debug_enabled(crate::debug::DebugFlags::M3PassTiming) {
+                            let tick=physical_counter();
+                            if let Some(batch)=self.active.first_mut() {batch.pipes_idle_tick=tick;}
+                        }
                         if retire_mmio&crate::m3_params::RETIRE_MMIO_PSTATE!=0 {
                             if let Err(e)=self.config.check_pstate(&self.drm,&self.device,"after a job") {
                                 if crate::t8122_start::is_t8122(self.device.soc()) {
@@ -503,8 +778,20 @@ impl Inner {
         }
         Ok(false)
     }
+    fn log_batch_milestones(&self,batch:&Batch,render_start:u64,render_end:u64,
+        render_gpu_ns:u64,fragment_sum_ns:u64) {
+        dev_info!(self.drm.as_ref(),"M3_BATCH_MILESTONE vm={} publication_tick={} draw={} mixed={} render_start_tick={} render_end_tick={} render_gpu_ns={} fragment_sum_ns={} fragment_host_tick={} fragment_fw_tick={} fragment_host_pending_tick={} fragment_fw_pending_tick={} pipes_idle_tick={} counter_hz=24000000\n",
+            batch.entries[0].0.vm.id(),batch.publication_tick,batch.last_draw,u32::from(batch.mixed.is_some()),
+            render_start,render_end,render_gpu_ns,fragment_sum_ns,batch.fragment_host_tick,batch.fragment_fw_tick,
+            batch.fragment_host_pending_tick,batch.fragment_fw_pending_tick,batch.pipes_idle_tick);
+        for (packet,command) in batch.entries.iter() {
+            dev_info!(self.drm.as_ref(),"M3_BATCH_PACKET vm={} publication_tick={} packet={:#x} command={}\n",
+                packet.vm.id(),batch.publication_tick,packet.profile_id(),command);
+        }
+    }
     /// Bookkeeping for a retired batch, then signal its completed packets.
     fn retire(&mut self,batch:&Batch)->Result {
+        if let Some(mixed)=&batch.mixed {return self.retire_mixed(batch,mixed);}
         let retire_start=batch.measure.then(Instant::<Monotonic>::now);
         let index=batch.index;let batch_count=batch.entries.len();let control=batch.first;
         self.state.health.record_completion();
@@ -529,6 +816,14 @@ impl Inner {
         };
         if kind==0 {
             self.render_batches[batch_count-1]+=1;
+            if batch.measure && batch.coalesced_stamps>0 && self.coalesced_render_stamps==0 {
+                if let NativeJob::Render(j)=&mut self.jobs[index] {
+                    let masks=j.stamp_flush_masks(batch.base,batch_count)?;
+                    dev_info!(self.drm.as_ref(),"M3_RENDER_STAMP_FLUSH vm={} batch={} ta_mask={:#x} fs_mask={:#x} coalesced={}\n",
+                        batch.entries[0].0.vm.id(),batch_count,masks[0],masks[1],batch.coalesced_stamps);
+                }
+            }
+            self.coalesced_render_stamps+=batch.coalesced_stamps;
             let vm=batch.entries[0].0.vm.id();
             self.pass_cost.record(vm,gpu_ns/batch_count as u64);
             self.render_initialized=true;
@@ -541,20 +836,23 @@ impl Inner {
                 _=>return Err(EINVAL),
             };
             let valid=batch.publication_tick!=0 && span[0]>=batch.publication_tick && span[1]>=span[0] && observed_tick>=span[1];
-            dev_info!(self.drm.as_ref(),"M3_BATCH_BOUNDARY cs={:#x} batch={} publication_tick={} gpu_start_tick={} gpu_end_tick={} observed_tick={} counter_hz=24000000 valid={}\n",
-                cs,batch_count,batch.publication_tick,span[0],span[1],observed_tick,u32::from(valid));
+            dev_info!(self.drm.as_ref(),"M3_BATCH_BOUNDARY vm={} cs={:#x} batch={} publication_tick={} gpu_start_tick={} gpu_end_tick={} observed_tick={} counter_hz=24000000 valid={}\n",
+                batch.entries[0].0.vm.id(),cs,batch_count,batch.publication_tick,span[0],span[1],observed_tick,u32::from(valid));
+            self.log_batch_milestones(batch,
+                if kind==0 {span[0]} else {0},if kind==0 {span[1]} else {0},
+                if kind==0 {gpu_ns} else {0},stages[1]);
             if let NativeJob::Compute(j)=&mut self.jobs[index] {
                 for (slot,(p,next)) in batch.entries.iter().enumerate() {
                     let crate::m3_submit::Command::Compute(c)=p.commands[*next] else {return Err(EINVAL);};
                     let ns=j.slot_gpu_ns(slot)?;
-                    dev_info!(self.drm.as_ref(),"M3_COMPUTE_SLOT slot={} batch={} cdm={:#x} end={:#x} usc={:#x} gpu_ns={}\n",slot,batch_count,c.base,c.end,c.usc_base,ns);
+                    dev_info!(self.drm.as_ref(),"M3_COMPUTE_SLOT vm={} slot={} batch={} cdm={:#x} end={:#x} usc={:#x} gpu_ns={}\n",p.vm.id(),slot,batch_count,c.base,c.end,c.usc_base,ns);
                 }
             }
             if let NativeJob::Render(j)=&mut self.jobs[index] {
                 for (slot,(p,next)) in batch.entries.iter().enumerate() {
                     let crate::m3_submit::Command::Render{command:r,..}=p.commands[*next] else {return Err(EINVAL);};
                     let s=j.slot_stage_ns(batch.base,batch_count,slot)?;
-                    dev_info!(self.drm.as_ref(),"M3_PASS_SLOT slot={} batch={} vdm={:#x} width={} height={} samples={} ta_ns={} fragment_ns={} gap_ns={}\n",slot,batch_count,r.vdm_base,r.width,r.height,r.samples,s[0],s[1],s[2]);
+                    dev_info!(self.drm.as_ref(),"M3_PASS_SLOT vm={} slot={} batch={} vdm={:#x} width={} height={} samples={} ta_ns={} fragment_ns={} gap_ns={}\n",p.vm.id(),slot,batch_count,r.vdm_base,r.width,r.height,r.samples,s[0],s[1],s[2]);
                 }
             }
         }
@@ -575,6 +873,7 @@ impl Inner {
                     g.polling_ns+=batch.polling_ns;g.retirement_ns+=retirement_ns;
                     g.polls+=batch.polls;
                     g.stamp_ns+=batch.stamp_ns;g.first_event_ns+=batch.first_event_ns;g.events_ns+=batch.events_ns;
+                    for (total,observed) in g.completion_ns.iter_mut().zip(batch.completion_ns) {*total+=observed;}
                     if let Some((ta,fe))=ticks {
                         g.pickup_ns+=(ta as i64)*1000/24-batch.doorbell_counter_ns;
                         g.tail_ns+=retired_counter_ns-(fe as i64)*1000/24;
@@ -611,15 +910,15 @@ impl Inner {
         if kind==0 && t[0]%512==0 &&
             crate::debug::debug_enabled(crate::debug::DebugFlags::M3SubmitSummary) {
             let early=match &self.jobs[index] {NativeJob::Render(j)=>j.early_count(),_=>0};
-            dev_info!(self.drm.as_ref(),"M3_ORDERED_BATCHES depths={:?} early={} packets={}\n", self.render_batches,early,self.coalesced_packets);
+            dev_info!(self.drm.as_ref(),"M3_ORDERED_BATCHES depths={:?} early={} packets={} coalesced_stamps={}\n", self.render_batches,early,self.coalesced_packets,self.coalesced_render_stamps);
             let now=<Monotonic as kernel::time::ClockSource>::ktime_get();
             dev_info!(self.drm.as_ref(),"M3_GEOMETRY_BATCH ns={} render_count={} overflow={}\n",
                 now,t[0],self.geometry_overflow);
             self.geometry_overflow=0;
             for g in &mut self.geometry {
                 if g.count==0 {continue;}
-                dev_info!(self.drm.as_ref(),"M3_GEOMETRY ns={} width={} height={} samples={} count={} prepare_ns={} active_ns={} gpu_ns={} tiling_ns={} fragment_ns={} max_fragment_ns={} polling_ns={} retirement_ns={} sleeping_ns={} polls={} stamp_ns={} first_event_ns={} events_ns={} pickup_ns={} tail_ns={}\n",
-                    now,g.width,g.height,g.samples,g.count,g.prepare_ns,g.active_ns,g.gpu_ns,g.tiling_ns,g.fragment_ns,g.max_fragment_ns,g.polling_ns,g.retirement_ns,g.sleeping_ns,g.polls,g.stamp_ns,g.first_event_ns,g.events_ns,g.pickup_ns,g.tail_ns);
+                dev_info!(self.drm.as_ref(),"M3_GEOMETRY ns={} width={} height={} samples={} count={} prepare_ns={} active_ns={} gpu_ns={} tiling_ns={} fragment_ns={} max_fragment_ns={} polling_ns={} retirement_ns={} sleeping_ns={} polls={} stamp_ns={} first_event_ns={} events_ns={} pickup_ns={} tail_ns={} gpu_stamp_ns={} fw_stamp_ns={} queue_done_ns={} queue_read_ns={}\n",
+                    now,g.width,g.height,g.samples,g.count,g.prepare_ns,g.active_ns,g.gpu_ns,g.tiling_ns,g.fragment_ns,g.max_fragment_ns,g.polling_ns,g.retirement_ns,g.sleeping_ns,g.polls,g.stamp_ns,g.first_event_ns,g.events_ns,g.pickup_ns,g.tail_ns,g.completion_ns[0],g.completion_ns[1],g.completion_ns[2],g.completion_ns[3]);
                 *g=GeometryTiming::default();
             }
         }
@@ -687,8 +986,8 @@ impl Runtime {
             }
         };
         Ok(Self { inner: ManuallyDrop::new(owner.write(Inner { transport, state, config, uat, drm, device,
-            jobs:KVec::new(),packets:KVec::new(),pending:KVec::new(),active:KVec::new(),gpu_pending:false,fault_captured:false,timing:[[0;7];2],render_batches:[0;crate::m3_pass_layout::SLOTS],
-            geometry:[GeometryTiming::default();32],geometry_overflow:0,coalesced_packets:0,pass_cost:policy::PassCosts::default(),render_initialized:false,t8122_verdict:false,
+            jobs:KVec::new(),packets:KVec::new(),pending:KVec::new(),active:KVec::new(),gpu_pending:false,active_power_last:None,active_power_samples:0,fault_captured:false,timing:[[0;7];2],render_batches:[0;crate::m3_pass_layout::SLOTS],
+            geometry:[GeometryTiming::default();32],geometry_overflow:0,coalesced_packets:0,coalesced_render_stamps:0,mixed_batches:0,pass_cost:policy::PassCosts::default(),render_initialized:false,t8122_verdict:false,
             boot_step:crate::t8122_start::BootStep::Publish })) })
     }
     pub(crate) fn drm(&self) -> driver::AsahiDevRef { self.inner.drm.clone() }
@@ -751,6 +1050,21 @@ impl Runtime {
     /// One completion-worker step: retire the active batch if it has completed, then publish
     /// the next one. The worker drops the runtime lock between steps.
     pub(crate) fn service_job(&mut self)->Service {
+        let chip=self.inner.device.soc().chip_id;
+        let busy=self.inner.state.healthy() &&
+            (!self.inner.active.is_empty() || !self.inner.pending.is_empty());
+        if let Err(error)=self.inner.config.performance_request(chip,busy) {
+            self.inner.fail_active(error);
+            return Service::Idle;
+        }
+        let result=self.service_job_inner();
+        if matches!(result,Service::Idle) || !self.inner.state.healthy() ||
+            (self.inner.active.is_empty() && self.inner.pending.is_empty()) {
+            let _=self.inner.config.performance_request(chip,false);
+        }
+        result
+    }
+    fn service_job_inner(&mut self)->Service {
         let inner: &mut Inner=&mut *self.inner;
         if inner.active.is_empty() {
             if inner.fault_captured || !inner.state.healthy() {inner.fail_pending(EIO);return Service::Idle;}
@@ -813,6 +1127,10 @@ impl Runtime {
         let inner: &mut Inner = &mut *self.inner;
         inner.config.drain(&inner.drm)?;
         inner.config.log_ready(&inner.drm)?;
+        if inner.device.soc().chip_id==0x6030 &&
+            (crate::m3_params::active_power() || crate::m3_params::globals_debug_off()) {
+            inner.config.log_globals_debug(&inner.drm)?;
+        }
         inner.config.check_pstate(&inner.drm, &inner.device, "after boot")?;
         inner.state.health.set_gpu_pending(false);
         dev_info!(pdev.as_ref(), "M3: firmware accepted owned initdata and device controls\n");
@@ -849,6 +1167,8 @@ impl Runtime {
 }
 impl Drop for Runtime {
     fn drop(&mut self) {
+        let chip=self.inner.device.soc().chip_id;
+        let _=self.inner.config.performance_request(chip,false);
         self.inner.state.health.mark_failed();
         // Unpublished packets never reach the firmware; a published batch's packets stay
         // retained below if the GPU may still use them, but their fences must not hang.
@@ -867,7 +1187,7 @@ impl Drop for Runtime {
 
 /// Same scaling contract as G16's qualified publication profiler. AP counter
 /// rates may differ between SoCs; firmware command timestamps use 24 MHz.
-fn physical_counter() -> u64 {
+pub(crate) fn physical_counter() -> u64 {
     let tick: u64;
     let frequency: u64;
     // SAFETY: Read architectural counters only; no device state is modified.

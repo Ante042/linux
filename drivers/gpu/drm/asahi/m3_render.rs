@@ -30,6 +30,8 @@ pub(crate) struct Render {
     last_progress_ns:i64,
     draw:u64, heads:[u16;2], cached_views:KVec<CachedViews>,
     slot:usize, batch_count:usize, early_count:u32,
+    /// Measurement packets in the pass most recently appended to its queues.
+    stage_timestamps:[bool;2],
     /// First pass slot of the current batch; its passes use base..base+batch_count mod SLOTS.
     base:usize,
     checkpoint:(u64,[u16;2],usize,usize,u32,usize),
@@ -89,7 +91,7 @@ impl Render {
         tiler_bytes.resize(tiler::SIZE,0u8,GFP_KERNEL)?;
         let mut fragment_bytes=KVec::new();
         fragment_bytes.resize(fragment::SIZE,0u8,GFP_KERNEL)?;
-        let mut job=Self{passes,init_bm,stats,sequence_bytes,tiler_bytes,fragment_bytes,objects,_aliases:aliases,_binding:binding,last_progress_ns:0,draw:0,heads:[0;2],cached_views:KVec::new(),slot:0,batch_count:0,early_count:0,base:0,checkpoint:(0,[0;2],0,0,0,0),clusters,registers};
+        let mut job=Self{passes,init_bm,stats,sequence_bytes,tiler_bytes,fragment_bytes,objects,_aliases:aliases,_binding:binding,last_progress_ns:0,draw:0,heads:[0;2],cached_views:KVec::new(),slot:0,batch_count:0,early_count:0,stage_timestamps:[true;2],base:0,checkpoint:(0,[0;2],0,0,0,0),clusters,registers};
         // Lists and the matching manager are built before InitBM publication.
         job.initialize_parameter_buffer()?;
         for pool in &UMA_POOLS { pool.initialize(&mut job.objects)?; }
@@ -189,7 +191,8 @@ impl Render {
     // Construct synchronization from the actual owners after resetting a pass,
     // before publishing its ring entries. InitBM is shared and dispatched only
     // for draw one; rewriting its bytes after retirement preserves the old path.
-    fn prepare_sync(&mut self, early: bool, draw: u64) -> Result {
+    fn prepare_sync(&mut self, early: bool, draw: u64,
+        predecessor:Option<sync::CompletionDependency>) -> Result {
         let address = |owner: usize| queue::FirmwareVa::new(self.objects[owner].va()).map_err(|_| EINVAL);
         let manager = address(BUFFER_MANAGER)?;
         let ta_stamp = address(s::TA_FW_STAMP)?;
@@ -201,13 +204,17 @@ impl Render {
         self.init_bm.write(0, &init)?;
         let ta_value = timeline::stamp(s::STAMP_TA - 256, draw);
         let fs_value = timeline::stamp(s::STAMP_FRAGMENT - 256, draw);
+        let previous=predecessor.unwrap_or(sync::CompletionDependency {
+            stamp:if early {ta_stamp} else {fs_stamp},
+            value:timeline::stamp((if early {s::STAMP_TA} else {s::STAMP_FRAGMENT})-256,draw-1),
+            event:u32::from(!early),
+        });
         self.write_barrier(P::TilerToFragment, sync::Barrier {
             stamp: ta_stamp, wait_value: ta_value, event: 0, self_value: fs_value,
             uuid: 0x3d0000, dependency: sync::Dependency::TilerToFragment })?;
         self.write_barrier(P::TilerDependency, sync::Barrier {
-            stamp: if early { ta_stamp } else { fs_stamp },
-            wait_value: timeline::stamp((if early {s::STAMP_TA} else {s::STAMP_FRAGMENT}) - 256, draw - 1),
-            event: u32::from(!early), self_value: ta_value,
+            stamp: previous.stamp, wait_value: previous.value,
+            event: previous.event, self_value: ta_value,
             uuid: DEPENDENCY_UUID, dependency: sync::Dependency::PreviousPass })?;
         self.write_barrier(P::FragmentDependency, sync::Barrier {
             stamp: fs_stamp, wait_value: timeline::stamp(s::STAMP_FRAGMENT - 256, draw - 1), event: 1, self_value: fs_value,
@@ -262,12 +269,14 @@ impl Render {
                 fw_stamp:shared(if fs{s::FRAGMENT_FW_STAMP}else{s::TA_FW_STAMP})?,
                 context:self._binding.slot(),stamp:timeline::stamp((if fs{s::STAMP_FRAGMENT}else{s::STAMP_TA}) - 256, draw),
             };
-            if fs {
+            let timed=self.stage_timestamps[usize::from(fs)];
+            let length=if fs {
                 let b=pass.get(P::FragmentScratch);
                 let scratch=GpuRegion::new(b.gpu_va()?,b.size()).map_err(|_|EINVAL)?;
-                sequence::Fragment{owners,scratch,queue_command_count:timeline::previous(draw)}.encode(&mut self.sequence_bytes).map_err(|_|EINVAL)?;
-            }else{sequence::Tiler{owners,scratch:fw(P::TilerScratch)?}.encode(&mut self.sequence_bytes).map_err(|_|EINVAL)?;}
+                sequence::Fragment{owners,scratch,queue_command_count:timeline::previous(draw)}.encode_timestamps(&mut self.sequence_bytes,timed).map_err(|_|EINVAL)?
+            }else{sequence::Tiler{owners,scratch:fw(P::TilerScratch)?}.encode_timestamps(&mut self.sequence_bytes,timed).map_err(|_|EINVAL)?};
             self.passes[self.slot].get_mut(target).write(0,&self.sequence_bytes)?;
+            self.passes[self.slot].get_mut(if fs{P::FragmentCommand}else{P::TilerCommand}).u32(sequence::command_length_offset(fs),length as u32)?;
         }
         Ok(())
     }
@@ -333,11 +342,13 @@ impl Render {
         self.passes[self.slot].get_mut(P::FragmentCommand).write(0,&self.fragment_bytes)
     }
     pub(crate) fn set_user_timestamps(&mut self,addresses:[[u64;2];2])->Result {
+        if addresses.iter().enumerate().any(|(stage,pair)|*pair!=[0;2] && !self.stage_timestamps[stage]) {return Err(EINVAL);}
         for (stage,(command,sequence,offset,start,end)) in [
             (P::TilerCommand,P::TilerSequence,sequence::ta::USER_PAIR,sequence::ta::TIMESTAMP_START,sequence::ta::TIMESTAMP_END),
             (P::FragmentCommand,P::FragmentSequence,sequence::fragment::USER_PAIR,sequence::fragment::TIMESTAMP_START,sequence::fragment::TIMESTAMP_END)
         ].into_iter().enumerate() {
             let pair=addresses[stage];
+            if !self.stage_timestamps[stage] {continue;}
             self.passes[self.slot].get_mut(command).u64(offset,pair[0])?;
             self.passes[self.slot].get_mut(command).u64(offset+8,pair[1])?;
             let pointer=if pair==[0,0] {0} else {self.passes[self.slot].get_mut(command).va()+offset as u64};
@@ -500,17 +511,29 @@ impl Render {
     /// are immediately visible to running firmware, even before a new doorbell.
     /// Each append selects disjoint host-mutated pass storage. A TA dependency
     /// retains full fragment-to-next-TA ordering for arbitrary resource hazards.
-    pub(crate) fn append(&mut self,r:agx_uapi::UapiRenderCommand,usc:u64)->Result {
+    pub(crate) fn append(&mut self,r:agx_uapi::UapiRenderCommand,usc:u64,coalesce_stamps:bool,timestamps:[bool;2])->Result {
+        self.append_after(r,usc,coalesce_stamps,None,timestamps)
+    }
+    pub(crate) fn completion_dependency(&self)->Result<sync::CompletionDependency> {
+        Ok(sync::CompletionDependency {
+            stamp:queue::FirmwareVa::new(self.objects[s::FRAGMENT_FW_STAMP].va()).map_err(|_|EINVAL)?,
+            value:timeline::stamp(s::STAMP_FRAGMENT-256,self.draw),event:1,
+        })
+    }
+    pub(crate) fn append_after(&mut self,r:agx_uapi::UapiRenderCommand,usc:u64,
+        coalesce_stamps:bool,predecessor:Option<sync::CompletionDependency>,timestamps:[bool;2])->Result {
+        if predecessor.is_some_and(|p|p.event!=2) {return Err(EINVAL);}
         if self.batch_count>=pass_layout::SLOTS {
             pr_err!("M3 render batch limit: batch={} slots={}\n",
                 self.batch_count,pass_layout::SLOTS);
             return Err(E2BIG);
         }
         self.slot=Self::at(self.base,self.batch_count);
+        self.stage_timestamps=timestamps;
         // Retain the conservative stage-scope permission. Only a pass after the
         // first of its batch may overlap its predecessor's stages. Explicit
         // start timestamps keep the original full-order execution boundary.
-        let early=self.batch_count>0 && *crate::module_parameters::m3_early_tiling.value()!=0
+        let early=predecessor.is_none() && self.batch_count>0 && *crate::module_parameters::m3_early_tiling.value()!=0
             && r.flags&(1<<5)!=0 && r.vertex_timestamps.start.handle==0
             && r.fragment_timestamps.start.handle==0;
         if early {self.early_count+=1;}
@@ -538,7 +561,14 @@ impl Render {
         self.patch_context()?;
         self.prepare_fragment(r,usc,draw)?;
         self.prepare_sequences(draw)?;
-        self.prepare_sync(early, draw)?;
+        self.prepare_sync(early, draw, predecessor)?;
+        // Encode before either ring WRITE exposes the command to firmware.
+        // The caller retains every pass owner until the final flushed stamps,
+        // queues, events and engine-idle checks retire this entire batch.
+        if coalesce_stamps {
+            self.passes[self.slot].get_mut(P::TilerCommand).u32(tiler::FLUSH_STAMPS,0)?;
+            self.passes[self.slot].get_mut(P::FragmentCommand).u32(fragment::FLUSH_STAMPS,0)?;
+        }
         let dep=P::TilerDependency;
         let fs_dep=P::FragmentDependency;
         let ta=self.passes[self.slot].get_mut(P::TilerCommand).va();
@@ -585,6 +615,37 @@ impl Render {
         Ok(())
     }
     pub(crate) fn queues(&self)->[u64;2] {[self.objects[s::TA_QUEUE].va(),self.objects[s::FRAGMENT_QUEUE].va()]}
+    /// Read retained command bytes only after exact batch retirement.
+    pub(crate) fn stamp_flush_masks(&mut self,base:usize,count:usize)->Result<[u16;2]> {
+        if base>=pass_layout::SLOTS || count==0 || count>pass_layout::SLOTS {return Err(EINVAL);}
+        let mut masks=[0;2];
+        for slot in 0..count {
+            let pass=&mut self.passes[Self::at(base,slot)];
+            for (stage,field,offset) in [(0,P::TilerCommand,tiler::FLUSH_STAMPS),
+                (1,P::FragmentCommand,fragment::FLUSH_STAMPS)] {
+                if pass.get_mut(field).read_u32(offset)?!=0 {masks[stage]|=1u16<<slot;}
+            }
+        }
+        Ok(masks)
+    }
+    /// Read the fragment host and firmware stamps without changing retirement.
+    pub(crate) fn fragment_stamp_parts(&mut self)->Result<[bool;2]> {
+        let value=timeline::stamp(s::STAMP_FRAGMENT - 256,self.draw);
+        Ok([self.objects[s::FRAGMENT_STAMP].read_u32(0)?==value,
+            self.objects[s::FRAGMENT_FW_STAMP].read_u32(0)?==value])
+    }
+    /// Observe each completion condition across both render queues independently.
+    pub(crate) fn completion_parts(&mut self)->Result<[bool;4]> {
+        let mut done=[true;4];
+        for (stamp,fw,pointers,value,head) in [(s::TA_STAMP,s::TA_FW_STAMP,s::TA_POINTERS,timeline::stamp(s::STAMP_TA - 256, self.draw),self.heads[0]),
+            (s::FRAGMENT_STAMP,s::FRAGMENT_FW_STAMP,s::FRAGMENT_POINTERS,timeline::stamp(s::STAMP_FRAGMENT - 256, self.draw),self.heads[1])] {
+            done[0]&=self.objects[stamp].read_u32(0)?==value;
+            done[1]&=self.objects[fw].read_u32(0)?==value;
+            done[2]&=self.objects[pointers].read_u32(queue::DONE)?==u32::from(head);
+            done[3]&=self.objects[pointers].read_u32(queue::READ)?==u32::from(head);
+        }
+        Ok(done)
+    }
     pub(crate) fn complete(&mut self)->Result<bool> {
         for (stamp,fw,pointers,value,head) in [(s::TA_STAMP,s::TA_FW_STAMP,s::TA_POINTERS,timeline::stamp(s::STAMP_TA - 256, self.draw),self.heads[0]),
             (s::FRAGMENT_STAMP,s::FRAGMENT_FW_STAMP,s::FRAGMENT_POINTERS,timeline::stamp(s::STAMP_FRAGMENT - 256, self.draw),self.heads[1])] {

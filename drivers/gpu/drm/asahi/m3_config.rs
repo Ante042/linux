@@ -55,6 +55,12 @@ pub(crate) struct Config {
     pub(crate) completed_events: u64,
     pstates: crate::m3_adt_config::PstateWatch,
     thermal: crate::m3_thermal::Governor,
+    request_top: u32,
+    request_value: u32,
+    request_checked: bool,
+    request_check_at: Option<kernel::time::Instant<kernel::time::Monotonic>>,
+    request_writes: u64,
+    request_observed: u32,
 }
 impl Config {
     /// Snapshot owned RAM only. Firmware can still update these buffers;
@@ -184,7 +190,9 @@ impl Config {
         };
         Ok(Self { objects, _iomaps: iomaps, completed_events: 0,
             #[cfg(CONFIG_DEV_COREDUMP)] fault_reserve,
-            pstates: crate::m3_adt_config::PstateWatch::new(contents.pstates), thermal })
+            pstates: crate::m3_adt_config::PstateWatch::new(contents.pstates), thermal,
+            request_top:contents.table.0,request_value:0,request_checked:false,
+            request_check_at:None,request_writes:0,request_observed:0 })
     }
     fn initialize_records(objects: &mut [Buffer]) -> Result {
         let records = Records::encode(|index: usize| {
@@ -195,6 +203,40 @@ impl Config {
         objects[CONTROL_REGION].write(0, &records.control)
     }
     pub(crate) fn root(&self) -> u64 { self.objects[storage::ROOT].va() }
+    pub(crate) fn log_globals_debug(&mut self,dev:&driver::AsahiDevice)->Result {
+        let value=self.objects[GLOBALS].read_u32(crate::m3_globals_debug::OFFSET)?;
+        dev_info!(dev.as_ref(),"M3_GLOBALS_DEBUG off={} value={} request_level={}\n",
+            u8::from(crate::m3_params::globals_debug_off()),value,crate::m3_params::consistent_perf());
+        Ok(())
+    }
+    pub(crate) fn performance_request(&mut self,chip:u32,busy:bool)->Result {
+        let Some(value)=crate::m3_consistent_perf::request(chip,
+            crate::m3_params::consistent_perf(),busy,self.request_top) else {return Ok(());};
+        if value==0 && self.request_value==0 {return Ok(());}
+        let now=kernel::time::Instant::<kernel::time::Monotonic>::now();
+        let elapsed=self.request_check_at.map(|last|(now-last).as_nanos());
+        if !crate::m3_consistent_perf::refresh_due(value,self.request_value,elapsed) {
+            return Ok(());
+        }
+        type P=crate::fw::initdata::raw::PowerCtlBlock;
+        let at=core::mem::offset_of!(P,consistent_perf_state);
+        if !self.request_checked {
+            let mut flag=[0];
+            self.objects[GLOBALS_POWER].read(core::mem::offset_of!(P,perf_ctrl_override_active),&mut flag)?;
+            if flag[0]!=0 || self.objects[GLOBALS_POWER].read_u32(at)?!=0 {return Err(EINVAL);}
+            self.request_checked=true;
+        }
+        let observed=self.objects[GLOBALS_POWER].read_u32(at)?;
+        self.request_observed=observed;
+        if observed!=value {
+            self.objects[GLOBALS_POWER].packed_request(at,value)?;
+            agx_memory::publish();
+            self.request_writes=self.request_writes.saturating_add(1);
+        }
+        self.request_value=value;
+        self.request_check_at=Some(now);
+        Ok(())
+    }
     /// Move the runtime cap by temperature (the thermal limit), then check the performance
     /// state the firmware reports against the ceiling and the runtime cap. Called after boot and
     /// after every job, by the job thread.
@@ -212,6 +254,27 @@ impl Config {
     pub(crate) fn stats_region(&self) -> Result<init::Region> {
         let owner = &self.objects[HARDWARE_DATA];
         init::Region::new(owner.va(), owner.size()).map_err(|_| EINVAL)
+    }
+
+    pub(crate) fn log_active_power(&mut self, dev: &driver::AsahiDevice,
+                                  device: &crate::m3_device::Device,
+                                  sequence: u32) -> Result {
+        let cap = self.thermal.allowed(kernel::time::Instant::<kernel::time::Monotonic>::now());
+        self.pstates.log_active(dev.as_ref(), &mut self.objects[HARDWARE_DATA],
+                               device.pstate_register()?, cap, sequence)?;
+        type P=crate::fw::initdata::raw::PowerCtlBlock;
+        type G=crate::fw::initdata::raw::GlobalsG15V14_8_3;
+        let request=self.objects[GLOBALS_POWER].read_u32(core::mem::offset_of!(P,consistent_perf_state))?;
+        let cap_word=self.objects[GLOBALS].read_u32(core::mem::offset_of!(G,perf_state_cap))?;
+        let power_if=core::mem::offset_of!(G,power_if_target);
+        let target1=self.objects[GLOBALS].read_u32(power_if+4)?;
+        let target2=self.objects[GLOBALS].read_u32(power_if+8)?;
+        let mut override_active=[0];
+        self.objects[GLOBALS_POWER].read(core::mem::offset_of!(P,perf_ctrl_override_active),&mut override_active)?;
+        dev_info!(dev.as_ref(),"M3_PERF_REQUEST sample={} level={} request={} cap_word={} target1={} target2={} writes={} observed={} override_active={}\n",
+            sequence,crate::m3_params::consistent_perf(),request,cap_word,target1,target2,
+            self.request_writes,self.request_observed,override_active[0]);
+        Ok(())
     }
 
     pub(crate) fn render_pb(&mut self) -> Result {

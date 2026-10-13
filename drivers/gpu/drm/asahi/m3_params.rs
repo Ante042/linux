@@ -149,6 +149,59 @@ static M3_RENDER_BATCH_OVERRIDE: AtomicU64 = AtomicU64::new(0);
 m3_param!("m3_render_batch_override", M3_RENDER_BATCH_OVERRIDE,
     parse_render_batch_override, 0o644, Some(get_atomic_param));
 
+fn parse_render_stamp_coalesce(text:&str)->Option<u64> {
+    parse_u64(text).filter(|value| *value<=1)
+}
+
+/// Root-only T6030 render stamp-flush coalescing; zero retains per-pass flushes.
+/// Each publication snapshots the setting before encoding any pass.
+static M3_RENDER_STAMP_COALESCE: AtomicU64 = AtomicU64::new(0);
+m3_param!("m3_render_stamp_coalesce", M3_RENDER_STAMP_COALESCE,
+    parse_render_stamp_coalesce, 0o644, Some(get_atomic_param));
+pub(crate) fn render_stamp_coalesce()->bool {
+    M3_RENDER_STAMP_COALESCE.load(Ordering::Relaxed)!=0
+}
+
+/// T6030 cross-engine publications retain GPU ordering with firmware barriers.
+/// Zero preserves the existing host retirement between engine groups.
+static M3_MIXED_BATCH: AtomicU64 = AtomicU64::new(0);
+m3_param!("m3_mixed_batch", M3_MIXED_BATCH,
+    parse_render_stamp_coalesce, 0o644, Some(get_atomic_param));
+pub(crate) fn mixed_batch()->bool {
+    M3_MIXED_BATCH.load(Ordering::Relaxed)!=0
+}
+
+/// Boot-only T6030 power-state sampling while GPU stamps are outstanding.
+/// Zero preserves the completion path without additional register reads.
+static M3_ACTIVE_POWER: AtomicU64 = AtomicU64::new(0);
+m3_param!("m3_active_power", M3_ACTIVE_POWER, parse_render_stamp_coalesce);
+pub(crate) fn active_power()->bool {
+    M3_ACTIVE_POWER.load(Ordering::Relaxed)==1
+}
+
+/// Boot-only T6030 Globals debug-word experiment. Zero preserves the runtime word.
+static M3_GLOBALS_DEBUG_OFF: AtomicU64 = AtomicU64::new(0);
+m3_param!("m3_globals_debug_off",M3_GLOBALS_DEBUG_OFF,parse_render_stamp_coalesce);
+pub(crate) fn globals_debug_off()->bool {M3_GLOBALS_DEBUG_OFF.load(Ordering::Relaxed)==1}
+
+/// T6030-only request while work is pending or active. Zero leaves firmware
+/// performance selection unchanged; three requests the top published state.
+static M3_CONSISTENT_PERF: AtomicU64 = AtomicU64::new(0);
+fn parse_consistent_perf(text: &str)->Option<u64> {
+    parse_u64(text).filter(|v| matches!(*v,0|3))
+}
+m3_param!("m3_consistent_perf",M3_CONSISTENT_PERF,parse_consistent_perf,0o644,Some(get_atomic_param));
+pub(crate) fn consistent_perf()->u64 {M3_CONSISTENT_PERF.load(Ordering::Relaxed)}
+
+/// One preserves internal render measurements. Application timestamp requests
+/// remain recorded when zero omits measurements on T6030.
+static M3_RENDER_INTERNAL_TIMESTAMPS: AtomicU64 = AtomicU64::new(1);
+m3_param!("m3_render_internal_timestamps", M3_RENDER_INTERNAL_TIMESTAMPS,
+    parse_render_stamp_coalesce, 0o644, Some(get_atomic_param));
+pub(crate) fn render_internal_timestamps()->bool {
+    M3_RENDER_INTERNAL_TIMESTAMPS.load(Ordering::Relaxed)!=0
+}
+
 /// Snapshot once per batch. A live change affects later publications, never the
 /// storage, ordering or retirement checks of work already on the firmware queues.
 pub(crate) fn render_batch_size() -> usize {
