@@ -638,6 +638,7 @@ static void orientation_faults(void)
                 } else {
                     assert(!strcmp(caller, "j700_dp_wait") ||
                            !strcmp(caller, "j700_field_update") ||
+                           !strcmp(caller, "j700_usb_field_update") ||
                            !strcmp(caller, "atcphy_power_on") ||
                            !strcmp(caller, "atcphy_configure") ||
                            (fixed && (!strcmp(caller, "atcphy_pipehandler_lock") ||

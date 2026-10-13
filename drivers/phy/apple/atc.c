@@ -2789,7 +2789,7 @@ static int atcphy_configure(struct apple_atcphy *atcphy, enum atcphy_mode mode)
 	u32 reg;
 
 	lockdep_assert_held(&atcphy->lock);
-	if (atcphy->hw->has_t8140_dp && atcphy->fixed_usb2 && atcphy->host_active &&
+	if (atcphy->hw->has_t8140_dp && atcphy->fixed_usb2 &&
 	    atcphy->pipe_state != ATCPHY_PIPEHANDLER_STATE_DUMMY)
 		return -EBUSY;
 	if (atcphy->hw->has_t8140_dp && atcphy->dp_owned_pmas &&

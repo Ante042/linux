@@ -57,7 +57,7 @@ static int j700_usb_capture(struct apple_atcphy *p, enum atcphy_mode mode)
 
 	if (!p->hw->has_t8140_dp || !p->fixed_usb2)
 		return 0;
-	if (p->host_active && p->pipe_state != ATCPHY_PIPEHANDLER_STATE_DUMMY)
+	if (p->pipe_state != ATCPHY_PIPEHANDLER_STATE_DUMMY)
 		return -EBUSY;
 	for (unsigned int lane = 0; lane < 2; lane++) {
 		if (!cfg->dp_lane[lane] || (p->dp_usb_context_valid & BIT(lane)))
@@ -73,6 +73,16 @@ static int j700_usb_capture(struct apple_atcphy *p, enum atcphy_mode mode)
 	return 0;
 }
 
+/* Same control write/delay/poll sequence, retaining its final sample for diagnostics. */
+static int j700_usb_field_update(struct apple_atcphy *p, u32 offset, u32 mask,
+				 u32 value, u32 *observed)
+{
+	core_mask32(p, offset, mask, value);
+	usleep_range(10, 20);
+	return readl_poll_timeout_atomic(p->regs.core + offset, *observed,
+					(*observed & mask) == value, 1, 100);
+}
+
 /* Restore only DP-owned bits, with the PIPE parked and the DP PMA idle. */
 static int j700_usb_restore(struct apple_atcphy *p, enum atcphy_mode mode)
 {
@@ -83,7 +93,7 @@ static int j700_usb_restore(struct apple_atcphy *p, enum atcphy_mode mode)
 
 	if (!p->hw->has_t8140_dp || !p->fixed_usb2)
 		return 0;
-	if (p->host_active && p->pipe_state != ATCPHY_PIPEHANDLER_STATE_DUMMY)
+	if (p->pipe_state != ATCPHY_PIPEHANDLER_STATE_DUMMY)
 		return -EBUSY;
 	if (p->dp_owned_pmas || p->dp_idle_pmas)
 		return -EBUSY;
@@ -101,7 +111,7 @@ static int j700_usb_restore(struct apple_atcphy *p, enum atcphy_mode mode)
 				core_mask32(p, offset, mask, value);
 				observed = core_read32(p, offset) & mask;
 				if (observed != value) {
-					dev_dbg(p->dev, "USB restore readback pma=%u reg=%#x mask=%#x expected=%#x actual=%#x\n",
+					dev_dbg(p->dev, "USB restore stage=static pma=%u reg=%#x mask=%#x expected=%#x observed=%#x\n",
 						lane, offset, mask, value, observed);
 					return -EIO;
 				}
@@ -110,22 +120,24 @@ static int j700_usb_restore(struct apple_atcphy *p, enum atcphy_mode mode)
 		/* Preserve the public PMA power bit order, using saved values. */
 		for (unsigned int i = 0; i < ARRAY_SIZE(power_order); i++) {
 			u32 mask = BIT(4 * lane + power_order[i]);
+			u32 value = p->dp_usb_context[lane][3] & mask, observed;
 
-			ret = j700_field_update(p, 0x200, mask, p->dp_usb_context[lane][3] & mask);
+			ret = j700_usb_field_update(p, 0x200, mask, value, &observed);
 			if (ret) {
-				dev_dbg(p->dev, "USB restore power pma=%u reg=0x200 mask=%#x ret=%d\n",
-					lane, mask, ret);
+				dev_dbg(p->dev, "USB restore stage=power pma=%u reg=0x200 mask=%#x expected=%#x observed=%#x ret=%d\n",
+					lane, mask, value, observed & mask, ret);
 				return ret;
 			}
 		}
 		/* Restore receiver enables, then release its two idle controls. */
 		for (unsigned int i = 0; i < ARRAY_SIZE(receiver_order); i++) {
 			u32 mask = BIT(lane + receiver_order[i]);
+			u32 value = p->dp_usb_context[lane][1] & mask, observed;
 
-			ret = j700_field_update(p, 0xc, mask, p->dp_usb_context[lane][1] & mask);
+			ret = j700_usb_field_update(p, 0xc, mask, value, &observed);
 			if (ret) {
-				dev_dbg(p->dev, "USB restore receiver pma=%u reg=0xc mask=%#x ret=%d\n",
-					lane, mask, ret);
+				dev_dbg(p->dev, "USB restore stage=receiver pma=%u reg=0xc mask=%#x expected=%#x observed=%#x ret=%d\n",
+					lane, mask, value, observed & mask, ret);
 				return ret;
 			}
 		}

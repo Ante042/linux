@@ -81,7 +81,7 @@ static void atcphy_observe_pmas(struct apple_atcphy *p, const char *stage,
 { (void)p; (void)stage; (void)target; }
 static int atcphy_configure(struct apple_atcphy *p, enum atcphy_mode mode);
 ''')
-for name in ('core_read32', 'atcphy_get_mode_config', 'j700_field_update'):
+for name in ('core_read32', 'atcphy_get_mode_config'):
     parts.append(function(name))
 # Actual restoration functions and gates; analog lane setup stays outside this PIPE unit.
 parts.append(dp[dp.index('/* Masks are the union'):dp.index('/* Retry only the idle operations')])

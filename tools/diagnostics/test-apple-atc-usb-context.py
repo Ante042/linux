@@ -14,6 +14,7 @@ root = Path(__file__).resolve().parents[2]
 parser = argparse.ArgumentParser()
 parser.add_argument('--out', type=Path)
 parser.add_argument('--parent-source', type=Path)
+parser.add_argument('--gate-parent-source', type=Path)
 args = parser.parse_args()
 fixture = root / 'tools/diagnostics/test-apple-atc-parking.py'
 code = fixture.read_text().split('with tempfile.TemporaryDirectory')[0]
@@ -22,6 +23,11 @@ if args.parent_source:
     variants['parent'] = {
         'atc': (args.parent_source / 'drivers/phy/apple/atc.c').read_text(),
         'dp': (args.parent_source / 'drivers/phy/apple/atc-j700-dp.h').read_text(),
+    }
+if args.gate_parent_source:
+    variants['gate-parent'] = {
+        'atc': (args.gate_parent_source / 'drivers/phy/apple/atc.c').read_text(),
+        'dp': (args.gate_parent_source / 'drivers/phy/apple/atc-j700-dp.h').read_text(),
     }
 variants['candidate'] = {
     'atc': (root / 'drivers/phy/apple/atc.c').read_text(),
@@ -152,7 +158,7 @@ static void restore_controls(void)
     p.dp_idle_pmas=0;p.pipe_state=ATCPHY_PIPEHANDLER_STATE_USB3;
     assert(j700_usb_restore(&p,APPLE_ATCPHY_MODE_USB3_DP)==-EBUSY&&writes==before);
     p.pipe_state=ATCPHY_PIPEHANDLER_STATE_DUMMY;
-    fail_caller="j700_field_update";
+    fail_caller="j700_usb_field_update";
     assert(j700_usb_restore(&p,APPLE_ATCPHY_MODE_USB3_DP)==-ETIMEDOUT);
     assert(p.dp_usb_context_valid&1);
     assert(p.dp_usb_context_dirty&1);
@@ -163,7 +169,7 @@ static void restore_controls(void)
     assert(select_mode(&p,APPLE_ATCPHY_MODE_USB2)==0);
     orient(&p,0);
     u32 old_context[27];memcpy(old_context,p.dp_usb_context[0],sizeof(old_context));
-    fail_caller="j700_field_update";
+    fail_caller="j700_usb_field_update";
     assert(select_mode(&p,APPLE_ATCPHY_MODE_USB3_DP)==-ETIMEDOUT);
     assert(p.mode_dirty&&p.pipe_state==ATCPHY_PIPEHANDLER_STATE_DUMMY);
     assert((p.dp_usb_context_valid&1)&&(p.dp_usb_context_dirty&1));
@@ -208,10 +214,71 @@ static void restore_controls(void)
     puts("PASS: park/DP-idle failure retention, immutable snapshot, live/pending-owner restore guards, power readback failure/retry, legacy exclusions");
 #endif
 }
+
+static void inactive_host_gates(void)
+{
+#ifdef PROPOSAL
+    const struct phy_configure_opts_dp rate = {
+        .set_rate=true, .set_lanes=true, .link_rate=8100, .lanes=2,
+    };
+    unsigned int violations = 0;
+    for (unsigned int backend = ATCPHY_PIPEHANDLER_STATE_USB3;
+         backend <= ATCPHY_PIPEHANDLER_STATE_USB4; backend++) {
+        for (unsigned int entry = 0; entry < 3; entry++) {
+            struct apple_atcphy p;
+            seed_usb(&p, 1);
+            assert(j700_dp_configure(&p, &rate) == 0);
+            assert(select_mode(&p, APPLE_ATCPHY_MODE_USB2) == 0);
+            orient(&p, 0);
+            p.host_active = false;
+            p.pipe_state = backend;
+            unsigned int before_writes = writes, before_reads = mmio_reads;
+            unsigned int valid = p.dp_usb_context_valid, dirty = p.dp_usb_context_dirty;
+            u32 snapshot[2][27]; memcpy(snapshot, p.dp_usb_context, sizeof(snapshot));
+            int ret = entry == 0 ? j700_usb_capture(&p, APPLE_ATCPHY_MODE_USB3_DP) :
+                      entry == 1 ? j700_usb_restore(&p, APPLE_ATCPHY_MODE_USB3_DP) :
+                                   atcphy_configure(&p, APPLE_ATCPHY_MODE_USB3_DP);
+            bool blocked = ret == -EBUSY && writes == before_writes &&
+                           mmio_reads == before_reads && valid == p.dp_usb_context_valid &&
+                           dirty == p.dp_usb_context_dirty &&
+                           !memcmp(snapshot, p.dp_usb_context, sizeof(snapshot));
+            printf("inactive-host backend=%u entry=%u ret=%d new_writes=%u new_reads=%u blocked=%u\n",
+                   backend, entry, ret, writes-before_writes, mmio_reads-before_reads, blocked);
+            violations += !blocked;
+        }
+    }
+    fflush(stdout); assert(!violations);
+    puts("PASS: six inactive-host/live-PIPE entry gates retain snapshots and perform zero MMIO");
+#endif
+}
+static void failure_diagnostics(void)
+{
+#ifdef PROPOSAL
+    struct apple_atcphy p;
+    const struct phy_configure_opts_dp rate={.set_rate=true,.set_lanes=true,.link_rate=8100,.lanes=2};
+    const char *stages[] = { "stage=static", "stage=power", "stage=receiver" };
+    for (unsigned int stage=0; stage<3; stage++) {
+        seed_usb(&p,1); assert(j700_dp_configure(&p,&rate)==0);
+        assert(select_mode(&p,APPLE_ATCPHY_MODE_USB2)==0); orient(&p,0);
+        diagnostic_records=0; last_diagnostic[0]=0;
+        blocked_offset=stage==0 ? 0x9244 : stage==1 ? 0x200 : 0xc;
+        int ret=select_mode(&p,APPLE_ATCPHY_MODE_USB3_DP);
+        assert(ret==(stage==0 ? -EIO : -ETIMEDOUT));
+        assert(diagnostic_records==1 && strstr(last_diagnostic,stages[stage]));
+        assert(strstr(last_diagnostic,"pma=0") && strstr(last_diagnostic,"reg="));
+        assert(strstr(last_diagnostic,"mask=") && strstr(last_diagnostic,"expected="));
+        assert(strstr(last_diagnostic,"observed="));
+        assert(p.mode_dirty && (p.dp_usb_context_valid&1) && (p.dp_usb_context_dirty&1));
+        blocked_offset=0;
+    }
+    puts("PASS: static/power/receiver errors preserve state and report stage/PMA/register/mask/expected/final observed");
+#endif
+}
 int main(int argc,char **argv)
 {
+    if(argc>1 && !strcmp(argv[1],"inactive-host")) { inactive_host_gates(); return 0; }
     if(argc>1)return original_fixture_main(argc,argv);
-    mask_coverage();masked_roundtrip();restore_controls();
+    mask_coverage();masked_roundtrip();restore_controls();inactive_host_gates();failure_diagnostics();
     puts("PASS: masked restoration roundtrips; no BIST readiness or USB speed is modeled");
     return 0;
 }
@@ -220,25 +287,41 @@ with tempfile.TemporaryDirectory(prefix="apple-atc-usb-context-") as temporary:
     out = args.out or Path(temporary)
     out.mkdir(parents=True, exist_ok=True)
     for name, texts in variants.items():
-     ns={'__file__':str(fixture)}
-     local=code.replace("atc = (root / 'drivers/phy/apple/atc.c').read_text()", 'atc = '+repr(texts['atc']))
-     local=local.replace("dp = (root / 'drivers/phy/apple/atc-j700-dp.h').read_text()", 'dp = '+repr(texts['dp']))
+        ns={'__file__':str(fixture)}
+        local=code.replace("atc = (root / 'drivers/phy/apple/atc.c').read_text()", 'atc = '+repr(texts['atc']))
+        local=local.replace("dp = (root / 'drivers/phy/apple/atc-j700-dp.h').read_text()", 'dp = '+repr(texts['dp']))
 
 
-     exec(local,ns)
-     production=ns['production'].replace('static u32 registers[', 'static u32 blocked_offset;\nstatic bool track_dp_writes;\nstatic u32 dp_write_masks[0x30000 / 4];\nstatic u32 registers[', 1)
-     production=production.replace('    registers[offset / 4] = (registers[offset / 4] & ~mask) | value;', '    if (track_dp_writes) dp_write_masks[offset / 4] |= mask | value;\n    if (blocked_offset && offset == blocked_offset) { writes++; return; }\n    registers[offset / 4] = (registers[offset / 4] & ~mask) | value;', 1)
-     if name=='parent':
-      proposal=texts.copy();proposal['dp']=variants['candidate']['dp']
-      # Only share the public field inventory and address mapper with the parent control.
-      start=proposal['dp'].index('/* Masks are the union')
-      end=proposal['dp'].index('/* Capture before')
-      production=production.replace(texts['dp'],proposal['dp'][start:end]+texts['dp'])
-     suffix=ns['suffix'].replace('int main(', 'int original_fixture_main(',1)+controls
-     unit=out/(name+'-restoration-test.c')
-     unit.write_text(ns['prefix']+('#define PROPOSAL\n' if name=='candidate' else '')+production+suffix)
-     subprocess.run(['clang','-std=gnu11','-Wall','-Werror','-O1','-g','-fsanitize=address,undefined','-fno-omit-frame-pointer',str(unit),'-o',str(out/(name+'-restoration-test'))],check=True)
-     r=subprocess.run([str(out/(name+'-restoration-test'))],capture_output=True,text=True)
-     (out/(name+'-restoration-test.log')).write_text(r.stdout+r.stderr)
-     print(name,'exit',r.returncode,r.stdout,r.stderr[-500:])
-     assert r.returncode!=0 if name=='parent' else r.returncode==0
+        exec(local,ns)
+        production=ns['production'].replace('static u32 registers[', 'static u32 blocked_offset;\nstatic unsigned int mmio_reads;\nstatic bool track_dp_writes;\nstatic u32 dp_write_masks[0x30000 / 4];\nstatic u32 registers[', 1)
+        production=production.replace('static u32 readl(void *address) { return *(u32 *)address; }', 'static u32 readl(void *address) { mmio_reads++; return *(u32 *)address; }', 1)
+        production=production.replace('    registers[offset / 4] = (registers[offset / 4] & ~mask) | value;', '    if (track_dp_writes) dp_write_masks[offset / 4] |= mask | value;\n    if (blocked_offset && offset == blocked_offset) { writes++; return; }\n    registers[offset / 4] = (registers[offset / 4] & ~mask) | value;', 1)
+        if name=='parent':
+            proposal=texts.copy();proposal['dp']=variants['candidate']['dp']
+            # Only share the public field inventory and address mapper with the parent control.
+            start=proposal['dp'].index('/* Masks are the union')
+            end=proposal['dp'].index('/* Capture before')
+            production=production.replace(texts['dp'],proposal['dp'][start:end]+texts['dp'])
+        suffix=ns['suffix'].replace('int main(', 'int original_fixture_main(',1)+controls
+        unit=out/(name+'-restoration-test.c')
+        logger = r'''
+#include <stdarg.h>
+static unsigned int diagnostic_records;
+static char last_diagnostic[512];
+static void record_debug(const char *format, ...)
+{
+    if (!strstr(format, "USB restore stage=")) return;
+    va_list args; va_start(args,format);
+    vsnprintf(last_diagnostic,sizeof(last_diagnostic),format,args);
+    va_end(args); diagnostic_records++;
+    fputs(last_diagnostic,stdout);
+}
+#undef dev_dbg
+#define dev_dbg(dev, format, ...) record_debug(format, ##__VA_ARGS__)
+'''
+        unit.write_text(ns['prefix']+logger+('#define PROPOSAL\n' if name!='parent' else '')+production+suffix)
+        subprocess.run(['clang','-std=gnu11','-Wall','-Werror','-O1','-g','-fsanitize=address,undefined','-fno-omit-frame-pointer',str(unit),'-o',str(out/(name+'-restoration-test'))],check=True)
+        r=subprocess.run([str(out/(name+'-restoration-test'))]+(['inactive-host'] if name=='gate-parent' else []),capture_output=True,text=True)
+        (out/(name+'-restoration-test.log')).write_text(r.stdout+r.stderr)
+        print(name,'exit',r.returncode,r.stdout,r.stderr[-500:])
+        assert r.returncode!=0 if name in ('parent','gate-parent') else r.returncode==0
