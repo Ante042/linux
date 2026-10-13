@@ -57,6 +57,7 @@ static unsigned int frees, sends;
 static int wire_fail, timeout, reply_status;
 static struct apple_epic_service *afk_service_get(struct apple_epic_service *s) { return s->enabled?s:NULL; }
 static void afk_service_put(struct apple_epic_service *s) { (void)s; }
+static void afk_trace_ring_snapshot(struct apple_dcp_afkep *ep) { (void)ep; }
 static void *dma_alloc_coherent(void *dev,size_t n,dma_addr_t *address,int flags)
 { void *p=calloc(1,n);(void)dev;(void)flags;*address=(uintptr_t)p;return p; }
 static void dma_free_coherent(void *dev,size_t n,void *p,dma_addr_t a)
