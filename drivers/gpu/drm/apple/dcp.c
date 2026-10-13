@@ -647,9 +647,13 @@ static int dcp_dptx_connect_session(struct apple_dcp *dcp, u32 port,
 		goto out_unlock;
 	}
 	if (dcp->external) {
+		/*
+		 * The port must still have its display: a Type-C cable, or HPD
+		 * on the fixed HDMI output, which has no cable flag.
+		 */
 		if (!dcp->dptxport[port].connected ||
-		    !READ_ONCE(dcp->typec_cable_connected) || READ_ONCE(dcp->crashed) ||
-		    dcpext_scanout_terminal(dcp)) {
+		    !(READ_ONCE(dcp->typec_cable_connected) || dcp_hdmi_port_attached(dcp)) ||
+		    READ_ONCE(dcp->crashed) || dcpext_scanout_terminal(dcp)) {
 			ret = -ENOLINK;
 			goto out_unlock;
 		}
