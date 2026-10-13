@@ -18,6 +18,7 @@
 
 #include "dwc3-apple-state.h"
 #include "glue.h"
+#include "io.h"
 
 /*
  * This platform requires a very specific sequence of operations to bring up dwc3 and its USB3 PHY:
