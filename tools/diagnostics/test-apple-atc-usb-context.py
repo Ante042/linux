@@ -223,8 +223,8 @@ with tempfile.TemporaryDirectory(prefix="apple-atc-usb-context-") as temporary:
      ns={'__file__':str(fixture)}
      local=code.replace("atc = (root / 'drivers/phy/apple/atc.c').read_text()", 'atc = '+repr(texts['atc']))
      local=local.replace("dp = (root / 'drivers/phy/apple/atc-j700-dp.h').read_text()", 'dp = '+repr(texts['dp']))
-    
-    
+
+
      exec(local,ns)
      production=ns['production'].replace('static u32 registers[', 'static u32 blocked_offset;\nstatic bool track_dp_writes;\nstatic u32 dp_write_masks[0x30000 / 4];\nstatic u32 registers[', 1)
      production=production.replace('    registers[offset / 4] = (registers[offset / 4] & ~mask) | value;', '    if (track_dp_writes) dp_write_masks[offset / 4] |= mask | value;\n    if (blocked_offset && offset == blocked_offset) { writes++; return; }\n    registers[offset / 4] = (registers[offset / 4] & ~mask) | value;', 1)
