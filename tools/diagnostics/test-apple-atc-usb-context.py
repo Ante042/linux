@@ -41,6 +41,33 @@ static void seed_usb(struct apple_atcphy *p, unsigned int first)
     orient(p, first);
     assert(select_mode(p, APPLE_ATCPHY_MODE_USB3_DP) == 0);
 }
+
+static void mask_coverage(void)
+{
+    struct apple_atcphy p;
+    memset(dp_write_masks, 0, sizeof(dp_write_masks));
+    seed_usb(&p, 1);
+    for (unsigned int rate = 0; rate < 4; rate++) {
+        track_dp_writes = true;
+        assert(j700_dp_start(&p, 1, rate, false) == 0);
+        j700_dp_equalize(&p, 0, true, 0x123);
+        j700_dp_equalize(&p, 0, false, 0x123);
+        assert(j700_dp_stop(&p) == 0);
+        track_dp_writes = false;
+    }
+    unsigned int entries = 0;
+    for (unsigned int offset = 0; offset < sizeof(dp_write_masks); offset += 4) {
+        if (!((offset >= 0x9000 && offset <= 0xdfff) || offset == 8 ||
+              offset == 0xc || offset == 0x10c || offset == 0x200)) continue;
+        u32 expected = 0;
+        for (unsigned int i = 0; i < ARRAY_SIZE(j700_usb_fields); i++)
+            if (j700_usb_fields[i].offset == offset) expected = j700_usb_fields[i].mask;
+        assert(dp_write_masks[offset / 4] == expected);
+        entries += !!expected;
+    }
+    assert(entries == 27);
+    puts("PASS: 27 masks equal the actual public DP start/voltage/stop write union at every rate");
+}
 static void masked_roundtrip(void)
 {
     const struct phy_configure_opts_dp rate = {
@@ -51,6 +78,12 @@ static void masked_roundtrip(void)
         struct apple_atcphy p;
         seed_usb(&p, first);
         unsigned int old_dp=!first;
+#ifdef PROPOSAL
+        assert(p.dp_usb_context_valid & BIT(old_dp));
+        assert(p.dp_usb_context[old_dp][1] == 0);
+        assert(p.dp_usb_context[old_dp][3] == (0xeU << (4 * old_dp)));
+        assert(((registers[0x200 / 4] >> (4 * old_dp)) & 0xf) == 1);
+#endif
         u32 saved[27], outside[27];
         for (unsigned int i=0;i<27;i++) {
             u32 offset,mask;
@@ -178,7 +211,7 @@ static void restore_controls(void)
 int main(int argc,char **argv)
 {
     if(argc>1)return original_fixture_main(argc,argv);
-    masked_roundtrip();restore_controls();
+    mask_coverage();masked_roundtrip();restore_controls();
     puts("PASS: masked restoration roundtrips; no BIST readiness or USB speed is modeled");
     return 0;
 }
@@ -193,8 +226,8 @@ with tempfile.TemporaryDirectory(prefix="apple-atc-usb-context-") as temporary:
     
     
      exec(local,ns)
-     production=ns['production'].replace('static u32 registers[', 'static u32 blocked_offset;\nstatic u32 registers[', 1)
-     production=production.replace('    registers[offset / 4] = (registers[offset / 4] & ~mask) | value;', '    if (blocked_offset && offset == blocked_offset) { writes++; return; }\n    registers[offset / 4] = (registers[offset / 4] & ~mask) | value;', 1)
+     production=ns['production'].replace('static u32 registers[', 'static u32 blocked_offset;\nstatic bool track_dp_writes;\nstatic u32 dp_write_masks[0x30000 / 4];\nstatic u32 registers[', 1)
+     production=production.replace('    registers[offset / 4] = (registers[offset / 4] & ~mask) | value;', '    if (track_dp_writes) dp_write_masks[offset / 4] |= mask | value;\n    if (blocked_offset && offset == blocked_offset) { writes++; return; }\n    registers[offset / 4] = (registers[offset / 4] & ~mask) | value;', 1)
      if name=='parent':
       proposal=texts.copy();proposal['dp']=variants['candidate']['dp']
       # Only share the public field inventory and address mapper with the parent control.
