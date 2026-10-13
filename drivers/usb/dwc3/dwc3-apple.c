@@ -20,6 +20,10 @@
 #include "glue.h"
 #include "io.h"
 
+static bool diagnostic_j700_u3_awake;
+module_param(diagnostic_j700_u3_awake, bool, 0444);
+MODULE_PARM_DESC(diagnostic_j700_u3_awake, "Diagnostic J700 USB3 awake trial (default off)");
+
 /*
  * This platform requires a very specific sequence of operations to bring up dwc3 and its USB3 PHY:
  *
@@ -194,6 +198,14 @@ static void dwc3_apple_set_ptrcap(struct dwc3_apple *appledwc, u32 mode)
 	dwc3_set_prtcap(&appledwc->dwc, mode, false);
 }
 
+static bool dwc3_apple_j700_u3_trial(struct dwc3_apple *appledwc)
+{
+	return diagnostic_j700_u3_awake && appledwc->fixed_hub &&
+		of_machine_is_compatible("apple,j700") &&
+		of_device_is_compatible(appledwc->dev->of_node, "apple,t8140-dwc3") &&
+		appledwc->mmio_resource && appledwc->mmio_resource->start == 0x40a280000ULL;
+}
+
 static int dwc3_apple_core_probe(struct dwc3_apple *appledwc)
 {
 	struct dwc3_probe_data probe_data = {};
@@ -209,6 +221,9 @@ static int dwc3_apple_core_probe(struct dwc3_apple *appledwc)
 	probe_data.ignore_clocks_and_resets = true;
 	probe_data.skip_core_init_mode = true;
 	probe_data.properties = DWC3_DEFAULT_PROPERTIES;
+	probe_data.properties.dis_u3_susphy = dwc3_apple_j700_u3_trial(appledwc);
+	if (probe_data.properties.dis_u3_susphy)
+		dev_info(appledwc->dev, "J700 USB3 suspend-PHY diagnostic selected\n");
 
 	/*
 	 * This runs from the role switch callback, so a failure leaves the glue

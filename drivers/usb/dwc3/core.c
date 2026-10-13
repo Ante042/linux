@@ -1703,6 +1703,9 @@ static void dwc3_get_software_properties(struct dwc3 *dwc,
 
 	if (properties->needs_full_reinit)
 		dwc->needs_full_reinit = true;
+	/* Software selection follows firmware parsing and precedes PHY setup. */
+	if (properties->dis_u3_susphy)
+		dwc->dis_u3_susphy_quirk = true;
 
 	dwc->gsbuscfg0_reqinfo = DWC3_GSBUSCFG0_REQINFO_UNSPECIFIED;
 
