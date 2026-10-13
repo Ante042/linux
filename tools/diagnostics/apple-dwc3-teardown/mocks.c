@@ -7,7 +7,9 @@ struct apple_atcphy {
     int lock, dp_link_rate;
     bool swap_lanes, tunnel_clock_on, tunnel_saved;
     bool fixed_usb2, host_active, mode_dirty, ss_tunables, dp_tunables, aux_power_requested;
-    unsigned int dp_owned_pmas;
+    unsigned int dp_owned_pmas, dp_idle_pmas;
+    unsigned int dp_usb_context_valid, dp_usb_context_dirty;
+    u32 dp_usb_context[2][27];
     enum atcphy_mode mode, typec_mode;
     enum atcphy_pipehandler_state pipe_state;
 };

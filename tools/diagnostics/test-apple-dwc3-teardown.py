@@ -16,6 +16,7 @@ args = p.parse_args()
 args.out.mkdir(parents=True, exist_ok=True)
 files = {n: (args.source / f).read_text() for n, f in {
     'atc': 'drivers/phy/apple/atc.c',
+    'dp': 'drivers/phy/apple/atc-j700-dp.h',
     'phy': 'drivers/phy/phy-core.c',
     'core': 'drivers/usb/dwc3/core.c',
     'apple': 'drivers/usb/dwc3/dwc3-apple.c',
@@ -72,8 +73,10 @@ names['core'] = ('dwc3_phy_power_on', 'dwc3_phy_power_off', 'dwc3_phy_exit',
                  'dwc3_core_exit_after_phy_power_off', 'dwc3_core_exit',
                  'dwc3_core_remove_common', 'dwc3_core_remove', 'dwc3_core_remove_no_shutdown')
 names['atc'] += ('atcphy_dwc3_reset_deassert',)
+names['atc'] = tuple(name for name in names['atc'] if name not in ('atcphy_get_mode_config', 'j700_field_update'))
 names = {n: tuple(name for name in group if re.search(r'^(?:static [^\n]*\b|(?:int|void) )' + name + r'\(', files[n], re.M))
          for n, group in names.items()}
+context = (fn('atc', 'core_read32') + '\n' + fn('atc', 'atcphy_get_mode_config') + '\n' + fn('atc', 'j700_field_update') + '\n' + files['dp'][files['dp'].index('/* Masks are the union'):files['dp'].index('/* Retry only the idle operations')])
 functions = '\n\n'.join(fn(n, name) for n, group in names.items() for name in group)
 definitions = []
 lines = iter(files['atc'].splitlines())
@@ -89,7 +92,7 @@ here = Path(__file__).resolve().parent
 fallback = '' if 'dwc3_core_remove_no_shutdown' in names['core'] else '#define dwc3_core_remove_no_shutdown dwc3_core_remove\n'
 unit = ((here / 'apple-dwc3-teardown/prefix.c').read_text() + '\n' + definitions + '\n' +
         '\n'.join(decls) + '\n' + (here / 'apple-dwc3-teardown/mocks.c').read_text() + '\n' +
-        functions + '\n' + fallback + (here / 'apple-dwc3-teardown/cases.c').read_text())
+        context + '\n' + functions + '\n' + fallback + (here / 'apple-dwc3-teardown/cases.c').read_text())
 (args.out / 'extracted-production.c').write_text(functions)
 (args.out / 'host.c').write_text(unit)
 metadata = {'functions': names, 'extracted_sha256': hashlib.sha256(functions.encode()).hexdigest(),

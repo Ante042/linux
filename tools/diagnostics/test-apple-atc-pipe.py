@@ -11,6 +11,7 @@ import tempfile
 
 root = Path(__file__).resolve().parents[2]
 source = (root / 'drivers/phy/apple/atc.c').read_text()
+dp = (root / 'drivers/phy/apple/atc-j700-dp.h').read_text()
 
 
 def block(marker):
@@ -39,7 +40,10 @@ struct apple_atcphy {
     void *dev;
     int lock;
     bool fixed_usb2, host_active, ss_tunables, dp_tunables, mode_dirty;
-    unsigned int dp_owned_pmas;
+    unsigned int dp_owned_pmas, dp_idle_pmas;
+    unsigned int dp_usb_context_valid, dp_usb_context_dirty;
+    u32 dp_usb_context[2][27];
+    bool swap_lanes;
     enum atcphy_mode mode, typec_mode;
     enum atcphy_pipehandler_state pipe_state;
 };
@@ -66,6 +70,7 @@ static void core_mask32(struct apple_atcphy *p, u32 o, u32 m, u32 v)
 { assert(o < sizeof(core_regs) && o % 4 == 0); mask32(p->regs.core + o, m, v); }
 static void core_set32(struct apple_atcphy *p, u32 o, u32 v) { core_mask32(p, o, 0, v); }
 static void core_clear32(struct apple_atcphy *p, u32 o, u32 v) { core_mask32(p, o, v, 0); }
+#define readl_poll_timeout_atomic readl_poll_timeout
 #define readl_poll_timeout(address, value, condition, interval, timeout) \
     ({ (value) = readl(address); polls++; \
        polls == fail_poll || !(condition) ? -ETIMEDOUT : 0; })
@@ -74,8 +79,22 @@ static void core_clear32(struct apple_atcphy *p, u32 o, u32 v) { core_mask32(p, 
 static void atcphy_observe_pmas(struct apple_atcphy *p, const char *stage,
                               enum atcphy_mode target)
 { (void)p; (void)stage; (void)target; }
+static int atcphy_configure(struct apple_atcphy *p, enum atcphy_mode mode);
+''')
+for name in ('core_read32', 'atcphy_get_mode_config', 'j700_field_update'):
+    parts.append(function(name))
+# Actual restoration functions and gates; analog lane setup stays outside this PIPE unit.
+parts.append(dp[dp.index('/* Masks are the union'):dp.index('/* Retry only the idle operations')])
+parts.append(r'''
 static int atcphy_configure(struct apple_atcphy *p, enum atcphy_mode mode)
-{ lane_calls++; p->mode = mode; p->mode_dirty = false; return 0; }
+{
+    int ret;
+    lane_calls++; p->mode_dirty = true;
+    ret = j700_usb_capture(p, mode);
+    if (!ret) ret = j700_usb_restore(p, mode);
+    if (ret) return ret;
+    p->mode = mode; p->mode_dirty = false; return 0;
+}
 ''')
 for name in ('atcphy_pipehandler_lock', 'atcphy_pipehandler_unlock', 'atcphy_pipehandler_check',
              'atcphy_pipehandler_set_mux', 'atcphy_clear_nonselected_phy_reset',
@@ -98,6 +117,7 @@ prefix = r'''
 typedef uint32_t u32;
 typedef uint16_t u16;
 #define BIT(n) (1U << (n))
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 #define GENMASK(h, l) ((~0U << (l)) & (~0U >> (31 - (h))))
 #define FIELD_PREP(m, v) (((u32)(v) << __builtin_ctz(m)) & (m))
 #define FIELD_GET(m, v) (((v) & (m)) >> __builtin_ctz(m))
@@ -109,6 +129,7 @@ typedef uint16_t u16;
 #define WARN_ON_ONCE(v) assert(!(v))
 #define guard(kind) (void)
 #define fallthrough __attribute__((fallthrough))
+#define usleep_range(...) ((void)0)
 #define udelay(n) ((void)(n))
 enum { TYPEC_STATE_SAFE, TYPEC_STATE_USB, TYPEC_MODE_USB4,
        TYPEC_DP_STATE_C, TYPEC_DP_STATE_D, TYPEC_DP_STATE_E };

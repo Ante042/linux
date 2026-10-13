@@ -47,6 +47,8 @@ struct apple_atcphy {
     bool aux_power_requested, mode_dirty, dp_spread_spectrum, dp_presets_valid[5];
     u32 dp_presets[5][16];
     unsigned int dp_idle_pmas, dp_owned_pmas;
+    unsigned int dp_usb_context_valid, dp_usb_context_dirty;
+    u32 dp_usb_context[2][27];
     enum atcphy_mode mode, typec_mode;
     enum atcphy_pipehandler_state pipe_state;
 };
@@ -138,7 +140,7 @@ for name in ('atcphy_pipehandler_lock', 'atcphy_pipehandler_unlock', 'atcphy_pip
              'atcphy_configure_pipehandler', 'atcphy_park_pipehandler',
              'atcphy_usb2_power_off', '_atcphy_dwc3_reset_assert', 'atcphy_dwc3_reset_assert'):
     parts.append(function(atc, name))
-for name in ('atcphy_get_mode_config', 'j700_field_update', 'j700_pma_idle'):
+for name in ('core_read32', 'atcphy_get_mode_config', 'j700_field_update', 'j700_pma_idle'):
     parts.append(function(atc, name))
 parts.append(dp)
 for name in ('atcphy_configure_lanes', 'j700_aux_enable', 'j700_aux_disable',
@@ -147,6 +149,8 @@ for name in ('atcphy_configure_lanes', 'j700_aux_enable', 'j700_aux_disable',
              'atcphy_usb3_set_mode', 'atcphy_usb3_power_off'):
     parts.append(function(atc, name))
 production = '\n'.join(parts)
+if 'static int j700_usb_capture(' in dp:
+    production = '#define HAS_USB_CONTEXT\n' + production
 print('Production parking/caller SHA256:', hashlib.sha256(production.encode()).hexdigest(), flush=True)
 prefix = r'''
 #include <assert.h>
@@ -205,11 +209,12 @@ static struct atcphy_hw hw = {
     .pipe_mux_clk = PIPEHANDLER_MUX_CTRL_CLK_T8103,
     .pipe_mux_data = PIPEHANDLER_MUX_CTRL_DATA_T8103,
 };
-static void initial(struct apple_atcphy *p, bool fixed, bool dirty, bool swapped)
+static void cold_initial(struct apple_atcphy *p, bool fixed, bool swapped)
 {
     memset(registers, 0, sizeof(registers));
     memset(pipe_regs, 0, sizeof(pipe_regs));
     memset(usb2_regs, 0, sizeof(usb2_regs));
+    registers[0x200 / 4] = 0xee; /* public PMA powered state, synthetic cold fixture */
     registers[AUS_COMMON_DIG_RCAL1 / 4] = AUS_COMMON_DIG_RCAL1_ALL_CODES_DONE;
     pipe_regs[PIPEHANDLER_AON_GEN / 4] = PIPEHANDLER_AON_GEN_DWC3_RESET_N;
     usb2_regs[USB2PHY_USBCTL / 4] = USB2PHY_USBCTL_RUN;
@@ -221,9 +226,9 @@ static void initial(struct apple_atcphy *p, bool fixed, bool dirty, bool swapped
         .fixed_usb2 = fixed, .host_active = true, .swap_lanes = swapped,
         .ss_tunables = true, .dp_tunables = true, .dp_presets_valid = { true },
         .mode = APPLE_ATCPHY_MODE_USB3_DP, .typec_mode = APPLE_ATCPHY_MODE_USB3_DP,
-        .pipe_state = ATCPHY_PIPEHANDLER_STATE_USB3, .mode_dirty = dirty,
-        .dp_owned_pmas = 3, .dp_idle_pmas = dirty ? 1 : 0,
-        .aux_power_requested = true,
+        .pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY, .mode_dirty = false,
+        .dp_owned_pmas = 0, .dp_idle_pmas = 0,
+        .aux_power_requested = false,
     };
     polls = fail_poll = writes = usb2_on = usb2_writes = reset_writes = mux_writes = 0;
     stuck_ack = bist_status_stuck = false;
@@ -232,6 +237,27 @@ static void initial(struct apple_atcphy *p, bool fixed, bool dirty, bool swapped
     bist_faults = 0;
     require_parked = false;
 }
+static void initial(struct apple_atcphy *p, bool fixed, bool dirty, bool swapped)
+{
+    cold_initial(p, fixed, swapped);
+#ifdef HAS_USB_CONTEXT
+    if (fixed && hw.has_t8140_dp) {
+        /* Two-PMA cleanup stress setup: capture before ownership and actual DP writes. */
+        assert(j700_usb_capture(p, APPLE_ATCPHY_MODE_DP) == 0);
+        assert(atcphy_configure_pipehandler(p, true) == 0);
+        assert(j700_dp_start(p, 3, 3, false) == 0);
+    } else
+#endif
+    {
+        p->pipe_state = ATCPHY_PIPEHANDLER_STATE_USB3;
+        p->dp_owned_pmas = 3; /* legacy synthetic cleanup ownership, no J700 context path */
+    }
+    p->mode_dirty = dirty;
+    p->dp_idle_pmas = dirty ? 1 : 0;
+    p->aux_power_requested = true;
+    polls = fail_poll = writes = usb2_on = usb2_writes = reset_writes = mux_writes = 0;
+}
+
 static void inject_parking(unsigned int fault)
 {
     pipe_regs[PIPEHANDLER_LOCK_ACK / 4] = PIPEHANDLER_LOCK_EN;
@@ -472,7 +498,7 @@ static void orient(struct apple_atcphy *p, bool reverse)
 }
 static void orientation_initial(struct apple_atcphy *p, bool fixed)
 {
-    initial(p, fixed, false, false);
+    cold_initial(p, fixed, false);
     p->mode = p->typec_mode = fixed ? APPLE_ATCPHY_MODE_USB2 : APPLE_ATCPHY_MODE_OFF;
     p->pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY;
     p->dp_owned_pmas = p->dp_idle_pmas = 0;

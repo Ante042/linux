@@ -46,6 +46,8 @@ struct apple_atcphy {
     bool aux_power_requested, mode_dirty, dp_spread_spectrum, dp_presets_valid[5];
     u32 dp_presets[5][16];
     unsigned int dp_idle_pmas, dp_owned_pmas;
+    unsigned int dp_usb_context_valid, dp_usb_context_dirty;
+    u32 dp_usb_context[2][27];
     enum atcphy_mode mode, typec_mode;
     enum atcphy_pipehandler_state pipe_state;
 };
@@ -101,7 +103,7 @@ static void atcphy_observe_pmas(struct apple_atcphy *p, const char *stage,
 static int atcphy_configure_pipehandler(struct apple_atcphy *p, bool host)
 { (void)host; p->pipe_state = atcphy_modes[p->mode].pipehandler_state; return 0; }
 ''')
-for name in ('atcphy_get_mode_config', 'j700_field_update', 'j700_pma_idle'):
+for name in ('core_read32', 'atcphy_get_mode_config', 'j700_field_update', 'j700_pma_idle'):
     parts.append(function(atc, name))
 parts.append(dp)
 for name in ('atcphy_configure_lanes', 'j700_aux_enable', 'j700_aux_disable',
