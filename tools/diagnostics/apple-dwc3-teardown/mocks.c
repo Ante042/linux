@@ -70,6 +70,10 @@ static int j700_dp_stop(struct apple_atcphy *p) { assert(!p->dp_owned_pmas); ret
 static int j700_dp_idle_pending(struct apple_atcphy *p) { (void)p; return 0; }
 static void atc_tunnel_stop_t8103(struct apple_atcphy *p) { (void)p; }
 static void atc_tunnel_restore(struct apple_atcphy *p) { (void)p; }
+/* The read-only observer is tested separately; preserve actual caller control flow. */
+static void atcphy_observe_pmas(struct apple_atcphy *p, const char *stage,
+                              enum atcphy_mode target)
+{ (void)p; (void)stage; (void)target; }
 static void atcphy_usb2_power_on(struct apple_atcphy *p) { (void)p; }
 static void atcphy_apply_tunables(struct apple_atcphy *p, enum atcphy_mode m) { (void)p; (void)m; }
 static int atcphy_configure_lanes(struct apple_atcphy *p, enum atcphy_mode m) { (void)p; (void)m; return 0; }
