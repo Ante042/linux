@@ -2775,6 +2775,14 @@ static int atcphy_configure(struct apple_atcphy *atcphy, enum atcphy_mode mode)
 		return 0;
 	}
 
+	/*
+	 * Fixed-hub SAFE keeps USB2 up rather than taking the block OFF.
+	 * With PIPE parked and DP owners released, reinitialize USB3 before
+	 * programming its lanes; the existing sequence releases this reset.
+	 */
+	if (atcphy->hw->has_t8140_dp && atcphy->fixed_usb2)
+		core_clear32(atcphy, ATCPHY_POWER_CTRL, ATCPHY_POWER_PHY_RESET_N);
+
 	ret = atcphy_power_on(atcphy);
 	if (ret)
 		return ret;
