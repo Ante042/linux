@@ -1089,7 +1089,7 @@ static int atcphy_pipehandler_lock(struct apple_atcphy *atcphy)
 		requested, atcphy->mode, atcphy->pipe_state,
 		atcphy->host_active, atcphy->mode_dirty);
 	if (requested & PIPEHANDLER_LOCK_EN) {
-		dev_warn(atcphy->dev, "Pipehandler lock already requested\n");
+		dev_dbg(atcphy->dev, "Pipehandler lock already requested\n");
 	} else {
 		set32(atcphy->regs.pipehandler + PIPEHANDLER_LOCK_REQ, PIPEHANDLER_LOCK_EN);
 	}
