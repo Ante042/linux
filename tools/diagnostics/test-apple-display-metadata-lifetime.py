@@ -30,6 +30,7 @@ metadata = function((base / 'dcp-display-metadata.h').read_text(), 'struct dcp_d
 epoch = (base / 'dcp-metadata-epoch.h').read_text().replace('#include <linux/types.h>', '')
 cache = dcp[dcp.index('static bool dcp_firmware_metadata_enabled('):dcp.index('void dcp_set_dimensions(')]
 getter = function(iomfb, 'int dcp_get_modes(')
+physical_current = function((base / 'epic/dpavservep.c').read_text(), 'bool dcpavserv_edid_current(')
 cleanup = function(iomfb, 'static void dcp_clear_connector_edid(') + '\n' + function(iomfb, 'static void dcp_consume_edid_invalidation(')
 hotplug = function(iomfb, 'void dcp_hotplug(')
 disconnect = function(dcp, 'static void disconnected_hpd_event(')
@@ -67,7 +68,7 @@ static unsigned int trace_observations;
 #define READ_ONCE(x) (x)
 #define WRITE_ONCE(x,v) ((x)=(v))
 #define xchg(p,v) __atomic_exchange_n(p,v,__ATOMIC_SEQ_CST)
-#define lockdep_assert_held(p) assert(held_mutex==(p))
+#define lockdep_assert_held(p) assert(mutex_held(p))
 #define ERR_PTR(n) ((void *)(intptr_t)(n))
 #define PTR_ERR(p) ((int)(intptr_t)(p))
 #define IS_ERR(p) ((uintptr_t)(p) > (uintptr_t)-4096)
@@ -94,8 +95,11 @@ struct work_struct { unsigned int scheduled; };
 struct mutex { pthread_mutex_t native; };
 static _Thread_local struct mutex *held_mutex;
 static _Thread_local bool modeset_held;
-static void mutex_lock(struct mutex *m) { assert(!modeset_held); assert(held_mutex != m); assert(!pthread_mutex_lock(&m->native)); held_mutex=m; }
-static void mutex_unlock(struct mutex *m) { assert(held_mutex==m); held_mutex=NULL; assert(!pthread_mutex_unlock(&m->native)); }
+static _Thread_local struct mutex *held_stack[4];
+static _Thread_local unsigned int held_depth;
+static bool mutex_held(struct mutex *m) { for(unsigned int i=0;i<held_depth;i++) if(held_stack[i]==m) return true; return false; }
+static void mutex_lock(struct mutex *m) { assert(!modeset_held); assert(!mutex_held(m)); assert(held_depth<4); assert(!pthread_mutex_lock(&m->native)); held_stack[held_depth++]=m; held_mutex=m; }
+static void mutex_unlock(struct mutex *m) { assert(held_mutex==m); assert(held_depth); held_depth--; held_mutex=held_depth ? held_stack[held_depth-1] : NULL; assert(!pthread_mutex_unlock(&m->native)); }
 static struct mutex *acquire(struct mutex *m) { mutex_lock(m); return m; }
 static void release(struct mutex **m) { if (*m) mutex_unlock(*m); }
 static struct mutex *once(struct mutex *m) { mutex_unlock(m); return NULL; }
@@ -123,6 +127,9 @@ struct apple_connector {
 state = r'''
 struct apple_dcp {
     void *dev;
+    struct mutex hpd_mutex;
+    bool typec_cable_connected, quiescing;
+    u64 typec_generation;
     struct { int iomfb_method_profile; } hw;
     struct apple_connector *connector;
     struct { void *data; size_t length, received; bool contiguous, payload_complete; struct dcp_metadata_ticket metadata_ticket; } chunks;
@@ -145,6 +152,7 @@ static unsigned int allocations, raw_reads, mode_adds, clears, property_identity
 static bool invalidate_during_update;
 static bool update_error;
 static bool raw_available;
+static bool detach_during_read, replug_during_read;
 static const struct drm_edid *allocate(unsigned int identity)
 {
     struct drm_edid *edid = malloc(sizeof(*edid)); assert(edid);
@@ -163,11 +171,20 @@ static void drm_mode_probed_add(struct drm_connector *c, struct drm_display_mode
 static void drm_connector_set_vrr_capable_property(struct drm_connector *c, bool v)
 { (void)c; (void)v; }
 static bool dcp_has_panel(struct apple_dcp *p) { (void)p; return false; }
-static const struct drm_edid *dcpavserv_copy_edid(struct apple_dcp *p)
-{ (void)p; raw_reads++; return raw_available ? allocate(0xfeed) : ERR_PTR(-ENODEV); }
+static const struct drm_edid *dcpavserv_copy_edid(struct apple_dcp *p, u64 generation)
+{
+    assert(!mutex_held(&p->hpd_mutex));
+    (void)generation; raw_reads++;
+    if (detach_during_read) {
+        mutex_lock(&p->hpd_mutex); p->typec_generation++;
+        p->typec_cable_connected=replug_during_read;
+        mutex_unlock(&p->hpd_mutex);
+    }
+    return raw_available ? allocate(0xfeed) : ERR_PTR(-ENODEV);
+}
 static int drm_edid_connector_update(struct drm_connector *c, const struct drm_edid *e)
 {
-    assert(held_mutex==&c->dev->mode_config.mutex);
+    assert(mutex_held(&c->dev->mode_config.mutex));
     if (e && update_error) return -ENOMEM;
     struct test_blob *old=c->edid_blob_ptr;
     struct test_blob *next=NULL;
@@ -227,6 +244,9 @@ static void initial(void)
     free(p.chunks.data);
     assert(!allocations);
     memset(&p,0,sizeof(p)); memset(&c,0,sizeof(c));
+    assert(!pthread_mutex_init(&p.hpd_mutex.native,NULL));
+    p.typec_cable_connected=true; p.typec_generation=1;
+    detach_during_read=replug_during_read=false;
     p.hw.iomfb_method_profile=DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL;
     p.fw_compat=DCP_FIRMWARE_H17P;
     static typeof(*p.dcpavservep) av={true}; p.dcpavservep=&av;
@@ -389,14 +409,24 @@ int main(void)
     assert(!pthread_create(&b,NULL,hotplug_thread,NULL));
     assert(!pthread_create(&reader,NULL,reader_thread,NULL));
     assert(!pthread_join(a,NULL) && !pthread_join(b,NULL) && !pthread_join(reader,NULL));
+    initial(); raw_available=true; detach_during_read=true;
+    assert(probe(&c.base)==1 && !c.drm_edid && !property_identity && !allocations);
+    assert(raw_reads==1 && !p.typec_cable_connected);
+    assert(probe(&c.base)==1 && raw_reads==1); /* No request while disconnected. */
+    initial(); raw_available=true; detach_during_read=replug_during_read=true;
+    assert(probe(&c.base)==1 && !c.drm_edid && !property_identity && !allocations);
+    detach_during_read=false;
+    assert(probe(&c.base)==1 && c.drm_edid && c.drm_edid_generation==2);
+    p.typec_generation++; /* Missed worker: generation alone rejects the old cache. */
+    assert(probe(&c.base)==1 && raw_reads==3 && c.drm_edid_generation==3);
     initial(); assert(!blob_allocations && trace_observations);
-    puts("PASS: mutex-serialized EDID/blob get_modes, hotplug, sysfs reader and same-epoch publication, first-connection scope, raw precedence, invalidation, no added modes");
+    puts("PASS: mutex-serialized EDID/blob get_modes, hotplug, sysfs reader and same-epoch publication, first-connection scope, raw precedence, delayed disconnect/replug rejection, generation cache invalidation, no added modes");
     return 0;
 }
 '''
 with tempfile.TemporaryDirectory(prefix='dcp-metadata-lifetime-') as tmp:
     tmp = Path(tmp)
-    (tmp / 'test.c').write_text(prefix + metadata + epoch + state + cache + chunk_callbacks + cleanup + getter + hotplug + disconnect + suffix)
+    (tmp / 'test.c').write_text(prefix + metadata + epoch + state + cache + chunk_callbacks + cleanup + physical_current + getter + hotplug + disconnect + suffix)
     command = shlex.split(os.environ.get('CC','clang'))
     command += ['-std=gnu11','-Wall','-Wextra','-Werror','-Wno-sign-compare','-O1','-g',
                 '-fsanitize=address,undefined','-fno-omit-frame-pointer','-pthread']
