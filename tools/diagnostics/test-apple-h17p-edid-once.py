@@ -64,7 +64,7 @@ static int kstrtobool(const char *p,bool *v)
 static int param_get_bool(char *p,const struct kernel_param *k)
 { return sprintf(p,"%c\n",*(bool *)k->arg ? 'Y':'N'); }
 struct apple_dcp;
-struct ep { struct apple_dcp *dcp; bool inline_v2; };
+struct ep { struct apple_dcp *dcp; bool wire_v2; };
 struct apple_epic_service { struct ep *ep; bool enabled; unsigned int users; };
 struct apple_dcp {
     struct { int iomfb_method_profile; } hw;
@@ -99,7 +99,7 @@ static atomic_t winners=ATOMIC_INIT(0);
 static void *contender(void *unused) { (void)unused; if(dcpavserv_edid_probe_allowed(&d)) atomic_fetch_add(&winners,1); return NULL; }
 int main(void)
 {
-    struct ep ep={.dcp=&d,.inline_v2=true}; struct apple_epic_service s={.ep=&ep,.enabled=true,.users=1};
+    struct ep ep={.dcp=&d,.wire_v2=true}; struct apple_epic_service s={.ep=&ep,.enabled=true,.users=1};
     struct kernel_param parameter={0}; char state[4]; u64 epoch=0;
     d.dcpavserv.service=&s;
     assert(diagnostic_h17p_edid_probe_get(state,&parameter)==2 && !strcmp(state,"N\n"));
@@ -131,7 +131,7 @@ int main(void)
     assert(!diagnostic_h17p_edid_probe_set("0",&parameter));
     assert(PTR_ERR(dcpavserv_copy_edid(&d,1,&epoch))==-EAGAIN && reads==3);
     /* Other profiles neither require nor consume this H17P permission. */
-    d.hw.iomfb_method_profile=0; ep.inline_v2=false;
+    d.hw.iomfb_method_profile=0; ep.wire_v2=false;
     e=dcpavserv_copy_edid(&d,0,&epoch); assert(!IS_ERR(e) && legacy_reads==1); drm_edid_free(e);
     assert(!diagnostic_h17p_edid_probe_set("1",&parameter));
     d.hw.iomfb_method_profile=3;
