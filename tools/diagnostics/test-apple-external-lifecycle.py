@@ -218,6 +218,8 @@ static int dptxport_set_hpd(void *s, bool hpd)
 static int dptxport_release_display(void *s)
 { (void)s; event('R'); releases++; return release_error; }
 
+static unsigned int av_retirements;
+static void dpavservep_detach(struct apple_dcp *p) { assert(!p->hpd_mutex.held);av_retirements++; }
 static void av_service_disconnect(struct apple_dcp *p) { (void)p; }
 static int dcp_dptx_connect_raw(struct apple_dcp *p, u32 port, bool *waiting_service)
 {
@@ -569,6 +571,15 @@ int main(void)
         assert(p.external_error == -EPROTO && !power1 && p.iomfb.presentation_paused);
         owned(&p);
     }
+    /* AV retirement is physical/fallback disconnect, not ordinary DPMS. */
+    initial(&p); unsigned int av_before=av_retirements;
+    assert(dcp_external_disconnect(&p, false)==0 && av_retirements==av_before);
+    initial(&p); p.external_error=-EIO; av_before=av_retirements;
+    assert(dcp_external_disconnect(&p, true)==-EIO && av_retirements==av_before+1);
+    initial(&p); p.external_stop_generation=p.external_generation-1; av_before=av_retirements;
+    dcp_external_stop_work(&p.external_stop_work); assert(av_retirements==av_before);
+    p.external_stop_generation=p.external_generation;
+    dcp_external_stop_work(&p.external_stop_work); assert(av_retirements==av_before+1);
     puts("PASS: strict drain, callbacks, admission, exact RPC, stop/restart, stale epochs, modeset gate, retained ownership");
     return 0;
 }

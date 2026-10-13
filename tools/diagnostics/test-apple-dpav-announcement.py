@@ -26,6 +26,7 @@ prefix=r'''
 #include <string.h>
 #include <errno.h>
 typedef int64_t s64;typedef uint32_t u32;typedef uint64_t u64;
+#define U16_MAX UINT16_MAX
 #define READ_ONCE(x) (x)
 #define WRITE_ONCE(x,v) ((x)=(v))
 #define IS_ERR(p) ((uintptr_t)(p)>(uintptr_t)-4096)
@@ -53,19 +54,19 @@ static int wait_for_completion_timeout(bool *p,unsigned int timeout)
 static void schedule_work(unsigned int *p) { (*p)++; }
 struct apple_dcp;
 struct apple_dcp_afkep { struct apple_dcp *dcp; u32 endpoint; bool wire_v2,inline_v2,match_epic_name; };
-struct apple_epic_service { struct apple_dcp_afkep *ep; bool enabled; unsigned int users,channel; void *cookie; };
+struct apple_epic_service { struct apple_dcp_afkep *ep; bool enabled,torndown; struct { u64 generation,epoch; } admission; unsigned int users,channel; void *cookie; };
 struct apple_connector { void *dcp; bool connected,edid_invalidation_pending; struct { int registration_state; } base; unsigned int hotplug_wq; };
 struct apple_dcp {
     void *dev; struct { int iomfb_method_profile; } hw;
-    bool quiescing; unsigned int nr_modes;
+    bool quiescing,hpd_mutex,typec_cable_connected; u64 typec_generation; unsigned int nr_modes;
     struct apple_connector *connector;
     struct apple_dcp_afkep *dcpavservep;
     struct { bool lock,enabled,enable_completion; u64 epoch; struct apple_epic_service *service; } dcpavserv;
 };
 static struct apple_epic_service *afk_service_get(struct apple_epic_service *s)
-{ if(!s || !s->enabled) return NULL; s->users++;return s; }
+{ if(!s || !s->enabled || s->torndown) return NULL; s->users++;return s; }
 static void afk_service_put(struct apple_epic_service *s) { assert(s->users);s->users--; }
-static void afk_service_disable(struct apple_epic_service *s) { s->enabled=false; }
+static void afk_service_retire(struct apple_epic_service *s) { s->enabled=false;s->torndown=true; }
 static const int dpavservep_ops[1]={0};
 static struct apple_dcp_afkep ep;
 static struct apple_epic_service service;
@@ -78,7 +79,8 @@ static int afk_start(struct apple_dcp_afkep *e)
 static void afk_shutdown(struct apple_dcp_afkep *e) { assert(e==&ep);shutdowns++; }
 static void afk_trace_ring_snapshot(struct apple_dcp_afkep *e) { assert(e==&ep);snapshots++; }
 '''
-parts=[function('static void dcpavserv_notify_edid('),function('static int dcpavserv_prepare('),
+parts=[function('static void dcpavserv_notify_edid('),function('static bool dcpavserv_identity('),
+       function('static bool dcpavserv_admission_current('),function('static int dcpavserv_prepare('),
        function('static void dcpavserv_init('),function('static void dcpavserv_invalidate_edid('),
        function('static void dcpavserv_teardown('),function('void dpavservep_detach('),
        function('int dpavservep_init(')]

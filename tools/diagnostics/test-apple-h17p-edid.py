@@ -41,6 +41,7 @@ prefix = r'''
 typedef uint8_t u8;
 typedef uint64_t u64;
 typedef int64_t s64;
+#define U16_MAX UINT16_MAX
 #define READ_ONCE(x) (x)
 #define WRITE_ONCE(x,v) ((x)=(v))
 #define ERR_PTR(x) ((void *)(intptr_t)(x))
@@ -80,7 +81,7 @@ static void schedule_work(int *p) { (*p)++; }
 struct apple_dcp;
 struct apple_connector { void *dcp; struct { int registration_state; } base; bool connected, edid_invalidation_pending; int hotplug_wq; };
 struct apple_dcp_afkep { struct apple_dcp *dcp; u8 endpoint; bool wire_v2; };
-struct apple_epic_service { struct apple_dcp_afkep *ep; unsigned int users; bool enabled; void *cookie; unsigned int channel; };
+struct apple_epic_service { struct apple_dcp_afkep *ep; unsigned int users; bool enabled,torndown; struct { u64 generation,epoch; } admission; void *cookie; unsigned int channel; };
 struct apple_dcp {
     struct apple_dcp_afkep *dcpavservep, *dptxep, *avep, *systemep, *ibootep, *dptx_controller_ep;
     struct { bool lock, enabled; u64 epoch; int enable_completion; struct apple_epic_service *service; } dcpavserv;
@@ -96,9 +97,10 @@ static unsigned int reads, allocations, legacy_reads, receives;
 static unsigned int event;
 static struct apple_dcp_afkep *received_ep;
 static struct apple_epic_service *afk_service_get(struct apple_epic_service *s)
-{ if(!s || !s->enabled) return NULL; s->users++; return s; }
+{ if(!s || !s->enabled || s->torndown) return NULL; s->users++; return s; }
 static void afk_service_put(struct apple_epic_service *s)
 { assert(s->users); s->users--; }
+static void afk_service_retire(struct apple_epic_service *s) { s->enabled=false;s->torndown=true; }
 static void drm_edid_free(const struct drm_edid *e)
 { if(e) { assert(allocations); allocations--; free((void *)e); } }
 static void dcpavserv_teardown(struct apple_epic_service *s);
@@ -122,6 +124,8 @@ parts = [function('epic/dpavservep.c', 'static void dcpavserv_notify_edid('),
          function('epic/dpavservep.c', 'static void dcpavserv_teardown('),
          function('dcp.c', 'static struct apple_dcp_afkep *dcp_afkep('),
          function('dcp.c', 'static void dcp_recv_msg('),
+         function('epic/dpavservep.c', 'static bool dcpavserv_identity('),
+         function('epic/dpavservep.c', 'static bool dcpavserv_admission_current('),
          function('epic/dpavservep.c', 'static int dcpavserv_prepare('),
          function('epic/dpavservep.c', 'static int dcpdpserv_prepare('),
          function('epic/dpavservep.c', 'static void dcpavserv_init('),
@@ -147,7 +151,7 @@ int main(void)
     dcp_recv_msg(&d,0x2a,4); assert(received_ep==&av && receives==3);
     dcp_recv_msg(&d,0x2c,5); assert(received_ep==&tx && receives==4);
     d.dcpavservep=NULL; dcp_recv_msg(&d,0x2a,6); assert(receives==4); d.dcpavservep=&av;
-    struct apple_epic_service s={.ep=&av,.users=1,.enabled=true};
+    struct apple_epic_service s={.ep=&av,.users=1,.enabled=true,.channel=1};
     const char *name="dcpav-service-epic", *class="AppleDCPDP2HDMI";
     assert(!dcpavserv_prepare(&s,name,class,1));
     assert(dcpavserv_prepare(&s,name,class,0)==-ENODEV);
@@ -175,14 +179,14 @@ int main(void)
     assert(PTR_ERR(dcpavserv_copy_edid(&d,3,&epoch))==-ENODEV);
     assert(connector.edid_invalidation_pending && connector.hotplug_wq && d.dcpavserv.epoch==2);
     /* Same slot and physical generation: CLOSE/re-OPEN gets a fresh ticket. */
-    s.enabled=true; dcpavserv_init(&s,name,class,1);
+    s.enabled=true; assert(!dcpavserv_prepare(&s,name,class,1)); dcpavserv_init(&s,name,class,1);
     assert(d.dcpavserv.service==&s && s.users==1 && d.dcpavserv.epoch==3);
     mutex_lock(&d.dcpavserv.lock);
     assert(!dcpavserv_edid_service_current(&d,1) && dcpavserv_edid_service_current(&d,3));
     mutex_unlock(&d.dcpavserv.lock);
     event=0; e=dcpavserv_copy_edid(&d,3,&epoch); assert(!IS_ERR(e) && epoch==3);
     /* Simulate retirement in the final validation-to-publication gap. */
-    s.enabled=false; dcpavserv_teardown(&s); s.enabled=true; dcpavserv_init(&s,name,class,1);
+    s.enabled=false; dcpavserv_teardown(&s); s.enabled=true; assert(!dcpavserv_prepare(&s,name,class,1)); dcpavserv_init(&s,name,class,1);
     mutex_lock(&d.dcpavserv.lock); assert(!dcpavserv_edid_service_current(&d,epoch)); mutex_unlock(&d.dcpavserv.lock);
     drm_edid_free(e); assert(d.typec_generation==3 && d.dcpavserv.epoch==5 && s.users==1);
     s.enabled=false; dcpavserv_teardown(&s);
