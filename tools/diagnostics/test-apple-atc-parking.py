@@ -119,6 +119,10 @@ static void clear32(void *p, u32 v) { mask32(p, v, 0); }
        polls == fail_poll || bist_fault || \
        (fail_caller && !strcmp(fail_caller, __func__)) || !(condition) ? -ETIMEDOUT : 0; })
 #define readl_poll_timeout readl_poll_timeout_atomic
+/* Observation is read-only and separately tested; retain production caller control flow. */
+static void atcphy_observe_pmas(struct apple_atcphy *p, const char *stage,
+                              enum atcphy_mode target)
+{ (void)p; (void)stage; (void)target; }
 static void atcphy_usb2_power_on(struct apple_atcphy *p) { (void)p; usb2_on++; }
 static void atcphy_apply_tunables(struct apple_atcphy *p, enum atcphy_mode mode)
 { (void)p; (void)mode; }

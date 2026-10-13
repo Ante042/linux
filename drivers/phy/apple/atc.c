@@ -1011,6 +1011,48 @@ static const struct atcphy_mode_configuration *atcphy_get_mode_config(struct app
 		return &atcphy_modes[mode].normal;
 }
 
+/* Readback only; callers hold the PHY mutex and keep the fixed host live. */
+static inline u32 core_read32(struct apple_atcphy *atcphy, u32 reg)
+{
+	return readl(atcphy->regs.core + reg);
+}
+
+/* Static configuration fields already read/modified by the public DP path. */
+static void atcphy_observe_pmas(struct apple_atcphy *atcphy, const char *stage,
+				enum atcphy_mode target)
+{
+	lockdep_assert_held(&atcphy->lock);
+	if (!atcphy->hw->has_t8140_dp || !atcphy->fixed_usb2 ||
+	    !atcphy->host_active || atcphy->mode == APPLE_ATCPHY_MODE_OFF ||
+	    !of_machine_is_compatible("apple,j700") || !atcphy->res.core ||
+	    atcphy->res.core->start != 0x40b000000ULL ||
+	    resource_size(atcphy->res.core) < ATCPHY_MISC + sizeof(u32))
+		return;
+
+	/* Read arguments are evaluated only when debug and its rate limit allow. */
+	dev_dbg_ratelimited(atcphy->dev,
+			    "PMA observe stage=%s target=%u mode=%u swap=%u pipe=%u dirty=%u owned=%u idle=%u lane=%#x crossbar=%#x misc=%#x reset=%#x rx=%#x power=%#x bist=%#x ov1=%#x ov2=%#x status2=%#x native=%#x mux=%#x pma0[9244,b068,b06c,d004,d010]=%#x,%#x,%#x,%#x,%#x pma1[10244,12068,1206c,14004,14010]=%#x,%#x,%#x,%#x,%#x\n",
+			    stage, target, atcphy->mode, atcphy->swap_lanes,
+			    atcphy->pipe_state, atcphy->mode_dirty,
+			    atcphy->dp_owned_pmas, atcphy->dp_idle_pmas,
+			    core_read32(atcphy, atcphy->hw->aciophy_lane_mode),
+			    core_read32(atcphy, atcphy->hw->aciophy_crossbar),
+			    core_read32(atcphy, ATCPHY_MISC),
+			    core_read32(atcphy, ATCPHY_POWER_CTRL),
+			    core_read32(atcphy, 0x000c), core_read32(atcphy, 0x0200),
+			    core_read32(atcphy, ACIOPHY_BIST_CFG1),
+			    core_read32(atcphy, ACIOPHY_BIST_MAC_USBPHY_CFG_OV1),
+			    core_read32(atcphy, ACIOPHY_BIST_MAC_USBPHY_CFG_OV2),
+			    core_read32(atcphy, ACIOPHY_BIST_MAC_USBPHY_STATUS2),
+			    readl(atcphy->regs.pipehandler + PIPEHANDLER_NONSELECTED_OVERRIDE),
+			    readl(atcphy->regs.pipehandler + PIPEHANDLER_MUX_CTRL),
+			    core_read32(atcphy, 0x9244), core_read32(atcphy, 0xb068),
+			    core_read32(atcphy, 0xb06c), core_read32(atcphy, 0xd004),
+			    core_read32(atcphy, 0xd010), core_read32(atcphy, 0x10244),
+			    core_read32(atcphy, 0x12068), core_read32(atcphy, 0x1206c),
+			    core_read32(atcphy, 0x14004), core_read32(atcphy, 0x14010));
+}
+
 static void j700_dp_tunables(struct apple_atcphy *atcphy)
 {
 	apple_tunable_apply(atcphy->regs.axi2af, atcphy->tunables.axi2af);
@@ -1169,6 +1211,7 @@ static void atcphy_configure_pipehandler_usb3_host_t8122(struct apple_atcphy *at
 	int ret;
 	u32 reg;
 
+	atcphy_observe_pmas(atcphy, "bist-before", atcphy->mode);
 	core_set32(atcphy, ACIOPHY_BIST_CFG1, ACIOPHY_BIST_CFG1_CLOCK_EN);
 	/* This should be a mask, but unsure what bits should be cleared */
 	writel(ACIOPHY_BIST_MAC_USBPHY_CFG_OV1_LN0_PIPE_RESET_N_OV | FIELD_PREP(ACIOPHY_BIST_MAC_USBPHY_CFG_OV1_LN0_PWR_DOWN_OV, 2),
@@ -1240,6 +1283,7 @@ static void atcphy_configure_pipehandler_usb3_host_t8122(struct apple_atcphy *at
 	}
 	core_clear32(atcphy, ACIOPHY_BIST_CFG1, ACIOPHY_BIST_CFG1_USB_EN);
 	core_clear32(atcphy, ACIOPHY_BIST_CFG1, ACIOPHY_BIST_CFG1_CLOCK_EN);
+	atcphy_observe_pmas(atcphy, "bist-after", atcphy->mode);
 }
 
 static void atcphy_configure_pipehandler_usb3_host_t8103(struct apple_atcphy *atcphy)
@@ -1476,8 +1520,11 @@ static int atcphy_configure_pipehandler(struct apple_atcphy *atcphy, bool host)
 		ret = atcphy_configure_pipehandler_dummy(atcphy);
 		break;
 	}
-	if (!ret)
+	if (!ret) {
 		atcphy->pipe_state = state;
+		if (state == ATCPHY_PIPEHANDLER_STATE_USB3)
+			atcphy_observe_pmas(atcphy, "pipe-after", atcphy->mode);
+	}
 
 	return ret;
 }
@@ -3407,6 +3454,8 @@ static int atcphy_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *sta
 		 * backend to the other PMA when orientation changes. Park before
 		 * rebuilding the lanes, then reconnect while dwc3 is in host mode.
 		 */
+		atcphy_observe_pmas(atcphy, state->mode == TYPEC_STATE_SAFE ?
+				    "safe-before" : "mux-before", target_mode);
 		ret = atcphy_park_pipehandler(atcphy);
 		if (ret)
 			return ret;
@@ -3414,6 +3463,9 @@ static int atcphy_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *sta
 		ret = atcphy_configure(atcphy, target_mode);
 		if (ret)
 			return ret;
+
+		atcphy_observe_pmas(atcphy, state->mode == TYPEC_STATE_SAFE ?
+				    "safe-after" : "lanes-after", target_mode);
 
 		if (atcphy->host_active && atcphy->pipe_state != pipe_state)
 			ret = atcphy_configure_pipehandler(atcphy, true);

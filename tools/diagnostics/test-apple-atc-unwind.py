@@ -94,6 +94,10 @@ static void atc_tunnel_stop_t8103(struct apple_atcphy *p) { (void)p; }
 static void atc_tunnel_restore(struct apple_atcphy *p) { (void)p; }
 static int atcphy_park_pipehandler(struct apple_atcphy *p)
 { p->pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY; return 0; }
+/* Observation is read-only and separately tested; retain production caller control flow. */
+static void atcphy_observe_pmas(struct apple_atcphy *p, const char *stage,
+                              enum atcphy_mode target)
+{ (void)p; (void)stage; (void)target; }
 static int atcphy_configure_pipehandler(struct apple_atcphy *p, bool host)
 { (void)host; p->pipe_state = atcphy_modes[p->mode].pipehandler_state; return 0; }
 ''')

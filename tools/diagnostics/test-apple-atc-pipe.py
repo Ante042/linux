@@ -70,6 +70,10 @@ static void core_clear32(struct apple_atcphy *p, u32 o, u32 v) { core_mask32(p, 
     ({ (value) = readl(address); polls++; \
        polls == fail_poll || !(condition) ? -ETIMEDOUT : 0; })
 /* Lane configuration is outside this test: count calls and commit its result. */
+/* Observation is read-only and separately tested; retain production caller control flow. */
+static void atcphy_observe_pmas(struct apple_atcphy *p, const char *stage,
+                              enum atcphy_mode target)
+{ (void)p; (void)stage; (void)target; }
 static int atcphy_configure(struct apple_atcphy *p, enum atcphy_mode mode)
 { lane_calls++; p->mode = mode; p->mode_dirty = false; return 0; }
 ''')
