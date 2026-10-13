@@ -139,6 +139,11 @@ static void dcp_release_rtkit(void *data)
 
 #define DCP_BOOT_TIMEOUT msecs_to_jiffies(1000)
 
+static unsigned int experimental_h17p_av_discovery;
+module_param(experimental_h17p_av_discovery, uint, 0444);
+MODULE_PARM_DESC(experimental_h17p_av_discovery,
+		 "H17P AV discovery: 1 observes; 2 opens only the observed DP device transport");
+
 static bool experimental_h17p_external;
 module_param(experimental_h17p_external, bool, 0444);
 MODULE_PARM_DESC(experimental_h17p_external,
@@ -2077,7 +2082,7 @@ static struct apple_dcp_afkep *dcp_afkep(struct apple_dcp *dcp, u8 endpoint)
 {
 	switch (endpoint) {
 	case AV_ENDPOINT:
-		return dcp->avep;
+		return dcp->avep ? dcp->avep : dcp->av_discovery;
 	case SYSTEM_ENDPOINT:
 		return dcp->systemep;
 	case DISP0_ENDPOINT:
@@ -2160,7 +2165,7 @@ static void dcp_recv_msg(void *cookie, u8 endpoint, u64 message)
 	case IOMFB_ENDPOINT:
 		return iomfb_recv_msg(dcp, message);
 	case AV_ENDPOINT:
-		ep = dcp->avep;
+		ep = dcp->avep ? dcp->avep : dcp->av_discovery;
 		break;
 	case SYSTEM_ENDPOINT:
 		ep = dcp->systemep;
@@ -2985,6 +2990,69 @@ unsigned long* dcp_get_iomfb_surfaces(struct platform_device *pdev)
 	return dcp->iomfb_surfaces;
 }
 
+/* The native H17P registry names this interface, but its endpoint is unproven. */
+static int dcp_av_discovery_prepare(struct apple_epic_service *service,
+				  const char *name, const char *class, s64 unit)
+{
+	bool open_device = experimental_h17p_av_discovery == 2 && name && class &&
+		!strcmp(name, "dcpdp-device-epic") && !strcmp(class, "DCPDPDevice");
+
+	dev_info(service->ep->dcp->dev,
+		 "AV discovery ep:%02x channel:%u name:%s class:%s unit:%lld; %s\n",
+		 service->ep->endpoint, service->channel,
+		 name ?: "(none)", class ?: "(none)", unit,
+		 open_device ? "transport OPEN only" : "no OPEN");
+	/* The observed device may be opened, but no service command is sent. */
+	return open_device ? 0 : -ECANCELED;
+}
+
+static void dcp_av_discovery_teardown(struct apple_epic_service *service)
+{
+	afk_service_disable(service);
+}
+
+static const struct apple_epic_service_ops dcp_av_discovery_ops[] = {
+	{
+		.name = "dcpav-video-interface-epic",
+		.reusable = true,
+		.prepare = dcp_av_discovery_prepare,
+	},
+	{
+		.name = "dcpdp-device-epic",
+		.reusable = true,
+		.prepare = dcp_av_discovery_prepare,
+		.teardown = dcp_av_discovery_teardown,
+	},
+	{},
+};
+
+static void dcp_start_av_discovery(struct apple_dcp *dcp)
+{
+	struct apple_dcp_afkep *ep;
+	int ret;
+
+	if (!experimental_h17p_av_discovery || experimental_h17p_av_discovery > 2 ||
+	    dcp->av_discovery ||
+	    dcp->fw_compat != DCP_FIRMWARE_H17P ||
+	    dcp->hw.iomfb_method_profile !=
+		    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL)
+		return;
+	ep = afk_init(dcp, AV_ENDPOINT, dcp_av_discovery_ops);
+	if (IS_ERR(ep)) {
+		dev_info(dcp->dev, "AV discovery allocation failed: %ld\n", PTR_ERR(ep));
+		return;
+	}
+	ep->wire_v2 = true;
+	ep->match_epic_name = true;
+	ep->debugfs_entry = dcp->ep_debugfs[AV_ENDPOINT - 0x20];
+	/* Publish before startup can deliver messages. Never alias audio state. */
+	dcp->av_discovery = ep;
+	ret = afk_start(ep);
+	if (ret)
+		dev_info(dcp->dev, "AV discovery startup incomplete: %d; retaining endpoint\n", ret);
+	/* A timeout is not a firmware/DMA fence: do not free or restart it. */
+}
+
 int dcp_start(struct platform_device *pdev)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
@@ -3084,6 +3152,7 @@ int dcp_start(struct platform_device *pdev)
 	}
 #endif
 
+	dcp_start_av_discovery(dcp);
 	return ret;
 }
 
@@ -4093,6 +4162,7 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 		}
 		iomfb_queue_stop(dcp);
 		afk_quiesce(dcp->avep);
+		afk_quiesce(dcp->av_discovery);
 		afk_quiesce(dcp->dptxep);
 		afk_quiesce(dcp->dptx_controller_ep);
 		afk_quiesce(dcp->ibootep);
@@ -4144,6 +4214,11 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 	if (dcp->systemep) {
 		afk_shutdown(dcp->systemep);
 		dcp->systemep = NULL;
+	}
+
+	if (dcp->av_discovery) {
+		afk_shutdown(dcp->av_discovery);
+		dcp->av_discovery = NULL;
 	}
 
 	if (dcp->dcpavservep) {
