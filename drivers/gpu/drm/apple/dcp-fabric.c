@@ -208,6 +208,33 @@ bool dcp_is_typec_only(struct platform_device *pdev)
 	return !dcp->fixed_phy;
 }
 
+static int dcp_route_clock_rate(struct apple_dcp_typec_route *route,
+				struct phy *phy, unsigned int dpin, u8 rate)
+{
+	int ret;
+
+	if (of_machine_is_compatible("apple,t6030")) {
+		typeof(apple_atc_dp_tunnel_rate_source) *fn;
+
+		if (apple_dp_tunnel_t6030_pclk(route->mux_index, dpin) < 0)
+			return -EOPNOTSUPP;
+		fn = symbol_get(apple_atc_dp_tunnel_rate_source);
+		if (!fn)
+			return -ENOENT;
+		ret = fn(phy, route->mux_index, dpin, rate);
+		symbol_put(apple_atc_dp_tunnel_rate_source);
+	} else {
+		typeof(apple_atc_dp_tunnel_rate) *fn;
+
+		fn = symbol_get(apple_atc_dp_tunnel_rate);
+		if (!fn)
+			return -ENOENT;
+		ret = fn(phy, dpin, rate);
+		symbol_put(apple_atc_dp_tunnel_rate);
+	}
+	return ret;
+}
+
 static int dcp_typec_route_activate(struct apple_dcp_typec_route *route,
 				    struct mux_control *xbar);
 static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route);
@@ -363,13 +390,10 @@ static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route)
 
 		if (route->tunnel && dcp->phy) {
 			/* the tunnel pixel clock must not outlive the tunnel */
-			typeof(apple_atc_dp_tunnel_rate) *stop =
-				symbol_get(apple_atc_dp_tunnel_rate);
+			int err = dcp_route_clock_rate(route, dcp->phy, route->tunnel_dpin, 0);
 
-			if (stop) {
-				stop(dcp->phy, route->tunnel_dpin, 0);
-				symbol_put(apple_atc_dp_tunnel_rate);
-			}
+			if (err)
+				dev_warn(dcp->dev, "DP tunnel clock stop failed: %d\n", err);
 		}
 		route->active_xbar = NULL;
 		route->tunnel = false;
@@ -1623,7 +1647,6 @@ int dcp_direct_crossbar_link(struct apple_dcp *dcp, bool up)
 int dcp_tunnel_set_rate(struct apple_dcp *dcp, struct phy *phy, u32 unit,
 			u32 link_rate)
 {
-	typeof(apple_atc_dp_tunnel_rate) *fn;
 	struct apple_dcp_typec_route *route;
 	int ret;
 
@@ -1635,18 +1658,9 @@ int dcp_tunnel_set_rate(struct apple_dcp *dcp, struct phy *phy, u32 unit,
 		return -ENODEV;
 	if (!dcp_fabric_callback_valid(route->tunnel_generation, dcp->tb_generation))
 		return -ESTALE;
-	/*
-	 * The T6030 tunnel clock supports only core0 -> DP IN0 (PCLK1) so far;
-	 * other routes need PCLK slot selection and accounting.
-	 */
-	if (link_rate && of_machine_is_compatible("apple,t6030") &&
-	    (route->mux_index != 0 || dcp->dptx_dfp_port != 1))
+	if (of_machine_is_compatible("apple,t6030") &&
+	    (unit || dcp->dptx_dfp_port != 1))
 		return -EOPNOTSUPP;
-	fn = symbol_get(apple_atc_dp_tunnel_rate);
-	if (!fn) {
-		dev_err(dcp->dev, "phy-apple-atc not loaded, no DP tunnel clock\n");
-		return -ENOENT;
-	}
 	if (unit) {
 		/* Each DP IN owns a reference, including on a shared clock. */
 		ret = 0;
@@ -1655,9 +1669,8 @@ int dcp_tunnel_set_rate(struct apple_dcp *dcp, struct phy *phy, u32 unit,
 		} else {
 			if (!link_rate && dcp->split.xbar_up)
 				dcp_dpxbar_link(dcp->split.xbar, false);
-			ret = fn(phy, 1, link_rate);
+			ret = dcp_route_clock_rate(route, phy, 1, link_rate);
 		}
-		symbol_put(apple_atc_dp_tunnel_rate);
 		dcp->split.clock_ok = !ret && link_rate;
 		if (ret)
 			dev_warn(dcp->dev, "tiled: dpin1 pixel clock (rate 0x%x) failed: %d\n",
@@ -1666,8 +1679,7 @@ int dcp_tunnel_set_rate(struct apple_dcp *dcp, struct phy *phy, u32 unit,
 	}
 	if (!link_rate && route->xbar_up)
 		dcp_dpxbar_link(route->active_xbar, false);
-	ret = fn(phy, route->tunnel_dpin, link_rate);
-	symbol_put(apple_atc_dp_tunnel_rate);
+	ret = dcp_route_clock_rate(route, phy, route->tunnel_dpin, link_rate);
 	dcp->tb_clock_ok = !ret && link_rate;
 	if (ret)
 		dev_warn(dcp->dev, "DP tunnel pixel clock (rate 0x%x) failed: %d\n",

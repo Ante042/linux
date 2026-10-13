@@ -18,7 +18,7 @@ CASES = ['m2-admission', 'm1-admission', 'm1max-admission', 'm2pro-sequence',
 NAMES = ['apple_atc_tunnel_is_t600x', 'apple_atc_tunnel_is_t8103_style',
          'atc_tunnel_stop_t8103', 'atc_tunnel_pclk_t8103',
          'atc_tunnel_wake_t8103', 'atc_tunnel_start_t8103',
-         'apple_atc_dp_tunnel_rate']
+         'apple_atc_dp_tunnel_rate_source', 'apple_atc_dp_tunnel_rate']
 
 def main():
     parser = argparse.ArgumentParser()
@@ -33,6 +33,7 @@ def main():
         return subprocess.check_output(['git', 'show', f'{args.ref}:{path}'], cwd=ROOT, text=True) if args.ref else (ROOT / path).read_text()
     source = read('drivers/phy/apple/atc.c')
     bodies = [module.function(source, name) for name in NAMES]
+    bodies.insert(0, module.function(read('include/linux/soc/apple/dp-tunnel.h'), 'apple_dp_tunnel_t6030_pclk'))
     bodies.insert(0, module.function(read('drivers/phy/apple/atc-tunnel.h'), 'apple_atc_t602x_gate'))
     lines = iter(source.splitlines(keepends=True))
     definitions = []

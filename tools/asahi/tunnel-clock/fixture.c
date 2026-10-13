@@ -25,7 +25,7 @@ struct resource {u64 start,size;};
 struct apple_atcphy {int lock,mode;void *dev,*np;
  struct {u8 *core;} regs;struct {struct resource *core;} res;
  bool tunnel_clock_on,tunnel_dual_stream,tunnel_routes_present;
- u8 tunnel_rate;unsigned tunnel_users;int dp_link_rate;};
+ u8 tunnel_rate;unsigned tunnel_users,tunnel_source;int dp_link_rate;};
 struct phy {const void *ops;struct apple_atcphy *data;};
 static int apple_atc_dp_phy_ops;
 static const char *soc;
