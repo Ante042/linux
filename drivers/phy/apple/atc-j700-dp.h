@@ -93,14 +93,18 @@ static int j700_usb_restore(struct apple_atcphy *p, enum atcphy_mode mode)
 			continue;
 		if (p->dp_usb_context_dirty & BIT(lane)) {
 			for (unsigned int i = 0; i < ARRAY_SIZE(j700_usb_fields); i++) {
-				u32 offset, mask, value = p->dp_usb_context[lane][i];
+				u32 offset, mask, observed, value = p->dp_usb_context[lane][i];
 
 				if (i == 1 || i == 3)
 					continue;
 				j700_usb_field(i, lane, &offset, &mask);
 				core_mask32(p, offset, mask, value);
-				if ((core_read32(p, offset) & mask) != value)
+				observed = core_read32(p, offset) & mask;
+				if (observed != value) {
+					dev_dbg(p->dev, "USB restore readback pma=%u reg=%#x mask=%#x expected=%#x actual=%#x\n",
+						lane, offset, mask, value, observed);
 					return -EIO;
+				}
 			}
 		}
 		/* Preserve the public PMA power bit order, using saved values. */
@@ -108,16 +112,22 @@ static int j700_usb_restore(struct apple_atcphy *p, enum atcphy_mode mode)
 			u32 mask = BIT(4 * lane + power_order[i]);
 
 			ret = j700_field_update(p, 0x200, mask, p->dp_usb_context[lane][3] & mask);
-			if (ret)
+			if (ret) {
+				dev_dbg(p->dev, "USB restore power pma=%u reg=0x200 mask=%#x ret=%d\n",
+					lane, mask, ret);
 				return ret;
+			}
 		}
 		/* Restore receiver enables, then release its two idle controls. */
 		for (unsigned int i = 0; i < ARRAY_SIZE(receiver_order); i++) {
 			u32 mask = BIT(lane + receiver_order[i]);
 
 			ret = j700_field_update(p, 0xc, mask, p->dp_usb_context[lane][1] & mask);
-			if (ret)
+			if (ret) {
+				dev_dbg(p->dev, "USB restore receiver pma=%u reg=0xc mask=%#x ret=%d\n",
+					lane, mask, ret);
 				return ret;
+			}
 		}
 		p->dp_usb_context_dirty &= ~BIT(lane);
 		p->dp_usb_context_valid &= ~BIT(lane);
