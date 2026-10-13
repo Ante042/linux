@@ -983,10 +983,9 @@ impl Runtime {
             }
             started=true;
             // The UAT geometry of the admitted SoC (complete: `Soc::require_complete`).
-            let hwcfg=device.soc().hwcfg.ok_or(ENODEV)?;
             // SAFETY: the admitted RTKit (J514S on T6030) is awake; no initdata or GPU
             // job has been published. Its running PPL handoff owns the peer lock.
-            let uat=unsafe {mmu::Uat::new_m3_running(&drm,hwcfg)}?;
+            let uat=unsafe {mmu::Uat::new_m3_running(&drm,device.soc())}?;
             let config=Config::new(&drm,&uat,device.firmware(),&contents)?;
             Ok((uat,config))
         })();
