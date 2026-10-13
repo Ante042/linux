@@ -393,6 +393,12 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
             service_name = name;
         }
 
+	if (ep == ep->dcp->av_discovery)
+		dev_info(ep->dcp->dev,
+			 "AV announcement channel:%u name:%s class:%s unit:%lld\n",
+			 channel, epic_name ?: "(none)",
+			 epic_class ?: "(none)", epic_unit);
+
 	if (ep->match_epic_name)
 		ops = afk_match_service(ep, epic_name);
 	else
