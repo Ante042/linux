@@ -657,6 +657,9 @@ struct atcphy_hw {
  * @mode_dirty: Mode transition needs cleanup before it can be retried
  * @dp_idle_pmas: J700 PMAs with an incomplete routing idle sequence
  * @dp_owned_pmas: J700 PMAs requiring main-link cleanup
+ * @dp_usb_context_valid: Physical PMAs retaining their pre-DP USB field values
+ * @dp_usb_context_dirty: PMAs whose static fields were programmed by DP
+ * @dp_usb_context: Saved bits from the public per-PMA DP write masks
  * @dp_spread_spectrum: J700 main-link spread-spectrum state
  * @dp_presets: Firmware-derived per-rate drive presets
  * @dp_presets_valid: Firmware supplied each drive-preset table
@@ -722,6 +725,8 @@ struct apple_atcphy {
 	bool mode_dirty;
 	u8 dp_idle_pmas;
 	u8 dp_owned_pmas;
+	u8 dp_usb_context_valid, dp_usb_context_dirty;
+	u32 dp_usb_context[2][27];
 	bool dp_spread_spectrum;
 	u32 dp_presets[5][16];
 	bool dp_presets_valid[5];
@@ -2784,6 +2789,9 @@ static int atcphy_configure(struct apple_atcphy *atcphy, enum atcphy_mode mode)
 	u32 reg;
 
 	lockdep_assert_held(&atcphy->lock);
+	if (atcphy->hw->has_t8140_dp && atcphy->fixed_usb2 && atcphy->host_active &&
+	    atcphy->pipe_state != ATCPHY_PIPEHANDLER_STATE_DUMMY)
+		return -EBUSY;
 	if (atcphy->hw->has_t8140_dp && atcphy->dp_owned_pmas &&
 	    (mode != atcphy->mode || atcphy->mode_dirty)) {
 		atcphy->mode_dirty = true;
@@ -2833,6 +2841,14 @@ static int atcphy_configure(struct apple_atcphy *atcphy, enum atcphy_mode mode)
 	ret = atcphy_power_on(atcphy);
 	if (ret)
 		return ret;
+
+	if (atcphy->hw->has_t8140_dp && atcphy->fixed_usb2) {
+		ret = j700_usb_capture(atcphy, mode);
+		if (!ret)
+			ret = j700_usb_restore(atcphy, mode);
+		if (ret)
+			return ret;
+	}
 
 	atcphy_apply_tunables(atcphy, mode);
 
