@@ -243,14 +243,14 @@ TRACE_EVENT(afk_recv_header,
 			     __field(u32, channel)
 			     __field(u32, type)
 			     __field(size_t, data_size)
-			     __field(u8, captured)
-			     __array(u8, header, 32)),
+			     __field(u16, captured)
+			     __array(u8, header, 256)),
 	    TP_fast_assign(__assign_str(devname);
 			__entry->endpoint = ep->endpoint;
 			__entry->channel = channel;
 			__entry->type = type;
 			__entry->data_size = data_size;
-			__entry->captured = data ? min_t(size_t, data_size, 32) : 0;
+			__entry->captured = data ? min_t(size_t, data_size, sizeof(__entry->header)) : 0;
 			memset(__entry->header, 0, sizeof(__entry->header));
 			if (__entry->captured)
 				memcpy(__entry->header, data, __entry->captured);

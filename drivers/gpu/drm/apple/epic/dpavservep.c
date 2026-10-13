@@ -8,7 +8,10 @@
 
 #include <drm/drm_edid.h>
 
+#include <linux/atomic.h>
 #include <linux/completion.h>
+#include <linux/kstrtox.h>
+#include <linux/moduleparam.h>
 #include <linux/device.h>
 #include <linux/types.h>
 
@@ -17,6 +20,48 @@
 #include "../dcp-internal.h"
 #include "../connector.h"
 #include "../trace.h"
+
+/* Diagnostic only: no external H17P EDID command without an explicit arm. */
+static atomic_t diagnostic_h17p_edid_probe = ATOMIC_INIT(0);
+
+static int diagnostic_h17p_edid_probe_set(const char *value,
+					const struct kernel_param *param)
+{
+	bool armed;
+	int ret = kstrtobool(value, &armed);
+
+	if (ret)
+		return ret;
+	atomic_set(&diagnostic_h17p_edid_probe, armed);
+	return 0;
+}
+
+static int diagnostic_h17p_edid_probe_get(char *buffer,
+					const struct kernel_param *param)
+{
+	bool armed = atomic_read(&diagnostic_h17p_edid_probe);
+	struct kernel_param snapshot = *param;
+
+	snapshot.arg = &armed;
+	return param_get_bool(buffer, &snapshot);
+}
+
+static const struct kernel_param_ops diagnostic_h17p_edid_probe_ops = {
+	.set = diagnostic_h17p_edid_probe_set,
+	.get = diagnostic_h17p_edid_probe_get,
+};
+module_param_cb(diagnostic_h17p_edid_probe, &diagnostic_h17p_edid_probe_ops,
+		NULL, 0600);
+MODULE_PARM_DESC(diagnostic_h17p_edid_probe,
+		 "DIAGNOSTIC ONLY: arm one external H17P EDID read; consumed on attempt");
+
+static bool dcpavserv_edid_probe_allowed(struct apple_dcp *dcp)
+{
+	if (dcp->hw.iomfb_method_profile !=
+	    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL)
+		return true;
+	return atomic_xchg(&diagnostic_h17p_edid_probe, 0);
+}
 
 static void dcpavserv_notify_edid(struct apple_epic_service *service)
 {
@@ -340,6 +385,10 @@ const struct drm_edid *dcpavserv_copy_edid(struct apple_dcp *dcp, u64 generation
 {
 	struct apple_epic_service *service;
 	const struct drm_edid *edid;
+
+	/* Consume before any request-side failure; only an explicit write rearms. */
+	if (!dcpavserv_edid_probe_allowed(dcp))
+		return ERR_PTR(-EAGAIN);
 
 	scoped_guard(mutex, &dcp->hpd_mutex) {
 		if (!dcpavserv_edid_current(dcp, generation))

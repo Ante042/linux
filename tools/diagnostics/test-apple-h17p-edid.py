@@ -101,6 +101,8 @@ static void afk_service_put(struct apple_epic_service *s)
 { assert(s->users); s->users--; }
 static void drm_edid_free(const struct drm_edid *e)
 { if(e) { assert(allocations); allocations--; free((void *)e); } }
+/* Lifetime fixtures grant reads; the diagnostic gate has a dedicated test. */
+static bool dcpavserv_edid_probe_allowed(struct apple_dcp *d) { (void)d; return true; }
 static void dcpavserv_teardown(struct apple_epic_service *s);
 static const struct drm_edid *dcpavserv_read_edid_inline(struct apple_epic_service *s)
 {
