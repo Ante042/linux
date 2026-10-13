@@ -147,7 +147,7 @@ struct apple_dcp {
     unsigned int nr_modes;
     int fw_compat;
     struct { bool valid; } mode_state;
-    struct { bool inline_v2; } *dcpavservep;
+    struct { bool wire_v2; } *dcpavservep;
 };
 static struct apple_dcp *current_for_update;
 static unsigned int allocations, raw_reads, mode_adds, clears, property_identity, blob_allocations, notifications, retrains;

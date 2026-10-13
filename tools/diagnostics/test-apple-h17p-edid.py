@@ -79,7 +79,7 @@ static void schedule_work(int *p) { (*p)++; }
 #define IOMFB_ENDPOINT 0x37
 struct apple_dcp;
 struct apple_connector { void *dcp; struct { int registration_state; } base; bool connected, edid_invalidation_pending; int hotplug_wq; };
-struct apple_dcp_afkep { struct apple_dcp *dcp; u8 endpoint; bool inline_v2; };
+struct apple_dcp_afkep { struct apple_dcp *dcp; u8 endpoint; bool wire_v2; };
 struct apple_epic_service { struct apple_dcp_afkep *ep; unsigned int users; bool enabled; void *cookie; unsigned int channel; };
 struct apple_dcp {
     struct apple_dcp_afkep *dcpavservep, *dptxep, *avep, *systemep, *ibootep, *dptx_controller_ep;
@@ -141,7 +141,7 @@ int main(void)
     dcp_recv_msg(&d,0x28,1); assert(received_ep==&av && receives==1);
     dcp_recv_msg(&d,0x2a,2); assert(received_ep==&tx && receives==2);
     d.hw.iomfb_method_profile=DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL;
-    av.endpoint=0x2a; av.inline_v2=true; tx.endpoint=0x2c;
+    av.endpoint=0x2a; av.wire_v2=true; tx.endpoint=0x2c;
     assert(!dcp_afkep(&d,0x28) && dcp_afkep(&d,0x2a)==&av && dcp_afkep(&d,0x2c)==&tx);
     dcp_recv_msg(&d,0x28,3); assert(receives==2);
     dcp_recv_msg(&d,0x2a,4); assert(received_ep==&av && receives==3);
@@ -186,7 +186,7 @@ int main(void)
     mutex_lock(&d.dcpavserv.lock); assert(!dcpavserv_edid_service_current(&d,epoch)); mutex_unlock(&d.dcpavserv.lock);
     drm_edid_free(e); assert(d.typec_generation==3 && d.dcpavserv.epoch==5 && s.users==1);
     s.enabled=false; dcpavserv_teardown(&s);
-    av.inline_v2=false; av.endpoint=0x28; d.hw.iomfb_method_profile=0;
+    av.wire_v2=false; av.endpoint=0x28; d.hw.iomfb_method_profile=0;
     d.dcpavserv.enabled=false; assert(!dcpavserv_prepare(&s,name,NULL,0));
     assert(dcpavserv_prepare(&s,name,class,1)==-ENODEV);
     assert(!dcpdpserv_prepare(&s,NULL,NULL,3));
