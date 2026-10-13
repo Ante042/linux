@@ -143,7 +143,7 @@ struct dcp_tb_attach_context {unsigned dpin;bool active;u64 generation;int(*set_
 static int tipd_sn201202x_data,other_tipd_data;
 static int dcp_typec_fabric_lock,dcp_tb_handoff_lock,dcp_dual_stream_routes;
 static int binding_drains;
-static int preselect_error,source_error,connect_error,clock_calls,clock_error;
+static int preselect_error,source_error,connect_error,clock_calls,clock_error,clock_source;
 static unsigned clock_dpin,clock_rate;
 static int hpd_error,release_error,hpd_calls,release_calls,crossbar_calls;
 static int role_changes,safe_changes,orientation_changes,tbt_changes,queues,connect_calls;
@@ -182,7 +182,10 @@ static int dcp_dpxbar_preselect(struct mux_control *m,int s){return s==MUX_IDLE_
 static int dcp_dpxbar_tunnel_select_source(struct mux_control *m,int s){return s==-1?0:source_error;}
 static int apple_atc_dp_tunnel_rate(void *p,unsigned dpin,unsigned rate){clock_calls++;clock_dpin=dpin;clock_rate=rate;return clock_error;}
 static int dcp_dpxbar_link(struct mux_control *m,bool up){crossbar_calls++;return 0;}
-static bool of_machine_is_compatible(const char *s){return false;}
+static bool m3_soc;
+static bool of_machine_is_compatible(const char *s){return m3_soc&&!strcmp(s,"apple,t6030");}
+static inline int apple_dp_tunnel_t6030_pclk(unsigned source,unsigned dpin);
+static int apple_atc_dp_tunnel_rate_source(void *p,unsigned source,unsigned dpin,unsigned rate){clock_source=source;return apple_atc_dp_tunnel_rate(p,dpin,rate);}
 static bool dcp_modes_end_typec(struct apple_dcp *d,struct apple_dcp_typec_route *r){deactivations++;return false;}
 static bool dcp_typec_dual_stream(void){return false;}
 static void apple_connector_set_pipeline(struct apple_connector *c,void *p){c->dcp=p;}
@@ -352,6 +355,26 @@ int main(int argc,char **argv)
         .display_route_active=true,.state_valid=true,.state={.alt=&alt,.mode=TYPEC_DP_STATE_A},
         .port_altmode_dp=&alt,.dp_status=DP_STATUS_HPD_STATE|DP_STATUS_IRQ_HPD,.mux=&mux};
     c.pm.phase=CD321X_PM_RUNNING;c.update_status.status_changed=TPS_STATUS_PLUG_PRESENT;
+    if(!strncmp(name,"m3-source",9)){
+        m3_soc=true;d.phy=&d;d.dptx_tunnel=true;d.dptx_dfp_port=1;
+        route.tunnel=true;route.tunnel_generation=d.tb_generation=7;
+        route.mux_index=strstr(name,"source0")?0:strstr(name,"source1")?1:2;
+        route.active_xbar=&xbar;route.xbar_up=true;
+        if(strstr(name,"dpin1"))route.tunnel_dpin=1;
+        if(strstr(name,"stale"))route.tunnel_generation=6;
+        if(strstr(name,"clock-error"))clock_error=-EIO;
+        if(strstr(name,"deactivate")){
+            int ret=dcp_typec_route_deactivate(&route);
+            assert(!ret&&clock_calls==1&&clock_source==2&&!clock_rate&&!route.tunnel&&!d.dptx_tunnel);
+            return 0;
+        }
+        unsigned rate=strstr(name,"stop")?0:0x14;
+        int ret=dcp_tunnel_set_rate(&d,(struct phy *)&d,0,rate);
+        if(route.mux_index==1||route.tunnel_dpin)assert(ret==-EOPNOTSUPP&&!clock_calls);
+        else if(route.tunnel_generation!=d.tb_generation)assert(ret==-ESTALE&&!clock_calls);
+        else assert(ret==clock_error&&clock_calls==1&&clock_source==(int)route.mux_index&&clock_rate==rate&&d.tb_clock_ok==(!ret&&rate));
+        return 0;
+    }
     if(!strncmp(name,"tile-",5)){
         d.external=d.external_native=false;d.phy=&d;d.dptx_tunnel=true;
         d.dptxport[1].enabled=true;d.dptxport[1].service=&other;

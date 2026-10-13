@@ -12,12 +12,13 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
 FUNCTIONS = {
+    'include/linux/soc/apple/dp-tunnel.h': ['apple_dp_tunnel_t6030_pclk'],
     'drivers/gpu/drm/apple/dcp.c': [
         'dcp_dptx_release_locked', 'dcp_dptx_disconnect',
         'dcp_dptx_disconnect_drained', 'dcp_dptx_disconnect_oob',
         'dcp_dptx_connect_tile', 'dcp_dptx_connect',
         'dcp_dptx_park', 'dcp_external_retry_work', 'dcp_external_sink_irq'],
-    'drivers/gpu/drm/apple/dcp-fabric.c': [
+    'drivers/gpu/drm/apple/dcp-fabric.c': ['dcp_route_clock_rate',
         'dcp_tb_reserve_revoke', 'dcp_tb_invalidate', 'dcp_tb_drain_unlock',
         'dcp_tb_drain_wait', 'dcp_tb_drain_lock', 'dcp_tb_binding_drain',
         'dcp_tb_finish_request', 'dcp_tb_dispatch', 'dcp_follow_save_split',
@@ -38,7 +39,10 @@ FUNCTIONS = {
         'cd321x_dp_hpd', 'cd321x_dp_release_first',
         'cd321x_retry_revalidation', 'cd321x_update_work'],
 }
-CASES = ['release-success', 'release-failure', 'hpd-failure',
+CASES = ['m3-source2-deactivate', 'm3-source2-rate', 'm3-source2-stop', 'm3-source2-clock-error',
+         'm3-source0-rate', 'm3-source1-rate', 'm3-source2-dpin1',
+         'm3-source2-stale',
+'release-success', 'release-failure', 'hpd-failure',
          'release-repeat', 'invalid-cache-repeat', 'replug',
          'safe-release-failure', 'safe-release-success',
          'owner-route', 'cached-update', 'tunnel', 'legacy-controller',
