@@ -146,14 +146,16 @@ impl UatConfig {
         }
     }
 
-    /// The M3 runtime's UAT on the SoC of `cfg`: the bootloader-reserved handoff tables, with the
-    /// root geometry of that SoC (42-bit roots and output addresses on every AGX3 part). On
+    /// The M3 runtime's UAT on the admitted `soc`: the bootloader-reserved handoff tables, with
+    /// the root geometry of that SoC (42-bit roots and output addresses on every AGX3 part). On
     /// T6030 this is chip 0x6030, 42/42, the configuration its runtime always used.
-    fn m3_runtime(cfg: &'static hw::HwConfig) -> Result<Self> {
-        let soc = crate::m3_soc::by_chip(cfg.chip_id).ok_or(ENODEV)?;
-        if cfg.uat_ias != 42 || cfg.uat_oas != 42
-            || !soc.hwcfg.is_some_and(|expected| core::ptr::eq(expected, cfg))
-        {
+    ///
+    /// The caller passes the SoC its resource admission accepted, rather than this looking the
+    /// chip up in the runtime table: an armed T6031 start is admitted without being in that
+    /// table, which stays T6030 and T8122 only.
+    fn m3_runtime(soc: &'static crate::m3_soc::Soc) -> Result<Self> {
+        let cfg = soc.hwcfg.ok_or(ENODEV)?;
+        if cfg.chip_id != soc.chip_id || cfg.uat_ias != 42 || cfg.uat_oas != 42 {
             return Err(ENODEV);
         }
         Ok(Self {
@@ -2645,7 +2647,7 @@ impl Uat {
             if region.start() != firmware.resources.regions[i].base
                 || region.size() != firmware.resources.regions[i].size { return Err(EINVAL); }
         }
-        Self::new_with_config(dev, UatConfig::m3_runtime(&hw::t8122::HWCONFIG_T8122)?,
+        Self::new_with_config(dev, UatConfig::m3_runtime(&crate::m3_soc::T8122)?,
             false, HandoffMode::FirmwareG16)
     }
 
@@ -2666,16 +2668,16 @@ impl Uat {
         self.inner.firmware_cache_flush_ready.store(false, Ordering::Release);
     }
 
-    /// The M3 runtime's UAT on the SoC of `cfg` (`m3_soc::Soc::hwcfg`).
+    /// The M3 runtime's UAT on the admitted `soc`, with its `m3_soc::Soc::hwcfg`.
     ///
     /// # Safety
     /// The admitted RTKit (J514S on T6030) has completed wake, but has not received an initdata
     /// root. The owner retains power and excludes GPU jobs until publication.
     pub(crate) unsafe fn new_m3_running(
         dev: &driver::AsahiDevice,
-        cfg: &'static hw::HwConfig,
+        soc: &'static crate::m3_soc::Soc,
     ) -> Result<Self> {
-        Self::new_with_config(dev, UatConfig::m3_runtime(cfg)?, true, HandoffMode::FirmwareM3)
+        Self::new_with_config(dev, UatConfig::m3_runtime(soc)?, true, HandoffMode::FirmwareM3)
     }
 
     #[inline(never)]
