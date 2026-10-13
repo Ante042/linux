@@ -45,7 +45,27 @@ pub(crate) struct Packet {
     finish_claimed: AtomicBool,
     /// Queue urgency (3 = UAPI realtime .. 0 = UAPI low): more urgent packets are published first.
     pub(crate) urgency:u8,
+    /// Who submitted the packet, for the failure log only.
+    pub(crate) owner:Owner,
     vm_job:Pin<KBox<Mutex<Option<mmu::M3VmJobGuard>>>>,
+}
+/// The process and thread that submitted a packet, recorded in the submit ioctl. Only logged:
+/// a renamed task leaves a stale name, which is harmless.
+#[derive(Copy,Clone)]
+pub(crate) struct Owner {pub(crate) pid:i32,process:[u8;16],thread:[u8;16]}
+impl Owner {
+    fn current()->Self {
+        let task=kernel::current!();
+        let leader=task.group_leader();
+        Self {pid:leader.pid(),process:crate::m3_client::task_comm(leader),
+            thread:crate::m3_client::task_comm(task)}
+    }
+    fn name(comm:&[u8;16])->&str {
+        let len=comm.iter().position(|&b|b==0).unwrap_or(comm.len());
+        core::str::from_utf8(&comm[..len]).unwrap_or("?")
+    }
+    pub(crate) fn process(&self)->&str {Self::name(&self.process)}
+    pub(crate) fn thread(&self)->&str {Self::name(&self.thread)}
 }
 impl Packet {
     pub(crate) fn profile_id(&self)->usize {self as *const Self as usize}
@@ -199,7 +219,7 @@ impl queue::Queue for Queue {
         parser.finish().map_err(|_|EINVAL)?;
         let packet=Arc::new(Packet{vm:self.vm.clone(),commands,timestamps,attachments:flushes,wide_visibility:visibility,
             completion:self.fences.new_fence(0,Completion)?.into(),
-            finish_claimed:AtomicBool::new(false),urgency:self.urgency,
+            finish_claimed:AtomicBool::new(false),urgency:self.urgency,owner:Owner::current(),
             vm_job:KBox::pin_init(new_mutex!(Some(vm_job)),GFP_KERNEL)?},GFP_KERNEL)?;
         let mut job=self.entity.new_job(1,Job{shared:self.shared.clone(),packet})?;
         for sync in syncs.drain(0..in_sync_count) {if let Some(f)=sync.fence {job.add_dependency(f)?;}}

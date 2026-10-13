@@ -357,6 +357,27 @@ impl Config {
             halt_count,halted,resume,info[0],info[1],packet,self.completed_events,events);
         Ok(())
     }
+    /// Read-only: log the event ring entries from the host's read index to the firmware's write
+    /// index (at most 16), as `drain` reads them. Nothing is consumed or acknowledged, and the
+    /// completion count is not changed.
+    pub(crate) fn log_event_ring(&mut self, dev: &driver::AsahiDevice) -> Result {
+        const SIZE: usize = 0x38;
+        const COUNT: usize = 256;
+        let r = self.objects[storage::EVENT*2].read_u32(0)? as usize;
+        let w = self.objects[storage::EVENT*2].read_u32(0x20)? as usize;
+        dev_info!(dev.as_ref(), "M3 event ring: read={} write={}\n", r, w);
+        if r >= COUNT || w >= COUNT { return Err(EIO); }
+        let mut index = r;
+        for _ in 0..16 {
+            if index == w { break; }
+            let mut raw = [0u8; SIZE];
+            self.objects[storage::EVENT*2+1].read(index * SIZE, &mut raw)?;
+            dev_info!(dev.as_ref(), "M3 event ring entry {} kind={} bytes={:02x?}\n",
+                index, u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]), raw);
+            index = (index + 1) % COUNT;
+        }
+        Ok(())
+    }
     pub(crate) fn control(&mut self, opcode: u32) -> Result<u32> {
         if !matches!(opcode, 0x13 | 9) { return Err(EINVAL); }
         let w = self.objects[storage::DEVICE_CONTROL*2].read_u32(0x20)?;
