@@ -495,6 +495,8 @@ static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route)
 		if (sel && sel != -EOPNOTSUPP)
 			dev_warn(dcp->dev, "DP tunnel source reset failed: %d\n", sel);
 	}
+	if (dcp_is_external_h17p(dcp))
+		dpavservep_detach(dcp);
 	route->selected = false;
 	if (dcp->active_typec_route == route)
 		dcp->active_typec_route = NULL;
@@ -1751,6 +1753,10 @@ static void send_vblank_event(struct drm_device *dev,
 
 /**
  * dcp_crtc_send_page_flip_event - helper to send vblank event after pageflip
+ * @crtc: CRTC whose flip completed
+ * @e: pending vblank event
+ * @now: swap completion timestamp
+ * @start: swap submission timestamp
  *
  * Compensate for unknown slack between page flip and arrival of the
  * swap_complete callback. Minimal observed duration on DCP with HDMI output
@@ -2017,15 +2023,13 @@ void dcp_set_dimensions(struct apple_dcp *dcp)
 		height_mm = dcp->panel.height_mm;
 	}
 
-	/* Set the connector info */
-	if (dcp->connector) {
-		struct drm_connector *connector = &dcp->connector->base;
-
-		mutex_lock(&connector->dev->mode_config.mutex);
-		connector->display_info.width_mm = width_mm;
-		connector->display_info.height_mm = height_mm;
-		mutex_unlock(&connector->dev->mode_config.mutex);
-	}
+	/*
+	 * This callback runs on the ordered RTKit RX worker. A mode probe
+	 * can hold mode_config.mutex while waiting for an AFK reply which
+	 * that same worker still has to dispatch. Defer the DRM update.
+	 */
+	if (dcp->connector && !READ_ONCE(dcp->quiescing))
+		schedule_work(&dcp->connector->hotplug_wq);
 
 	/*
 	 * Fix up any probed modes. Modes are created when parsing
@@ -2036,6 +2040,21 @@ void dcp_set_dimensions(struct apple_dcp *dcp)
 		dcp->modes[i].mode.width_mm = width_mm;
 		dcp->modes[i].mode.height_mm = height_mm;
 	}
+}
+
+void dcp_update_connector_dimensions(struct apple_dcp *dcp,
+				     struct drm_connector *connector)
+{
+	int width_mm = READ_ONCE(dcp->width_mm);
+	int height_mm = READ_ONCE(dcp->height_mm);
+
+	lockdep_assert_held(&connector->dev->mode_config.mutex);
+	if (!width_mm || !height_mm) {
+		width_mm = dcp->panel.width_mm;
+		height_mm = dcp->panel.height_mm;
+	}
+	connector->display_info.width_mm = width_mm;
+	connector->display_info.height_mm = height_mm;
 }
 
 bool dcp_has_panel(struct apple_dcp *dcp)
@@ -2075,6 +2094,11 @@ static void dcp_delayed_vblank(struct work_struct *work)
 
 static struct apple_dcp_afkep *dcp_afkep(struct apple_dcp *dcp, u8 endpoint)
 {
+	/* DPAV 0x2a on H17P overlaps the legacy DPTX endpoint number. */
+	if (dcp->dcpavservep && endpoint == dcp->dcpavservep->endpoint)
+		return dcp->dcpavservep;
+	if (dcp->dptxep && endpoint == dcp->dptxep->endpoint)
+		return dcp->dptxep;
 	switch (endpoint) {
 	case AV_ENDPOINT:
 		return dcp->avep;
@@ -2082,13 +2106,6 @@ static struct apple_dcp_afkep *dcp_afkep(struct apple_dcp *dcp, u8 endpoint)
 		return dcp->systemep;
 	case DISP0_ENDPOINT:
 		return dcp->ibootep;
-	case DPAVSERV_ENDPOINT:
-		return dcp->dcpavservep;
-	case DPTX_ENDPOINT:
-		return dcp->dptxep;
-	case DPTX_ENDPOINT_V2:
-		return dcp->hw.iomfb_method_profile ==
-		       DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL ? dcp->dptxep : NULL;
 	case DPTX_CONTROLLER_ENDPOINT:
 		return dcp->dptx_controller_ep;
 	default:
@@ -2156,34 +2173,10 @@ static void dcp_recv_msg(void *cookie, u8 endpoint, u64 message)
 		return;
 	}
 
-	switch (endpoint) {
-	case IOMFB_ENDPOINT:
+	if (endpoint == IOMFB_ENDPOINT)
 		return iomfb_recv_msg(dcp, message);
-	case AV_ENDPOINT:
-		ep = dcp->avep;
-		break;
-	case SYSTEM_ENDPOINT:
-		ep = dcp->systemep;
-		break;
-	case DISP0_ENDPOINT:
-		ep = dcp->ibootep;
-		break;
-	case DPAVSERV_ENDPOINT:
-		ep = dcp->dcpavservep;
-		break;
-	case DPTX_ENDPOINT:
-		ep = dcp->dptxep;
-		break;
-	case DPTX_ENDPOINT_V2:
-		ep = dcp->dptxep;
-		break;
-	case DPTX_CONTROLLER_ENDPOINT:
-		ep = dcp->dptx_controller_ep;
-		break;
-	default:
-		ep = NULL;
-		break;
-	}
+
+	ep = dcp_afkep(dcp, endpoint);
 
 	if (!ep) {
 		dev_warn_ratelimited(dcp->dev,
@@ -2627,16 +2620,21 @@ static int dcp_external_disconnect(struct apple_dcp *dcp, bool physical)
 	cancel_delayed_work_sync(&dcp->typec_reconnect_wq);
 	cancel_delayed_work_sync(&dcp->placeholder_edid_wq);
 	guard(mutex)(&dcp->external_lock);
-	ret = dcp_external_stop_locked(dcp, dcp->external_generation);
+	/* Invalidate physical EDID before waiting for firmware power/link teardown. */
 	if (physical) {
-		dcp->external_cable = false;
-		dcp->external_generation++;
-		dcp_external_publish_generation(dcp);
 		scoped_guard(mutex, &dcp->hpd_mutex) {
 			WRITE_ONCE(dcp->typec_cable_connected, false);
 			dcp->typec_generation++;
 			dcp_firmware_metadata_connection(dcp, dcp->typec_generation, false);
 		}
+		/* HPD is fenced; retire the AV owner after releasing hpd_mutex. */
+		dpavservep_detach(dcp);
+	}
+	ret = dcp_external_stop_locked(dcp, dcp->external_generation);
+	if (physical) {
+		dcp->external_cable = false;
+		dcp->external_generation++;
+		dcp_external_publish_generation(dcp);
 		/* A missing cable is reported even when its hardware remains owned. */
 		dcp_external_report_disconnected(dcp);
 	}
@@ -2655,6 +2653,8 @@ static void dcp_external_stop_work(struct work_struct *work)
 	cancel_delayed_work_sync(&dcp->placeholder_edid_wq);
 	guard(mutex)(&dcp->external_lock);
 	if (generation == dcp->external_generation) {
+		/* The deferred disconnect also covers missing out-of-band HPD. */
+		dpavservep_detach(dcp);
 		dcp_external_stop_locked(dcp, generation);
 		dcp_external_report_disconnected(dcp);
 	}
@@ -3845,6 +3845,8 @@ static void dcp_disable_typec_work(struct apple_dcp *dcp, bool release_cable)
 		dcp->typec_generation++;
 		dcp_firmware_metadata_connection(dcp, dcp->typec_generation, false);
 	}
+	if (release_cable && dcp_is_external_h17p(dcp))
+		dpavservep_detach(dcp);
 	/* Block new enqueues as well as draining users of the AFK endpoints. */
 	disable_delayed_work_sync(&dcp->typec_reconnect_wq);
 	disable_delayed_work_sync(&dcp->placeholder_edid_wq);
@@ -4237,7 +4239,7 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	mutex_init(&dcp->tb_lock);
 	spin_lock_init(&dcp->mode_state.lock);
 	spin_lock_init(&dcp->metadata.lock);
-	spin_lock_init(&dcp->dcpavserv.lock);
+	mutex_init(&dcp->dcpavserv.lock);
 	dcp->hw = *(struct apple_dcp_hw_data *)of_device_get_match_data(dev);
 	if (dcp->hw.iomfb_method_profile ==
 	    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL) {

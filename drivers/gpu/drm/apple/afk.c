@@ -165,7 +165,7 @@ void afk_trace_ring_snapshot(struct apple_dcp_afkep *ep)
 	u32 rx_rptr = 0, rx_wptr = 0, tx_rptr = 0, tx_wptr = 0;
 	bool rx_ready, tx_ready;
 
-	if (!ep || !ep->inline_v2 || !trace_afk_ring_snapshot_enabled())
+	if (!ep || !ep->wire_v2 || !trace_afk_ring_snapshot_enabled())
 		return;
 	spin_lock_irqsave(&ep->lock, flags);
 	if (ep->stopping) {
@@ -884,7 +884,8 @@ static void afk_v2_receive(struct apple_dcp_afkep *ep, u32 channel, u32 type,
 		if (frame.type == EPIC_SUBTYPE_ANNOUNCE_H17P)
 			afk_recv_handle_init(ep, frame.interface, (void *)frame.payload,
 					     frame.payload_size);
-		else if (frame.type == AFKV2_CLOSE && frame.interface_flags == 1)
+		else if ((frame.type == AFKV2_CLOSE && frame.interface_flags == 1) ||
+			 (ep == ep->dcp->dcpavservep && afkv2_closed_report(&frame)))
 			afk_recv_handle_teardown(ep, frame.interface);
 		return;
 	}
@@ -1680,7 +1681,7 @@ static int afk_send_command_timeout_len(struct apple_epic_service *service, u8 t
 	ret = 0;
 	if (retcode)
 		*retcode = service->cmds[idx].retcode;
-	if (ep->inline_v2 && received)
+	if (ep->wire_v2 && received)
 		copy_len = service->cmds[idx].reply_length;
 	if (ep->wire_v2 && !service->cmds[idx].retcode &&
 	    service->cmds[idx].reply_length < copy_len)
