@@ -65,7 +65,7 @@ pub(crate) enum GpuCore {
     // G15P = 21,
     G15G = 22,
     G15S = 23,
-    /// The next entry of the same list, not confirmed; only the T6031 table names it.
+    /// Not confirmed on hardware yet; only the T6031 table uses it.
     #[allow(dead_code)]
     G15C = 24,
 }

@@ -59,8 +59,8 @@ pub(crate) const HWB_454: u32 = 1;
 pub(crate) const HWB_B20: u32 = 0x28;
 pub(crate) const HWB_17B8: u32 = 5;
 pub(crate) const HWB_1818: u32 = 1;
-/// The default firmware GPU core type: G15C in the firmware's core type list (`hw::GpuCore`,
-/// where G15G = 22 and G15S = 23 are the values the T8122 and T6030 firmware take).
+/// The default GPU core type for T6031, `hw::GpuCore::G15C`. T8122 uses G15G (22) and T6030
+/// uses G15S (23).
 pub(crate) const GPU_CORE: u32 = 24;
 /// The power target while the boot loader's power model is a stand-in, in mW.
 pub(crate) const POWER_CAP_MW: u32 = 30_000;
@@ -614,9 +614,9 @@ impl Values {
         }
     }
 
-    /// The firmware's revision id: as given, or for the revision read, the one the firmware's
-    /// revision list gives it. Revision 0x12 has no entry in that list; it takes B1's (4), the
-    /// nearest earlier revision, until a start shows otherwise.
+    /// The revision id passed to the firmware: as given, or the one mapped below from the
+    /// revision read. Revision 0x12 has no mapping of its own; it takes B1's (4), the nearest
+    /// earlier revision, until a start shows otherwise.
     pub(crate) fn rev_id(&self, revision: u32) -> Option<u32> {
         self.rev_id.or(match revision {
             0x00 => Some(1),
@@ -749,8 +749,7 @@ pub(crate) struct Identity {
 /// The core slots of T6031: four clusters of ten.
 pub(crate) const CORE_SLOTS: u32 = 40;
 
-/// The GPU revisions with an entry in the revision lists, as the revision byte of the
-/// identification word.
+/// The GPU revisions this driver maps, as the revision byte of the identification word.
 pub(crate) const REVISIONS: [u32; 7] = [0x00, 0x01, 0x10, 0x11, 0x12, 0x20, 0x21];
 
 /// Admit the boot loader's reading: the 14.8.3 firmware ABI, a successful guarded read
@@ -778,7 +777,7 @@ pub(crate) fn validate_identity(
     }
     let revision = (id_version >> 8) & 0xff;
     if !REVISIONS.contains(&revision) {
-        return Err("id-version has a revision the GPU revision list does not have");
+        return Err("id-version has a revision this driver does not map");
     }
     let core_mask = u64::from(masks[0]) | (u64::from(masks[1]) << 32);
     if core_mask == 0 || core_mask >> CORE_SLOTS != 0 || masks[2] != 0 || masks[3] != 0 {

@@ -35,8 +35,8 @@ pub(crate) const HWCONFIG_T6031: super::HwConfig = HwConfig {
     chip_id: 0x6031,
     gpu_gen: GpuGen::G15,       // ID_VERSION[31:24] == 7
     gpu_variant: GpuVariant::C, // ID_VERSION[23:16] == 4, one die
-    // The next entry of the firmware core type list after G15G (22) and G15S (23); not
-    // confirmed (`t6031_knobs::GPU_CORE` lists the alternatives).
+    // G15C (24), after G15G (22) and G15S (23). Not confirmed on hardware yet
+    // (`t6031_knobs::GPU_CORE` lists the alternatives).
     gpu_core: Some(GpuCore::G15C),
 
     // The 24 MHz reference clock, 42-bit UAT roots and output addresses, as on every AGX3 part.
