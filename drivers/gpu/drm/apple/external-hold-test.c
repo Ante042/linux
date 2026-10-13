@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /*
- * A display on a direct Type-C route whose description the firmware
- * withdraws while the port keeps HPD: what a compositor that probes the
- * connector reads, and which hotplug events it gets. The probes run the
- * production detect, get_modes and mode_valid callbacks through the DRM
- * probe helper, as DRM_IOCTL_MODE_GETCONNECTOR does.
+ * A display on a direct Type-C route, or on the fixed HDMI output, whose
+ * description the firmware withdraws while the port keeps HPD: what a
+ * compositor that probes the connector reads, and which hotplug events it
+ * gets. The probes run the production detect, get_modes and mode_valid
+ * callbacks through the DRM probe helper, as DRM_IOCTL_MODE_GETCONNECTOR
+ * does.
  */
+#include <kunit/static_stub.h>
 #include <kunit/test.h>
 #include <linux/platform_device.h>
 #include <linux/workqueue.h>
@@ -39,6 +41,8 @@ struct hold_fixture {
 	enum drm_connector_status observed_status;
 	unsigned int notifications;
 	atomic_t relinks;
+	/* The HDMI HPD level, for the fixed HDMI output. */
+	bool hdmi_hpd;
 };
 
 static const struct drm_display_mode hold_1080p = {
@@ -191,6 +195,42 @@ static void hold_attach(struct kunit *test, struct hold_fixture *f)
 	KUNIT_ASSERT_EQ(test, f->observed_status, connector_status_connected);
 }
 
+/* Stands in for the HDMI HPD GPIO, which the test machine does not have. */
+static bool hold_hdmi_port_attached(struct apple_dcp *dcp)
+{
+	return READ_ONCE(container_of(dcp, struct hold_fixture, dcp)->hdmi_hpd);
+}
+
+/* The pipe drives its fixed HDMI output, with HPD at @hpd. */
+static void hold_use_hdmi(struct kunit *test, struct hold_fixture *f, bool hpd)
+{
+	f->dcp.fixed_connector_type = DRM_MODE_CONNECTOR_HDMIA;
+	f->dcp.typec_cable_connected = false;
+	f->hdmi_hpd = hpd;
+	kunit_activate_static_stub(test, dcp_hdmi_port_attached, hold_hdmi_port_attached);
+}
+
+/* The desktop set the mode, which also resets the retry count. */
+static void hold_mode_set(struct hold_fixture *f)
+{
+	dcp_mode_set_valid(&f->dcp.mode_state, true);
+	atomic_set(&f->dcp.external_retries, 0);
+}
+
+/* The connector has an EDID, as after the compositor's first probe. */
+static void hold_install_edid(struct kunit *test, struct hold_fixture *f)
+{
+	const struct drm_edid *edid;
+	u64 generation;
+
+	KUNIT_ASSERT_TRUE(test, apple_connector_edid_begin(&f->connector, &f->pipeline,
+							   &generation));
+	edid = drm_edid_alloc(test_edid_dvi_1080p, sizeof(test_edid_dvi_1080p));
+	KUNIT_ASSERT_NOT_NULL(test, edid);
+	KUNIT_ASSERT_TRUE(test, apple_connector_edid_install(&f->connector, &f->pipeline,
+							     generation, edid));
+}
+
 /* The retry's timer fires now. */
 static void hold_fire_retry(struct kunit *test, struct hold_fixture *f)
 {
@@ -337,14 +377,130 @@ static void hold_needs_queued_retry(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, f->observed_status, connector_status_disconnected);
 }
 
-/* A fixed (HDMI) output disconnects at once, as before. */
-static void hold_not_for_fixed_output(struct kunit *test)
+/*
+ * The HDMI port withdraws the description after a connect and after mode
+ * sets, with HPD high. A probe in the window reads the display, with its
+ * modes and EDID; the return sends one event and no status change.
+ */
+static void hold_hdmi_keeps_modes(struct kunit *test)
+{
+	struct hold_fixture *f = test->priv;
+	enum drm_connector_status status;
+	bool has_edid;
+
+	hold_use_hdmi(test, f, true);
+	hold_attach(test, f);
+	hold_install_edid(test, f);
+
+	iomfb_v14_7_external_withdrawn(&f->dcp);
+	flush_work(&f->connector.hotplug_wq);
+	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&f->dcp.external_retry_wq));
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->dcp.external_held), 1);
+	KUNIT_EXPECT_FALSE(test, READ_ONCE(f->dcp.mode_state.valid));
+	KUNIT_EXPECT_EQ(test, f->notifications, 1U);
+	KUNIT_EXPECT_EQ(test, hold_probe(f, &status, &has_edid), 1);
+	KUNIT_EXPECT_EQ(test, status, connector_status_connected);
+	KUNIT_EXPECT_TRUE(test, has_edid);
+
+	dcp_v14_external_hotplug(&f->dcp, true);
+	flush_work(&f->connector.hotplug_wq);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->dcp.external_held), 0);
+	KUNIT_EXPECT_EQ(test, f->notifications, 2U);
+	KUNIT_EXPECT_EQ(test, f->observed_status, connector_status_connected);
+	KUNIT_EXPECT_EQ(test, hold_probe(f, &status, &has_edid), 1);
+	KUNIT_EXPECT_EQ(test, status, connector_status_connected);
+	KUNIT_EXPECT_TRUE(test, has_edid);
+
+	/* Set again before the retry fires: it finds the display set, silently. */
+	hold_mode_set(f);
+	hold_fire_retry(test, f);
+	KUNIT_EXPECT_TRUE(test, READ_ONCE(f->connector.connected));
+	KUNIT_EXPECT_EQ(test, f->notifications, 2U);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->relinks), 0);
+}
+
+/*
+ * Unlike a Type-C connection, every HDMI withdrawal with HPD high is held,
+ * here more often than there are retries: each mode set that succeeds gives
+ * the retries back. Each return sends one event; none reports a disconnect.
+ */
+static void hold_hdmi_every_withdrawal(struct kunit *test)
+{
+	struct hold_fixture *f = test->priv;
+	unsigned int i;
+
+	hold_use_hdmi(test, f, true);
+	hold_attach(test, f);
+	for (i = 0; i < HOLD_MAX_RETRIES + 1; i++) {
+		iomfb_v14_7_external_withdrawn(&f->dcp);
+		flush_work(&f->connector.hotplug_wq);
+		KUNIT_EXPECT_EQ(test, atomic_read(&f->dcp.external_held), 1);
+		KUNIT_EXPECT_TRUE(test, READ_ONCE(f->connector.connected));
+		KUNIT_EXPECT_EQ(test, f->notifications, 1U + i);
+
+		dcp_v14_external_hotplug(&f->dcp, true);
+		flush_work(&f->connector.hotplug_wq);
+		KUNIT_EXPECT_EQ(test, atomic_read(&f->dcp.external_held), 0);
+		KUNIT_EXPECT_EQ(test, f->notifications, 2U + i);
+		KUNIT_EXPECT_EQ(test, f->observed_status, connector_status_connected);
+
+		hold_mode_set(f);
+		hold_fire_retry(test, f);
+		KUNIT_EXPECT_EQ(test, f->notifications, 2U + i);
+	}
+}
+
+/*
+ * Not described again, and the display unplugged meanwhile: the retry
+ * reports one disconnect.
+ */
+static void hold_hdmi_not_back_releases(struct kunit *test)
+{
+	struct hold_fixture *f = test->priv;
+	enum drm_connector_status status;
+
+	hold_use_hdmi(test, f, true);
+	hold_attach(test, f);
+	iomfb_v14_7_external_withdrawn(&f->dcp);
+	flush_work(&f->connector.hotplug_wq);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->dcp.external_held), 1);
+	KUNIT_EXPECT_EQ(test, f->notifications, 1U);
+
+	f->hdmi_hpd = false;
+	hold_fire_retry(test, f);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->dcp.external_held), 0);
+	KUNIT_EXPECT_FALSE(test, READ_ONCE(f->connector.connected));
+	KUNIT_EXPECT_EQ(test, f->notifications, 2U);
+	KUNIT_EXPECT_EQ(test, f->observed_status, connector_status_disconnected);
+	KUNIT_EXPECT_EQ(test, hold_probe(f, &status, NULL), 0);
+	KUNIT_EXPECT_EQ(test, status, connector_status_disconnected);
+}
+
+/* HDMI HPD low at the withdrawal: a disconnect at once, no retry. */
+static void hold_hdmi_hpd_low_disconnects(struct kunit *test)
 {
 	struct hold_fixture *f = test->priv;
 
-	f->dcp.fixed_connector_type = DRM_MODE_CONNECTOR_HDMIA;
-	f->dcp.typec_cable_connected = false;
+	hold_use_hdmi(test, f, true);
 	hold_attach(test, f);
+	f->hdmi_hpd = false;
+	iomfb_v14_7_external_withdrawn(&f->dcp);
+	flush_work(&f->connector.hotplug_wq);
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&f->dcp.external_retry_wq));
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->dcp.external_held), 0);
+	KUNIT_EXPECT_FALSE(test, READ_ONCE(f->connector.connected));
+	KUNIT_EXPECT_EQ(test, f->notifications, 2U);
+	KUNIT_EXPECT_EQ(test, f->observed_status, connector_status_disconnected);
+}
+
+/* HDMI with no retry left to bound the hold: a disconnect, as before. */
+static void hold_hdmi_needs_queued_retry(struct kunit *test)
+{
+	struct hold_fixture *f = test->priv;
+
+	hold_use_hdmi(test, f, true);
+	hold_attach(test, f);
+	atomic_set(&f->dcp.external_retries, HOLD_MAX_RETRIES);
 	iomfb_v14_7_external_withdrawn(&f->dcp);
 	flush_work(&f->connector.hotplug_wq);
 	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&f->dcp.external_retry_wq));
@@ -391,7 +547,11 @@ static struct kunit_case hold_test_cases[] = {
 	KUNIT_CASE(hold_not_back_releases),
 	KUNIT_CASE(hold_once_per_connection),
 	KUNIT_CASE(hold_needs_queued_retry),
-	KUNIT_CASE(hold_not_for_fixed_output),
+	KUNIT_CASE(hold_hdmi_keeps_modes),
+	KUNIT_CASE(hold_hdmi_every_withdrawal),
+	KUNIT_CASE(hold_hdmi_not_back_releases),
+	KUNIT_CASE(hold_hdmi_hpd_low_disconnects),
+	KUNIT_CASE(hold_hdmi_needs_queued_retry),
 	KUNIT_CASE(hold_not_for_tunnel),
 	KUNIT_CASE(hold_stale_release_ignored),
 	{ }
