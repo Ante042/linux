@@ -7,6 +7,7 @@
 #include <linux/err.h>
 #include <linux/kconfig.h>
 #include <linux/of_platform.h>
+#include <linux/ratelimit.h>
 #include <linux/slab.h>
 #include <linux/sizes.h>
 #include <linux/unaligned.h>
@@ -341,6 +342,20 @@ static int afk_send_epic_token(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 			       enum epic_type etype, enum epic_category ecat, u8 stype,
 			       const void *payload, size_t payload_len, u64 token);
 
+/* Only parsed identity metadata; never dump property blobs or peer memory. */
+static void afk_dpav_announcement(struct apple_dcp_afkep *ep, u32 channel,
+				 const char *name, const char *class, s64 unit,
+				 const struct apple_epic_service_ops *ops,
+				 const char *reason, int ret)
+{
+	if (!ep->wire_v2 || ep != ep->dcp->dcpavservep)
+		return;
+	dev_info_ratelimited(ep->dcp->dev,
+		"AFK DPAV ep:%02x channel:%u compartment:%.48s class:%.48s unit:%lld ops:%.32s reason:%s ret:%d\n",
+		ep->endpoint, channel, name ?: "(absent)", class ?: "(absent)",
+		unit, ops ? ops->name : "(none)", reason, ret);
+}
+
 static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 				 u8 *payload, size_t payload_size)
 {
@@ -355,8 +370,12 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 	u8 *props = payload + sizeof(name);
 	size_t props_size = payload_size - sizeof(name);
 
-	if (afk_epic_find_service(ep, channel))
+	service = afk_epic_find_service(ep, channel);
+	if (service) {
+		afk_dpav_announcement(ep, channel, NULL, NULL, -1, service->ops,
+				      "active-or-pending-channel", -EBUSY);
 		return;
+	}
 
 	if (payload_size < sizeof(name)) {
 		dev_err(ep->dcp->dev, "AFK[ep:%02x]: payload too small: %lx\n",
@@ -399,6 +418,8 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 		ops = afk_match_service(ep, service_name);
 
 	if (!ops) {
+		afk_dpav_announcement(ep, channel, epic_name, epic_class, epic_unit,
+				      NULL, "unmatched-compartment", -ENODEV);
 		dev_err(ep->dcp->dev,
 			"AFK[ep:%02x]: unable to match service %s on channel %d\n",
 			ep->endpoint, service_name, channel);
@@ -414,6 +435,8 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 		}
 	}
 	if (!service) {
+		afk_dpav_announcement(ep, channel, epic_name, epic_class, epic_unit,
+				      ops, "no-reusable-slot", -EBUSY);
 		dev_err(ep->dcp->dev, "AFK[ep:%02x]: no reusable service slots\n",
 			ep->endpoint);
 		goto free;
@@ -423,6 +446,8 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 		int ret = ops->prepare(service, epic_name, epic_class, epic_unit);
 
 		if (ret) {
+			afk_dpav_announcement(ep, channel, epic_name, epic_class,
+					      epic_unit, ops, "prepare-rejected", ret);
 			dev_err(ep->dcp->dev, "AFK service %s admission failed: %d\n",
 				service_name, ret);
 			afk_service_discard(service);
@@ -436,6 +461,8 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 		if (ret) {
 			unsigned long flags;
 
+			afk_dpav_announcement(ep, channel, epic_name, epic_class,
+					      epic_unit, ops, "open-failed", ret);
 			if (ops->prepare) {
 				afk_service_discard(service);
 			} else {
@@ -453,6 +480,9 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 		afk_service_publish(service);
 	if (ops->init)
 		ops->init(service, epic_name, epic_class, epic_unit);
+	afk_dpav_announcement(ep, channel, epic_name, epic_class, epic_unit, ops,
+			      READ_ONCE(service->enabled) && !READ_ONCE(service->torndown) ?
+			      "initialized" : "retired-during-init", 0);
 	dev_info(ep->dcp->dev, "AFK[ep:%02x]: new service %s on channel %d\n",
 		 ep->endpoint, service_name, channel);
 

@@ -10,6 +10,7 @@
 
 #include <linux/completion.h>
 #include <linux/device.h>
+#include <linux/ratelimit.h>
 #include <linux/types.h>
 
 #include "../afk.h"
@@ -61,8 +62,13 @@ static int dcpavserv_prepare(struct apple_epic_service *service, const char *nam
 	bool v2 = service->ep->wire_v2;
 	int ret = 0;
 
-	if (!dcpavserv_identity(service, name, class, unit))
+	if (!dcpavserv_identity(service, name, class, unit)) {
+		if (v2)
+			dev_info_ratelimited(dcp->dev,
+				"DCPAVSERV: channel:%u prepare rejected: identity\n",
+				service->channel);
 		return -ENODEV;
+	}
 	if (v2)
 		mutex_lock(&dcp->hpd_mutex);
 	mutex_lock(&dcp->dcpavserv.lock);
@@ -74,6 +80,12 @@ static int dcpavserv_prepare(struct apple_epic_service *service, const char *nam
 		service->admission.generation = v2 ? dcp->typec_generation : 0;
 		service->admission.epoch = dcp->dcpavserv.epoch;
 	}
+	if (v2 && ret)
+		dev_info_ratelimited(dcp->dev,
+			"DCPAVSERV: channel:%u prepare rejected: %s generation:%llu cable:%u quiescing:%u\n",
+			service->channel, ret == -EBUSY ? "owner" : "attachment",
+			dcp->typec_generation, dcp->typec_cable_connected,
+			READ_ONCE(dcp->quiescing));
 	mutex_unlock(&dcp->dcpavserv.lock);
 	if (v2)
 		mutex_unlock(&dcp->hpd_mutex);
@@ -104,6 +116,14 @@ static void dcpavserv_init(struct apple_epic_service *service, const char *name,
 			published = true;
 		}
 	}
+	if (v2 && !published)
+		dev_info_ratelimited(dcp->dev,
+			"DCPAVSERV: channel:%u init rejected: identity:%u owner:%u epoch:%llu/%llu generation:%llu/%llu cable:%u quiescing:%u\n",
+			service->channel, dcpavserv_identity(service, name, class, unit),
+			dcp->dcpavserv.enabled, service->admission.epoch,
+			dcp->dcpavserv.epoch, service->admission.generation,
+			dcp->typec_generation, dcp->typec_cable_connected,
+			READ_ONCE(dcp->quiescing));
 	mutex_unlock(&dcp->dcpavserv.lock);
 	if (v2)
 		mutex_unlock(&dcp->hpd_mutex);

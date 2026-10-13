@@ -38,6 +38,7 @@ typedef int64_t s64;typedef uint32_t u32;typedef uint64_t u64;
 #define to_platform_device(p) (p)
 #define trace_dcpavserv_init(...) ((void)0)
 #define dev_info(...) ((void)0)
+#define dev_info_ratelimited(...) ((void)0)
 #define dev_err(...) ((void)0)
 static unsigned int warnings;
 #define dev_warn(...) (warnings++)

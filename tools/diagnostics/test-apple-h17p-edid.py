@@ -57,6 +57,7 @@ static bool *once(bool *p) { assert(*p); *p=false; return NULL; }
 static void mutex_lock(bool *p) { (void)acquire(p); }
 static void mutex_unlock(bool *p) { (void)once(p); }
 #define dev_info(...) ((void)0)
+#define dev_info_ratelimited(...) ((void)0)
 #define dev_err(...) ((void)0)
 #define trace_dcpavserv_init(...) ((void)0)
 #define DRM_CONNECTOR_REGISTERED 1
