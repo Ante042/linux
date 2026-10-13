@@ -389,6 +389,7 @@ struct apple_dcp {
 	struct dcpavserv dcpavserv;
 
 	struct apple_dcp_afkep *avep;
+	struct apple_dcp_afkep *av_discovery;
 	struct audiosrv_data *audiosrv;
 
 	struct apple_dcp_afkep *dptxep;
