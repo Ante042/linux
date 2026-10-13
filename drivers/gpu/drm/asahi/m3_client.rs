@@ -88,7 +88,7 @@ impl ClientGate {
 }
 
 /// The name of `task`, for log lines only.
-fn task_comm(task: &kernel::task::Task) -> [u8; 16] {
+pub(crate) fn task_comm(task: &kernel::task::Task) -> [u8; 16] {
     let mut name = [0u8; 16];
     // SAFETY: `comm` is a fixed-size array inside the live task. It is read byte by byte with
     // volatile loads because a concurrent rename may change it; a torn name is only printed.

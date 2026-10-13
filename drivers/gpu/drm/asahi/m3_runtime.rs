@@ -124,8 +124,10 @@ impl Inner {
     }
     /// asahi.g15_debug bit 56. Wait up to 100 ms for the firmware to report
     /// that it halted, resume it, and log every change of the halt words,
-    /// the engine state, the failed job's retirement and the event count
-    /// for about half a second. The GPU stays marked failed.
+    /// the engine state, the failed job's retirement, whether every queue
+    /// message was consumed and the event count for about half a second,
+    /// then the event ring entries the host has not consumed. The GPU stays
+    /// marked failed; the event ring's read index is not advanced.
     fn resume_experiment(&mut self, index: usize, vm: &mmu::Vm) -> Result {
         let start=Instant::<Monotonic>::now();
         let mut halt=self.config.halt_state()?;
@@ -146,12 +148,14 @@ impl Inner {
             // 0: idle and no fault bits, 1: an engine is busy, 2: fault bits set.
             let engines=match self.device.check_idle() {Ok(())=>0u8,Err(e) if e==EBUSY=>1,Err(_)=>2};
             let complete=self.jobs[index].complete().unwrap_or(false);
+            // 0: queues not drained, 1: every submitted queue message consumed, 2: read failed.
+            let pipes=match self.config.pipes_idle() {Ok(false)=>0u8,Ok(true)=>1,Err(_)=>2};
             let events=self.state.event_messages.load(Ordering::Acquire);
             let crashed=self.state.health.crashed();
-            let now=(halt,engines,complete,events,crashed);
+            let now=(halt,engines,complete,pipes,events,crashed);
             if last!=Some(now) {
-                dev_info!(self.drm.as_ref(),"M3: resume-after-fault: +{}us: halt_count={} halted={} resume={} engines={} job_complete={} event_messages={} crashed={}\n",
-                    resumed.elapsed().as_nanos()/1000,halt.0,halt.1,halt.2,engines,complete,events,crashed);
+                dev_info!(self.drm.as_ref(),"M3: resume-after-fault: +{}us: halt_count={} halted={} resume={} engines={} job_complete={} pipes_idle={} event_messages={} crashed={}\n",
+                    resumed.elapsed().as_nanos()/1000,halt.0,halt.1,halt.2,engines,complete,pipes,events,crashed);
                 last=Some(now);
             }
             if crashed {break;}
@@ -159,6 +163,7 @@ impl Inner {
         }
         self.jobs[index].log(&self.drm)?;
         self.device.log_engine_state(vm)?;
+        self.config.log_event_ring(&self.drm)?;
         let events=self.state.event_messages.load(Ordering::Acquire);
         self.config.log_recovery_state(&self.drm,events)
     }
@@ -174,10 +179,27 @@ impl Inner {
     fn fail_active(&mut self, error: Error) {
         let _=self.config.performance_request(self.device.soc().chip_id,false);
         if let Some((index,vm))=self.active.first().map(|b|(b.index,b.entries[0].0.vm.clone())) {
+            self.log_owners(error);
             self.fail(index,&vm,error);
         } else {self.capture_fault(error);}
         for batch in self.active.drain_all() {Self::finish_all(&batch.entries,Err(error));}
         self.fail_pending(error);
+    }
+    /// Name the processes whose published commands were in flight when the GPU failed. Batches
+    /// in flight share one VM, so this is normally one process; a VM shared between processes
+    /// names each submitter once (the first four).
+    fn log_owners(&self, error: Error) {
+        let commands:usize=self.active.iter().map(|b|b.entries.len()).sum();
+        let mut logged=[0i32;4];
+        let mut count=0;
+        for (packet,_) in self.active.iter().flat_map(|b|b.entries.iter()) {
+            let owner=&packet.owner;
+            if logged[..count].contains(&owner.pid) {continue;}
+            if count==logged.len() {break;}
+            dev_err!(self.drm.as_ref(),"M3 failed work owner: VM={} process {} pid {} thread {} (error {:?}, {} commands in flight)\n",
+                packet.vm.id(),owner.process(),owner.pid,owner.thread(),error,commands);
+            logged[count]=owner.pid;count+=1;
+        }
     }
     /// Hardware completion is separate from fence signaling: cancellation can win the
     /// signal race while the DMA guard must survive until its final published batch retires.
