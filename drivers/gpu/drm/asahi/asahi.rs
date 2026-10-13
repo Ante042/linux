@@ -92,6 +92,8 @@ mod g15_probe;
 mod t8122_admission;
 mod t8122_knobs;
 mod t8122_start;
+mod t6031_knobs;
+mod t6031_start;
 mod g15_selftest;
 #[cfg(CONFIG_DEV_COREDUMP)]
 mod agx_fault;

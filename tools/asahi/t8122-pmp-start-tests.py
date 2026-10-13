@@ -72,32 +72,33 @@ struct Soc{chip_id:u32,gpu_name:&'static str,id:Id,sgx_setup:Option<(usize,u32)>
 static T8122:Soc=Soc{chip_id:0x8122,gpu_name:"G15G",id:Id{version:0x07022000,version_mask:!0,counts:0x0011010a,counts_mask:!0},sgx_setup:Some((0xd14000,0x70001))};
 static T6030:Soc=Soc{chip_id:0x6030,..T8122};
 mod t8122_start {pub struct Experiment; impl Experiment{pub fn sgx_setup(&self)->Option<(usize,u32)>{Some((0xd14000,0x70001))}}pub fn is_t8122(s:&super::Soc)->bool{s.chip_id==0x8122}}
-mod m3_board {pub fn has_pmp_link<T>(_:&super::platform::Device<T>)->bool{unsafe{super::LINKED}}pub fn core_mask_valid(_:&super::Soc,m:u32)->bool{m==0x3ff}}
+mod t6031_start {pub struct Experiment; impl Experiment{pub fn sgx_setup(&self)->Option<(usize,u32)>{None}}pub fn is_t6031(s:&super::Soc)->bool{s.chip_id==0x6031}}
+mod m3_board {pub fn has_pmp_link<T>(_:&super::platform::Device<T>)->bool{unsafe{super::LINKED}}pub fn core_slots(_:&super::Soc)->u32{10}pub fn core_mask_valid(_:&super::Soc,m:u64)->bool{m==0x3ff}}
 struct DevRef;
 impl<T> From<&platform::Device<T>> for DevRef{fn from(_:&platform::Device<T>)->Self{Self}}
 impl DevRef{fn as_ref(&self)->&Self{self}}
-struct Device{dev:DevRef,asc:Mapping,sgx:Mapping,firmware:Firmware,core_mask:u32,soc:&'static Soc,power_vote:bool}
+struct Device{dev:DevRef,asc:Mapping,sgx:Mapping,firmware:Firmware,core_mask:u64,soc:&'static Soc,power_vote:bool}
 '''
 CONTROLS = r'''
 fn reset(){TRACE.lock().unwrap().clear();unsafe{LINKED=true;LINK_ERROR=0;READY_ERROR=0;COMMAND_ERROR=0;STOPPED=true;MAP_ACCESS=true;VALID_ID=true;LIVE_ON_ERROR=false;}}
 fn trace()->Vec<&'static str>{TRACE.lock().unwrap().clone()}
 fn main(){
     let pdev=platform::Device::<Core>(std::marker::PhantomData);
-    reset();let d=Device::new(&pdev,Firmware,&T8122,None).unwrap();
+    reset();let d=Device::new(&pdev,Firmware,&T8122,None,None).unwrap();
     assert_eq!(trace(),vec!["link","ready","on","id","id","id","setup"]);drop(d);
     assert_eq!(&trace()[7..],&["ready","off"]);
-    reset();unsafe{LINKED=false;}assert!(matches!(Device::new(&pdev,Firmware,&T8122,None),Err(ENODEV)));assert!(trace().is_empty());
-    reset();unsafe{LINK_ERROR=EPROBE_DEFER;}assert!(matches!(Device::new(&pdev,Firmware,&T8122,None),Err(EPROBE_DEFER)));assert_eq!(trace(),vec!["link"]);
-    reset();unsafe{READY_ERROR=EPROBE_DEFER;}assert!(matches!(Device::new(&pdev,Firmware,&T8122,None),Err(EPROBE_DEFER)));assert_eq!(trace(),vec!["link","ready","ready"]);
-    reset();unsafe{READY_ERROR=EIO;}assert!(matches!(Device::new(&pdev,Firmware,&T8122,None),Err(EIO)));assert_eq!(trace(),vec!["link","ready","ready"]);
-    reset();unsafe{COMMAND_ERROR=EIO;}assert!(matches!(Device::new(&pdev,Firmware,&T8122,None),Err(EIO)));assert_eq!(trace(),vec!["link","ready","on","ready","off"]);
-    reset();unsafe{COMMAND_ERROR=EIO;LIVE_ON_ERROR=true;}assert!(matches!(Device::new(&pdev,Firmware,&T8122,None),Err(EIO)));assert_eq!(trace(),vec!["link","ready","on"]);
-    reset();unsafe{STOPPED=false;}assert!(matches!(Device::new(&pdev,Firmware,&T8122,None),Err(EBUSY)));assert_eq!(trace(),vec!["link"]);
-    reset();unsafe{VALID_ID=false;}assert!(matches!(Device::new(&pdev,Firmware,&T8122,None),Err(EIO)));assert_eq!(trace(),vec!["link","ready","on","id","ready","off"]);
-    reset();let d=Device::new(&pdev,Firmware,&T8122,None).unwrap();unsafe{STOPPED=false;}drop(d);assert!(!trace().contains(&"off"));
-    reset();let d=Device::new(&pdev,Firmware,&T8122,None).unwrap();unsafe{MAP_ACCESS=false;}drop(d);assert!(!trace().contains(&"off"));
-    reset();assert!(matches!(Device::new(&pdev,Firmware,&T6030,None),Err(ENOTSUPP)));assert!(trace().is_empty());
-    reset();unsafe{LINKED=false;}let d=Device::new(&pdev,Firmware,&T6030,None).unwrap();drop(d);assert_eq!(trace(),vec!["id","id","id","setup"]);
+    reset();unsafe{LINKED=false;}assert!(matches!(Device::new(&pdev,Firmware,&T8122,None,None),Err(ENODEV)));assert!(trace().is_empty());
+    reset();unsafe{LINK_ERROR=EPROBE_DEFER;}assert!(matches!(Device::new(&pdev,Firmware,&T8122,None,None),Err(EPROBE_DEFER)));assert_eq!(trace(),vec!["link"]);
+    reset();unsafe{READY_ERROR=EPROBE_DEFER;}assert!(matches!(Device::new(&pdev,Firmware,&T8122,None,None),Err(EPROBE_DEFER)));assert_eq!(trace(),vec!["link","ready","ready"]);
+    reset();unsafe{READY_ERROR=EIO;}assert!(matches!(Device::new(&pdev,Firmware,&T8122,None,None),Err(EIO)));assert_eq!(trace(),vec!["link","ready","ready"]);
+    reset();unsafe{COMMAND_ERROR=EIO;}assert!(matches!(Device::new(&pdev,Firmware,&T8122,None,None),Err(EIO)));assert_eq!(trace(),vec!["link","ready","on","ready","off"]);
+    reset();unsafe{COMMAND_ERROR=EIO;LIVE_ON_ERROR=true;}assert!(matches!(Device::new(&pdev,Firmware,&T8122,None,None),Err(EIO)));assert_eq!(trace(),vec!["link","ready","on"]);
+    reset();unsafe{STOPPED=false;}assert!(matches!(Device::new(&pdev,Firmware,&T8122,None,None),Err(EBUSY)));assert_eq!(trace(),vec!["link"]);
+    reset();unsafe{VALID_ID=false;}assert!(matches!(Device::new(&pdev,Firmware,&T8122,None,None),Err(EIO)));assert_eq!(trace(),vec!["link","ready","on","id","ready","off"]);
+    reset();let d=Device::new(&pdev,Firmware,&T8122,None,None).unwrap();unsafe{STOPPED=false;}drop(d);assert!(!trace().contains(&"off"));
+    reset();let d=Device::new(&pdev,Firmware,&T8122,None,None).unwrap();unsafe{MAP_ACCESS=false;}drop(d);assert!(!trace().contains(&"off"));
+    reset();assert!(matches!(Device::new(&pdev,Firmware,&T6030,None,None),Err(ENOTSUPP)));assert!(trace().is_empty());
+    reset();unsafe{LINKED=false;}let d=Device::new(&pdev,Firmware,&T6030,None,None).unwrap();drop(d);assert_eq!(trace(),vec!["id","id","id","setup"]);
     println!("PASS actual Device::new/Drop: link-ready-vote-ID-setup ordering, defer/refusal, ASC ownership and release controls; T6030 unchanged");
 }
 '''
@@ -106,7 +107,12 @@ def build(source, path):
     body = function(source, '    pub(crate) fn new(')
     drop = function(source, 'impl Drop for Device') if 'impl Drop for Device' in source else ''
     prefix = PREFIX if 'power_vote:' in body else PREFIX.replace(',power_vote:bool', '')
-    path.write_text(prefix + 'impl Device {\n' + body + '\n}\n' + drop + CONTROLS)
+    controls = CONTROLS
+    if 't6031: Option' not in body:
+        # Before the T6031 start: four arguments and a 32-bit core mask.
+        prefix = prefix.replace('core_mask:u64', 'core_mask:u32').replace('m:u64', 'm:u32')
+        controls = controls.replace(',None,None)', ',None)')
+    path.write_text(prefix + 'impl Device {\n' + body + '\n}\n' + drop + controls)
     subprocess.run(['rustc','--edition=2021',str(path),'-o',str(path.with_suffix(''))],check=True)
     return subprocess.run([str(path.with_suffix(''))],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
 
