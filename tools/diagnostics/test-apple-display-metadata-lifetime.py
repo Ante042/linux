@@ -31,6 +31,7 @@ epoch = (base / 'dcp-metadata-epoch.h').read_text().replace('#include <linux/typ
 cache = dcp[dcp.index('static bool dcp_firmware_metadata_enabled('):dcp.index('void dcp_set_dimensions(')]
 getter = function(iomfb, 'int dcp_get_modes(')
 physical_current = function((base / 'epic/dpavservep.c').read_text(), 'bool dcpavserv_edid_current(')
+service_current = function((base / 'epic/dpavservep.c').read_text(), 'bool dcpavserv_edid_service_current(')
 cleanup = function(iomfb, 'static void dcp_clear_connector_edid(') + '\n' + function(iomfb, 'static void dcp_consume_edid_invalidation(')
 hotplug = function(iomfb, 'void dcp_hotplug(')
 disconnect = function(dcp, 'static void disconnected_hpd_event(')
@@ -117,7 +118,7 @@ struct apple_connector {
     const struct drm_edid *drm_edid;
     bool drm_edid_firmware_derived;
     bool edid_invalidation_pending;
-    u64 drm_edid_generation;
+    u64 drm_edid_generation, drm_edid_service_epoch;
     bool connected;
     struct work_struct hotplug_wq;
 };
@@ -128,6 +129,7 @@ state = r'''
 struct apple_dcp {
     void *dev;
     struct mutex hpd_mutex;
+    struct { struct mutex lock; bool enabled; void *service; u64 epoch; } dcpavserv;
     bool typec_cable_connected, quiescing;
     u64 typec_generation;
     struct { int iomfb_method_profile; } hw;
@@ -153,6 +155,7 @@ static bool invalidate_during_update;
 static bool update_error;
 static bool raw_available;
 static bool detach_during_read, replug_during_read;
+static bool retire_after_read;
 static const struct drm_edid *allocate(unsigned int identity)
 {
     struct drm_edid *edid = malloc(sizeof(*edid)); assert(edid);
@@ -171,9 +174,11 @@ static void drm_mode_probed_add(struct drm_connector *c, struct drm_display_mode
 static void drm_connector_set_vrr_capable_property(struct drm_connector *c, bool v)
 { (void)c; (void)v; }
 static bool dcp_has_panel(struct apple_dcp *p) { (void)p; return false; }
-static const struct drm_edid *dcpavserv_copy_edid(struct apple_dcp *p, u64 generation)
+static const struct drm_edid *dcpavserv_copy_edid(struct apple_dcp *p, u64 generation, u64 *epoch)
 {
-    assert(!mutex_held(&p->hpd_mutex));
+    assert(!mutex_held(&p->hpd_mutex) && !mutex_held(&p->dcpavserv.lock));
+    *epoch=p->dcpavserv.epoch;
+    if (retire_after_read) { p->dcpavserv.epoch+=2; p->connector->edid_invalidation_pending=true; }
     (void)generation; raw_reads++;
     if (detach_during_read) {
         mutex_lock(&p->hpd_mutex); p->typec_generation++;
@@ -185,6 +190,11 @@ static const struct drm_edid *dcpavserv_copy_edid(struct apple_dcp *p, u64 gener
 static int drm_edid_connector_update(struct drm_connector *c, const struct drm_edid *e)
 {
     assert(mutex_held(&c->dev->mode_config.mutex));
+    if (e && e->identity==0xfeed) {
+        assert(mutex_held(&current_for_update->dcpavserv.lock));
+        if(current_for_update->hw.iomfb_method_profile==DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL)
+            assert(mutex_held(&current_for_update->hpd_mutex));
+    }
     if (e && update_error) return -ENOMEM;
     struct test_blob *old=c->edid_blob_ptr;
     struct test_blob *next=NULL;
@@ -199,6 +209,7 @@ static int drm_edid_connector_update(struct drm_connector *c, const struct drm_e
     if (invalidate_during_update && e && e->identity!=0xfeed) current_for_update->metadata.epoch.invalidated=true;
     return 0;
 }
+static void dcp_update_connector_dimensions(struct apple_dcp *p, struct drm_connector *c) { (void)p; assert(mutex_held(&c->dev->mode_config.mutex)); }
 static bool dcp_is_usb4_output(struct apple_dcp *p) { (void)p; return false; }
 static bool apple_dp_tunnel_t602x(void) { return false; }
 #define DRM_MODE_LINK_STATUS_BAD 1
@@ -245,8 +256,10 @@ static void initial(void)
     assert(!allocations);
     memset(&p,0,sizeof(p)); memset(&c,0,sizeof(c));
     assert(!pthread_mutex_init(&p.hpd_mutex.native,NULL));
+    assert(!pthread_mutex_init(&p.dcpavserv.lock.native,NULL));
+    p.dcpavserv.enabled=true; p.dcpavserv.service=&p; p.dcpavserv.epoch=1;
     p.typec_cable_connected=true; p.typec_generation=1;
-    detach_during_read=replug_during_read=false;
+    detach_during_read=replug_during_read=retire_after_read=false;
     p.hw.iomfb_method_profile=DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL;
     p.fw_compat=DCP_FIRMWARE_H17P;
     static typeof(*p.dcpavservep) av={true}; p.dcpavservep=&av;
@@ -419,14 +432,28 @@ int main(void)
     assert(probe(&c.base)==1 && c.drm_edid && c.drm_edid_generation==2);
     p.typec_generation++; /* Missed worker: generation alone rejects the old cache. */
     assert(probe(&c.base)==1 && raw_reads==3 && c.drm_edid_generation==3);
+    initial(); raw_available=true;
+    assert(probe(&c.base)==1 && c.drm_edid && c.drm_edid_service_epoch==1);
+    p.dcpavserv.epoch+=2; /* Replacement without physical generation or worker. */
+    assert(probe(&c.base)==1 && raw_reads==2 && c.drm_edid_service_epoch==3);
+    p.dcpavserv.enabled=false; p.dcpavserv.epoch++;
+    c.edid_invalidation_pending=true; raw_available=false;
+    assert(probe(&c.base)==1 && !c.drm_edid && !property_identity && !allocations);
+    initial(); raw_available=true; retire_after_read=true;
+    assert(probe(&c.base)==1 && !c.drm_edid && !property_identity && !allocations);
+    assert(p.typec_generation==1); /* Replacement in the check/publication gap. */
+    retire_after_read=false;
+    assert(probe(&c.base)==1 && c.drm_edid_service_epoch==3);
+    assert(!c.edid_invalidation_pending); /* Old CLOSE cannot erase the fresh cache. */
+    dcp_hotplug(&c.hotplug_wq); assert(c.drm_edid);
     initial(); assert(!blob_allocations && trace_observations);
-    puts("PASS: mutex-serialized EDID/blob get_modes, hotplug, sysfs reader and same-epoch publication, first-connection scope, raw precedence, delayed disconnect/replug rejection, generation cache invalidation, no added modes");
+    puts("PASS: mutex-serialized EDID/blob get_modes, hotplug, sysfs reader and same-epoch publication, first-connection scope, raw precedence, delayed disconnect/replug rejection, physical and service cache invalidation, service replacement publication gap, no added modes");
     return 0;
 }
 '''
 with tempfile.TemporaryDirectory(prefix='dcp-metadata-lifetime-') as tmp:
     tmp = Path(tmp)
-    (tmp / 'test.c').write_text(prefix + metadata + epoch + state + cache + chunk_callbacks + cleanup + physical_current + getter + hotplug + disconnect + suffix)
+    (tmp / 'test.c').write_text(prefix + metadata + epoch + state + cache + chunk_callbacks + cleanup + physical_current + service_current + getter + hotplug + disconnect + suffix)
     command = shlex.split(os.environ.get('CC','clang'))
     command += ['-std=gnu11','-Wall','-Wextra','-Werror','-Wno-sign-compare','-O1','-g',
                 '-fsanitize=address,undefined','-fno-omit-frame-pointer','-pthread']

@@ -42,6 +42,7 @@ typedef uint8_t u8;
 typedef uint64_t u64;
 typedef int64_t s64;
 #define READ_ONCE(x) (x)
+#define WRITE_ONCE(x,v) ((x)=(v))
 #define ERR_PTR(x) ((void *)(intptr_t)(x))
 #define PTR_ERR(x) ((int)(intptr_t)(x))
 #define IS_ERR(x) ((uintptr_t)(x) > (uintptr_t)-4096)
@@ -52,6 +53,16 @@ static bool *acquire(bool *p) { assert(!*p); *p=true; return p; }
 static void release(bool **p) { if(*p) { assert(**p); **p=false; } }
 static bool *once(bool *p) { assert(*p); *p=false; return NULL; }
 #define scoped_guard(k,p) for(bool *_lock __attribute__((cleanup(release)))=acquire(p); _lock; _lock=once(_lock))
+static void mutex_lock(bool *p) { (void)acquire(p); }
+static void mutex_unlock(bool *p) { (void)once(p); }
+#define dev_info(...) ((void)0)
+#define dev_err(...) ((void)0)
+#define trace_dcpavserv_init(...) ((void)0)
+#define DRM_CONNECTOR_REGISTERED 1
+#define to_platform_device(x) (x)
+static void reinit_completion(int *p) { *p=0; }
+static void complete(int *p) { *p=1; }
+static void schedule_work(int *p) { (*p)++; }
 #define dev_dbg_ratelimited(...) ((void)0)
 #define dev_warn_ratelimited(...) ((void)0)
 #define trace_dcp_recv_msg(...) ((void)0)
@@ -67,11 +78,13 @@ static bool *once(bool *p) { assert(*p); *p=false; return NULL; }
 #define DPTX_CONTROLLER_ENDPOINT 0x24
 #define IOMFB_ENDPOINT 0x37
 struct apple_dcp;
+struct apple_connector { void *dcp; struct { int registration_state; } base; bool connected, edid_invalidation_pending; int hotplug_wq; };
 struct apple_dcp_afkep { struct apple_dcp *dcp; u8 endpoint; bool inline_v2; };
-struct apple_epic_service { struct apple_dcp_afkep *ep; unsigned int users; bool enabled; };
+struct apple_epic_service { struct apple_dcp_afkep *ep; unsigned int users; bool enabled; void *cookie; unsigned int channel; };
 struct apple_dcp {
     struct apple_dcp_afkep *dcpavservep, *dptxep, *avep, *systemep, *ibootep, *dptx_controller_ep;
-    struct { bool lock, enabled; struct apple_epic_service *service; } dcpavserv;
+    struct { bool lock, enabled; u64 epoch; int enable_completion; struct apple_epic_service *service; } dcpavserv;
+    struct apple_connector *connector; unsigned int nr_modes;
     struct { int iomfb_method_profile; } hw;
     bool hpd_mutex, typec_cable_connected, quiescing;
     u64 typec_generation;
@@ -88,13 +101,14 @@ static void afk_service_put(struct apple_epic_service *s)
 { assert(s->users); s->users--; }
 static void drm_edid_free(const struct drm_edid *e)
 { if(e) { assert(allocations); allocations--; free((void *)e); } }
+static void dcpavserv_teardown(struct apple_epic_service *s);
 static const struct drm_edid *dcpavserv_read_edid_inline(struct apple_epic_service *s)
 {
     struct apple_dcp *d=s->ep->dcp;
     assert(!d->hpd_mutex && !d->dcpavserv.lock && s->users==2);
     reads++;
     if(event==1 || event==2) { d->typec_generation++; d->typec_cable_connected=(event==2); }
-    if(event==3) { d->dcpavserv.service=NULL; d->dcpavserv.enabled=false; s->enabled=false; afk_service_put(s); }
+    if(event==3) { s->enabled=false; dcpavserv_teardown(s); }
     struct drm_edid *e=malloc(sizeof(*e)); assert(e); e->identity=42; allocations++; return e;
 }
 static const struct drm_edid *dcpavserv_read_edid_legacy(struct apple_epic_service *s)
@@ -103,16 +117,24 @@ static void iomfb_recv_msg(struct apple_dcp *d, u64 message) { (void)d; (void)me
 static void afk_receive_message(struct apple_dcp_afkep *ep, u64 message)
 { (void)message; received_ep=ep; receives++; }
 '''
-parts = [function('dcp.c', 'static struct apple_dcp_afkep *dcp_afkep('),
+parts = [function('epic/dpavservep.c', 'static void dcpavserv_notify_edid('),
+         function('epic/dpavservep.c', 'static void dcpavserv_invalidate_edid('),
+         function('epic/dpavservep.c', 'static void dcpavserv_teardown('),
+         function('dcp.c', 'static struct apple_dcp_afkep *dcp_afkep('),
          function('dcp.c', 'static void dcp_recv_msg('),
          function('epic/dpavservep.c', 'static int dcpavserv_prepare('),
          function('epic/dpavservep.c', 'static int dcpdpserv_prepare('),
+         function('epic/dpavservep.c', 'static void dcpavserv_init('),
          function('epic/dpavservep.c', 'bool dcpavserv_edid_current('),
+         function('epic/dpavservep.c', 'bool dcpavserv_edid_service_current('),
          function('epic/dpavservep.c', 'const struct drm_edid *dcpavserv_copy_edid(')]
 suffix = r'''
 int main(void)
 {
-    struct apple_dcp d={.fw_compat=DCP_FIRMWARE_H17P};
+    u64 epoch=0;
+    int device;
+    struct apple_connector connector={.dcp=&device,.base.registration_state=DRM_CONNECTOR_REGISTERED,.connected=true};
+    struct apple_dcp d={.fw_compat=DCP_FIRMWARE_H17P,.dev=&device,.connector=&connector,.nr_modes=1};
     struct apple_dcp_afkep av={.dcp=&d,.endpoint=0x28}, tx={.dcp=&d,.endpoint=0x2a};
     d.dcpavservep=&av; d.dptxep=&tx;
     assert(dcp_afkep(&d,0x28)==&av && dcp_afkep(&d,0x2a)==&tx && !dcp_afkep(&d,0x2c));
@@ -138,25 +160,38 @@ int main(void)
     av.endpoint=0x28; assert(dcpavserv_prepare(&s,name,class,1)==-ENODEV); av.endpoint=0x2a;
     assert(dcpdpserv_prepare(&s,"dcpdp-service-epic",class,3)==-ENODEV);
     d.dcpavserv.enabled=true; assert(dcpavserv_prepare(&s,name,class,1)==-EBUSY);
-    d.dcpavserv.service=&s; d.typec_generation=1; d.typec_cable_connected=true;
-    const struct drm_edid *e=dcpavserv_copy_edid(&d,1);
+    d.dcpavserv.service=&s; d.dcpavserv.epoch=1; d.typec_generation=1; d.typec_cable_connected=true;
+    const struct drm_edid *e=dcpavserv_copy_edid(&d,1,&epoch);
     assert(!IS_ERR(e) && s.users==1 && reads==1); drm_edid_free(e);
     d.typec_cable_connected=false;
-    assert(PTR_ERR(dcpavserv_copy_edid(&d,1))==-ESTALE && reads==1);
+    assert(PTR_ERR(dcpavserv_copy_edid(&d,1,&epoch))==-ESTALE && reads==1);
     d.typec_cable_connected=true;
-    assert(PTR_ERR(dcpavserv_copy_edid(&d,0))==-ESTALE && reads==1);
-    event=1; assert(PTR_ERR(dcpavserv_copy_edid(&d,1))==-ESTALE && !allocations && s.users==1);
+    assert(PTR_ERR(dcpavserv_copy_edid(&d,0,&epoch))==-ESTALE && reads==1);
+    event=1; assert(PTR_ERR(dcpavserv_copy_edid(&d,1,&epoch))==-ESTALE && !allocations && s.users==1);
     event=2; d.typec_cable_connected=true;
-    assert(PTR_ERR(dcpavserv_copy_edid(&d,2))==-ESTALE && !allocations && s.users==1);
-    event=0; e=dcpavserv_copy_edid(&d,3); assert(!IS_ERR(e)); drm_edid_free(e);
-    event=3; assert(PTR_ERR(dcpavserv_copy_edid(&d,3))==-ENODEV && !allocations && !s.users);
-    assert(PTR_ERR(dcpavserv_copy_edid(&d,3))==-ENODEV);
+    assert(PTR_ERR(dcpavserv_copy_edid(&d,2,&epoch))==-ESTALE && !allocations && s.users==1);
+    event=0; e=dcpavserv_copy_edid(&d,3,&epoch); assert(!IS_ERR(e)); drm_edid_free(e);
+    event=3; assert(PTR_ERR(dcpavserv_copy_edid(&d,3,&epoch))==-ENODEV && !allocations && !s.users);
+    assert(PTR_ERR(dcpavserv_copy_edid(&d,3,&epoch))==-ENODEV);
+    assert(connector.edid_invalidation_pending && connector.hotplug_wq && d.dcpavserv.epoch==2);
+    /* Same slot and physical generation: CLOSE/re-OPEN gets a fresh ticket. */
+    s.enabled=true; dcpavserv_init(&s,name,class,1);
+    assert(d.dcpavserv.service==&s && s.users==1 && d.dcpavserv.epoch==3);
+    mutex_lock(&d.dcpavserv.lock);
+    assert(!dcpavserv_edid_service_current(&d,1) && dcpavserv_edid_service_current(&d,3));
+    mutex_unlock(&d.dcpavserv.lock);
+    event=0; e=dcpavserv_copy_edid(&d,3,&epoch); assert(!IS_ERR(e) && epoch==3);
+    /* Simulate retirement in the final validation-to-publication gap. */
+    s.enabled=false; dcpavserv_teardown(&s); s.enabled=true; dcpavserv_init(&s,name,class,1);
+    mutex_lock(&d.dcpavserv.lock); assert(!dcpavserv_edid_service_current(&d,epoch)); mutex_unlock(&d.dcpavserv.lock);
+    drm_edid_free(e); assert(d.typec_generation==3 && d.dcpavserv.epoch==5 && s.users==1);
+    s.enabled=false; dcpavserv_teardown(&s);
     av.inline_v2=false; av.endpoint=0x28; d.hw.iomfb_method_profile=0;
     d.dcpavserv.enabled=false; assert(!dcpavserv_prepare(&s,name,NULL,0));
     assert(dcpavserv_prepare(&s,name,class,1)==-ENODEV);
     assert(!dcpdpserv_prepare(&s,NULL,NULL,3));
     d.dcpavserv.service=&s; d.dcpavserv.enabled=true; s.enabled=true; s.users=1; event=0;
-    d.typec_cable_connected=false; e=dcpavserv_copy_edid(&d,0);
+    d.typec_cable_connected=false; e=dcpavserv_copy_edid(&d,0,&epoch);
     assert(!IS_ERR(e) && legacy_reads==1 && s.users==1); drm_edid_free(e);
     assert(!allocations && !d.hpd_mutex && !d.dcpavserv.lock);
     puts("PASS: production old/new lookup and receive, exact service admission before OPEN, delayed disconnect/replug, service detach pins, legacy transport");
