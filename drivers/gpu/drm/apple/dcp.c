@@ -142,7 +142,7 @@ static void dcp_release_rtkit(void *data)
 static unsigned int experimental_h17p_av_discovery;
 module_param(experimental_h17p_av_discovery, uint, 0444);
 MODULE_PARM_DESC(experimental_h17p_av_discovery,
-		 "H17P AV discovery: 1 observes; 2 opens only the observed DP device transport");
+		 "H17P endpoint 0x2a identity discovery: 1 observes without OPEN");
 
 static bool experimental_h17p_external;
 module_param(experimental_h17p_external, bool, 0444);
@@ -2080,9 +2080,13 @@ static void dcp_delayed_vblank(struct work_struct *work)
 
 static struct apple_dcp_afkep *dcp_afkep(struct apple_dcp *dcp, u8 endpoint)
 {
+	/* The diagnostic owns its actual endpoint, never a legacy slot alias. */
+	if (dcp->av_discovery && endpoint == dcp->av_discovery->endpoint)
+		return dcp->av_discovery;
+
 	switch (endpoint) {
 	case AV_ENDPOINT:
-		return dcp->avep ? dcp->avep : dcp->av_discovery;
+		return dcp->avep;
 	case SYSTEM_ENDPOINT:
 		return dcp->systemep;
 	case DISP0_ENDPOINT:
@@ -2149,6 +2153,11 @@ static void dcp_recv_msg(void *cookie, u8 endpoint, u64 message)
 
 	trace_dcp_recv_msg(dcp, endpoint, message);
 
+	if (dcp->av_discovery && endpoint == dcp->av_discovery->endpoint) {
+		afk_receive_message(dcp->av_discovery, message);
+		return;
+	}
+
 	/*
 	 * H17P starts endpoints that have no AFK instance behind them (the
 	 * remote allocator endpoint, for one).  Log their messages rather than
@@ -2165,7 +2174,7 @@ static void dcp_recv_msg(void *cookie, u8 endpoint, u64 message)
 	case IOMFB_ENDPOINT:
 		return iomfb_recv_msg(dcp, message);
 	case AV_ENDPOINT:
-		ep = dcp->avep ? dcp->avep : dcp->av_discovery;
+		ep = dcp->avep;
 		break;
 	case SYSTEM_ENDPOINT:
 		ep = dcp->systemep;
@@ -2994,16 +3003,14 @@ unsigned long* dcp_get_iomfb_surfaces(struct platform_device *pdev)
 static int dcp_av_discovery_prepare(struct apple_epic_service *service,
 				  const char *name, const char *class, s64 unit)
 {
-	bool open_device = experimental_h17p_av_discovery == 2 && name && class &&
-		!strcmp(name, "dcpdp-device-epic") && !strcmp(class, "DCPDPDevice");
 
 	dev_info(service->ep->dcp->dev,
 		 "AV discovery ep:%02x channel:%u name:%s class:%s unit:%lld; %s\n",
 		 service->ep->endpoint, service->channel,
 		 name ?: "(none)", class ?: "(none)", unit,
-		 open_device ? "transport OPEN only" : "no OPEN");
-	/* The observed device may be opened, but no service command is sent. */
-	return open_device ? 0 : -ECANCELED;
+		 "no OPEN");
+	/* Identity discovery never opens a service or sends a service command. */
+	return -ECANCELED;
 }
 
 static void dcp_av_discovery_teardown(struct apple_epic_service *service)
@@ -3031,20 +3038,21 @@ static void dcp_start_av_discovery(struct apple_dcp *dcp)
 	struct apple_dcp_afkep *ep;
 	int ret;
 
-	if (!experimental_h17p_av_discovery || experimental_h17p_av_discovery > 2 ||
+	if (!experimental_h17p_av_discovery || experimental_h17p_av_discovery != 1 ||
 	    dcp->av_discovery ||
 	    dcp->fw_compat != DCP_FIRMWARE_H17P ||
 	    dcp->hw.iomfb_method_profile !=
 		    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL)
 		return;
-	ep = afk_init(dcp, AV_ENDPOINT, dcp_av_discovery_ops);
+	/* H17P moved the port from 0x2a to 0x2c. Identify 0x2a without OPEN. */
+	ep = afk_init(dcp, DPTX_ENDPOINT, dcp_av_discovery_ops);
 	if (IS_ERR(ep)) {
 		dev_info(dcp->dev, "AV discovery allocation failed: %ld\n", PTR_ERR(ep));
 		return;
 	}
 	ep->wire_v2 = true;
 	ep->match_epic_name = true;
-	ep->debugfs_entry = dcp->ep_debugfs[AV_ENDPOINT - 0x20];
+	ep->debugfs_entry = dcp->ep_debugfs[DPTX_ENDPOINT - 0x20];
 	/* Publish before startup can deliver messages. Never alias audio state. */
 	dcp->av_discovery = ep;
 	ret = afk_start(ep);
