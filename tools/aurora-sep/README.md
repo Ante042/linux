@@ -34,9 +34,11 @@ extent passes the driver's narrow ownership checks: one physical extent, no snap
 state, and a single extent reference owned by the `.gl` inode. The kernel
 resolves that extent from checksum-validated APFS metadata; unsupported layouts
 fail closed. Set `options apple_sep xart_writes=0 provision_keybag=0` in a
-modprobe configuration to retain read-only operation. Identity-keybag creation
-still requires `provision_keybag=1`; `load-driver` supplies that option. The
-package blacklists alias-based loading so the explicit loader can set its
+modprobe configuration to retain read-only operation. `provision_keybag=1`
+is also the default: first boot creates the Linux identity needed for trusted
+keys, and later boots recover that identity and its machine reference key.
+An existing unreadable or invalid identity is not silently replaced.
+The package blacklists alias-based loading so the explicit loader can set its
 options on the first insertion. Any already-loaded module causes a clear
 reboot refusal: Rust module parameters are not exposed through sysfs, so its
 initial options and firmware order cannot be verified. The loader never
