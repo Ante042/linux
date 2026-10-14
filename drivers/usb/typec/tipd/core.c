@@ -212,10 +212,11 @@ static int tps6598x_read_partner_identity(struct tps6598x *tps)
 	return 0;
 }
 
-static void tps6598x_set_data_role(struct tps6598x *tps,
+static int tps6598x_set_data_role(struct tps6598x *tps,
 				   enum typec_data_role role, bool connected)
 {
 	enum usb_role role_val;
+	int ret;
 
 	if (role == TYPEC_HOST)
 		role_val = USB_ROLE_HOST;
@@ -225,8 +226,11 @@ static void tps6598x_set_data_role(struct tps6598x *tps,
 	if (!connected)
 		role_val = USB_ROLE_NONE;
 
-	usb_role_switch_set_role(tps->role_sw, role_val);
+	ret = usb_role_switch_set_role(tps->role_sw, role_val);
+	if (ret)
+		return ret;
 	typec_set_data_role(tps->port, role);
+	return 0;
 }
 
 static int tps6598x_connect(struct tps6598x *tps, u32 status)
@@ -259,7 +263,9 @@ static int tps6598x_connect(struct tps6598x *tps, u32 status)
 	else
 		typec_set_orientation(tps->port, TYPEC_ORIENTATION_NORMAL);
 	typec_set_mode(tps->port, TYPEC_STATE_USB);
-	tps6598x_set_data_role(tps, TPS_STATUS_TO_TYPEC_DATAROLE(status), true);
+	ret = tps6598x_set_data_role(tps, TPS_STATUS_TO_TYPEC_DATAROLE(status), true);
+	if (ret)
+		return ret;
 
 	tps->partner = typec_register_partner(tps->port, &desc);
 	if (IS_ERR(tps->partner))
@@ -273,7 +279,7 @@ static int tps6598x_connect(struct tps6598x *tps, u32 status)
 	return 0;
 }
 
-static void tps6598x_disconnect(struct tps6598x *tps, u32 status)
+static void tps6598x_drop_partner(struct tps6598x *tps, u32 status)
 {
 	if (!IS_ERR(tps->partner))
 		typec_unregister_partner(tps->partner);
@@ -281,11 +287,37 @@ static void tps6598x_disconnect(struct tps6598x *tps, u32 status)
 	typec_set_pwr_opmode(tps->port, TYPEC_PWR_MODE_USB);
 	typec_set_pwr_role(tps->port, TPS_STATUS_TO_TYPEC_PORTROLE(status));
 	typec_set_vconn_role(tps->port, TPS_STATUS_TO_TYPEC_VCONN(status));
-	typec_set_orientation(tps->port, TYPEC_ORIENTATION_NONE);
-	typec_set_mode(tps->port, TYPEC_STATE_SAFE);
-	tps6598x_set_data_role(tps, TPS_STATUS_TO_TYPEC_DATAROLE(status), false);
+}
+
+static int tps6598x_disconnect(struct tps6598x *tps, u32 status)
+{
+	struct typec_mux_state safe = { .mode = TYPEC_STATE_SAFE };
+	bool prepared = tps->remove_safe_prepared;
+	int ret;
+
+	tps->remove_safe_prepared = false;
+	tps6598x_drop_partner(tps, status);
+	if (!prepared) {
+		typec_set_orientation(tps->port, TYPEC_ORIENTATION_NONE);
+		ret = typec_mux_begin(tps->mux, &safe);
+		if (ret)
+			return ret;
+		/* Park while the host still supplies the PIPE backend clock. */
+		ret = typec_mux_apply(tps->mux);
+		if (ret)
+			return ret;
+	}
+	ret = tps6598x_set_data_role(tps, TPS_STATUS_TO_TYPEC_DATAROLE(status), false);
+	if (ret) {
+		typec_mux_abort(tps->mux);
+		return ret;
+	}
+	ret = typec_mux_end(tps->mux);
+	if (ret)
+		return ret;
 
 	power_supply_changed(tps->psy);
+	return 0;
 }
 
 int tps6598x_exec_cmd_tmo(struct tps6598x *tps, const char *cmd,
@@ -529,7 +561,9 @@ static void tps6598x_handle_plug_event(struct tps6598x *tps, u32 status)
 		if (ret)
 			dev_err(tps->dev, "failed to register partner\n");
 	} else {
-		tps6598x_disconnect(tps, status);
+		ret = tps6598x_disconnect(tps, status);
+		if (ret)
+			dev_err(tps->dev, "hardware disconnect failed: %d\n", ret);
 	}
 }
 
@@ -777,6 +811,23 @@ static void cd321x_update_work(struct work_struct *work)
 	was_disconnected |= partner_changed;
 
 	/*
+	 * Report sink absence before any fallible hardware transition. A failed
+	 * shutdown retains the route/PHY owner, but cannot keep the sink present.
+	 * Every Type-C port references the same external DCP connector.  Only the
+	 * port which successfully acquired the shared display route may report a
+	 * disconnect.  A second DP sink can negotiate Alt Mode even though its mux
+	 * request is rejected with -EBUSY; treating that sink as the connector
+	 * owner would tear down the display carried by the first port.
+	 */
+	if (IS_REACHABLE(CONFIG_DRM) && cd321x->connector_fwnode &&
+	    dp_route_was_active &&
+	    (!new_connected || was_disconnected || !dp_connected || !dp_hpd ||
+	     dp_hpd_changed || dp_mode_changed)) {
+		drm_connector_oob_hotplug_event(cd321x->connector_fwnode,
+					      connector_status_disconnected);
+	}
+
+	/*
 	 * ACIO carries the tunneled PCIe reset handshake over the still-live
 	 * Type-C data path. Close a disappearing USB4/TBT session before dropping
 	 * the USB role; otherwise the role transition tears down the ATC lanes and
@@ -796,20 +847,6 @@ static void cd321x_update_work(struct work_struct *work)
 		ret = usb_role_switch_set_role(tps->role_sw, USB_ROLE_NONE);
 		if (ret)
 			goto retry;
-	}
-
-	/*
-	 * Every Type-C port references the same external DCP connector.  Only the
-	 * port which successfully acquired the shared display route may report a
-	 * disconnect.  A second DP sink can negotiate Alt Mode even though its mux
-	 * request is rejected with -EBUSY; treating that sink as the connector
-	 * owner would tear down the display carried by the first port.
-	 */
-	if (IS_REACHABLE(CONFIG_DRM) && cd321x->connector_fwnode &&
-	    dp_route_was_active &&
-	    (!new_connected || was_disconnected || !dp_connected || !dp_hpd ||
-	     dp_hpd_changed || dp_mode_changed)) {
-		drm_connector_oob_hotplug_event(cd321x->connector_fwnode, connector_status_disconnected);
 	}
 
 	/* Process partner disconnection or change */
@@ -1510,7 +1547,17 @@ cd321x_register_port(struct tps6598x *tps, struct fwnode_handle *fwnode)
 	cd321x->state.alt = NULL;
 	cd321x->state.mode = TYPEC_STATE_SAFE;
 	cd321x->state.data = NULL;
-	cd321x->state_valid = !typec_set_mode(tps->port, TYPEC_STATE_SAFE);
+	ret = typec_set_mode(tps->port, TYPEC_STATE_SAFE);
+	cd321x->state_valid = !ret;
+	/*
+	 * A fixed host can register its SuperSpeed root after the mux provider.
+	 * Wait for that consumer at probe instead of exhausting the cable retry
+	 * budget before it exists. Host startup does not depend on this port.
+	 */
+	if (ret == -EAGAIN) {
+		ret = -EPROBE_DEFER;
+		goto err_put_switch;
+	}
 
 	cd321x->tbt_notifier.notifier_call = cd321x_tbt_notify;
 	ret = typec_thunderbolt_switch_register_notifier(cd321x->tbt_switch,
@@ -1525,6 +1572,8 @@ err_put_switch:
 	typec_thunderbolt_switch_put(cd321x->tbt_switch);
 	cd321x->tbt_switch = NULL;
 err_unregister_mux:
+	fwnode_handle_put(cd321x->connector_fwnode);
+	cd321x->connector_fwnode = NULL;
 	typec_mux_put(cd321x->mux);
 	cd321x->mux = NULL;
 err_unregister_altmodes:
@@ -1549,6 +1598,8 @@ cd321x_unregister_port(struct tps6598x *tps)
 	struct cd321x *cd321x = container_of(tps, struct cd321x, tps);
 
 	cd321x_stop_work(cd321x);
+	fwnode_handle_put(cd321x->connector_fwnode);
+	cd321x->connector_fwnode = NULL;
 	typec_thunderbolt_switch_put(cd321x->tbt_switch);
 	cd321x->tbt_switch = NULL;
 	typec_mux_put(cd321x->mux);
@@ -1966,12 +2017,13 @@ tps25750_register_port(struct tps6598x *tps, struct fwnode_handle *fwnode)
 	return 0;
 }
 
-static void cd321x_remove(struct tps6598x *tps)
+static int cd321x_remove(struct tps6598x *tps)
 {
 	struct cd321x *cd321x = container_of(tps, struct cd321x, tps);
 	struct typec_thunderbolt_switch_data tbt_switch_data = {
 		.state = TYPEC_THUNDERBOLT_SWITCH_OFF,
 	};
+	struct typec_mux_state safe = { .mode = TYPEC_STATE_SAFE };
 	int ret;
 
 	cd321x_stop_work(cd321x);
@@ -1988,10 +2040,24 @@ static void cd321x_remove(struct tps6598x *tps)
 	ret = typec_thunderbolt_switch_set(cd321x->tbt_switch,
 					   &tbt_switch_data);
 	if (ret)
-		dev_warn(tps->dev,
-			 "failed to close Thunderbolt/USB4 session on remove: %d\n",
-			 ret);
-	usb_role_switch_set_role(tps->role_sw, USB_ROLE_NONE);
+		return ret;
+	/* Display quiescence must precede even an ordinary host-role shutdown. */
+	typec_set_orientation(tps->port, TYPEC_ORIENTATION_NONE);
+	ret = typec_mux_begin(tps->mux, &safe);
+	if (ret)
+		return ret;
+	/* Park while the host still supplies the PIPE backend clock. */
+	ret = typec_mux_apply(tps->mux);
+	if (ret)
+		return ret;
+	ret = usb_role_switch_set_role(tps->role_sw, USB_ROLE_NONE);
+	if (ret) {
+		typec_mux_abort(tps->mux);
+		return ret;
+	}
+	/* Same task/handle completes without another post-shutdown set callback. */
+	tps->remove_safe_prepared = true;
+	return 0;
 }
 
 
@@ -2000,7 +2066,8 @@ int tipd_init(struct tps6598x *tps)
 	struct fwnode_handle *fwnode;
 	u32 status;
 	u32 vid;
-	int ret;
+	int ret, cleanup_ret;
+	bool reset_allowed = true;
 
 	tps->reset = devm_gpiod_get_optional(tps->dev, "reset", GPIOD_OUT_LOW);
 	if (IS_ERR(tps->reset))
@@ -2073,19 +2140,32 @@ int tipd_init(struct tps6598x *tps)
 	if (ret)
 		goto err_role_put;
 
-	ret = tps->data->register_port(tps, fwnode);
-	if (ret)
+	tps->mux = fwnode_typec_mux_get(fwnode);
+	if (IS_ERR(tps->mux)) {
+		ret = PTR_ERR(tps->mux);
+		/* No provider reference means rollback cannot prove SAFE. */
+		reset_allowed = false;
 		goto err_role_put;
+	}
+
+	ret = tps->data->register_port(tps, fwnode);
+	if (ret) {
+		/* No live port remains to prove SAFE on failed registration. */
+		reset_allowed = false;
+		goto err_mux_put;
+	}
 
 	if (status & TPS_STATUS_PLUG_PRESENT) {
 		ret = -EINVAL;
 		if (!tps6598x_read_power_status(tps))
-			goto err_unregister_port;
+			goto err_disconnect;
 		if (!tps->data->read_data_status(tps))
-			goto err_unregister_port;
+			goto err_disconnect;
 		ret = tps->data->connect(tps, status);
-		if (ret)
+		if (ret) {
 			dev_err(tps->dev, "failed to register partner\n");
+			goto err_disconnect;
+		}
 	}
 
 	if (tps->irq) {
@@ -2118,9 +2198,14 @@ int tipd_init(struct tps6598x *tps)
 	return 0;
 
 err_disconnect:
-	tps6598x_disconnect(tps, 0);
-err_unregister_port:
+	cleanup_ret = tps6598x_disconnect(tps, 0);
+	if (cleanup_ret) {
+		dev_err(tps->dev, "probe hardware rollback failed: %d\n", cleanup_ret);
+		reset_allowed = false;
+	}
 	tps->data->unregister_port(tps);
+err_mux_put:
+	typec_mux_put(tps->mux);
 err_role_put:
 	usb_role_switch_put(tps->role_sw);
 err_fwnode_put:
@@ -2129,7 +2214,8 @@ err_clear_mask:
 	tps6598x_write64(tps, TPS_REG_INT_MASK1, 0);
 err_reset_controller:
 	/* Reset PD controller to remove any applied patch */
-	tps->data->reset(tps);
+	if (reset_allowed)
+		tps->data->reset(tps);
 
 	return ret;
 }
@@ -2137,6 +2223,8 @@ EXPORT_SYMBOL_GPL(tipd_init);
 
 void tipd_remove(struct tps6598x *tps)
 {
+	int ret = 0;
+
 	tipd_debugfs_unregister(tps);
 
 	if (!tps->irq)
@@ -2145,16 +2233,23 @@ void tipd_remove(struct tps6598x *tps)
 		devm_free_irq(tps->dev, tps->irq, tps);
 
 	if (tps->data->remove)
-		tps->data->remove(tps);
+		ret = tps->data->remove(tps);
 
-	tps6598x_disconnect(tps, 0);
+	if (!ret)
+		ret = tps6598x_disconnect(tps, 0);
+	else
+		tps6598x_drop_partner(tps, 0);
+	if (ret)
+		dev_err(tps->dev, "hardware teardown failed on remove: %d\n", ret);
 	tps->data->unregister_port(tps);
+	typec_mux_put(tps->mux);
 	usb_role_switch_put(tps->role_sw);
 
 	/* Reset PD controller to remove any applied patch */
-	tps->data->reset(tps);
+	if (!ret)
+		tps->data->reset(tps);
 
-	if (tps->reset)
+	if (!ret && tps->reset)
 		gpiod_set_value_cansleep(tps->reset, 1);
 }
 EXPORT_SYMBOL_GPL(tipd_remove);

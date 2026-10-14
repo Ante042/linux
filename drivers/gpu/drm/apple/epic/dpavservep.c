@@ -50,7 +50,8 @@ static bool dcpavserv_admission_current(struct apple_dcp *dcp, u64 generation)
 {
 	lockdep_assert_held(&dcp->hpd_mutex);
 	/* Initial service discovery may precede the first Type-C attachment. */
-	return !READ_ONCE(dcp->quiescing) && generation == dcp->typec_generation &&
+	return !READ_ONCE(dcp->quiescing) && !READ_ONCE(dcp->external_physically_absent) &&
+		generation == dcp->typec_generation &&
 		(!generation || dcp->typec_cable_connected);
 }
 
@@ -78,6 +79,26 @@ static int dcpavserv_prepare(struct apple_epic_service *service, const char *nam
 	mutex_unlock(&dcp->dcpavserv.lock);
 	if (v2)
 		mutex_unlock(&dcp->hpd_mutex);
+	return ret;
+}
+
+static int dcpavserv_revalidate(struct apple_epic_service *service, const char *name,
+				const char *class, s64 unit)
+{
+	struct apple_dcp *dcp = service->ep->dcp;
+	int ret = 0;
+
+	if (!dcpavserv_identity(service, name, class, unit))
+		return -ENODEV;
+	mutex_lock(&dcp->hpd_mutex);
+	mutex_lock(&dcp->dcpavserv.lock);
+	if (dcp->dcpavserv.enabled)
+		ret = -EBUSY;
+	else if (service->admission.epoch != dcp->dcpavserv.epoch ||
+		 !dcpavserv_admission_current(dcp, service->admission.generation))
+		ret = -ENODEV;
+	mutex_unlock(&dcp->dcpavserv.lock);
+	mutex_unlock(&dcp->hpd_mutex);
 	return ret;
 }
 
@@ -177,7 +198,7 @@ static int dcpdpserv_prepare(struct apple_epic_service *service, const char *nam
 			    const char *class, s64 unit)
 {
 	/* No production command transport is needed for this H17P service. */
-	return service->ep->wire_v2 ? -ENODEV : 0;
+	return service->ep->wire_v2 ? -EOPNOTSUPP : 0;
 }
 
 static void dcpdpserv_init(struct apple_epic_service *service, const char *name,
@@ -361,16 +382,18 @@ bool dcpavserv_edid_current(struct apple_dcp *dcp, u64 generation)
 {
 	lockdep_assert_held(&dcp->hpd_mutex);
 	return dcp->hw.iomfb_method_profile !=
-		DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL ||
+		DCP_IOMFB_METHODS_H17P_EXTERNAL ||
 		(dcp->typec_cable_connected && generation == dcp->typec_generation &&
-		 !READ_ONCE(dcp->quiescing));
+		 !READ_ONCE(dcp->quiescing) && !READ_ONCE(dcp->external_physically_absent));
 }
 
 bool dcpavserv_edid_service_current(struct apple_dcp *dcp, u64 epoch)
 {
 	lockdep_assert_held(&dcp->dcpavserv.lock);
 	return dcp->dcpavserv.enabled && dcp->dcpavserv.service &&
-		epoch == dcp->dcpavserv.epoch;
+		epoch == dcp->dcpavserv.epoch &&
+		(dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17P_EXTERNAL ||
+		 !READ_ONCE(dcp->external_physically_absent));
 }
 
 const struct drm_edid *dcpavserv_copy_edid(struct apple_dcp *dcp, u64 generation,
@@ -416,6 +439,7 @@ static const struct apple_epic_service_ops dpavservep_ops[] = {
 		.name = "dcpav-service-epic",
 		.reusable = true,
 		.prepare = dcpavserv_prepare,
+		.revalidate = dcpavserv_revalidate,
 		.init = dcpavserv_init,
 		.teardown = dcpavserv_teardown,
 		.report = dcpavserv_report,
@@ -423,6 +447,7 @@ static const struct apple_epic_service_ops dpavservep_ops[] = {
 	{
 		.name = "dcpdp-service-epic",
 		.reusable = true,
+		.optional = true,
 		.prepare = dcpdpserv_prepare,
 		.init = dcpdpserv_init,
 		.teardown = dcpdpserv_teardown,
@@ -439,13 +464,13 @@ int dpavservep_init(struct apple_dcp *dcp)
 	init_completion(&dcp->dcpavserv.enable_completion);
 
 	ep = afk_init(dcp, dcp->hw.iomfb_method_profile ==
-		      DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL ?
+		      DCP_IOMFB_METHODS_H17P_EXTERNAL ?
 		      DPAVSERV_ENDPOINT_V2 : DPAVSERV_ENDPOINT, dpavservep_ops);
 	if (IS_ERR(ep))
 		return PTR_ERR(ep);
 	/* External H17P uses AFKV2 service calls with host-owned OOB buffers. */
 	ep->wire_v2 = dcp->hw.iomfb_method_profile ==
-		DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL;
+		DCP_IOMFB_METHODS_H17P_EXTERNAL;
 	ep->inline_v2 = false;
 	dcp->dcpavservep = ep;
 
@@ -466,7 +491,6 @@ int dpavservep_init(struct apple_dcp *dcp)
 	ret = wait_for_completion_timeout(&dcp->dcpavserv.enable_completion,
 					  msecs_to_jiffies(1000));
 	if (!ret) {
-		afk_trace_ring_snapshot(ep);
 		dev_warn(dcp->dev, "DCPAVSERV: timed out waiting for EDID service announcement\n");
 		return -ETIMEDOUT;
 	}

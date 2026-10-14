@@ -1,3 +1,0 @@
-// SPDX-License-Identifier: GPL-2.0+ OR MIT
-/* Compatibility alias: external display is now part of the ordinary J700 tree. */
-#include "t8140-j700.dts"
