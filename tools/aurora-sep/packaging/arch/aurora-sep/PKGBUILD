@@ -7,7 +7,7 @@
 
 pkgname=aurora-sep
 pkgver=1
-pkgrel=4
+pkgrel=5
 pkgdesc="Loader and desktop integration for the Apple SEP (Touch ID) driver"
 url="https://github.com/aurora-silicon/linux/tree/aurora-wip/tools/aurora-sep"
 arch=(any)
@@ -21,6 +21,7 @@ depends=(
 )
 optdepends=('glib2-devel: fingerprint at the GNOME login screen')
 source=(load-driver
+        aurora-sep-firmware-order.conf
         aurora-sep.service
         fprintd-aurora.conf
         aurora-sep-ready
@@ -31,7 +32,8 @@ source=(load-driver
         aurora-sep-greeter-fingerprint.service
         README.md
         XART-SAFETY.md)
-sha256sums=('abea60bb264ced349f7cf671d8d26e1609a81a60ea4c34d66ec6f7f73b847dbb'
+sha256sums=('3d7d665d57a2f3647c3edda8c896671f1ba06abedfd2bb8781aef7529e3cae86'
+            '1197effa8beca3de44f11e3ab9b7d45ed686bed20eda792ef8a9c1c1573cf243'
             '447f99cc3c7e683134f31b993aa825fadde24e4854954a3035c96e6631d4d4d0'
             'f8d0c4b9385e6716d5ac5dd9941a57459fbc551a8238383bcde36cd929d0523f'
             '2db07d3a0191e8d14581a3056505a8c4225b2fc8e6ea4a1956ae5493abcbb0ae'
@@ -40,7 +42,7 @@ sha256sums=('abea60bb264ced349f7cf671d8d26e1609a81a60ea4c34d66ec6f7f73b847dbb'
             '0695bd9ce4c207241db13c3ea07819a032d8213417021378f5015ab9317cde12'
             '5936eb76db666496a8700dade7ac6bcb3785b517958dcea10685690f1822c86f'
             'ffab97b20bfd5f0eb1ab641179a131843349cf16890fff0cf2d893f0b5681b37'
-            '7777f399b05f9ed860687140efdb0e07ea7b2d23939fe59ec4894690dff299cc'
+            '3b5664857bd1df8912741b6e64ab7d3d1c6e9005057f4c8f178436cdf4d2092d'
             '6628ae9c63265914e7206edf61e42c613810d9d9a61adc6c7c02327504911a42')
 
 # A unit and the helper it runs ($1, installed as $3), pointed at the
@@ -57,6 +59,8 @@ _unit() {
 }
 
 package() {
+  install -Dm644 aurora-sep-firmware-order.conf \
+    "$pkgdir/usr/lib/modprobe.d/aurora-sep-firmware-order.conf"
   _unit load-driver aurora-sep.service aurora-sep-load
   _unit aurora-sep-ready aurora-sep-ready.service aurora-sep-ready
   _unit aurora-sep-greeter-fingerprint aurora-sep-greeter-fingerprint.service \

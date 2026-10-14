@@ -39,7 +39,19 @@ if [ "${AURORA_SEP_SESSION:-0}" != 1 ]; then
     exec keyctl session aurora-sep-load env AURORA_SEP_SESSION=1 "$0" "$@"
 fi
 
-modprobe apple_sep xart_writes=1 provision_keybag=1
+# Rust module parameters are not exported through sysfs, so an existing
+# attachment cannot prove its initial options or firmware ordering. SEP cannot
+# reattach safely in the same boot. The ordered service must perform the first
+# load; never unload the driver or treat a repeated modprobe as reconfiguration.
+if [ -d /sys/module/apple_sep ]; then
+    log "apple_sep is already loaded; its initial options and firmware order cannot be verified; reboot with the firmware-ordered SEP service; do not unload or reload the driver"
+    exit 1
+fi
+
+if ! modprobe --first-time apple_sep xart_writes=1 provision_keybag=1; then
+    log "initial SEP module load failed; preserve existing state and check the kernel log; reboot after correcting firmware or load ordering; do not unload or reload the driver"
+    exit 1
+fi
 
 work=$(mktemp -d /run/aurora-sep-load.XXXXXX)
 cleanup() {

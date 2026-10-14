@@ -4,6 +4,9 @@
 
 import hashlib
 import re
+import os
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -57,6 +60,72 @@ class FedoraSpecTest(unittest.TestCase):
         text = (FEDORA / "build.sh").read_text()
         self.assertIn("aurora-sep.spec", text)
         self.assertNotIn("dnf -y download --source libfprint", text)
+
+
+class LoaderOrderingTest(unittest.TestCase):
+    def preflight(self, values=None):
+        # Execute the real loader up to insertion, without executing modprobe,
+        # touching real SEP state, or taking a keyring session on the host.
+        source = (SEP / "load-driver").read_text()
+        prelude = source.split("\nif ! modprobe --first-time apple_sep ", 1)[0]
+        with tempfile.TemporaryDirectory() as directory:
+            module = Path(directory) / "apple_sep"
+            if values is not None:
+                (module / "parameters").mkdir(parents=True)
+                for parameter, value in values.items():
+                    (module / "parameters" / parameter).write_text(value + "\n")
+            script = prelude.replace("/sys/module/apple_sep", str(module)) + "\nprintf 'insertion reached\\n'\n"
+            environment = dict(os.environ, AURORA_SEP_SESSION="1")
+            return subprocess.run(["sh", "-c", script], env=environment, text=True, capture_output=True)
+
+    def test_first_load_passes_preflight(self):
+        result = self.preflight()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("insertion reached", result.stdout)
+
+    def test_any_existing_attachment_refuses_without_reload(self):
+        # Even fabricated matching parameter files cannot prove compatibility:
+        # the public Rust module exposes no such sysfs parameter interface.
+        for values in ({"xart_writes": "1", "provision_keybag": "1"},
+                       {"xart_writes": "1", "provision_keybag": "0"}, {}):
+            with self.subTest(values=values):
+                result = self.preflight(values)
+                self.assertEqual(result.returncode, 1)
+                self.assertNotIn("insertion reached", result.stdout)
+                self.assertIn("reboot", result.stderr)
+                self.assertIn("cannot be verified", result.stderr)
+                self.assertIn("do not unload or reload", result.stderr)
+        self.assertNotIn("/sys/module/apple_sep/parameters", (SEP / "load-driver").read_text())
+
+    def test_actual_insertion_failure_refuses_without_probing_or_retry(self):
+        source = (SEP / "load-driver").read_text()
+        # Run the actual modprobe failure branch with a recording shell command;
+        # stop before the later key/device probes. No real module is inserted.
+        prelude = source.split("\nwork=$(mktemp", 1)[0]
+        with tempfile.TemporaryDirectory() as directory:
+            module = Path(directory) / "absent-module"
+            script = ("modprobe() { printf 'attempt:%s\\n' \"$*\"; return 1; }\n"
+                      + prelude.replace("/sys/module/apple_sep", str(module))
+                      + "\nprintf 'unsafe continuation\\n'\n")
+            result = subprocess.run(["sh", "-c", script], env=dict(os.environ, AURORA_SEP_SESSION="1"),
+                                    text=True, capture_output=True)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("attempt:--first-time apple_sep xart_writes=1 provision_keybag=1", result.stdout)
+        self.assertEqual(result.stdout.count("attempt:"), 1)
+        self.assertNotIn("unsafe continuation", result.stdout)
+        self.assertIn("preserve existing state", result.stderr)
+        self.assertIn("check the kernel log", result.stderr)
+        self.assertNotIn("race", result.stderr)
+
+    def test_alias_blacklist_is_packaged_without_blocking_explicit_load(self):
+        effective = [line for line in (SEP / "aurora-sep-firmware-order.conf").read_text().splitlines()
+                     if line and not line.startswith("#")]
+        self.assertEqual(effective, ["blacklist apple_sep"])
+        for recipe in (ARCH / "aurora-sep/PKGBUILD", FEDORA / "aurora-sep.spec"):
+            source = recipe.read_text()
+            self.assertIn("/lib/modprobe.d/aurora-sep-firmware-order.conf", source)
+            self.assertNotIn("omarchy-vendor-firmware.service", source)
+        self.assertIn("modprobe --first-time apple_sep xart_writes=1 provision_keybag=1", (SEP / "load-driver").read_text())
 
 
 if __name__ == "__main__":

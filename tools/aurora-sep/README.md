@@ -35,7 +35,17 @@ state, and a single extent reference owned by the `.gl` inode. The kernel
 resolves that extent from checksum-validated APFS metadata; unsupported layouts
 fail closed. Set `options apple_sep xart_writes=0 provision_keybag=0` in a
 modprobe configuration to retain read-only operation. Identity-keybag creation
-still requires `provision_keybag=1`; `load-driver` supplies that option.
+still requires `provision_keybag=1`; `load-driver` supplies that option. The
+package blacklists alias-based loading so the explicit loader can set its
+options on the first insertion. Any already-loaded module causes a clear
+reboot refusal: Rust module parameters are not exposed through sysfs, so its
+initial options and firmware order cannot be verified. The loader never
+unloads or reattaches SEP. Its successful systemd service stays active, so
+fprintd does not run the loader again. Platforms
+that extract firmware during boot must order this service after that extraction
+and include the alias blacklist in their initramfs. Omarchy's image integration
+orders it after `omarchy-vendor-firmware.service`; other distributions keep
+their own firmware dependency and do not require that Omarchy unit.
 Enabling writes has been tested on m2 with identity-keybag provisioning,
 trusted-key seal/unseal, and reboot reload. The raw iBoot container hash did not
 change in those tests, so an actual xART write was **not** validated. Do not

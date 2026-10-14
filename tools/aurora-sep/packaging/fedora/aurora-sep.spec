@@ -5,7 +5,7 @@
 
 Name:           aurora-sep
 Version:        1
-Release:        3%{?dist}
+Release:        4%{?dist}
 Summary:        Loader and desktop integration for the Apple SEP fingerprint driver
 
 License:        GPL-2.0-only
@@ -21,6 +21,7 @@ Source7:        fprintd-no-timeout.conf.in
 Source8:        logind-aurora-sep.conf
 Source9:        aurora-sep-greeter-fingerprint
 Source10:       aurora-sep-greeter-fingerprint.service
+Source11:       aurora-sep-firmware-order.conf
 
 BuildArch:      noarch
 BuildRequires:  systemd-rpm-macros
@@ -60,6 +61,8 @@ unit() {
         %{buildroot}%{_unitdir}/"${2##*/}"
     if grep -q /usr/local %{buildroot}%{_unitdir}/"${2##*/}"; then exit 1; fi
 }
+install -Dpm 0644 %{SOURCE11} \
+    %{buildroot}%{_prefix}/lib/modprobe.d/aurora-sep-firmware-order.conf
 unit %{SOURCE0} %{SOURCE1} aurora-sep-load
 unit %{SOURCE5} %{SOURCE6} aurora-sep-ready
 unit %{SOURCE9} %{SOURCE10} aurora-sep-greeter-fingerprint
@@ -86,6 +89,7 @@ echo 'enable aurora-sep.service' >%{buildroot}%{_presetdir}/80-aurora-sep.preset
 
 %files
 %doc README.md XART-SAFETY.md
+%{_prefix}/lib/modprobe.d/aurora-sep-firmware-order.conf
 %{_libexecdir}/aurora-sep-load
 %{_libexecdir}/aurora-sep-ready
 %{_libexecdir}/aurora-sep-greeter-fingerprint
