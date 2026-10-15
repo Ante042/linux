@@ -464,7 +464,7 @@ static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route)
 	guard(mutex)(&dcp->external_lock);
 	if (dcp_is_external_h17p(dcp) &&
 	    (dcp->external_error || (dcp->external_power_attempted && !dcp->external_stopped)))
-		return dcp->external_error ?: -EBUSY;
+		return dcp->external_error ?: -EAGAIN;
 
 	dcp_firmware_metadata_connection(dcp, READ_ONCE(dcp->typec_generation), false);
 
@@ -973,7 +973,7 @@ static int dcp_typec_route_prepare(struct typec_mux_dev *mux,
 
 	guard(mutex)(&dcp_typec_fabric_lock);
 	if (state->mode != TYPEC_STATE_SAFE)
-		return port->safe_pending ? -EBUSY : 0;
+		return port->safe_pending ? -EAGAIN : 0;
 	if (!port->owner || port->owner->tunnel)
 		return 0;
 	dcp = port->owner->dcp;
@@ -1060,8 +1060,9 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 
 	if (state->mode == TYPEC_STATE_SAFE && port->safe_pending)
 		return 0;
+	/* The previous SAFE transition has not finished; retry. */
 	if (port->safe_pending)
-		return -EBUSY;
+		return -EAGAIN;
 
 	/*
 	 * Every candidate route for this port is notified with the same state,
@@ -1154,7 +1155,7 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 			dcp_typec_rebalance_locked(NULL, 0);
 		if (!port->owner) {
 			if (hpd)
-				return -EBUSY;
+				return -ENOSPC;
 			port->applied_valid = true;
 			return 0;
 		}
@@ -1173,8 +1174,9 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 		if (!best)
 			best = dcp_typec_lowest_free(port);
 
+		/* Every pipeline is driving another port's display. */
 		if (!best)
-			return -EBUSY;
+			return -ENOSPC;
 
 		ret = dcp_typec_route_activate(best, best->xbar);
 		if (ret)
@@ -2497,12 +2499,12 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *waiting_s
 		dev_warn(dcp->dev, "dcp_dptx_connect: missing phy\n");
 		return -ENODEV;
 	}
-	dev_info(dcp->dev,
-		 "%s(port=%d) target=%u:%u typec=%d route=%s conn_type=%d connected=%d\n",
-		 __func__, port, dcp->dptx_die, dcp->dptx_phy,
-		 dcp_is_typec_output(dcp),
-		 dcp->active_typec_route ? "borrowed" : "fixed",
-		 dcp->connector_type, dcp->dptxport[port].connected);
+	dev_dbg(dcp->dev,
+		"%s(port=%d) target=%u:%u typec=%d route=%s conn_type=%d connected=%d\n",
+		__func__, port, dcp->dptx_die, dcp->dptx_phy,
+		dcp_is_typec_output(dcp),
+		dcp->active_typec_route ? "borrowed" : "fixed",
+		dcp->connector_type, dcp->dptxport[port].connected);
 
 	mutex_lock(&dcp->hpd_mutex);
 	if (!dptx_service_available(&dcp->dptxport[port])) {
@@ -4430,7 +4432,7 @@ static int dcp_platform_probe(struct platform_device *pdev)
 			set_bit(surf, dcp->iomfb_surfaces);
 		surf++;
 	}
-	/* The qualified J700 loader names surface zero rather than enabling it. */
+	/* The J700 loader names surface zero rather than enabling it. */
 	if (of_machine_is_compatible("apple,j700") &&
 	    of_device_is_compatible(dev->of_node, "apple,t8140-dcp") &&
 	    num_surfs == 1 &&
@@ -4569,7 +4571,7 @@ static void dcp_platform_shutdown(struct platform_device *pdev)
 	    dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) {
 		/*
 		 * This firmware keeps scanning across soft DPMS and has no
-		 * qualified stop sequence. Component unbind releases the RTKit
+		 * known stop sequence. Component unbind releases the RTKit
 		 * devres group and the piodma domain while firmware may still
 		 * access them. Stop host submissions but keep the component and
 		 * its DMA resources alive until the system resets.
@@ -4629,6 +4631,40 @@ static void dcp_drain_for_sleep(struct apple_dcp *dcp)
 	dev_warn(dcp->dev, "brightness change still pending at suspend\n");
 }
 
+/*
+ * DPMS off leaves the internal H17P pipe scanning out (see dcp_poweroff()),
+ * and while it scans out the firmware publishes a property to the AP on every
+ * frame.  The mailbox interrupt is not suspended, so each of those messages
+ * wakes a CPU out of suspend-to-idle about 60 times a second.  Hold the
+ * messages in the mailbox for system sleep and process them at resume.
+ * apple-drm is a consumer of this device, so its suspend handler has blanked
+ * the panel before this runs and its resume handler restores the CRTC after.
+ */
+static void dcp_hold_for_sleep(struct apple_dcp *dcp)
+{
+	if (!dcp_uses_soft_dpms(dcp) || dcp->fw_compat != DCP_FIRMWARE_H17P ||
+	    dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G ||
+	    READ_ONCE(dcp->crashed))
+		return;
+
+	iomfb_pause_presentation(dcp, true);
+	if (iomfb_queue_settle(dcp, msecs_to_jiffies(500))) {
+		iomfb_pause_presentation(dcp, false);
+		return;
+	}
+	apple_rtkit_hold_rx(dcp->rtk);
+	dcp->rx_held = true;
+}
+
+static void dcp_release_after_sleep(struct apple_dcp *dcp)
+{
+	if (!dcp->rx_held)
+		return;
+	dcp->rx_held = false;
+	apple_rtkit_resume_rx(dcp->rtk);
+	iomfb_pause_presentation(dcp, false);
+}
+
 static int dcp_platform_suspend(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
@@ -4672,6 +4708,8 @@ static int dcp_platform_suspend(struct device *dev)
 	 * shutdown properly yet.
 	 */
 	device_set_wakeup_path(dev);
+	/* Last: the steps above still talk to the coprocessor. */
+	dcp_hold_for_sleep(dcp);
 
 	return 0;
 }
@@ -4680,6 +4718,7 @@ static int dcp_platform_resume(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 
+	dcp_release_after_sleep(dcp);
 	dcp_enable_typec_work(dcp);
 	if (dcp->hdmi_hpd_irq)
 		enable_irq(dcp->hdmi_hpd_irq);
@@ -4702,7 +4741,7 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t8112 = {
 	.num_dptx_ports = 2,
 };
 
-/* The internal T8140 endpoint uses the measured H17P method profile. */
+/* The internal T8140 endpoint uses the H17P method profile. */
 static const struct resource t8140_firmware_clock =
 	DEFINE_RES_MEM(0x302800000, 0xbc000);
 

@@ -2,7 +2,7 @@
 
 CFLAGS_trace.o = -I$(src)
 
-appledrm-y := apple_drv.o
+appledrm-y := apple_drv.o apple_resume.o
 appledrm-y += afk.o dcp.o dcp_backlight.o dptxep.o iomfb.o parser.o systemep.o
 appledrm-$(CONFIG_DRM_APPLE_AUDIO) += audio.o
 appledrm-$(CONFIG_DRM_APPLE_AUDIO) += av.o
@@ -12,6 +12,7 @@ appledrm-y += iomfb_v12_3.o
 appledrm-y += iomfb_v13_3.o
 appledrm-y += iomfb_h17p.o
 appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += iomfb_h17p_test.o
+appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += apple_resume_test.o
 appledrm-y += epic/dpavservep.o
 appledrm-y += plane.o
 

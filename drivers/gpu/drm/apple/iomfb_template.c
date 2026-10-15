@@ -459,7 +459,7 @@ static void iomfb_cb_pr_publish(struct apple_dcp *dcp, struct iomfb_property *pr
 	case IOMFB_PROPERTY_NITS:
 	{
 #if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
-		/* Measured H17P takeover comes from the powerlog hint interface. */
+		/* The H17P takeover level comes from the powerlog hint interface. */
 		if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G)
 			break;
 #endif
@@ -877,8 +877,8 @@ dcpep_cb_read_edt_data(struct apple_dcp *dcp, struct dcp_read_edt_data_req *req)
 {
 	/* Observe boot-property requests without inventing firmware timings. */
 	if (dcp->fixed_connector_type != DRM_MODE_CONNECTOR_eDP)
-		dev_info(dcp->dev,
-			 "read_edt_data key=%.*s count=%u default0=%#x ret=0\n",
+		dev_dbg(dcp->dev,
+			"read_edt_data key=%.*s count=%u default0=%#x ret=0\n",
 			 (int)sizeof(req->key), req->key, req->count,
 			 req->value[0]);
 
@@ -1109,8 +1109,8 @@ static u8 dcpep_cb_prop_end(struct apple_dcp *dcp,
 	u8 resp = dcpep_process_chunks(dcp, req);
 
 	if (dcp->fixed_connector_type != DRM_MODE_CONNECTOR_eDP)
-		dev_info(dcp->dev,
-			 "DCP property key=%.*s bytes=%zu accepted=%u nr_modes=%u\n",
+		dev_dbg(dcp->dev,
+			"DCP property key=%.*s bytes=%zu accepted=%u nr_modes=%u\n",
 			 (int)sizeof(req->key), req->key, dcp->chunks.length,
 			 resp, dcp->nr_modes);
 
@@ -1407,7 +1407,7 @@ static void release_swap_cookie(struct kref *ref)
  * format two bytes late and its surface check rejects the swap as an
  * unsupported format.
  *
- * H17G retains this public packing path. The measured H17P profile uses
+ * H17G retains this public packing path. The H17P profile uses
  * a separate wire record with the SPEC's 0x588 swap boundary.
  */
 static void dcp_h17p_prepare_swap(struct apple_dcp *dcp)
@@ -1430,7 +1430,7 @@ static void dcp_h17p_prepare_swap(struct apple_dcp *dcp)
 	req->swap.h17p_pre_swap_id[0x00] = 2;
 	req->swap.h17p_pre_swap_id[0x28] = 3;
 
-	/* The measured H17P layout is serialized without shifting its surfaces. */
+	/* The H17P layout is serialized without shifting its surfaces. */
 	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G)
 		return;
 
@@ -1744,7 +1744,7 @@ static void complete_set_powerstate(struct apple_dcp *dcp, void *out,
 
 static bool dcp_power_stop_confirmed(struct dcp_wait_cookie *cookie)
 {
-	/* H17P stop semantics still require hardware qualification. */
+	/* H17P does not confirm that scanout has stopped. */
 #if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
 	return false;
 #else
@@ -1782,7 +1782,7 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 	typeof(DCP_FW_UNION(dcp->swap)) *swap = &DCP_FW_UNION(dcp->swap);
 
 #if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
-	/* The measured profile has no safe pipe-off or surface-free transition. */
+	/* H17P has no known safe pipe-off or surface-free transition. */
 	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G)
 		return;
 #endif
@@ -1932,7 +1932,7 @@ static void dcpep_cb_hotplug(struct apple_dcp *dcp, u64 *connected)
 	if (dcp->main_display)
 		return;
 	/*
-	 * Report firmware hotplug independently of the USB4 PHY experiment.
+	 * Report firmware hotplug independently of the USB4 PHY.
 	 * Reassigning lpdptxphy blanked eDP even with these callbacks ignored;
 	 * suppressing connector notifications does not protect the panel.
 	 * Mode probing still uses this DCP's firmware modes, and mode_valid

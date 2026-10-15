@@ -40,6 +40,7 @@
 #include <drm/drm_vblank.h>
 #include <drm/drm_fixed.h>
 
+#include "apple_resume.h"
 #include "dcp.h"
 #include "plane.h"
 
@@ -930,9 +931,16 @@ static int apple_platform_suspend(struct device *dev)
 static int apple_platform_resume(struct device *dev)
 {
 	struct apple_drm_private *apple = dev_get_drvdata(dev);
+	bool dropped = false;
 
-	if (apple)
+	if (apple) {
+		if (apple->drm.mode_config.suspend_state)
+			dropped = apple_drm_drop_stale_crtcs(apple->drm.mode_config.suspend_state);
 		drm_mode_config_helper_resume(&apple->drm);
+		/* Have userspace set the mode of a CRTC resumed disabled again. */
+		if (dropped)
+			drm_kms_helper_hotplug_event(&apple->drm);
+	}
 
 	return 0;
 }
