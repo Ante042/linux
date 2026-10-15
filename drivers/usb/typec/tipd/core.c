@@ -1041,7 +1041,12 @@ static void cd321x_update_work(struct work_struct *work)
 	return;
 
 retry:
-	if (ret == -ESHUTDOWN) {
+	/*
+	 * The Thunderbolt provider disabled the port for good after a failed
+	 * resume recovery (see apple_cio_tbt_switch_set()). Other errors,
+	 * including -ESHUTDOWN while the provider unbinds, are retried as before.
+	 */
+	if (ret == -EHOSTDOWN) {
 		/* A terminal provider failure must not cycle the complex again. */
 		cd321x->state.alt = NULL;
 		cd321x->state.mode = TYPEC_STATE_SAFE;
