@@ -580,7 +580,7 @@ static int dchid_start_interface(struct dchid_iface *iface)
 	int ret;
 
 	if (iface->starting) {
-		dev_warn(iface->dchid->dev, "Interface %s is already starting", iface->name);
+		dev_warn(iface->dchid->dev, "Interface %s is already starting\n", iface->name);
 		return -EINPROGRESS;
 	}
 
@@ -607,7 +607,7 @@ static int dchid_start_interface(struct dchid_iface *iface)
 		dev_info(iface->dchid->dev, "Sending firmware for %s\n", iface->name);
 		ret = dchid_send_firmware(iface, fw, size);
 		if (ret < 0) {
-			dev_err(iface->dchid->dev, "Failed to send %s firmwareS", iface->name);
+			dev_err(iface->dchid->dev, "Failed to send %s firmware\n", iface->name);
 			goto err;
 		}
 
@@ -640,7 +640,7 @@ static int dchid_start(struct hid_device *hdev)
 	if (iface->keyboard_layout_id) {
 		int ret = device_create_file(&hdev->dev, &dev_attr_apple_layout_id);
 		if (ret) {
-			dev_warn(iface->dchid->dev, "Failed to create apple_layout_id: %d", ret);
+			dev_warn(iface->dchid->dev, "Failed to create apple_layout_id: %d\n", ret);
 			iface->keyboard_layout_id = 0;
 		}
 	}
@@ -675,7 +675,8 @@ static int dchid_open(struct hid_device *hdev)
 		}
 	}
 
-	iface->open = true;
+	/* Pairs with the acquire in dchid_handle_report(); publishes iface->hid. */
+	smp_store_release(&iface->open, true);
 	return 0;
 }
 
@@ -683,7 +684,7 @@ static void dchid_close(struct hid_device *hdev)
 {
 	struct dchid_iface *iface = hdev->driver_data;
 
-	iface->open = false;
+	WRITE_ONCE(iface->open, false);
 }
 
 static int dchid_parse(struct hid_device *hdev)
@@ -801,7 +802,7 @@ static void dchid_create_interface_work(struct work_struct *ws)
 	if (ret < 0) {
 		iface->hid = NULL;
 		hid_destroy_device(hid);
-		dev_warn(iface->dchid->dev, "Failed to register hid device %s", iface->name);
+		dev_warn(iface->dchid->dev, "Failed to register hid device %s\n", iface->name);
 	}
 }
 
@@ -1063,14 +1064,12 @@ static void dchid_handle_event(struct dockchannel_hid *dchid, void *data, size_t
 
 static void dchid_handle_report(struct dchid_iface *iface, void *data, size_t length)
 {
-	struct dockchannel_hid *dchid = iface->dchid;
-
-	if (!iface->hid) {
-		dev_warn(dchid->dev, "Report received but %s is not initialized!\n", iface->name);
-		return;
-	}
-
-	if (!iface->open)
+	/*
+	 * An interface starts reporting as soon as it is enabled, which is
+	 * before its HID device has been registered and opened. Until then
+	 * there is nobody to deliver the reports to.
+	 */
+	if (!smp_load_acquire(&iface->open))
 		return;
 
 	hid_input_report(iface->hid, HID_INPUT_REPORT, data, length, 1);
@@ -1134,7 +1133,7 @@ static void dchid_handle_ack(struct dchid_iface *iface, struct dchid_hdr *hdr, v
 	}
 	if (shdr->flags != iface->out_flags) {
 		dev_err(iface->dchid->dev,
-			"Received unexpected flags 0x%x on ACK channel (expFected 0x%x)\n",
+			"Received unexpected flags 0x%x on ACK channel (expected 0x%x)\n",
 			shdr->flags, iface->out_flags);
 		return;
 	}
@@ -1345,14 +1344,14 @@ static int dockchannel_hid_probe(struct platform_device *pdev)
 	 */
 	helper = of_parse_phandle(dev->of_node, "apple,helper-cpu", 0);
 	if (!helper) {
-		dev_err(dev, "Missing apple,helper-cpu property");
+		dev_err(dev, "Missing apple,helper-cpu property\n");
 		return -EINVAL;
 	}
 
 	helper_pdev = of_find_device_by_node(helper);
 	of_node_put(helper);
 	if (!helper_pdev) {
-		dev_err(dev, "Failed to find helper device");
+		dev_err(dev, "Failed to find helper device\n");
 		return -EINVAL;
 	}
 
@@ -1360,7 +1359,7 @@ static int dockchannel_hid_probe(struct platform_device *pdev)
 					     DL_FLAG_AUTOREMOVE_CONSUMER);
 	put_device(&helper_pdev->dev);
 	if (!dchid->helper_link) {
-		dev_err(dev, "Failed to link to helper device");
+		dev_err(dev, "Failed to link to helper device\n");
 		return -EINVAL;
 	}
 
@@ -1389,7 +1388,7 @@ static int dockchannel_hid_probe(struct platform_device *pdev)
 
 	dchid->comm = dchid_get_interface(dchid, IFACE_COMM, "comm");
 	if (!dchid->comm) {
-		dev_err(dchid->dev, "Failed to initialize comm interface");
+		dev_err(dchid->dev, "Failed to initialize comm interface\n");
 		destroy_workqueue(dchid->new_iface_wq);
 		return -EIO;
 	}
