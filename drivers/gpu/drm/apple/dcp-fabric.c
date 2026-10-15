@@ -66,6 +66,8 @@ struct apple_dcp_typec_port {
 	/* Direct DP-alt: the port is in DP mode, routed or not, and its HPD. */
 	bool dp_wanted;
 	bool dp_hpd;
+	/* the wait for a pipeline was logged since the port entered DP mode */
+	bool busy_noted;
 	/* dcp_typec_rebalance_locked()'s plan for the port's two streams */
 	struct apple_dcp_typec_route *target;
 	struct apple_dcp_typec_route *secondary_target;
@@ -1225,6 +1227,28 @@ void dcp_typec_reorder(void)
 		dcp_typec_rebalance_locked(NULL, 0);
 }
 
+/*
+ * A DP display on @port gets no pipeline: every one that could drive it
+ * drives another display. Say so once per plug, with the display's HPD up;
+ * the port controller only logs the -EBUSY. When one of those displays goes,
+ * the freed pipeline takes a waiting display without a replug (see
+ * dcp_typec_pipeline_freed()).
+ */
+static int dcp_typec_port_busy(struct apple_dcp_typec_port *port,
+			       struct apple_dcp *dcp)
+{
+	const char *label = NULL;
+
+	if (port->busy_noted)
+		return -EBUSY;
+	port->busy_noted = true;
+	of_property_read_string(port->connector_np, "label", &label);
+	dev_info(dcp->dev,
+		 "display on %s waits for a free external display pipeline (each one drives another display); it lights up on its own when one of those displays is unplugged\n",
+		 label ?: "a USB-C port");
+	return -EBUSY;
+}
+
 static int dcp_typec_route_set(struct typec_mux_dev *mux,
 			       struct typec_mux_state *state)
 {
@@ -1238,6 +1262,10 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 	bool hpd = dp_data && (dp_data->status & DP_STATUS_HPD_STATE);
 	bool was_counted;
 	int ret = 0;
+
+	/* A failed T8122 dcpext drives nothing; USB on the port goes on. */
+	if (READ_ONCE(route->dcp->ext_dead))
+		return 0;
 
 	guard(mutex)(&dcp_typec_fabric_lock);
 
@@ -1279,6 +1307,7 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 	if (!is_dp) {
 		port->dp_wanted = false;
 		port->dp_hpd = false;
+		port->busy_noted = false;
 
 		/* a Thunderbolt/USB4 DP tunnel is torn down by its own path */
 		if (port->owner && port->owner->tunnel) {
@@ -1336,7 +1365,7 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 			dcp_typec_rebalance_locked(NULL, 0);
 		if (!port->owner) {
 			if (hpd)
-				return -EBUSY;
+				return dcp_typec_port_busy(port, route->dcp);
 			port->applied_valid = true;
 			return 0;
 		}
@@ -1350,12 +1379,14 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 	if (!port->owner) {
 		best = dcp_typec_free_route(port);
 		if (!best)
-			return -EBUSY;
+			return hpd ? dcp_typec_port_busy(port, route->dcp) : -EBUSY;
 
 		ret = dcp_typec_route_activate(best, best->xbar);
 		if (ret)
 			return ret;
 		port->owner = best;
+		/* a later wait of this plug is reported again */
+		port->busy_noted = false;
 	}
 
 	if (hpd && !port->hpd) {
@@ -3136,6 +3167,29 @@ bool dcp_typec_port_has_candidate(unsigned int idx, struct platform_device *pdev
 			return true;
 
 	return false;
+}
+
+/*
+ * Is every pipeline that can drive port @idx unusable (a failed T8122
+ * dcpext)? Such a port gets no connector, rather than failing the DRM
+ * device of the internal panel.
+ */
+bool dcp_typec_port_unusable(unsigned int idx)
+{
+	struct apple_dcp_typec_port *port;
+	struct apple_dcp_typec_route *route;
+
+	guard(mutex)(&dcp_typec_fabric_lock);
+
+	port = dcp_typec_port_by_index(idx);
+	if (!port || list_empty(&port->routes))
+		return false;
+
+	list_for_each_entry(route, &port->routes, port_link)
+		if (!READ_ONCE(route->dcp->ext_dead))
+			return false;
+
+	return true;
 }
 
 void dcp_typec_port_set_connector(unsigned int idx, bool secondary,

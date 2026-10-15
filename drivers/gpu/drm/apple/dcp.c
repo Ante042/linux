@@ -24,6 +24,7 @@
 #include <linux/slab.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/soc/apple/j613-display.h>
+#include <linux/soc/apple/pmp-report.h>
 #include <linux/string.h>
 #include <linux/usb/typec_altmode.h>
 #include <linux/usb/typec_dp.h>
@@ -278,6 +279,10 @@ static void dcp_recv_msg(void *cookie, u8 endpoint, u64 message)
 
 	trace_dcp_recv_msg(dcp, endpoint, message);
 
+	/* A failed T8122 dcpext: its firmware may still talk, nobody listens. */
+	if (READ_ONCE(dcp->ext_dead))
+		return;
+
 	switch (endpoint) {
 	case IOMFB_ENDPOINT:
 		return iomfb_recv_msg(dcp, message);
@@ -305,6 +310,15 @@ static void dcp_rtk_crashed(void *cookie, const void *crashlog, size_t crashlog_
 {
 	struct apple_dcp *dcp = cookie;
 
+	/*
+	 * A failed T8122 dcpext: its start never ran (start_done is not set
+	 * up) and it has no connector. Its firmware may still report a crash.
+	 */
+	if (READ_ONCE(dcp->ext_dead)) {
+		dcp->crashed = true;
+		dev_err(dcp->dev, "unusable external display processor has crashed\n");
+		return;
+	}
 	dcp->crashed = true;
 	dev_err(dcp->dev, "DCP has crashed\n");
 	if (dcp->connector) {
@@ -496,6 +510,8 @@ static int dcp_dptx_connect_session(struct apple_dcp *dcp, u32 port,
 				    struct dcp_fabric_session session, bool cable,
 				    bool recovery)
 {
+	/* T8122 dcpext: HPD only after the link wait, see dcp_ext_dptx_607() */
+	bool late_hpd = dcp_ext_dptx_607(dcp);
 	unsigned long timeout;
 	u8 dfp_port;
 	int ret = 0;
@@ -542,14 +558,16 @@ static int dcp_dptx_connect_session(struct apple_dcp *dcp, u32 port,
 	dcp->dptxport[port].atcphy = dcp->phy;
 	/* a tiled display's second half comes in on the port's dpin1 */
 	dfp_port = port && READ_ONCE(dcp->split.active) ? 2 : dcp->dptx_dfp_port;
-	ret = dptxport_validate_connection(dcp->dptxport[port].service,
-					   dfp_port,
-					   dcp->dptx_phy, dcp->dptx_die);
-	if (ret) {
-		dev_err(dcp->dev,
-			"dcp_dptx_connect: failed to validate DPTX target %u:%u: %d\n",
-			dcp->dptx_die, dcp->dptx_phy, ret);
-		goto out_unlock;
+	if (!dcp_ext_dptx_607(dcp)) {
+		ret = dptxport_validate_connection(dcp->dptxport[port].service,
+						   dfp_port,
+						   dcp->dptx_phy, dcp->dptx_die);
+		if (ret) {
+			dev_err(dcp->dev,
+				"dcp_dptx_connect: failed to validate DPTX target %u:%u: %d\n",
+				dcp->dptx_die, dcp->dptx_phy, ret);
+			goto out_unlock;
+		}
 	}
 
 	if (!dcp_connect_session_valid_locked(dcp, session, cable, recovery)) {
@@ -559,7 +577,7 @@ static int dcp_dptx_connect_session(struct apple_dcp *dcp, u32 port,
 	ret = dptxport_connect(dcp->dptxport[port].service,
 			       dfp_port,
 			       dcp->dptx_phy, dcp->dptx_die,
-		       dcp_is_typec_output(dcp));
+			       dcp_is_typec_output(dcp) && !dcp_ext_dptx_607(dcp));
 	if (ret) {
 		dev_err(dcp->dev,
 			"dcp_dptx_connect: failed to connect DPTX target %u:%u: %d\n",
@@ -583,7 +601,7 @@ static int dcp_dptx_connect_session(struct apple_dcp *dcp, u32 port,
 		goto out_release;
 	}
 	dcp->dptxport[port].connected = true;
-	if (dcp_is_typec_output(dcp)) {
+	if (dcp_is_typec_output(dcp) && !late_hpd) {
 		if (dcp_uses_t6020_tunnel_flow(dcp))
 			ret = dptxport_set_hpd_timeout(dcp->dptxport[port].service,
 						       true, 8000);
@@ -620,16 +638,21 @@ static int dcp_dptx_connect_session(struct apple_dcp *dcp, u32 port,
 		ret = -ESTALE;
 		goto out_unlock;
 	}
-	if (!ret) {
+	if (!ret && late_hpd) {
+		/* Without HPD this firmware does not train: assert it now. */
+		dev_dbg(dcp->dev,
+			"dcp_dptx_connect: no link configuration on port %u yet, asserting HPD\n",
+			port);
+	} else if (!ret) {
 		dev_err(dcp->dev,
 			"dcp_dptx_connect: timed out waiting for port %u link configuration\n",
 			port);
 		ret = -ETIMEDOUT;
 		goto out_disconnect;
+	} else {
+		dev_dbg(dcp->dev, "dcp_dptx_connect: waited %d ms for link\n",
+			jiffies_to_msecs(timeout - ret));
 	}
-
-	dev_dbg(dcp->dev, "dcp_dptx_connect: waited %d ms for link\n",
-		jiffies_to_msecs(timeout - ret));
 
 	usleep_range(5, 10);
 	if (!dcp_connect_session_valid_locked(dcp, session, cable, recovery)) {
@@ -637,9 +660,13 @@ static int dcp_dptx_connect_session(struct apple_dcp *dcp, u32 port,
 		goto out_unlock;
 	}
 
-	if (dcp->connector_type == DRM_MODE_CONNECTOR_DisplayPort) {
+	if (dcp->connector_type == DRM_MODE_CONNECTOR_DisplayPort || late_hpd) {
 		ret = dptxport_set_hpd(dcp->dptxport[port].service, true);
-		if (ret && dcp->external)
+		if (ret && late_hpd)
+			dev_err(dcp->dev,
+				"dcp_dptx_connect: failed to assert HPD after the link wait: %d\n",
+				ret);
+		if (ret && (dcp->external || late_hpd))
 			goto out_disconnect;
 	}
 	if (!dcp_connect_session_valid_locked(dcp, session, cable, recovery)) {
@@ -1136,6 +1163,7 @@ int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port)
 		scoped_guard(mutex, &dcp->hpd_mutex) {
 			WRITE_ONCE(dcp->typec_cable_connected, false);
 			dcp->typec_generation++;
+			dcp->typec_unplugs++;
 			/* Nothing left to retry for the display that went. */
 			if (dcp->external_native)
 				cancel_delayed_work(&dcp->external_retry_wq);
@@ -1273,6 +1301,14 @@ bool dcp_fw_compat_is_12_x(struct platform_device *pdev)
 	return dcp->fw_compat == DCP_FIRMWARE_V_12_3;
 }
 
+/* A failed T8122 dcpext: no pipeline of the DRM device. */
+bool dcp_ext_unusable(struct platform_device *pdev)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	return !dcp || READ_ONCE(dcp->ext_dead);
+}
+
 bool dcp_fw_compat_is_14_7(struct platform_device *pdev)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
@@ -1391,6 +1427,9 @@ static void _dcp_poweroff(struct apple_dcp *dcp)
 	case DCP_FIRMWARE_V_13_5:
 		iomfb_poweroff_v13_3(dcp);
 		break;
+	case DCP_FIRMWARE_V_14_7_TEMPLATE:
+		iomfb_poweroff_v14_7_0(dcp);
+		break;
 	case DCP_FIRMWARE_V_26_6:
 		iomfb_v26_6_poweroff(dcp);
 		break;
@@ -1476,6 +1515,9 @@ static void __maybe_unused dcp_sleep(struct apple_dcp *dcp)
 	case DCP_FIRMWARE_V_13_5:
 		iomfb_sleep_v13_3(dcp);
 		break;
+	case DCP_FIRMWARE_V_14_7_TEMPLATE:
+		iomfb_sleep_v14_7_0(dcp);
+		break;
 	case DCP_FIRMWARE_V_26_6:
 		iomfb_v26_6_poweroff(dcp);
 		break;
@@ -1517,6 +1559,11 @@ void dcp_poweron(struct platform_device *pdev)
 	int ret;
 
 	if (dcp_is_typec_output(dcp)) {
+		/* T8122 dcpext only, see dcp_poweroff() */
+		if (dcp->ext_failsafe) {
+			scoped_guard(mutex, &dcp->hpd_mutex)
+				dcp->crtc_unplugs = dcp->typec_unplugs;
+		}
 		wait_for_typec_hpd = READ_ONCE(dcp->typec_crtc_off) &&
 				    READ_ONCE(dcp->typec_cable_connected);
 		WRITE_ONCE(dcp->typec_crtc_off, false);
@@ -1556,6 +1603,9 @@ void dcp_poweron(struct platform_device *pdev)
 	case DCP_FIRMWARE_V_13_5:
 		iomfb_poweron_v13_3(dcp);
 		break;
+	case DCP_FIRMWARE_V_14_7_TEMPLATE:
+		iomfb_poweron_v14_7_0(dcp);
+		break;
 	case DCP_FIRMWARE_V_26_6:
 		iomfb_v26_6_poweron(dcp);
 		break;
@@ -1573,11 +1623,37 @@ void dcp_poweron(struct platform_device *pdev)
 void dcp_poweroff(struct platform_device *pdev)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+	bool display_gone = false;
 	int ret;
 
 	cancel_delayed_work(&dcp->swap_watchdog_wq);
 	if (dcp->avep)
 		av_service_disconnect(dcp);
+
+	/*
+	 * The display this CRTC was powered on for has been unplugged since:
+	 * its link went down with the cable (dcp_dptx_disconnect_oob()), and
+	 * the desktop only now turns the CRTC off. By then the pipeline may
+	 * already drive the next display, on this port or on another one that
+	 * was waiting for it, and that connection is not the CRTC's to
+	 * release: dropping its HPD makes the firmware report the new display
+	 * inactive, and it stays dark.
+	 *
+	 * Only the T8122 dcpext (ext_failsafe) takes this path, the one
+	 * pipeline where it was run. Every other Type-C output releases its
+	 * connection below as before: the M1/M2 dcpext routes, and the T6030
+	 * split second port and external retry.
+	 */
+	if (dcp->ext_failsafe && dcp_is_typec_output(dcp)) {
+		scoped_guard(mutex, &dcp->hpd_mutex)
+			display_gone = dcp->typec_unplugs != dcp->crtc_unplugs;
+		if (display_gone) {
+			dev_dbg(dcp->dev,
+				"CRTC off after its display was unplugged: leaving the current connection alone\n");
+			_dcp_poweroff(dcp);
+			return;
+		}
+	}
 
 	/*
 	 * Powering a Type-C CRTC off drops DCP's synthetic HPD, and the firmware
@@ -1908,6 +1984,18 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 		return DCP_FIRMWARE_UNKNOWN;
 	}
 
+	/*
+	 * The T8122 external processor: Linux starts it and drives 14.7
+	 * firmware through the classic IOMFB template, as on M1/M2.
+	 */
+	if (of_device_is_compatible(dev->of_node, "apple,t8122-dcpext")) {
+		if (!strcmp(compat_str, "14.7.0"))
+			return DCP_FIRMWARE_V_14_7_TEMPLATE;
+		dev_err(dev, "T8122 external display not started: DCP firmware-compat %s is not 14.7.0\n",
+			compat_str);
+		return DCP_FIRMWARE_UNKNOWN;
+	}
+
 	/* The T6030 external processors: the 14.x firmware IOMFB only. */
 	if (of_device_is_compatible(dev->of_node, "apple,t6030-dcpext")) {
 		if (!strcmp(compat_str, "14.7.0"))
@@ -2006,7 +2094,50 @@ static bool dcp_show_notch(struct apple_dcp *dcp)
 	return show_notch || t6030_show_notch;
 }
 
-static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
+/*
+ * T8122 dcpext (DCP_FIRMWARE_V_14_7_TEMPLATE): if the PMP runs, the display
+ * gate added its DISPEXT request and pointed the dcpext at it
+ * (apple,pmp-report). As on T6030, run the processor only once the PMP has
+ * acknowledged that request: the running PMP owns the SoC power and
+ * performance states and treats a block whose request it has not taken as
+ * idle. The internal display started the PMP long before this, so the wait
+ * is short; it is bounded, and without an acknowledgement the processor is
+ * started anyway (as before the request existed), with a warning.
+ */
+#define DCP_EXT_PMP_TIMEOUT_MS	3000
+
+static void dcp_ext_wait_pmp(struct apple_dcp *dcp)
+{
+	struct device_node *entry;
+	unsigned long deadline;
+	int ret;
+
+	if (dcp->fw_compat != DCP_FIRMWARE_V_14_7_TEMPLATE)
+		return;
+	entry = of_parse_phandle(dcp->dev->of_node, "apple,pmp-report", 0);
+	if (!entry) {
+		dev_info(dcp->dev, "no PMP DISPEXT request; starting without one\n");
+		return;
+	}
+	deadline = jiffies + msecs_to_jiffies(DCP_EXT_PMP_TIMEOUT_MS);
+	for (;;) {
+		ret = apple_pmp_report_wait_ready(entry,
+						  msecs_to_jiffies(DCP_EXT_PMP_TIMEOUT_MS));
+		/* -EIO: the PMP runs, but has not acknowledged the request yet. */
+		if (ret != -EIO || time_after(jiffies, deadline))
+			break;
+		msleep(20);
+	}
+	of_node_put(entry);
+	if (ret)
+		dev_warn(dcp->dev,
+			 "the PMP has not acknowledged the DISPEXT request (%d); starting anyway\n",
+			 ret);
+	else
+		dev_info(dcp->dev, "PMP acknowledged the DISPEXT request\n");
+}
+
+static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *data)
 {
 	struct device_node *panel_np;
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
@@ -2121,6 +2252,8 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	dcp->swapped_out_fbs =
 		(struct list_head)LIST_HEAD_INIT(dcp->swapped_out_fbs);
 
+	dcp_ext_wait_pmp(dcp);
+
 	cpu_ctrl =
 		readl_relaxed(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
 	writel_relaxed(cpu_ctrl | APPLE_DCP_COPROC_CPU_CONTROL_RUN,
@@ -2141,6 +2274,27 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	return ret;
 }
 
+static void dcp_ext_give_up(struct apple_dcp *dcp, int err, const char *when);
+
+/*
+ * The T8122 dcpext boots its firmware here. If that fails, it must not take
+ * the internal panel's DRM device down with it: keep it as an unusable pipe.
+ */
+static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
+{
+	struct apple_dcp *dcp = dev_get_drvdata(dev);
+	int ret;
+
+	if (READ_ONCE(dcp->ext_dead))
+		return 0;
+	ret = dcp_comp_bind_pipe(dev, main, data);
+	if (ret && dcp->ext_failsafe) {
+		dcp_ext_give_up(dcp, ret, "bind");
+		return 0;
+	}
+	return ret;
+}
+
 /*
  * We need to shutdown DCP before tearing down the display subsystem. Otherwise
  * the DCP will crash and briefly flash a green screen of death.
@@ -2149,7 +2303,7 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 
-	if (!dcp)
+	if (!dcp || READ_ONCE(dcp->ext_dead))
 		return;
 
 	disable_work_sync(&dcp->dimensions_wq);
@@ -2297,7 +2451,7 @@ static int dcp_native_routes_error(struct apple_dcp *dcp, int err)
 	return 0;
 }
 
-static int dcp_platform_probe(struct platform_device *pdev)
+static int dcp_platform_probe_pipe(struct platform_device *pdev)
 {
 	if (of_machine_is_compatible("apple,t8140"))
 		return -ENODEV;
@@ -2329,6 +2483,7 @@ static int dcp_platform_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	dcp->fw_compat = fw_compat;
+	dcp->ext_failsafe = of_device_is_compatible(dev->of_node, "apple,t8122-dcpext");
 	dcp->external = of_device_is_compatible(dev->of_node, "apple,t6030-dcpext");
 	dcp->external_native = dcp->external && dcp_t6030_ext_native(dev->of_node);
 	dcp->dev = dev;
@@ -2589,6 +2744,114 @@ fixed_done:
 	return ret;
 }
 
+/*
+ * Marks a T8122 dcpext unusable, for good: its Type-C routes are disabled in
+ * the device tree, so that a USB-C port controller probing later does not
+ * wait for them, and a route already registered ignores mode changes (see
+ * dcp_typec_route_set()), so that USB on the port goes on.
+ */
+static void dcp_ext_give_up(struct apple_dcp *dcp, int err, const char *when)
+{
+	WRITE_ONCE(dcp->ext_dead, true);
+	dev_err(dcp->dev, "external display processor unusable (%s failed: %d); the internal display goes on without it\n",
+		when, err);
+	dcp_typec_routes_disable(dcp);
+}
+
+/*
+ * Whether the DP PHY and display crossbar of every Type-C route are there.
+ * Routes register one at a time, and one registered cannot be taken back,
+ * since a port controller may hold it: a later route waiting for its
+ * supplier would leave the dcpext unusable for the boot. Returns
+ * -EPROBE_DEFER until all of them are; other errors are left to the route
+ * probe, which reports them.
+ */
+static int dcp_ext_route_suppliers(struct device *dev)
+{
+	struct device_node *routes __free(device_node) =
+		of_get_child_by_name(dev->of_node, "typec-routes");
+	char name[16];
+	u32 index;
+
+	if (!routes)
+		return 0;
+	for_each_available_child_of_node_scoped(routes, route_np) {
+		struct mux_control *xbar;
+		struct phy *phy;
+
+		if (of_property_read_u32(route_np, "reg", &index))
+			continue;
+		snprintf(name, sizeof(name), "typec%u", index);
+		phy = of_phy_get(dev->of_node, name);
+		if (PTR_ERR_OR_ZERO(phy) == -EPROBE_DEFER)
+			return -EPROBE_DEFER;
+		if (!IS_ERR(phy))
+			of_phy_put(phy);
+		xbar = mux_control_get(dev, name);
+		if (PTR_ERR_OR_ZERO(xbar) == -EPROBE_DEFER)
+			return -EPROBE_DEFER;
+		if (!IS_ERR(xbar))
+			mux_control_put(xbar);
+	}
+	return 0;
+}
+
+/*
+ * The T8122 dcpext is a component of the panel's DRM device, so it must
+ * always register one, or the panel stays on the boot framebuffer. Keep
+ * deferring while its suppliers may still appear (bounded by the deferred
+ * probe timeout); on any other failure join as an unusable pipe.
+ */
+static int dcp_platform_probe(struct platform_device *pdev)
+{
+	struct device *dev = &pdev->dev;
+	struct apple_dcp *dcp;
+	void *group;
+	int ret;
+
+	if (!of_device_is_compatible(dev->of_node, "apple,t8122-dcpext"))
+		return dcp_platform_probe_pipe(pdev);
+
+	ret = dcp_ext_route_suppliers(dev);
+	if (ret)
+		goto unusable;
+
+	group = devres_open_group(dev, NULL, GFP_KERNEL);
+	if (!group)
+		return -ENOMEM;
+	ret = dcp_platform_probe_pipe(pdev);
+	if (!ret) {
+		devres_remove_group(dev, group);
+		return 0;
+	}
+
+	dcp = platform_get_drvdata(pdev);
+	if (dcp && dcp->nr_typec_routes) {
+		/* Routes may be in use already: keep them, and the pipe, as they are. */
+		devres_remove_group(dev, group);
+		dcp_ext_give_up(dcp, ret, "probe");
+		return component_add(dev, &dcp_comp_ops);
+	}
+
+	devres_release_group(dev, group);
+	platform_set_drvdata(pdev, NULL);
+unusable:
+	if (ret == -EPROBE_DEFER) {
+		ret = driver_deferred_probe_check_state(dev);
+		if (ret == -EPROBE_DEFER)
+			return ret;
+	}
+
+	dcp = devm_kzalloc(dev, sizeof(*dcp), GFP_KERNEL);
+	if (!dcp)
+		return -ENOMEM;
+	dcp->dev = dev;
+	dcp->ext_failsafe = true;
+	platform_set_drvdata(pdev, dcp);
+	dcp_ext_give_up(dcp, ret, "probe");
+	return component_add(dev, &dcp_comp_ops);
+}
+
 static void dcp_platform_remove(struct platform_device *pdev)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
@@ -2692,6 +2955,9 @@ static int dcp_platform_suspend(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 
+	if (READ_ONCE(dcp->ext_dead))
+		return 0;
+
 	/* Serialize PM against explicit bring-up, including queued startup work.
 	 * Before a startup attempt the device remains suspendable. After any
 	 * attempt we cannot prove DMA/firmware quiescence, even on failure.
@@ -2744,6 +3010,9 @@ static int dcp_platform_suspend(struct device *dev)
 static int dcp_platform_resume(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
+
+	if (READ_ONCE(dcp->ext_dead))
+		return 0;
 
 	dcp_enable_typec_work(dcp);
 	/* The HDMI output's PHY and crossbar may have lost their setup in sleep. */
@@ -2801,6 +3070,10 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t6030_dcpext = {
 	.num_dptx_ports = 1,
 };
 
+static const struct apple_dcp_hw_data apple_dcp_hw_t8122_dcpext = {
+	.num_dptx_ports = 2,
+};
+
 static const struct apple_dcp_hw_data apple_dcp_hw_dcpext = {
 	.num_dptx_ports = 2,
 };
@@ -2813,6 +3086,7 @@ static const struct of_device_id of_match[] = {
 	{ .compatible = "apple,t6030-dcpext", .data = &apple_dcp_hw_t6030_dcpext, },
 	{ .compatible = "apple,t8122-dcp", .data = &apple_dcp_hw_t8122, },
 	{ .compatible = "apple,t6031-dcp", .data = &apple_dcp_hw_t6031, },
+	{ .compatible = "apple,t8122-dcpext", .data = &apple_dcp_hw_t8122_dcpext, },
 	{ .compatible = "apple,dcp",       .data = &apple_dcp_hw_dcp,    },
 	{ .compatible = "apple,dcpext",    .data = &apple_dcp_hw_dcpext, },
 	{}

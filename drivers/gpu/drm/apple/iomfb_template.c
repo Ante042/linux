@@ -206,7 +206,11 @@ static bool iomfbep_cb_match_backlight_service(struct apple_dcp *dcp, int tag, v
 static void iomfb_cb_pr_publish(struct apple_dcp *dcp, struct iomfb_property *prop)
 {
 	switch (prop->id) {
+#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
+	case IOMFB_PROPERTY_NITS_V14_7:
+#else
 	case IOMFB_PROPERTY_NITS:
+#endif
 	{
 		if (dcp_has_panel(dcp)) {
 			dcp->brightness.nits = prop->value / dcp->brightness.scale;
@@ -466,6 +470,32 @@ static u64 dcpep_cb_get_frequency(struct apple_dcp *dcp)
 	return clk_get_rate(dcp->clk);
 }
 
+#if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
+/* The DVA that map_reg hands out for display register range @index. */
+static dma_addr_t dcpep_map_reg_dva(struct apple_dcp *dcp, u32 index,
+				    struct resource *rsrc)
+{
+#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
+	/*
+	 * T8122 dcpext (the only 14.7 template user): with the PMGR bandwidth
+	 * page mapped, the DART faults at display power-off and the DCP
+	 * crashes. Give it a RAM page instead.
+	 */
+	if (dcp->disp_bw_scratch_index && !dcp->disp_bw_doorbell_index &&
+	    index == dcp->disp_bw_scratch_index) {
+		dma_addr_t dva;
+
+		if (!dmam_alloc_coherent(dcp->dev, resource_size(rsrc), &dva,
+					 GFP_KERNEL))
+			return DMA_MAPPING_ERROR;
+		return dva;
+	}
+#endif
+	return dma_map_resource(dcp->dev, rsrc->start, resource_size(rsrc),
+				DMA_BIDIRECTIONAL, 0);
+}
+#endif
+
 static struct DCP_FW_NAME(dcp_map_reg_resp) dcpep_cb_map_reg(struct apple_dcp *dcp,
 						struct DCP_FW_NAME(dcp_map_reg_req) *req)
 {
@@ -477,8 +507,7 @@ static struct DCP_FW_NAME(dcp_map_reg_resp) dcpep_cb_map_reg(struct apple_dcp *d
 	} else {
 		struct resource *rsrc = dcp->disp_registers[req->index];
 #if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
-		dma_addr_t dva = dma_map_resource(dcp->dev, rsrc->start, resource_size(rsrc),
-						  DMA_BIDIRECTIONAL, 0);
+		dma_addr_t dva = dcpep_map_reg_dva(dcp, req->index, rsrc);
 		WARN_ON(dva == DMA_MAPPING_ERROR);
 #endif
 
@@ -1468,6 +1497,11 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 
 		req->swap.src_rect[l] = apple_state->src_rect;
 		req->swap.dst_rect[l] = apple_state->dst_rect;
+
+#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
+		/* As asahi-wip-7.2 does, which drives 14.7 dcpext this way. */
+		req->swap.surf_ids[l] = plane->base.id;
+#endif
 
 		if (dcp->notch_height > 0)
 			req->swap.dst_rect[l].y += dcp->notch_height;

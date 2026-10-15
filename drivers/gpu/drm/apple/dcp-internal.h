@@ -23,6 +23,7 @@
 #include "iomfb_v12_3.h"
 #include "iomfb_v13_3.h"
 #include "iomfb_v14_7.h"
+#include "iomfb_v14_7_tpl.h"
 #include "iomfb_v26_6.h"
 #include "epic/dpavservep.h"
 
@@ -43,6 +44,13 @@ enum dcp_firmware_version {
 	DCP_FIRMWARE_V_13_5,
 	DCP_FIRMWARE_V_14_7,
 	DCP_FIRMWARE_V_26_6,
+	/*
+	 * 14.7 firmware on a processor that Linux starts itself and drives
+	 * through the classic IOMFB template (iomfb_v14_7_tpl.c), as M1/M2
+	 * external processors: the T8122 dcpext. Its AFK, DPTX and DPAV
+	 * endpoints speak the 14.7 protocol (dcp_fw_is_14_7()).
+	 */
+	DCP_FIRMWARE_V_14_7_TEMPLATE,
 };
 
 enum {
@@ -148,6 +156,14 @@ struct apple_dcp {
 	enum dcp_firmware_version fw_compat;
 	bool external;
 	/*
+	 * T8122 dcpext: the panel's DRM device never waits on this processor.
+	 * A probe or bind failure leaves it in the device as an unusable pipe
+	 * (ext_dead): no CRTC, Type-C routes disabled or ignored, RTKit
+	 * messages dropped. See dcp_platform_probe().
+	 */
+	bool ext_failsafe;
+	bool ext_dead;
+	/*
 	 * A T6030 external processor in the main DRM device: the kernel starts
 	 * its firmware on first use, its modes come from the attached display.
 	 * Clear for the manual diagnostic path (separate scanout, explicit start).
@@ -235,6 +251,7 @@ struct apple_dcp {
 	union {
 		struct dcp_swap_submit_req_v12_3 v12_3;
 		struct dcp_swap_submit_req_v13_3 v13_3;
+		struct dcp_swap_submit_req_v14_7_0 v14_7_0;
 	} swap;
 
 	/* swap id of the last completed swap */
@@ -247,6 +264,10 @@ struct apple_dcp {
 	/* One HPD pulse after a placeholder EDID, per Type-C connection. */
 	bool placeholder_retried;
 	u64 typec_generation;	/* hpd_mutex: identifies the current connection */
+	/* hpd_mutex: Type-C displays unplugged so far; see dcp_poweroff() */
+	u64 typec_unplugs;
+	/* typec_unplugs when the CRTC was last powered on */
+	u64 crtc_unplugs;
 	u64 placeholder_generation;
 	struct delayed_work placeholder_edid_wq;
 	bool use_timestamps;
@@ -422,6 +443,31 @@ int dcp_backlight_register(struct apple_dcp *dcp);
 int dcp_backlight_update(struct apple_dcp *dcp);
 s32 dcp_ext_backlight_value(struct apple_dcp *dcp);
 bool dcp_has_panel(struct apple_dcp *dcp);
+
+/*
+ * Does @dcp run 14.7 firmware, whichever IOMFB path drives it? For the
+ * firmware protocol of the AFK, DPTX and DPAV endpoints. The IOMFB path
+ * itself is chosen by fw_compat: DCP_FIRMWARE_V_14_7 is Aurora's DCPLink
+ * session, DCP_FIRMWARE_V_14_7_TEMPLATE the classic IOMFB template.
+ */
+static inline bool dcp_fw_is_14_7(const struct apple_dcp *dcp)
+{
+	return dcp->fw_compat == DCP_FIRMWARE_V_14_7 ||
+	       dcp->fw_compat == DCP_FIRMWARE_V_14_7_TEMPLATE;
+}
+
+/*
+ * The T8122 dcpext connects its DPTX port as AsahiLinux/linux#607 does,
+ * the kernel this firmware was first driven with: no validation of the
+ * target, a connect without the supports-HPD attribute, GET_SUPPORTS_HPD
+ * answered with 0, HPD asserted only after the link-configuration wait,
+ * and tiled display hints acknowledged with 0. Every other DCP keeps the
+ * Type-C model of dcp_dptx_connect_session().
+ */
+static inline bool dcp_ext_dptx_607(const struct apple_dcp *dcp)
+{
+	return dcp->fw_compat == DCP_FIRMWARE_V_14_7_TEMPLATE;
+}
 
 #define DCP_AUDIO_MAX_CHANS 15
 
