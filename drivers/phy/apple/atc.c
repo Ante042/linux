@@ -2935,6 +2935,13 @@ static int atcphy_configure(struct apple_atcphy *atcphy, enum atcphy_mode mode)
 
 	/* Take the USB3 PHY out of reset */
 	core_set32(atcphy, ATCPHY_POWER_CTRL, ATCPHY_POWER_PHY_RESET_N);
+	/*
+	 * NOTE: Not what macos does, it takes the phy out of reset right before
+	 * writing to ACIOPHY_CFG0_COMMON_SMALL, does lane configuration with phy
+	 * out of reset, and the poll is right after AUS_COMMON_SHIM_BLK_BIAS_REG
+	 * write. Does not seem to matter, but if something does not work,
+	 * consider re-ordering things to macos order.
+	 */
 	if (atcphy->hw->gen == ATCPHY_GENERATION_T8122) {
 		ret = readl_poll_timeout(atcphy->regs.core + AUS_COMMON_DIG_RCAL1, reg,
 					 (reg & AUS_COMMON_DIG_RCAL1_ALL_CODES_DONE), 10, 100000);
