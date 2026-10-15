@@ -15,11 +15,13 @@
 #include <linux/usb/typec.h>
 #include <linux/usb/typec_mux.h>
 
+#include "cd321x-pm.h"
+
 #ifndef __TPS6598X_H__
 #define __TPS6598X_H__
 
+/* Also read by the SPMI glue to tell when the controller has woken up */
 #define TPS_REG_MODE			0x03
-#include "cd321x-pm.h"
 
 #define TPS_FIELD_GET(_mask, _reg) ((typeof(_mask))(((_reg) & (_mask)) >> __bf_shf(_mask)))
 
@@ -308,14 +310,11 @@ struct tipd_data {
 	bool (*read_data_status)(struct tps6598x *tps);
 	int (*reset)(struct tps6598x *tps);
 	int (*connect)(struct tps6598x *tps, u32 status);
-	void (*suspend_prepare)(struct tps6598x *tps);
-	void (*resume_reverify)(struct tps6598x *tps);
+	void (*prepare)(struct tps6598x *tps);
+	void (*complete)(struct tps6598x *tps);
 };
 
 struct tps6598x {
-	struct typec_mux *mux;
-	/* CD remove leaves one open SAFE transaction for generic completion. */
-	bool remove_safe_prepared;
 	struct device *dev;
 	struct regmap *regmap;
 	struct mutex lock; /* device lock */
@@ -329,6 +328,12 @@ struct tps6598x {
 	struct usb_pd_identity partner_identity;
 	struct usb_role_switch *role_sw;
 	struct typec_capability typec_cap;
+	struct typec_mux *mux;
+	/*
+	 * Set by ->remove() once it has parked the mux in SAFE, so that
+	 * tps6598x_disconnect() only ends that mux transaction.
+	 */
+	bool remove_safe_prepared;
 
 	struct power_supply *psy;
 	struct power_supply_desc psy_desc;
