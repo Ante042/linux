@@ -1882,8 +1882,18 @@ impl SepData {
                 return None;
             }
 
-            // The patch decision is made on status[8], not on state 9.
-            if st.patch_ack() == sensor::PATCH_ACCEPTED {
+            // Registration can reset the sensor session. Do not reuse the
+            // acknowledgement sampled before CLEAR_STATE and authentication.
+            let st = match sensor::status() {
+                Ok(st) if !st.is_silent() => st,
+                _ => {
+                    dev_warn!(self.dev, "sensor: status unavailable after registration\n");
+                    return None;
+                }
+            };
+            if st.patch_ack() == sensor::PATCH_ACCEPTED
+                && st.state != sensor::STATE_NEEDS_PATCH
+            {
                 return Some(PatchLoaded(()));
             }
             return self.apply_sensor_patch(st.patch_ack());
@@ -2577,6 +2587,11 @@ impl SepData {
         name: &'static CStr,
         payload: &[u8],
     ) -> Result<transfer::Completed> {
+        // The capture work item and the ioctl path both reach this endpoint.
+        // Without this, the second caller is refused with EBUSY, or clears a
+        // reply the first has not collected yet and takes the next one. Taken
+        // before the shutdown check, so a waiter never starts after remove().
+        let _exchange = self.sbio_exchange_lock.lock();
         if self.shutting_down.load(Relaxed) || !self.sbio_ready.load(Relaxed) {
             return Err(ENODEV);
         }
