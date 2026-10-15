@@ -436,6 +436,10 @@ static umode_t macsmc_hwmon_is_visible(const void *data,
 		return 0;
 	}
 
+	/* A sensor without a key could not be set up; see macsmc_hwmon_add_temp_channel(). */
+	if (!sensor->macsmc_key)
+		return 0;
+
 	/* Sensors only register ro attributes */
 	if (sensor->attrs & BIT(attr))
 		return 0444;
@@ -501,6 +505,30 @@ static int macsmc_hwmon_create_sensor(struct device *dev, struct apple_smc *smc,
 	return 0;
 }
 
+/*
+ * Account for the temperature sensor just set up at the end of @temp.
+ *
+ * Thermal zones refer to a temperature channel by the index of its node
+ * among the temperature-* nodes, so every node takes a channel. A sensor
+ * that could not be set up keeps its channel with no key, which hides it:
+ * hwmon creates no attributes and no thermal sensor for it, and only the
+ * zones that use it fail to register, instead of every later channel
+ * moving onto the wrong sensor.
+ */
+static void macsmc_hwmon_add_temp_channel(struct macsmc_hwmon_sensors *temp,
+					  int create_ret)
+{
+	struct macsmc_hwmon_sensor *sensor = &temp->sensors[temp->count++];
+
+	if (create_ret)
+		memset(sensor, 0, sizeof(*sensor));
+
+	/* A zero entry would end the list of channels here. */
+	sensor->attrs = HWMON_T_INPUT;
+	if (*sensor->label)
+		sensor->attrs |= HWMON_T_LABEL;
+}
+
 /* Discover reporting-only temperatures without a board-specific key table. */
 static int macsmc_hwmon_discover_temperatures(struct macsmc_hwmon *hwmon)
 {
@@ -514,9 +542,8 @@ static int macsmc_hwmon_discover_temperatures(struct macsmc_hwmon *hwmon)
 	if (!of_property_read_bool(hwmon->dev->of_node, "apple,discover-temperatures"))
 		return 0;
 
-	/* Dynamic channel numbers must not replace a DT-described thermal policy. */
-	if (hwmon->temp.count ||
-	    of_property_read_bool(hwmon->dev->of_node, "apple,cpu-thermal-policy"))
+	/* Dynamic channel numbers must not replace DT-described channels. */
+	if (hwmon->temp.count)
 		return -EINVAL;
 
 	/* Bound both allocation and mailbox transactions for invalid firmware data. */
@@ -638,6 +665,7 @@ static int macsmc_hwmon_populate_sensors(struct macsmc_hwmon *hwmon,
 	struct device_node *key_node __maybe_unused;
 	struct macsmc_hwmon_sensor *sensor;
 	u32 n_current = 0, n_fan = 0, n_power = 0, n_temperature = 0, n_voltage = 0;
+	int ret;
 
 	for_each_child_of_node_with_prefix(hwmon_node, key_node, "current-") {
 		n_current++;
@@ -714,14 +742,12 @@ static int macsmc_hwmon_populate_sensors(struct macsmc_hwmon *hwmon,
 
 		for_each_child_of_node_with_prefix(hwmon_node, key_node, "temperature-") {
 			sensor = &hwmon->temp.sensors[hwmon->temp.count];
-			if (!macsmc_hwmon_create_sensor(hwmon->dev, hwmon->smc, key_node, sensor)) {
-				sensor->attrs = HWMON_T_INPUT;
-
-				if (*sensor->label)
-					sensor->attrs |= HWMON_T_LABEL;
-
-				hwmon->temp.count++;
-			}
+			ret = macsmc_hwmon_create_sensor(hwmon->dev, hwmon->smc,
+							 key_node, sensor);
+			if (ret)
+				dev_warn(hwmon->dev, "%pOFn unavailable (%d), temp%u hidden\n",
+					 key_node, ret, hwmon->temp.count + 1);
+			macsmc_hwmon_add_temp_channel(&hwmon->temp, ret);
 		}
 	}
 
@@ -921,6 +947,10 @@ static struct platform_driver macsmc_hwmon_driver = {
 	},
 };
 module_platform_driver(macsmc_hwmon_driver);
+
+#if IS_ENABLED(CONFIG_SENSORS_MACSMC_HWMON_KUNIT_TEST)
+#include "macsmc-hwmon-test.c"
+#endif
 
 MODULE_DESCRIPTION("Apple Silicon SMC hwmon driver");
 MODULE_AUTHOR("James Calligeros <jcalligeros99@gmail.com>");

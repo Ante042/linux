@@ -72,6 +72,24 @@ static bool apple_mcc_plane_ready(struct apple_mcc *mcc, unsigned int plane)
 	return false;
 }
 
+/* Stop allocating on the first @count planes, then write back and invalidate them. */
+static void apple_mcc_disable_planes(struct apple_mcc *mcc, unsigned int count)
+{
+	unsigned int i;
+	u32 val;
+
+	for (i = 0; i < count; i++) {
+		writel(1, mcc->planes[i] + MCC_ALLOC_DISABLE);
+		writel(1, mcc->planes[i] + MCC_CACHE_FLUSH);
+	}
+
+	for (i = 0; i < count; i++)
+		if (readl_poll_timeout_atomic(mcc->planes[i] + MCC_CACHE_FLUSH, val,
+					      !(val & MCC_CACHE_FLUSH_BUSY), 10,
+					      MCC_FLUSH_TIMEOUT_US))
+			dev_err(mcc->dev, "plane %u flush timed out\n", i);
+}
+
 static int apple_mcc_enable(struct apple_mcc *mcc)
 {
 	unsigned int i;
@@ -84,6 +102,12 @@ static int apple_mcc_enable(struct apple_mcc *mcc)
 		writel(0, mcc->planes[i] + MCC_ALLOC_DISABLE);
 		if (readl(mcc->planes[i] + MCC_ALLOC_DISABLE)) {
 			dev_err(mcc->dev, "plane %u did not enable allocation\n", i);
+			/*
+			 * The driver will not bind, so nothing disables these
+			 * planes on shutdown: disable the ones enabled so far,
+			 * and this one, whose state is unknown, now.
+			 */
+			apple_mcc_disable_planes(mcc, i + 1);
 			return -EIO;
 		}
 	}
@@ -91,26 +115,12 @@ static int apple_mcc_enable(struct apple_mcc *mcc)
 	return 0;
 }
 
-/* Stop allocating, then write back and invalidate the cache. */
 static void apple_mcc_quiesce(struct apple_mcc *mcc)
 {
-	unsigned int i;
-	u32 val;
-
 	if (!mcc->enabled)
 		return;
 
-	for (i = 0; i < mcc->nr_planes; i++) {
-		writel(1, mcc->planes[i] + MCC_ALLOC_DISABLE);
-		writel(1, mcc->planes[i] + MCC_CACHE_FLUSH);
-	}
-
-	for (i = 0; i < mcc->nr_planes; i++)
-		if (readl_poll_timeout_atomic(mcc->planes[i] + MCC_CACHE_FLUSH, val,
-					      !(val & MCC_CACHE_FLUSH_BUSY), 10,
-					      MCC_FLUSH_TIMEOUT_US))
-			dev_err(mcc->dev, "plane %u flush timed out\n", i);
-
+	apple_mcc_disable_planes(mcc, mcc->nr_planes);
 	mcc->enabled = false;
 }
 

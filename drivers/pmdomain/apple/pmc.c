@@ -92,6 +92,8 @@ struct apple_pmc {
 	struct dentry *debugfs;
 	/* Cooling state of the DCS limit: 0 is none, dcs_max holds DCS at 0. */
 	unsigned long dcs_state;
+	/* DCS state the AP's agent voted for before probe, kept without a limit. */
+	unsigned int ap_dcs_vote;
 	/* Power cost of each DCS state in mW, if a model is described. */
 	u32 dcs_power[APPLE_PMC_MAX_STATES];
 	struct delayed_work dcs_work;
@@ -151,18 +153,46 @@ static int apple_pmc_enable_update(struct apple_pmc *pmc, unsigned int rail,
 	return apple_pmc_enable_write(pmc, rail);
 }
 
+/*
+ * Caller holds pmc->lock. Put the rails up to and including @last back to
+ * the enables in @prev, after a change failed on @last.
+ */
+static void apple_pmc_enable_restore(struct apple_pmc *pmc, const u32 *prev,
+				     unsigned int last)
+{
+	unsigned int rail;
+
+	for (rail = 0; rail <= last; rail++) {
+		pmc->enable[rail] = prev[rail];
+		apple_pmc_enable_write(pmc, rail);
+	}
+}
+
+/*
+ * Enable or disable @agent on every rail. If a rail does not take the
+ * change, undo it on the rails changed so far: genpd keeps a domain whose
+ * power_on() fails off, and never calls its power_off(), so an agent left
+ * enabled on some rails would stay enabled for good.
+ */
 static int apple_pmc_agent_enable(struct apple_pmc *pmc, unsigned int agent,
 				  bool enable)
 {
+	u32 prev[APPLE_PMC_MAX_RAILS];
 	unsigned long flags;
 	unsigned int rail;
 	int ret = 0;
 
 	raw_spin_lock_irqsave(&pmc->lock, flags);
-	for (rail = 0; rail < pmc->hw->rails && !ret; rail++)
+	memcpy(prev, pmc->enable, sizeof(prev));
+	for (rail = 0; rail < pmc->hw->rails; rail++) {
 		ret = apple_pmc_enable_update(pmc, rail,
 					      enable ? BIT(agent) : 0,
 					      enable ? 0 : BIT(agent));
+		if (ret) {
+			apple_pmc_enable_restore(pmc, prev, rail);
+			break;
+		}
+	}
 	raw_spin_unlock_irqrestore(&pmc->lock, flags);
 
 	return ret;
@@ -287,16 +317,27 @@ static unsigned int apple_pmc_dcs_demand(struct apple_pmc *pmc)
 	return min(demand, hw->dcs_max);
 }
 
+/* The DCS state the AP's agent votes for. */
+static unsigned int apple_pmc_ap_dcs_read(struct apple_pmc *pmc)
+{
+	const struct apple_pmc_hw *hw = pmc->hw;
+	u32 floor = readl(pmc->voters + hw->ap_agent * hw->agent_stride);
+
+	return (floor & APPLE_PMC_RAIL_MASK(hw->dcs_rail)) >>
+	       APPLE_PMC_RAIL_SHIFT(hw->dcs_rail);
+}
+
 /*
  * Caller holds pmc->lock. Vote through the AP's agent for what the other
- * agents ask for, capped by the limit; vote nothing without a limit.
+ * agents ask for, capped by the limit; without a limit, put back the vote
+ * the AP's agent had before probe.
  */
 static void apple_pmc_dcs_vote(struct apple_pmc *pmc)
 {
 	const struct apple_pmc_hw *hw = pmc->hw;
 	void __iomem *reg = pmc->voters + hw->ap_agent * hw->agent_stride;
 	u32 mask = APPLE_PMC_RAIL_MASK(hw->dcs_rail);
-	unsigned int state = 0;
+	unsigned int state = pmc->ap_dcs_vote;
 	u32 old, val;
 
 	if (pmc->dcs_state)
@@ -675,6 +716,7 @@ static int apple_pmc_probe(struct platform_device *pdev)
 					     "PMC is not responding\n");
 		pmc->enable[rail] = pmc->saved_enable[rail];
 	}
+	pmc->ap_dcs_vote = apple_pmc_ap_dcs_read(pmc);
 
 	count = of_property_count_u32_elems(np, "apple,static-voters");
 	if (count > 0) {
@@ -769,3 +811,7 @@ module_init(apple_pmc_init);
 
 MODULE_DESCRIPTION("Apple SoC PMC voter interface driver");
 MODULE_LICENSE("Dual MIT/GPL");
+
+#if IS_ENABLED(CONFIG_APPLE_PMC_KUNIT_TEST)
+#include "pmc-test.c"
+#endif

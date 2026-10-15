@@ -2624,7 +2624,7 @@ F:	drivers/clk/clk-apple-nco.c
 F:	drivers/cpufreq/apple-soc-cpufreq.c
 F:	drivers/dma/apple-admac.c
 F:	drivers/gpio/gpio-macsmc.c
-F:	drivers/hwmon/macsmc-hwmon.c
+F:	drivers/hwmon/macsmc-hwmon*.c
 F:	drivers/i2c/busses/i2c-pasemi-core.c
 F:	drivers/i2c/busses/i2c-pasemi-platform.c
 F:	drivers/input/misc/macsmc-input.c
