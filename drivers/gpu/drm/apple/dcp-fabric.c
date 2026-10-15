@@ -1219,8 +1219,10 @@ void dcp_typec_reorder(void)
 
 /*
  * A DP display on @port gets no pipeline: every one that could drive it
- * drives another display. Say so once per plug, in words a user can act on;
- * the port controller only logs the -EBUSY.
+ * drives another display. Say so once per plug, with the display's HPD up;
+ * the port controller only logs the -EBUSY. When one of those displays goes,
+ * the freed pipeline takes a waiting display without a replug (see
+ * dcp_typec_pipeline_freed()).
  */
 static int dcp_typec_port_busy(struct apple_dcp_typec_port *port,
 			       struct apple_dcp *dcp)
@@ -1232,7 +1234,7 @@ static int dcp_typec_port_busy(struct apple_dcp_typec_port *port,
 	port->busy_noted = true;
 	of_property_read_string(port->connector_np, "label", &label);
 	dev_info(dcp->dev,
-		 "display on %s waits for an external display pipeline: it drives another display; to switch, unplug that one, then plug this one in again\n",
+		 "display on %s waits for a free external display pipeline (each one drives another display); it lights up on its own when one of those displays is unplugged\n",
 		 label ?: "a USB-C port");
 	return -EBUSY;
 }
@@ -1367,12 +1369,14 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 	if (!port->owner) {
 		best = dcp_typec_free_route(port);
 		if (!best)
-			return dcp_typec_port_busy(port, route->dcp);
+			return hpd ? dcp_typec_port_busy(port, route->dcp) : -EBUSY;
 
 		ret = dcp_typec_route_activate(best, best->xbar);
 		if (ret)
 			return ret;
 		port->owner = best;
+		/* a later wait of this plug is reported again */
+		port->busy_noted = false;
 	}
 
 	if (hpd && !port->hpd) {
