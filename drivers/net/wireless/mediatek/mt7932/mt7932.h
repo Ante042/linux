@@ -2,14 +2,12 @@
 #ifndef MT7932_H
 #define MT7932_H
 
-
 #include <linux/average.h>
 #include <linux/completion.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/firmware.h>
 #include <linux/interrupt.h>
-#include <linux/irq.h>
 #include <linux/iommu.h>
 #include <linux/iopoll.h>
 #include <linux/module.h>
@@ -31,7 +29,6 @@
 #include "regulatory.h"
 #include "rate.h"
 #include "capabilities.h"
-
 
 #define W 0xd4000
 #define H 0xd6000
@@ -161,9 +158,6 @@ struct mt7932 {
 	struct rate_info station_rx_rate;
 	unsigned long station_rx_rate_time;
 	bool station_rx_rate_valid;
-	struct rate_info station_tx_rate;
-	unsigned long station_tx_rate_time, station_rate_query_time;
-	bool station_tx_rate_valid, station_rate_query_failed;
 	/* Connection quality monitor, protected by response_lock. */
 	struct ewma_mt7932_signal cqm_signal;
 	unsigned long cqm_sample_time;
@@ -251,8 +245,5 @@ int mt_set_power_mgmt(struct wiphy *wiphy, struct net_device *netdev,
 		      bool enabled, int timeout);
 void mt_power_work(struct work_struct *work);
 int mt_power_init(struct mt7932 *m);
-void mt_station_update_rate(struct mt7932 *m, const u8 *mac);
-
-bool mt_transport_polled(void);
 
 #endif
