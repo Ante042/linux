@@ -4682,7 +4682,8 @@ static bool sort_folio(struct lruvec *lruvec, struct folio *folio, struct scan_c
 	 * before I/O completes. Let the common path apply its GFP and mapping
 	 * deadlock checks instead of hiding those folios from it.
 	 */
-	if (writeback && !writeback_throttling_sane(sc))
+	if (IS_ENABLED(CONFIG_MM_SUBPAGE) && writeback &&
+	    !writeback_throttling_sane(sc))
 		return false;
 
 	/* waiting for writeback */
@@ -4719,8 +4720,12 @@ static bool isolate_folio(struct lruvec *lruvec, struct folio *folio, struct sca
 	if (!folio_test_referenced(folio))
 		set_mask_bits(&folio->flags.f, LRU_REFS_MASK, 0);
 
-	/* Preserve legacy memcg's repeated-writeback marker for shrink_folio_list(). */
-	if (writeback_throttling_sane(sc) || !folio_test_writeback(folio))
+	/*
+	 * For shrink_folio_list(). Subpage kernels keep legacy memcg's
+	 * repeated-writeback marker.
+	 */
+	if (!IS_ENABLED(CONFIG_MM_SUBPAGE) || writeback_throttling_sane(sc) ||
+	    !folio_test_writeback(folio))
 		folio_clear_reclaim(folio);
 
 	success = lru_gen_del_folio(lruvec, folio, true);
