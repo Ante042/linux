@@ -671,7 +671,9 @@ static int cd321x_typec_update_mode(struct tps6598x *tps,
 		ret = typec_thunderbolt_switch_set(cd321x->tbt_switch, &tbt_switch_data);
 	} else if (st->data_status & TPS_DATA_STATUS_DP_CONNECTION) {
 		struct typec_displayport_data dp_data;
+		enum cd321x_dp_send send;
 		unsigned long mode;
+		bool hpd_pulse;
 
 		switch (TPS_DATA_STATUS_DP_SPEC_PIN_ASSIGNMENT(st->data_status)) {
 		case TPS_DATA_STATUS_DP_SPEC_PIN_ASSIGNMENT_A:
@@ -708,18 +710,23 @@ static int cd321x_typec_update_mode(struct tps6598x *tps,
 		 * The sink dropped HPD and raised it again within the debounce
 		 * window, as a monitor does after losing the link. The coalesced
 		 * state looks unchanged, so the display side would never hear of
-		 * it: report the pulse as IRQ_HPD.
+		 * it: report the pulse as IRQ_HPD. A port with a "displayport"
+		 * reference reports the pulse out of band instead, as a
+		 * disconnect and a connect (see cd321x_update_work()).
 		 */
-		if ((st->data_status_changed & CD321X_DATA_STATUS_HPD_LEVEL) &&
-		    (dp_data.status & DP_STATUS_HPD_STATE) &&
-		    (cd321x->dp_status & DP_STATUS_HPD_STATE))
+		hpd_pulse = !(IS_REACHABLE(CONFIG_DRM) && cd321x->connector_fwnode) &&
+			    (st->data_status_changed & CD321X_DATA_STATUS_HPD_LEVEL) &&
+			    (dp_data.status & DP_STATUS_HPD_STATE) &&
+			    (cd321x->dp_status & DP_STATUS_HPD_STATE);
+		if (hpd_pulse)
 			dp_data.status |= DP_STATUS_IRQ_HPD;
 
 		if (cd321x->state_valid && cd321x->state.alt == cd321x->port_altmode_dp &&
-		    !(dp_data.status & DP_STATUS_IRQ_HPD) &&
-		    cd321x->state.mode == mode &&
-		    cd321x->dp_status == dp_data.status &&
-		    cd321x->dp_conf == dp_data.conf)
+		    cd321x->state.mode == mode && cd321x->dp_conf == dp_data.conf)
+			send = cd321x_dp_send(cd321x->dp_status, dp_data.status, hpd_pulse);
+		else
+			send = CD321X_DP_SEND;
+		if (send == CD321X_DP_SEND_NONE)
 			return 0;
 
 		cd321x->state.alt = cd321x->port_altmode_dp;
@@ -728,6 +735,21 @@ static int cd321x_typec_update_mode(struct tps6598x *tps,
 		ret = typec_thunderbolt_switch_set(cd321x->tbt_switch, &tbt_switch_data);
 		if (ret)
 			goto out;
+		if (send == CD321X_DP_SEND_EDGE) {
+			struct typec_displayport_data edge = {
+				.status = dp_data.status & ~DP_STATUS_IRQ_HPD,
+				.conf = dp_data.conf,
+			};
+
+			cd321x->state.data = &edge;
+			ret = typec_mux_set(cd321x->mux, &cd321x->state);
+			cd321x->state.data = &dp_data;
+			if (ret) {
+				*display_busy = cd321x_display_taken(ret, tps->h17_display);
+				goto out;
+			}
+			cd321x->dp_status = edge.status;
+		}
 		ret = typec_mux_set(cd321x->mux, &cd321x->state);
 		*display_busy = cd321x_display_taken(ret, tps->h17_display);
 		if (!ret) {
@@ -792,6 +814,8 @@ static void cd321x_dp_sid_replay(struct cd321x *cd321x, const struct cd321x_stat
 	} else {
 		return;
 	}
+	/* Not the HPD pulse: the update that follows reports that, once. */
+	edge.data_status_changed &= ~CD321X_DATA_STATUS_HPD_LEVEL;
 	cd321x_typec_update_mode(&cd321x->tps, &edge, &display_busy);
 }
 
