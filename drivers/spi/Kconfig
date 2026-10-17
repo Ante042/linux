@@ -140,7 +140,18 @@ config SPI_APPLE_QSPI
 	  on T8122 (J613 25G83), T8132 (M4) and T8140 systems. On T8122 and
 	  T8132 the driver defaults read-only, and only the pinned J613 NVRAM
 	  layout can enable bounded writes through an explicit root runtime
-	  opt-in. T8140 is not restricted.
+	  opt-in. On T8140 only the nvram partition accepts programs and
+	  erases; the rest of the boot NOR is read-only.
+
+config SPI_APPLE_QSPI_KUNIT_TEST
+	tristate "KUnit tests for the Apple QSPIMC boot NOR write window" if !KUNIT_ALL_TESTS
+	depends on KUNIT
+	depends on SPI_APPLE_QSPI || COMPILE_TEST
+	default KUNIT_ALL_TESTS
+	help
+	  Tests which T8140 boot NOR requests the QSPIMC driver admits: write
+	  enable control, and programs and erases inside the nvram partition
+	  only. No hardware is accessed.
 
 config SPI_AR934X
 	tristate "Qualcomm Atheros AR934X/QCA95XX SPI controller driver"
