@@ -412,6 +412,7 @@ static void swap_writepage_fs(struct folio *folio, struct swap_iocb **swap_plug)
 		*swap_plug = sio;
 }
 
+#ifdef CONFIG_MM_SUBPAGE
 static DEFINE_MUTEX(swap_extent_io_mutex);
 static struct bio_set swap_extent_bioset;
 
@@ -464,6 +465,23 @@ static void swap_submit_bio(struct bio *bio, void *private)
 	submit_bio(bio);
 }
 
+static void swap_submit_bio_wait(struct bio *bio, struct folio *folio)
+{
+	bio_await(bio, folio, swap_submit_bio);
+}
+#else
+/* Without subpage support, large folios never reach a swap file. */
+static inline void swap_submit_bio(struct bio *bio, void *private)
+{
+	submit_bio(bio);
+}
+
+static inline void swap_submit_bio_wait(struct bio *bio, struct folio *folio)
+{
+	submit_bio_wait(bio);
+}
+#endif
+
 static void swap_writepage_bdev_sync(struct folio *folio,
 		struct swap_info_struct *sis)
 {
@@ -480,7 +498,7 @@ static void swap_writepage_bdev_sync(struct folio *folio,
 	folio_start_writeback(folio);
 	folio_unlock(folio);
 
-	bio_await(&bio, folio, swap_submit_bio);
+	swap_submit_bio_wait(&bio, folio);
 	__end_swap_bio_write(&bio);
 }
 
@@ -643,7 +661,7 @@ static void swap_read_folio_bdev_sync(struct folio *folio,
 	count_mthp_stat(folio_order(folio), MTHP_STAT_SWPIN);
 	count_memcg_folio_events(folio, PSWPIN, folio_nr_pages(folio));
 	count_vm_events(PSWPIN, folio_nr_pages(folio));
-	bio_await(&bio, folio, swap_submit_bio);
+	swap_submit_bio_wait(&bio, folio);
 	__end_swap_bio_read(&bio);
 	put_task_struct(current);
 }
