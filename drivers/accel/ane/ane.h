@@ -17,6 +17,15 @@
 
 #include "ane_stats.h"
 
+#define ANE_DART_MAX 3
+#define ANE_DART_SCRATCH_MAX 16
+
+struct ane_dart_scratch {
+	u64 iova;
+	struct page *page;
+	struct drm_mm_node *node;
+};
+
 struct ane_device {
 	struct drm_device drm;
 	struct device *dev;
@@ -62,6 +71,9 @@ struct ane_device {
 	 * nodes (see ane_reclaim_preserved). Registered under engine_lock.
 	 */
 	struct list_head preserved_list;
+	/* Fault-drain DMA backing, retained until completion or a safe reset. */
+	struct ane_dart_scratch scratch[ANE_DART_SCRATCH_MAX];
+	int scratch_pages;
 	bool removed;
 
 	/*
@@ -136,15 +148,6 @@ struct ane_request {
 };
 
 /*
- * Drop the wedge pin (module refcount) without requiring a successful
- * recovery. Used by ane_drm_postclose so a wedged engine cannot leave
- * the module un-unloadable after a clean session close. Recovery stays
- * safe to call afterwards; if it returns error, the postclose path has
- * already unlocked the module count so the operator can swap the ko.
- */
-void ane_wedge_clear(struct ane_device *ane);
-
-/*
  * Reclaim wedge-preserved BO ranges (unmap, release nodes and pages).
  * Only legal once DMA is provably quiescent: after a successful
  * recovery power cycle, or at driver remove. Callers hold engine_lock.
@@ -155,15 +158,6 @@ int ane_boost_init(struct ane_device *ane);
 void ane_boost_exit(struct ane_device *ane);
 void ane_boost_begin(struct ane_device *ane);
 void ane_boost_end(struct ane_device *ane);
-
-#define ANE_DART_MAX 3
-#define ANE_DART_SCRATCH_MAX 16
-
-struct ane_dart_scratch {
-	u64 iova;
-	struct page *page;
-	struct drm_mm_node *node;
-};
 
 int ane_dart_init(struct ane_device *ane);
 void ane_dart_mask(struct ane_device *ane);

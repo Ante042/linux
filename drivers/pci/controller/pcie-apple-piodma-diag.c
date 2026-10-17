@@ -55,9 +55,14 @@
 #define PIODMA_FIFO_MASK		GENMASK(5, 0)
 #define PIODMA_IRQ_LIMIT		16
 
+/*
+ * The board DT opts in by pointing the host's "apple,piodma" at this engine;
+ * a host without that property stays root-port-only. enumerate=0 keeps every
+ * host on its root-port-only path for diagnosis.
+ */
 static bool enumerate = true;
-module_param(enumerate, bool, 0444);
-MODULE_PARM_DESC(enumerate, "Boot-time radio gate (read-only, default on; no effect off J700/T8140)");
+module_param(enumerate, bool, 0400);
+MODULE_PARM_DESC(enumerate, "Prime once, validate native ECAM, and enumerate the two Neo functions (default: on)");
 
 struct apple_piodma_request {
 	u16 offset;
@@ -99,6 +104,7 @@ struct apple_piodma_diag {
 	u64 pointer_prefix;
 	u8 secondary_bus;
 	bool retained;
+	bool ready;
 	bool guarded;
 	bool radio_admitted;
 	struct notifier_block pm_notifier;
@@ -162,6 +168,14 @@ static int apple_piodma_pm_notify(struct notifier_block *nb,
 
 	switch (action) {
 	case PM_SUSPEND_PREPARE:
+		/*
+		 * The suspend core marks suspend-to-idle only after these
+		 * notifiers have run, so pm_suspend_no_platform() is still
+		 * false here for every suspend. apple_piodma_pm_prepare()
+		 * makes the same check once the target state is known, and
+		 * still vetoes everything but suspend-to-idle.
+		 */
+		return NOTIFY_DONE;
 	case PM_HIBERNATION_PREPARE:
 	case PM_RESTORE_PREPARE:
 		dev_warn_ratelimited(diag->dev,
@@ -179,6 +193,9 @@ static int apple_piodma_pm_prepare(struct device *dev)
 	/* Acquire admission before either PCI children or DMA pointers escape. */
 	if (!diag || !smp_load_acquire(&diag->guarded))
 		return 0;
+	if (pm_suspend_no_platform() && READ_ONCE(diag->ready) &&
+	    smp_load_acquire(&diag->radio_admitted))
+		return 0;
 	/*
 	 * A /dev/snapshot file may have sent its PREPARE notifier before this
 	 * supplier probed. Its later image/restore/suspend ioctls go straight
@@ -188,10 +205,6 @@ static int apple_piodma_pm_prepare(struct device *dev)
 			     "sleep refused: Neo guard active during radio admission or retained DMA lifetime\n");
 	return -EOPNOTSUPP;
 }
-
-static const struct dev_pm_ops apple_piodma_pm_ops = {
-	.prepare = apple_piodma_pm_prepare,
-};
 
 static int apple_piodma_diag_root(struct apple_piodma_diag *diag, struct pci_dev *root)
 {
@@ -733,12 +746,13 @@ int apple_piodma_bootstrap_prime(struct device *supplier, struct pci_dev *root)
 		ret = apple_piodma_diag_initialize(diag);
 	if (!ret)
 		ret = apple_piodma_diag_submit(diag, 0);
-	if (ret)
-		dev_err(supplier, "bootstrap failure=%d; %s; no retry\n", ret,
-			diag->retained ? "retained ownership" : "no hardware publication");
-	else
+	if (ret) {
+		dev_err(supplier, "bootstrap failure=%d; retained ownership; no retry\n", ret);
+	} else {
+		WRITE_ONCE(diag->ready, true);
 		dev_info(supplier, "BOOTSTRAP_VALIDATED word=%#x; one retained slot\n",
 			 diag->slots[0].result);
+	}
 	return ret;
 }
 EXPORT_SYMBOL_GPL(apple_piodma_bootstrap_prime);
@@ -857,6 +871,60 @@ static void apple_piodma_diag_shutdown(struct platform_device *pdev)
 		dev_warn(&pdev->dev, "diagnostic arena retained; require full hardware reset\n");
 }
 
+/* No new request is permitted once the host has admitted its endpoints. */
+static int apple_piodma_diag_sleep_check(struct apple_piodma_diag *diag)
+{
+	if (!READ_ONCE(diag->ready) || READ_ONCE(diag->irq_fault))
+		return -EIO;
+	if (readl(diag->engine + 0x54) & BIT(0))
+		return -EBUSY;
+	if ((readl(diag->engine + 0x0c) & PIODMA_FIFO_MASK) != 16)
+		return -EBUSY;
+	return apple_piodma_diag_check_slots(diag);
+}
+
+static int apple_piodma_diag_suspend_noirq(struct device *dev)
+{
+	struct apple_piodma_diag *diag = dev_get_drvdata(dev);
+
+	if (!diag->retained)
+		return 0;
+	if (pm_suspend_target_state != PM_SUSPEND_TO_IDLE)
+		return -EOPNOTSUPP;
+	return apple_piodma_diag_sleep_check(diag);
+}
+
+static int apple_piodma_diag_resume_noirq(struct device *dev)
+{
+	struct apple_piodma_diag *diag = dev_get_drvdata(dev);
+	int ret;
+
+	if (!diag->retained)
+		return 0;
+	if (!READ_ONCE(diag->ready) || READ_ONCE(diag->irq_fault))
+		return -EIO;
+	/* Genpd may gate this island; restore configuration, never a command. */
+	ret = apple_piodma_diag_initialize(diag);
+	if (ret)
+		return ret;
+	return apple_piodma_diag_sleep_check(diag);
+}
+
+static int apple_piodma_diag_freeze(struct device *dev)
+{
+	struct apple_piodma_diag *diag = dev_get_drvdata(dev);
+
+	return diag->retained ? -EOPNOTSUPP : 0;
+}
+
+static const struct dev_pm_ops apple_piodma_diag_pm_ops = {
+	.prepare = apple_piodma_pm_prepare,
+	.suspend_noirq = apple_piodma_diag_suspend_noirq,
+	.resume_noirq = apple_piodma_diag_resume_noirq,
+	.freeze = apple_piodma_diag_freeze,
+	.poweroff = apple_piodma_diag_freeze,
+};
+
 static const struct of_device_id apple_piodma_diag_match[] = {
 	{ .compatible = "apple,t8140-piodma-diagnostic" },
 	{ }
@@ -868,7 +936,7 @@ static struct platform_driver apple_piodma_diag_driver = {
 	.driver = {
 		.name = "apple-piodma-diag",
 		.of_match_table = apple_piodma_diag_match,
-		.pm = pm_sleep_ptr(&apple_piodma_pm_ops),
+		.pm = pm_sleep_ptr(&apple_piodma_diag_pm_ops),
 		.suppress_bind_attrs = true,
 	},
 };

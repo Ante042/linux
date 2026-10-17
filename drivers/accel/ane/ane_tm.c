@@ -265,8 +265,7 @@ int ane_tm_execute(struct ane_device *ane, struct ane_request *req)
 	u32 finished = 0;
 	u32 fault_status = 0;
 	u64 fault_iova = 0;
-	struct ane_dart_scratch scratch[ANE_DART_SCRATCH_MAX];
-	int scratch_pages = 0;
+	struct ane_dart_scratch *scratch = ane->scratch;
 	bool faulted = false;
 	int err, status;
 
@@ -298,10 +297,10 @@ int ane_tm_execute(struct ane_device *ane, struct ane_request *req)
 			err = status;
 		if (ane_dart_faulted(ane, &fault_iova, &fault_status)) {
 			faulted = true;
-			if (scratch_pages >= ANE_DART_SCRATCH_MAX)
+			if (ane->scratch_pages >= ANE_DART_SCRATCH_MAX)
 				break;
 			if (ane_dart_drain_fault(ane, fault_iova, scratch,
-						 &scratch_pages))
+						 &ane->scratch_pages))
 				break;
 			/* The retried transaction now completes; poll on. */
 			continue;
@@ -321,7 +320,7 @@ int ane_tm_execute(struct ane_device *ane, struct ane_request *req)
 		if (err || ane_dart_faulted(ane, NULL, NULL)) {
 			/* Drain failed or the drained program never reached
 			 * completion: the engine is not idle and access is
-			 * off the table. wedge releases the scratch.
+			 * off the table. Retain scratch backing until reset.
 			 */
 			err = err ?: -EIO;
 			goto wedge;
@@ -334,11 +333,12 @@ int ane_tm_execute(struct ane_device *ane, struct ane_request *req)
 		 */
 		rmb();
 		tq_write32(ane, TQ_STATUS(req->qid), 0x0);
-		ane_dart_release_scratch(ane, scratch, scratch_pages);
+		ane_dart_release_scratch(ane, scratch, ane->scratch_pages);
 		ane_dart_unmask(ane);
 		dev_err(ane->dev,
 			"DART fault contained: status=%#x iova=%#llx scratch=%d\n",
-			fault_status, fault_iova, scratch_pages);
+			fault_status, fault_iova, ane->scratch_pages);
+		ane->scratch_pages = 0;
 		return -EIO;
 	}
 	if (err)
@@ -356,7 +356,6 @@ int ane_tm_execute(struct ane_device *ane, struct ane_request *req)
 	return 0;
 
 wedge:
-	ane_dart_release_scratch(ane, scratch, scratch_pages);
 	ane_dart_unmask(ane);
 	if (atomic_xchg(&ane->wedged, 1) == 0) {
 		__module_get(THIS_MODULE);
@@ -643,28 +642,4 @@ int ane_tm_recover(struct ane_device *ane)
 		dev_info(ane->dev, "tm recovered: idle, accepting work again\n");
 	}
 	return 0;
-}
-
-/*
- * Drop the wedge pin on demand. The recovery path in ane_tm_recover
- * does an atomic_xchg + module_put, but only on its success branch -
- * a real -110 with the engine stuck leaves ane->wedged set and the
- * module refcount one too high, so rmmod fails forever and the bug
- * becomes a kernel-brick-without-reboot. ane_drm_postclose calls
- * this unconditionally so every session close releases the pin,
- * letting the operator unload the ko for an updated build even when
- * the engine itself cannot be cleared in software.
- *
- * Pair count: must follow an ane_wedge_set() that called
- * __module_get(THIS_MODULE). Today the only such set is in the wedge:
- * branch of ane_tm_execute(); future sets must call this in their
- * clean-up path too.
- */
-void ane_wedge_clear(struct ane_device *ane)
-{
-	if (atomic_xchg(&ane->wedged, 0)) {
-		module_put(THIS_MODULE);
-		dev_info(ane->dev,
-			 "wedge pin released (engine state unknown)\n");
-	}
 }

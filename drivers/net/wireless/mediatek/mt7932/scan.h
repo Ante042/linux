@@ -5,10 +5,13 @@
 #include "protocol.h"
 #include "channels.h"
 
+/* CID03 carries this many band/channel slots, from 0xa0 up to 0xe0. */
+#define MT7932_SCAN_CHANNELS 32
+
 /* Selected ordinary TX17/fullmac wildcard scan, not a pre-RF gate.
  * Caller must own BSS0 and filter cfg80211 DISABLED channels first. NO_IR
- * channels require mt7932_scan_passive() before submission.
- * NEO_FIRST_CFG80211_SCAN_CONTRACT: 20ms dwell and meaningful MT7932 tail.
+ * channels require mt7932_scan_passive() before submission. The body uses
+ * a 20 ms dwell and fills the MT7932-specific tail.
  */
 static inline int mt7932_scan_body(u8 *body, size_t capacity, u8 seq,
 				   const u8 *channels, unsigned int count)
@@ -17,7 +20,7 @@ static inline int mt7932_scan_body(u8 *body, size_t capacity, u8 seq,
 				0x6b,7,0x0f,0xff,0xff,0xff,0xff,0xff,0xff};
 	unsigned int i, j;
 
-	if (capacity < 0x4d4 || !seq || seq > 127 || !count || count > 13)
+	if (capacity < 0x4d4 || !seq || seq > 127 || !count || count > MT7932_SCAN_CHANNELS)
 		return -EINVAL;
 	for (i = 0; i < count; i++) {
 		if (!mt7932_channel_band(channels[i]) ||
@@ -84,7 +87,7 @@ static inline void mt7932_scan_disconnected_passive(u8 body[0x4d4])
 }
 
 /* This firmware requires its native wildcard template. Directed scans use
- * no probe IEs. Forwarding the normal supplicant extras stalled the campaign
+ * no probe IEs. Forwarding the normal supplicant extras stalled the scan
  * on J700; arbitrary caller probe-IE carriage remains unsupported here.
  */
 static inline int mt7932_scan_options(u8 body[0x4d4], const u8 *ssid,

@@ -63,6 +63,8 @@ const LEGACY_VM_USER_RANGE: Range<u64> = mmu::IOVA_USER_BASE..mmu::IOVA_UNK_PAGE
 
 /// A client instance of an `mmu::Vm` address space.
 struct Vm {
+    /// Residency reclaim of a G17 VM; None elsewhere.
+    shrinker: Option<KBox<mmu::VmShrinker>>,
     ualloc: Arc<Mutex<alloc::DefaultAllocator>>,
     ualloc_priv: Arc<Mutex<alloc::DefaultAllocator>>,
     vm: mmu::Vm,
@@ -73,6 +75,27 @@ struct Vm {
 
 impl Drop for Vm {
     fn drop(&mut self) {
+        if self.vm.status().is_some() {
+            // G17 VM.
+            self.shrinker = None;
+            self.vm.close_idle_reclaim();
+            if let Some(status) = self.vm.status() {
+                // Retained graphs may keep this status alive; the client's mirror
+                // object must not outlive the client's VM handle.
+                status.release_mirror();
+            }
+            // Tracked jobs can outlive their file's VM handle. Their last guard performs
+            // these unmaps once no accepted work can still dereference the mappings.
+            if let Err(error) = self
+                .vm
+                .unmap_user_ranges(self.user_range.clone(), self.kernel_range.clone())
+            {
+                pr_err!("Vm::Drop: deferred user unmap failed: {:?}\n", error);
+            }
+            self.vm.bo_deferred_cleanup();
+            return;
+        }
+
         if !self.vm.is_m3() {
 
         // When the user Vm is dropped, unmap everything in the user range
@@ -185,11 +208,11 @@ impl SyncItem {
         in_count: u32,
         out_count: u32,
     ) -> Result<KVec<SyncItem>> {
-        let count = in_count + out_count;
-        let mut vec = KVec::with_capacity(count as usize, GFP_KERNEL)?;
+        let count = in_count.checked_add(out_count).ok_or(EOVERFLOW)?;
 
         const STRIDE: usize = core::mem::size_of::<uapi::drm_asahi_sync>();
-        let size = STRIDE * count as usize;
+        let size = STRIDE.checked_mul(count as usize).ok_or(EOVERFLOW)?;
+        let mut vec = KVec::with_capacity(count as usize, GFP_KERNEL)?;
 
         // SAFETY: We only read this once, so there are no TOCTOU issues.
         let mut reader = UserSlice::new(UserPtr::from_addr(ptr as _), size).reader();
@@ -314,8 +337,30 @@ impl File {
 
         let gpu = device.gpu()?;
 
-        if data.param_group == crate::agx_status::PARAM_GROUP_VM_STATUS {
-            return Self::get_vm_status(device, data, file);
+        match data.param_group {
+            crate::agx_status::PARAM_GROUP_VM_STATUS => {
+                return Self::get_vm_status(device, data, file);
+            }
+            uapi::DRM_ASAHI_PARAM_GROUP_VM_STATUS_MIRROR if device.g17().is_some() => {
+                return Self::register_vm_status_mirror(data, file);
+            }
+            uapi::DRM_ASAHI_PARAM_GROUP_QUEUE_LIMITS => {
+                if data.pad != 0
+                    || data.size < core::mem::size_of::<uapi::drm_asahi_queue_limits>() as u64
+                {
+                    return Err(EINVAL);
+                }
+                let limits = gpu.queue_limits().ok_or(EINVAL)?;
+                let words = [limits.max_queues, limits.max_in_flight_per_queue, 0, 0];
+                UserSlice::new(
+                    UserPtr::from_addr(data.pointer as _),
+                    core::mem::size_of_val(&words),
+                )
+                .writer()
+                .write(&words)?;
+                return Ok(0);
+            }
+            _ => {}
         }
 
         if data.param_group != 0 || data.pad != 0 {
@@ -359,6 +404,10 @@ impl File {
             params.features |= crate::agx_status::FEATURE_VM_STATUS;
         }
 
+        if gpu.queue_limits().is_some() {
+            params.features |= uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES as u64;
+        }
+
         if gpu.supports_scheduled_queues() {
             params.features |= uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_SCHEDULED_QUEUES as u64;
         }
@@ -381,6 +430,10 @@ impl File {
             && !matches!(facts.chip_id, 0x6031 | 0x6034 | 0x8132)
             && *module_parameters::fault_control.value() == 0xb
         {
+            params.features |= uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_SOFT_FAULTS as u64;
+        }
+        // The G17P runtime keeps its own soft-fault rule.
+        if device.g17().is_some() && *module_parameters::fault_control.value() == 0xb {
             params.features |= uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_SOFT_FAULTS as u64;
         }
 
@@ -410,16 +463,58 @@ impl File {
         let mut bytes = [0u8; VM_STATUS_SIZE];
         UserSlice::new(user, VM_STATUS_SIZE).reader().read_slice(&mut bytes)?;
         let vm_id = decode_request(&bytes).ok_or(EINVAL)?;
-        let status = {
+        let (g17_status, status) = {
             let vms = file.inner().vms();
             let guard = vms.lock();
             let vm = guard.get(vm_id as usize).ok_or(ENOENT)?;
-            vm.vm.status()?.clone()
+            match vm.vm.status() {
+                // G17 VMs keep their own sticky status object.
+                Some(status) => (Some(status.clone()), None),
+                None => (None, Some(vm.vm.agx_status()?.clone())),
+            }
         };
-        status.record(device.gpu()?.submission_error());
-        let bytes = encode_response(vm_id, status.get());
+        let error = match (g17_status, status) {
+            (Some(status), _) => status.reported_error(),
+            (None, Some(status)) => {
+                status.record(device.gpu()?.submission_error());
+                status.get()
+            }
+            (None, None) => return Err(EINVAL),
+        };
+        let bytes = encode_response(vm_id, error);
         UserSlice::new(user, VM_STATUS_SIZE).writer().write_slice(&bytes)?;
         Ok(0)
+    }
+
+    /// Register a file-owned GEM word as the mirror of a file-owned VM's status.
+    fn register_vm_status_mirror(data: &uapi::drm_asahi_get_params, file: &DrmFile) -> Result<u32> {
+        let size = core::mem::size_of::<uapi::drm_asahi_vm_status_mirror>();
+        if data.pad != 0 || data.size < size as u64 {
+            return Err(EINVAL);
+        }
+        let [vm_id, handle, offset, flags] =
+            UserSlice::new(UserPtr::from_addr(data.pointer as _), size)
+                .reader()
+                .read::<[u32; 4]>()?;
+        if flags != 0 || handle == 0 || offset % core::mem::align_of::<i32>() as u32 != 0 {
+            return Err(EINVAL);
+        }
+        let status = Self::vm_status(file, vm_id)?;
+        let owner = gem::ObjectRef::new(gem::Object::lookup_handle(file, handle)?);
+        status.attach_mirror(owner, offset as usize)?;
+        Ok(0)
+    }
+
+    fn vm_status(file: &DrmFile, vm_id: u32) -> Result<Arc<crate::g17::status::VmStatus>> {
+        let vms = file.inner().vms();
+        let guard = vms.lock();
+        Ok(guard
+            .get(vm_id as usize)
+            .ok_or(ENOENT)?
+            .vm
+            .status()
+            .ok_or(EINVAL)?
+            .clone())
     }
 
     /// IOCTL: vm_create: Create a new `Vm`.
@@ -428,9 +523,16 @@ impl File {
         data: &mut uapi::drm_asahi_vm_create,
         file: &DrmFile,
     ) -> Result<u32> {
-        let hal = device.gpu()?.params()?.gpu_hal_generation;
-        let expected = if hal == 200 { uapi::drm_asahi_vm_create_flags_DRM_ASAHI_VM_CREATE_HAL200 } else { 0 };
-        if data.flags != expected { return Err(EINVAL); }
+        if device.g17().is_some() {
+            // G17P reports HAL200; it accepts the acknowledgement but does not require it.
+            if data.flags & !uapi::drm_asahi_vm_create_flags_DRM_ASAHI_VM_CREATE_HAL200 != 0 {
+                return Err(EINVAL);
+            }
+        } else {
+            let hal = device.gpu()?.params()?.gpu_hal_generation;
+            let expected = if hal == 200 { uapi::drm_asahi_vm_create_flags_DRM_ASAHI_VM_CREATE_HAL200 } else { 0 };
+            if data.flags != expected { return Err(EINVAL); }
+        }
         if let Some(gate) = &file.inner().m3_client { gate.admit_vm(device, data.flags)?; }
         let kernel_range = data.kernel_start..data.kernel_end;
         let user_range = device.gpu()?.user_range()?;
@@ -516,6 +618,11 @@ impl File {
         let profile_vm_id = vm.id();
         resv.fill(KBox::new(
             Vm {
+                shrinker: if vm.residency_reclaim_enabled() {
+                    Some(mmu::VmShrinker::new(&vm)?)
+                } else {
+                    None
+                },
                 ualloc,
                 ualloc_priv,
                 vm,
@@ -574,21 +681,20 @@ impl File {
         }
 
         let resv_gem;
+        let mut reclaim_cpu = false;
         let resv_obj = if data.flags & uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_VM_PRIVATE != 0 {
-            resv_gem = file
-                .inner()
-                .vms()
-                .lock()
-                .get(data.vm_id.try_into()?)
-                .ok_or(ENOENT)?
-                .vm
-                .get_resv_obj();
+            let vms = file.inner().vms();
+            let vms = vms.lock();
+            let vm = &vms.get(data.vm_id.try_into()?).ok_or(ENOENT)?.vm;
+            // Only G17 VMs enable residency reclaim.
+            reclaim_cpu = vm.residency_reclaim_enabled();
+            resv_gem = vm.get_resv_obj();
             Some(resv_gem.deref())
         } else {
             None
         };
 
-        let gem = gem::new_object(device, data.size.try_into()?, data.flags, resv_obj)?;
+        let gem = gem::new_object(device, data.size.try_into()?, data.flags, resv_obj, reclaim_cpu)?;
 
         let handle = gem.create_handle(file)?;
         data.handle = handle;
@@ -627,6 +733,27 @@ impl File {
         Ok(0)
     }
 
+    /// IOCTL: gem_madvise: Mark a VM-private object purgeable or needed.
+    pub(crate) fn gem_madvise(
+        device: &AsahiDevice,
+        data: &mut uapi::drm_asahi_gem_madvise,
+        file: &DrmFile,
+    ) -> Result<u32> {
+        // Only the G17P runtime implements purgeable objects.
+        if device.g17().is_none() {
+            return Err(EINVAL);
+        }
+        if data.pad != 0 || data.madv > uapi::drm_asahi_gem_madv_DRM_ASAHI_GEM_MADV_DONTNEED {
+            return Err(EINVAL);
+        }
+        let gem = gem::Object::lookup_handle(file, data.handle)?;
+        data.retained = gem::madvise(
+            &gem,
+            data.madv == uapi::drm_asahi_gem_madv_DRM_ASAHI_GEM_MADV_DONTNEED,
+        )?;
+        Ok(0)
+    }
+
     /// IOCTL: vm_bind: Map or unmap memory into a Vm.
     pub(crate) fn vm_bind(
         device: &AsahiDevice,
@@ -643,6 +770,10 @@ impl File {
         if data.stride == 0 || data.pad != 0 {
             cls_pr_debug!(Errors, "vm_bind: Unexpected headers\n");
             return Err(EINVAL);
+        }
+
+        if device.g17().is_some() {
+            return Self::vm_bind_g17(data, file);
         }
 
         let vm_id = data.vm_id.try_into()?;
@@ -669,6 +800,94 @@ impl File {
             Self::do_gem_bind_unbind(vm_id, &bind, file)?;
         }
 
+        Ok(0)
+    }
+
+    /// Validate all operations and retain their objects before changing a tracked VM.
+    fn vm_bind_g17(data: &uapi::drm_asahi_vm_bind, file: &DrmFile) -> Result<u32> {
+        let count = usize::try_from(data.num_binds)?;
+        let stride = usize::try_from(data.stride)?;
+        let size = stride.checked_mul(count).ok_or(EOVERFLOW)?;
+        let mut bytes = KVec::new();
+        UserSlice::new(UserPtr::from_addr(data.userptr as _), size)
+            .reader()
+            .read_all(&mut bytes, GFP_KERNEL)?;
+        let (vm, user_range, kernel_range) = {
+            let vms = file.inner().vms();
+            let guard = vms.lock();
+            let entry = guard.get(data.vm_id as usize).ok_or(ENOENT)?;
+            (
+                entry.vm.clone(),
+                entry.user_range.clone(),
+                entry.kernel_range.clone(),
+            )
+        };
+        let mut batch = mmu::PreparedUserBindBatch::new(count)?;
+        let mut unmaps = 0;
+        // A fresh reader per declared stride also skips extension bytes in longer records.
+        for bytes in bytes.chunks_exact(stride) {
+            let op: uapi::drm_asahi_gem_bind_op = Reader::new(bytes).read_up_to(stride)?;
+            if op.range == 0 || (op.addr | op.range | op.offset) & mmu::UAT_PGMSK as u64 != 0 {
+                return Err(EINVAL);
+            }
+            let range = op.addr..op.addr.checked_add(op.range).ok_or(EINVAL)?;
+            if !user_range.is_superset(range.clone())
+                || kernel_range.overlaps(range.clone())
+                || vm.driver_range_overlaps(range.clone())
+            {
+                return Err(EINVAL);
+            }
+            if op.flags & uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_UNBIND != 0 {
+                if op.offset != 0
+                    || op.flags != uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_UNBIND
+                    || op.handle != 0
+                {
+                    return Err(EINVAL);
+                }
+                batch.push_unmap(vm.prepare_user_unmap(op.addr, op.range)?)?;
+                unmaps += 1;
+                continue;
+            }
+            vm.wait_for_user_map_admission()?;
+            if op.flags
+                & !(uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_READ
+                    | uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_WRITE
+                    | uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_SINGLE_PAGE)
+                != 0
+            {
+                return Err(EINVAL);
+            }
+            let read = op.flags & uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_READ != 0;
+            let write = op.flags & uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_WRITE != 0;
+            let prot = match (read, write) {
+                (true, true) => mmu::PROT_GPU_SHARED_RW,
+                (true, false) => mmu::PROT_GPU_SHARED_RO,
+                (false, true) => mmu::PROT_GPU_SHARED_WO,
+                (false, false) => return Err(EINVAL),
+            };
+            let single_page = op.flags & uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_SINGLE_PAGE != 0;
+            let object = gem::Object::lookup_handle(file, op.handle)?;
+            let accessed = if single_page {
+                mmu::UAT_PGSZ as u64
+            } else {
+                op.range
+            };
+            if op.offset.checked_add(accessed).ok_or(EINVAL)? > u64::try_from(object.size())? {
+                return Err(EINVAL);
+            }
+            vm.validate_context_binding(op.addr, op.range, single_page)?;
+            batch.push_map(vm.prepare_bind_object(
+                &object,
+                op.addr,
+                op.range,
+                op.offset,
+                prot,
+                single_page,
+            )?)?;
+        }
+        vm.reserve_deferred_user_unmaps(unmaps)?;
+        vm.commit_prepared_user_bind_batch(&mut batch)?;
+        vm.bo_deferred_cleanup();
         Ok(0)
     }
 
@@ -994,7 +1213,10 @@ impl File {
             .inner()
             .objects()
             .lock()
-            .insert_limit(1..=u32::MAX, obj, GFP_KERNEL)? as u64;
+            .insert_limit(1..=u32::MAX, obj, GFP_KERNEL);
+        // StoreError owns the rejected object. Convert it only after the
+        // temporary XArray guard is gone: dropping a mapping may sleep.
+        let handle = handle? as u64;
 
         data.object_handle = handle as u32;
         Ok(0)
@@ -1081,7 +1303,7 @@ impl File {
         let _ = file_vm;
         core::mem::drop(guard);
 
-        let queue = device.gpu()?.new_queue(
+        let mut queue = device.gpu()?.new_queue(
             vm,
             ualloc,
             ualloc_priv,
@@ -1089,6 +1311,9 @@ impl File {
             uapi::drm_asahi_priority_DRM_ASAHI_PRIORITY_REALTIME - data.priority,
             data.usc_exec_base,
         )?;
+
+        // Only G17P queues accept a nonzero render ray query scratch layout.
+        queue.reserve_render_scs(data.render_scs_layout)?;
 
         data.queue_id = resv.index().try_into()?;
         resv.fill(Arc::pin_init(new_mutex!(queue), GFP_KERNEL)?)?;
@@ -1152,6 +1377,21 @@ impl File {
             data.queue_id,
             id
         );
+        let mut vec = KVec::new();
+        let copy_commands = |bytes: &mut KVec<u8>| {
+            UserSlice::new(
+                UserPtr::from_addr(data.cmdbuf as _),
+                data.cmdbuf_size as usize,
+            )
+            .reader()
+            .read_all(bytes, GFP_KERNEL)
+        };
+        let guarded = device.g17().is_some();
+        // Once G17 output syncobjs are resolved, its queue must install a fence
+        // on every failure. Take the fallible userspace snapshot before that point.
+        if guarded {
+            copy_commands(&mut vec)?;
+        }
         let syncs =
             SyncItem::parse_array(file, data.syncs, data.in_sync_count, data.out_sync_count)?;
 
@@ -1163,22 +1403,23 @@ impl File {
             id
         );
 
-        let mut vec = KVec::new();
-
         // Copy the command buffer into the kernel. Because we need to iterate
         // the command buffer twice, we do this in one big copy_from_user to
         // avoid TOCTOU issues.
-        let reader = UserSlice::new(
-            UserPtr::from_addr(data.cmdbuf as _),
-            data.cmdbuf_size as usize,
-        )
-        .reader();
-        reader.read_all(&mut vec, GFP_KERNEL)?;
+        if !guarded {
+            copy_commands(&mut vec)?;
+        }
 
         let objects = file.inner().objects();
         let ret = queue
             .lock()
             .submit(id, syncs, data.in_sync_count as usize, &vec, objects);
+
+        if ret.is_ok() {
+            if let Some((util_min, duration_ms)) = gpu.syncobj_wait_hint() {
+                file.set_syncobj_wait_hint(util_min, duration_ms);
+            }
+        }
 
         match ret {
             Err(ERESTARTSYS) => Err(ERESTARTSYS),

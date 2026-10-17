@@ -26,6 +26,7 @@ use crate::{
     drm_gpu,
     file,
     g15_boot,
+    g17,
     gem::AsahiObject,
     gpu,
     hw,
@@ -44,6 +45,9 @@ pub(crate) struct AsahiData {
     pub(crate) completion: SetOnce<Arc<crate::m3_completion::Completion>>,
     pub(crate) pdev: ARef<platform::Device>,
     pub(crate) resources: Option<regs::Resources>,
+    /// Kernel GEM objects are marked held for the device (`gem::set_mapping_held`). Only the
+    /// G17P runtime sets this.
+    pub(crate) hold_kernel_pages: bool,
     #[pin]
     g16_completion_work: Work<AsahiDevice, 3>,
 
@@ -58,8 +62,31 @@ impl AsahiData {
             completion: SetOnce::new(),
             pdev,
             resources,
+            hold_kernel_pages: false,
             g16_completion_work <- new_work!("AsahiData::g16_completion_work"),
         })
+    }
+
+    /// Driver data of a G17P device.
+    fn new_g17(pdev: &platform::Device<Core>, resources: regs::Resources) -> impl PinInit<Self, Error> {
+        let pdev: ARef<platform::Device> = pdev.into();
+        try_pin_init!(Self {
+            gpu: SetOnce::new(),
+            is_m3: false,
+            completion: SetOnce::new(),
+            pdev,
+            resources: Some(resources),
+            hold_kernel_pages: true,
+            g16_completion_work <- new_work!("AsahiData::g16_completion_work"),
+        })
+    }
+
+    /// The G17P runtime, if this device runs it.
+    pub(crate) fn g17(&self) -> Option<&Arc<g17::Gpu>> {
+        match self.gpu.as_ref() {
+            Some(drm_gpu::Backend::G17(gpu)) => Some(gpu),
+            _ => None,
+        }
     }
 
     /// Runtime construction can use GEM before the GPU backend exists. All
@@ -89,6 +116,7 @@ enum AsahiRuntime {
     M3(crate::m3_drm::Registered),
     G16(crate::g16_drm::Registered),
     G15(crate::g15_probe::G15Manager),
+    G17(ARef<drm::Device<AsahiDriver>>, Arc<g17::Gpu>),
 }
 
 pub(crate) struct AsahiDriver {
@@ -103,6 +131,8 @@ pub(crate) enum ProbeConfig {
     /// topology decode run at probe time, then the probe fails closed before
     /// DMA setup, ASC start, or any MMIO write.
     Agx3Diagnostic(&'static hw::agx3::SocConfig),
+    /// G17 (T8140): the G17P firmware runtime.
+    G17(&'static g17::Config),
 }
 
 unsafe impl Send for AsahiDriver {}
@@ -132,6 +162,8 @@ impl drm::driver::Driver for AsahiDriver {
     type Object = drm::gem::shmem::Object<AsahiObject>;
 
     const INFO: drm::driver::DriverInfo = INFO;
+    /// Open files and exported buffers pin the module while G17P deferred cleanup can run.
+    const MODULE: Option<&'static kernel::ThisModule> = Some(&crate::THIS_MODULE);
     const FEATURES: u32 = drm::driver::FEAT_GEM
         | drm::driver::FEAT_RENDER
         | drm::driver::FEAT_SYNCOBJ
@@ -161,6 +193,8 @@ impl drm::driver::Driver for AsahiDriver {
             ioctl::AUTH | ioctl::RENDER_ALLOW, crate::file::File::queue_destroy),
         (ASAHI_SUBMIT,          drm_asahi_submit,
             ioctl::AUTH | ioctl::RENDER_ALLOW, crate::file::File::submit),
+        (ASAHI_GEM_MADVISE,     drm_asahi_gem_madvise,
+            ioctl::AUTH | ioctl::RENDER_ALLOW, crate::file::File::gem_madvise),
     }
 }
 
@@ -209,8 +243,8 @@ kernel::of_device_table!(
         // while its table is incomplete; T6031 starts that runtime only with
         // asahi.t6031_start=1 and otherwise fails closed the same way; the
         // others fail closed before any firmware handoff.
-        // The M4 (G16) and M5/A18 Pro (G17) bring-up runtimes are not bound
-        // in this kernel.
+        // The M4 (G16) and M5 bring-up runtimes are not bound in this kernel.
+        // The A18 Pro (T8140, G17P) runtime is bound below.
         (
             of::DeviceId::new(c_str!("apple,agx-t8122")),
             ProbeConfig::Agx3Diagnostic(&hw::agx3::T8122)
@@ -226,6 +260,10 @@ kernel::of_device_table!(
         (
             of::DeviceId::new(c_str!("apple,agx-t6032")),
             ProbeConfig::Agx3Diagnostic(&hw::agx3::T6032)
+        ),
+        (
+            of::DeviceId::new(c_str!("apple,agx-t8140")),
+            ProbeConfig::G17(&hw::t8140::CONFIG)
         ),
     ]
 );
@@ -417,6 +455,8 @@ impl platform::Driver for AsahiDriver {
         match &this.runtime {
             AsahiRuntime::M3(runtime) => runtime.stop(),
             AsahiRuntime::G16(runtime) => runtime.stop(),
+            // Driver data is dropped after devres, so CPU control must happen in unbind.
+            AsahiRuntime::G17(_, gpu) => gpu.shutdown(),
             _ => {},
         }
     }
@@ -483,6 +523,7 @@ impl platform::Driver for AsahiDriver {
                 }
             }
             ProbeConfig::Agx3Diagnostic(soc) => return Err(refuse_agx3_probe(pdev, soc)),
+            ProbeConfig::G17(cfg) => return Self::probe_g17(pdev, cfg),
         };
 
         unsafe { pdev.dma_set_mask_and_coherent(DmaMask::try_new(cfg.uat_oas)?)? };
@@ -542,5 +583,37 @@ impl platform::Driver for AsahiDriver {
         Ok(Self {
             runtime: AsahiRuntime::Legacy(drm),
         })
+    }
+}
+
+impl AsahiDriver {
+    fn probe_g17(pdev: &platform::Device<Core>, cfg: &'static g17::Config) -> Result<Self> {
+        // SAFETY: The GPU performs DMA through a UAT whose output width is part of the SoC config.
+        unsafe { pdev.dma_set_mask_and_coherent(DmaMask::try_new(cfg.uat_oas)?)? };
+        let res = regs::Resources::new(pdev)?;
+        // No userspace or GPU backend is published before the runtime is constructed.
+        let drm: ARef<AsahiDevice> =
+            drm::device::Device::new(pdev.as_ref(), AsahiData::new_g17(pdev, res.clone()))?;
+        let gpu = g17::Gpu::new(pdev, &drm, cfg, res)?;
+        if !drm.gpu.populate(drm_gpu::Backend::G17(gpu.clone())) {
+            gpu.shutdown();
+            return Err(EBUSY);
+        }
+        if let Err(error) = drm::driver::Registration::new_foreign_owned(&drm, pdev.as_ref(), 0) {
+            gpu.shutdown();
+            return Err(error);
+        }
+        Ok(Self {
+            runtime: AsahiRuntime::G17(drm, gpu),
+        })
+    }
+}
+
+impl Drop for AsahiDriver {
+    fn drop(&mut self) {
+        if let AsahiRuntime::G17(_, gpu) = &self.runtime {
+            // Also covers failure to allocate platform driver data after the probe body returned.
+            gpu.shutdown();
+        }
     }
 }

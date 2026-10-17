@@ -19,6 +19,7 @@ pub(crate) mod t6031;
 pub(crate) mod t8103;
 pub(crate) mod t8112;
 pub(crate) mod t8122;
+pub(crate) mod t8140;
 
 /// GPU revision enumeration. Note: Part of the UABI.
 #[derive(Debug, PartialEq, Copy, Clone)]

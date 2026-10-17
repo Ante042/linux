@@ -15,6 +15,10 @@ struct typec_switch_dev {
 struct typec_mux_dev {
 	struct device dev;
 	typec_mux_set_fn_t set;
+	typec_mux_set_fn_t prepare;
+	typec_mux_set_fn_t finish;
+	typec_mux_notify_fn_t commit;
+	typec_mux_notify_fn_t abort;
 };
 
 #define to_typec_switch_dev(_dev_) container_of(_dev_, struct typec_switch_dev, dev)

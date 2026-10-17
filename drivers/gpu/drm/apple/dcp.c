@@ -7,6 +7,7 @@
 #include <linux/completion.h>
 #include <linux/component.h>
 #include <linux/delay.h>
+#include <linux/device/driver.h>
 #include <linux/dma-mapping.h>
 #include <linux/gpio/consumer.h>
 #include <linux/iommu.h>
@@ -17,10 +18,12 @@
 #include <linux/mux/driver.h>
 #include <linux/soc/apple/dp-tunnel.h>
 #include <linux/moduleparam.h>
+#include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/of_device.h>
 #include <linux/of_graph.h>
 #include <linux/of_platform.h>
+#include <linux/property.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/soc/apple/j613-display.h>
@@ -33,6 +36,7 @@
 
 #include <drm/drm_edid.h>
 #include <drm/drm_fb_dma_helper.h>
+#include <drm/drm_drv.h>
 #include <drm/drm_fourcc.h>
 #include <drm/drm_framebuffer.h>
 #include <drm/drm_module.h>
@@ -47,6 +51,8 @@
 #include "dcp-hdmi.h"
 #include "dcpext_scanout.h"
 #include "dcp-internal.h"
+#include "dcp-external-bw.h"
+#include "dptx-service.h"
 #include "iomfb.h"
 #include "ibootep.h"
 #include "parser.h"
@@ -54,6 +60,9 @@
 
 #define APPLE_DCP_COPROC_CPU_CONTROL	 0x44
 #define APPLE_DCP_COPROC_CPU_CONTROL_RUN BIT(4)
+#define APPLE_DCP_COPROC_CPU_STATUS 0x48
+#define APPLE_DCP_COPROC_CPU_STATUS_STOPPED BIT(1)
+#define APPLE_DCP_COPROC_CPU_STATUS_IDLE BIT(5)
 
 #define DCP_BOOT_TIMEOUT msecs_to_jiffies(1000)
 
@@ -73,6 +82,31 @@ MODULE_PARM_DESC(hdmi_audio, "Enable unstable HDMI audio support");
 static bool unstable_edid = true;
 module_param(unstable_edid, bool, 0644);
 MODULE_PARM_DESC(unstable_edid, "Enable unstable EDID retrival support");
+
+/*
+ * H17-generation firmware (T8140 H17P, T8142 H17G) runs aurora-wip's
+ * processor lifecycle, below in the H17P section. Shared entry points
+ * hand those processors over to it.
+ */
+static void dcp_recv_msg_h17p(struct apple_dcp *dcp, u8 endpoint, u64 message);
+static void dcp_rtk_crashed_h17p(struct apple_dcp *dcp);
+static int dcp_rtk_shmem_setup_h17p(struct apple_dcp *dcp, struct apple_rtkit_shmem *bfr);
+static int dcp_crtc_atomic_check_h17p(struct drm_crtc *crtc, struct drm_atomic_state *state);
+static int dcp_dptx_connect_h17p(struct apple_dcp *dcp, u32 port);
+static int dcp_dptx_disconnect_h17p(struct apple_dcp *dcp, u32 port);
+static int dcp_dptx_connect_oob_h17p(struct platform_device *pdev, u32 port);
+static int dcp_dptx_disconnect_oob_h17p(struct platform_device *pdev, u32 port);
+static int dcp_start_h17p(struct platform_device *pdev);
+static void dcp_poweron_h17p(struct platform_device *pdev);
+static void dcp_poweroff_h17p(struct platform_device *pdev);
+static void dcp_disable_typec_work_h17p(struct apple_dcp *dcp, bool release_cable);
+static void dcp_enable_typec_work_h17p(struct apple_dcp *dcp);
+static int dcp_comp_bind_h17p(struct device *dev, struct device *main, void *data);
+static void dcp_comp_unbind_h17p(struct device *dev, struct device *main, void *data);
+static int dcp_platform_probe_h17p(struct platform_device *pdev);
+static void dcp_platform_shutdown_h17p(struct platform_device *pdev);
+static int dcp_platform_suspend_h17p(struct device *dev);
+static int dcp_platform_resume_h17p(struct device *dev);
 
 /* copied and simplified from drm_vblank.c */
 static void send_vblank_event(struct drm_device *dev,
@@ -230,9 +264,15 @@ static void dcp_delayed_vblank(struct work_struct *work)
 {
 	struct apple_dcp *dcp;
 
+	struct apple_crtc *crtc;
+
 	dcp = container_of(work, struct apple_dcp, vblank_wq);
+	/* RTKit can report a crash before the pipeline has a CRTC. */
+	crtc = READ_ONCE(dcp->crtc);
+	if (!crtc)
+		return;
 	mdelay(5);
-	dcp_drm_crtc_vblank(dcp->crtc);
+	dcp_drm_crtc_vblank(crtc);
 }
 
 #define DCP_SWAP_WATCHDOG_MS		1000
@@ -277,6 +317,9 @@ static void dcp_recv_msg(void *cookie, u8 endpoint, u64 message)
 {
 	struct apple_dcp *dcp = cookie;
 
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P)
+		return dcp_recv_msg_h17p(dcp, endpoint, message);
+
 	trace_dcp_recv_msg(dcp, endpoint, message);
 
 	/* A failed T8122 dcpext: its firmware may still talk, nobody listens. */
@@ -310,6 +353,9 @@ static void dcp_rtk_crashed(void *cookie, const void *crashlog, size_t crashlog_
 {
 	struct apple_dcp *dcp = cookie;
 
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P)
+		return dcp_rtk_crashed_h17p(dcp);
+
 	/*
 	 * A failed T8122 dcpext: its start never ran (start_done is not set
 	 * up) and it has no connector. Its firmware may still report a crash.
@@ -332,6 +378,9 @@ static void dcp_rtk_crashed(void *cookie, const void *crashlog, size_t crashlog_
 static int dcp_rtk_shmem_setup(void *cookie, struct apple_rtkit_shmem *bfr)
 {
 	struct apple_dcp *dcp = cookie;
+
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P)
+		return dcp_rtk_shmem_setup_h17p(dcp, bfr);
 
 	if (bfr->iova) {
 		struct iommu_domain *domain =
@@ -390,6 +439,15 @@ void dcp_send_message(struct apple_dcp *dcp, u8 endpoint, u64 message)
 {
 	int ret;
 
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P) {
+		if (READ_ONCE(dcp->quiescing))
+			return;
+		trace_dcp_send_msg(dcp, endpoint, message);
+		apple_rtkit_send_message(dcp->rtk, endpoint, message, NULL,
+					 true);
+		return;
+	}
+
 	trace_dcp_send_msg(dcp, endpoint, message);
 	/*
 	 * The adopted 14.7 session shares this mailbox with the panel link.
@@ -411,6 +469,8 @@ int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state *state)
 	struct drm_crtc_state *crtc_state;
 	bool needs_modeset;
 
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P)
+		return dcp_crtc_atomic_check_h17p(crtc, state);
 	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6)
 		return iomfb_v26_6_atomic_check(dcp, crtc, state);
 	if (dcp->fw_compat == DCP_FIRMWARE_V_14_7)
@@ -691,6 +751,13 @@ static int dcp_dptx_connect_session(struct apple_dcp *dcp, u32 port,
 	if (dcp->avep)
 		av_service_connect(dcp);
 
+	/* The sink's link comes up now, see dcp_typec_relink(). */
+	if (!port && dcp_is_typec_output(dcp)) {
+		scoped_guard(spinlock_irqsave, &dcp->relink_lock)
+			dcp_relink_link_up(&dcp->relink, dcp->typec_generation,
+					   jiffies);
+	}
+
 	ret = 0;
 	goto out_unlock;
 
@@ -947,6 +1014,9 @@ int dcp_dptx_connect(struct apple_dcp *dcp, u32 port)
 	struct dcp_fabric_session session;
 	int ret;
 
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P)
+		return dcp_dptx_connect_h17p(dcp, port);
+
 	scoped_guard(mutex, &dcp->hpd_mutex)
 		session = dcp_session_locked(dcp);
 	ret = dcp_dptx_connect_session(dcp, port, session, !!session.cookie, false);
@@ -1008,7 +1078,9 @@ static void dcp_placeholder_edid_work(struct work_struct *work)
 	 * Some adapters answer the first connection with a 1024x768
 	 * placeholder and publish the panel EDID only after HPD drops
 	 * and returns. One pulse; a second placeholder is left alone.
+	 * DCP reports the drop as an unplug, which is not a lost link.
 	 */
+	WRITE_ONCE(dcp->typec_hpd_held, true);
 	ret = dptxport_set_hpd(service, false);
 	if (ret) {
 		dev_info(dcp->dev, "placeholder EDID: HPD drop failed: %d\n",
@@ -1029,6 +1101,7 @@ static void dcp_placeholder_edid_work(struct work_struct *work)
 		dev_info(dcp->dev, "placeholder EDID: HPD assert failed: %d\n",
 			 ret);
 out_unlock:
+	WRITE_ONCE(dcp->typec_hpd_held, false);
 	mutex_unlock(&dcp->hpd_mutex);
 }
 
@@ -1064,6 +1137,158 @@ static void dcp_typec_reconnect_work(struct work_struct *work)
 	}
 	dev_err(dcp->dev, "Type-C DPTX reconnect failed after %u retries: %d\n",
 		dcp->typec_reconnect_tries, ret);
+}
+
+/* A display is attached to the Type-C output: a new attachment. */
+static void dcp_typec_attach_locked(struct apple_dcp *dcp)
+{
+	lockdep_assert_held(&dcp->hpd_mutex);
+	dcp->typec_generation++;
+	WRITE_ONCE(dcp->typec_cable_connected, true);
+	dcp->typec_reconnect_tries = 0;
+	dcp->placeholder_retried = false;
+	cancel_delayed_work(&dcp->typec_reconnect_wq);
+	/* A newly attached display gets its own retries. */
+	if (dcp->external_native) {
+		atomic_set(&dcp->external_retries, 0);
+		cancel_delayed_work(&dcp->external_retry_wq);
+	}
+}
+
+/* Connect the link of an attached display, retrying later if that fails. */
+static int dcp_dptx_connect_attached(struct apple_dcp *dcp, u32 port)
+{
+	int ret = dcp_dptx_connect(dcp, port);
+
+	if (ret && ret != -ESHUTDOWN && dcp_is_typec_output(dcp))
+		dcp_queue_typec_reconnect(dcp, DPTX_RECONNECT_DELAY);
+
+	return ret;
+}
+
+/*
+ * A USB-C monitor with a built-in hub can lose the DP link when the hub
+ * brings its SuperSpeed link up right around DCP's link training for the
+ * first modeset. DCP may then report the sink as unplugged about two
+ * seconds after HPD was asserted for it, although the sink still asserts
+ * HPD, and nothing else connects it again: replay an unplug and replug of
+ * the sink ("relink"), which trains the link once the hub has settled, as
+ * a cable replug does. A sink's IRQ_HPD gets a retrain, as before.
+ *
+ * The retries cover one attachment or one DPMS wake: the replay itself
+ * does not reset them, dcp_poweron() does. dcp-relink.h holds the
+ * decisions; relink_lock protects their state.
+ */
+static bool dcp_typec_relink_eligible(struct apple_dcp *dcp)
+{
+	struct apple_connector *connector = READ_ONCE(dcp->connector);
+
+	/* H17P and native external pipes recover through their own lifecycle */
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P || dcp->external_native ||
+	    !dcp_is_typec_output(dcp) || dcp_is_usb4_output(dcp) ||
+	    dcp_is_external_h17p(dcp) || !dcp->typec_connector)
+		return false;
+	/*
+	 * Only a sink that is attached, shown and still connected for DRM:
+	 * not one the driver itself let go, holds HPD low for (see
+	 * dcp_placeholder_edid_work()) or moves to another pipeline.
+	 */
+	return READ_ONCE(dcp->typec_cable_connected) &&
+	       !READ_ONCE(dcp->typec_crtc_off) &&
+	       !READ_ONCE(dcp->typec_hpd_held) &&
+	       !READ_ONCE(dcp->tb_retiring) &&
+	       !READ_ONCE(dcp->typec_follow_retiring) &&
+	       connector && READ_ONCE(connector->connected);
+}
+
+/* DCP reported an unplug of a Type-C sink that still asserts HPD */
+bool dcp_typec_relink(struct apple_dcp *dcp)
+{
+	unsigned long flags;
+	bool start;
+	u32 tries;
+
+	if (!dcp_typec_relink_eligible(dcp))
+		return false;
+
+	spin_lock_irqsave(&dcp->relink_lock, flags);
+	start = dcp_relink_unplug(&dcp->relink, READ_ONCE(dcp->typec_generation),
+				  jiffies);
+	if (start)
+		mod_delayed_work(system_freezable_wq, &dcp->typec_relink_wq, 0);
+	tries = dcp->relink.tries;
+	spin_unlock_irqrestore(&dcp->relink_lock, flags);
+
+	if (start)
+		dev_info(dcp->dev,
+			 "DCP dropped a sink that asserts HPD, relinking the Type-C sink (%u/%u)\n",
+			 tries, DCP_RELINK_RETRIES);
+	return start;
+}
+
+/*
+ * The sink asked for attention: IRQ_HPD or a coalesced HPD pulse. The
+ * caller retrains the link, as for any such request, unless a relink is
+ * queued or runs: that connects the sink anew, and until it does, the
+ * sink has no link to retrain.
+ */
+bool dcp_typec_sink_relink(struct apple_dcp *dcp)
+{
+	unsigned long flags;
+	bool active;
+
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P)
+		return false;
+
+	spin_lock_irqsave(&dcp->relink_lock, flags);
+	active = dcp->relink.active;
+	spin_unlock_irqrestore(&dcp->relink_lock, flags);
+
+	return active;
+}
+
+static void dcp_typec_relink_work(struct work_struct *work)
+{
+	struct apple_dcp *dcp =
+		container_of(to_delayed_work(work), struct apple_dcp,
+			     typec_relink_wq);
+	struct platform_device *pdev = to_platform_device(dcp->dev);
+	unsigned long flags;
+	u64 generation;
+	bool run;
+
+	scoped_guard(mutex, &dcp->hpd_mutex) {
+		generation = dcp->typec_generation;
+		spin_lock_irqsave(&dcp->relink_lock, flags);
+		run = dcp->relink.active && dcp->relink.generation == generation &&
+		      dcp->typec_cable_connected;
+		spin_unlock_irqrestore(&dcp->relink_lock, flags);
+	}
+	if (!run)
+		goto out;
+
+	dcp_dptx_disconnect_oob(pdev, 0);
+	msleep(DCP_RELINK_UNPLUG_MS);
+
+	/*
+	 * Attach the sink again as a replug does, unless a real unplug or
+	 * replug came meanwhile, which then takes over. Checked and done
+	 * under one hold of hpd_mutex, so that neither can come in between.
+	 */
+	cancel_delayed_work_sync(&dcp->placeholder_edid_wq);
+	scoped_guard(mutex, &dcp->hpd_mutex) {
+		if (dcp->typec_generation != generation + 1)
+			goto out;
+		dcp_typec_attach_locked(dcp);
+		spin_lock_irqsave(&dcp->relink_lock, flags);
+		dcp_relink_reattach(&dcp->relink, dcp->typec_generation, jiffies);
+		spin_unlock_irqrestore(&dcp->relink_lock, flags);
+	}
+	dcp_dptx_connect_attached(dcp, 0);
+out:
+	spin_lock_irqsave(&dcp->relink_lock, flags);
+	dcp_relink_end(&dcp->relink);
+	spin_unlock_irqrestore(&dcp->relink_lock, flags);
 }
 
 static void disconnected_hpd_event(struct apple_connector *con)
@@ -1116,6 +1341,9 @@ int dcp_dptx_disconnect(struct apple_dcp *dcp, u32 port)
 {
 	int ret;
 
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P)
+		return dcp_dptx_disconnect_h17p(dcp, port);
+
 	/* Release the caller's RemotePort service, not the downstream DFP port. */
 	dev_info(dcp->dev, "%s(port=%d)\n", __func__, port);
 
@@ -1131,33 +1359,27 @@ int dcp_dptx_disconnect(struct apple_dcp *dcp, u32 port)
 int dcp_dptx_connect_oob(struct platform_device *pdev, u32 port)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
-	int ret;
+
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P)
+		return dcp_dptx_connect_oob_h17p(pdev, port);
 
 	if (dcp_is_typec_output(dcp)) {
 		cancel_delayed_work_sync(&dcp->placeholder_edid_wq);
 		guard(mutex)(&dcp->hpd_mutex);
-		dcp->typec_generation++;
-		WRITE_ONCE(dcp->typec_cable_connected, true);
-		dcp->typec_reconnect_tries = 0;
-		dcp->placeholder_retried = false;
-		cancel_delayed_work(&dcp->typec_reconnect_wq);
-		/* A newly attached display gets its own retries. */
-		if (dcp->external_native) {
-			atomic_set(&dcp->external_retries, 0);
-			cancel_delayed_work(&dcp->external_retry_wq);
-		}
+		dcp_typec_attach_locked(dcp);
+		scoped_guard(spinlock_irqsave, &dcp->relink_lock)
+			dcp_relink_attach(&dcp->relink, dcp->typec_generation);
 	}
 
-	ret = dcp_dptx_connect(dcp, port);
-	if (ret && ret != -ESHUTDOWN && dcp_is_typec_output(dcp))
-		dcp_queue_typec_reconnect(dcp, DPTX_RECONNECT_DELAY);
-
-	return ret;
+	return dcp_dptx_connect_attached(dcp, port);
 }
 
 int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P)
+		return dcp_dptx_disconnect_oob_h17p(pdev, port);
 
 	if (dcp_is_typec_output(dcp)) {
 		scoped_guard(mutex, &dcp->hpd_mutex) {
@@ -1329,6 +1551,9 @@ int dcp_start(struct platform_device *pdev)
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 	int ret;
 
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P)
+		return dcp_start_h17p(pdev);
+
 	init_completion(&dcp->start_done);
 	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6)
 		return iomfb_v26_6_start(dcp);
@@ -1436,6 +1661,9 @@ static void _dcp_poweroff(struct apple_dcp *dcp)
 	case DCP_FIRMWARE_V_14_7:
 		iomfb_v14_7_poweroff(dcp);
 		break;
+	case DCP_FIRMWARE_H17P:
+		iomfb_poweroff_h17p(dcp);
+		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
 		break;
@@ -1524,6 +1752,9 @@ static void __maybe_unused dcp_sleep(struct apple_dcp *dcp)
 	case DCP_FIRMWARE_V_14_7:
 		iomfb_v14_7_poweroff(dcp);
 		break;
+	case DCP_FIRMWARE_H17P:
+		iomfb_sleep_h17p(dcp);
+		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
 		break;
@@ -1558,6 +1789,9 @@ void dcp_poweron(struct platform_device *pdev)
 	unsigned long remaining;
 	int ret;
 
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P)
+		return dcp_poweron_h17p(pdev);
+
 	if (dcp_is_typec_output(dcp)) {
 		/* T8122 dcpext only, see dcp_poweroff() */
 		if (dcp->ext_failsafe) {
@@ -1568,6 +1802,18 @@ void dcp_poweron(struct platform_device *pdev)
 				    READ_ONCE(dcp->typec_cable_connected);
 		WRITE_ONCE(dcp->typec_crtc_off, false);
 		WRITE_ONCE(dcp->typec_follow_start, false);
+		/*
+		 * A DPMS wake retrains the link like a replug: give it a fresh
+		 * relink budget. No relink runs while the CRTC was off.
+		 */
+		if (wait_for_typec_hpd) {
+			unsigned long flags;
+
+			spin_lock_irqsave(&dcp->relink_lock, flags);
+			dcp_relink_wake(&dcp->relink,
+					READ_ONCE(dcp->typec_generation), jiffies);
+			spin_unlock_irqrestore(&dcp->relink_lock, flags);
+		}
 
 		/*
 		 * A Type-C CRTC disable releases its DPTX session. Re-establish it
@@ -1576,6 +1822,8 @@ void dcp_poweron(struct platform_device *pdev)
 		if (READ_ONCE(dcp->typec_cable_connected)) {
 			cancel_delayed_work(&dcp->typec_reconnect_wq);
 			dcp->typec_reconnect_tries = 0;
+			/* the modeset of this commit follows, see dcpep_cb_hotplug() */
+			WRITE_ONCE(dcp->typec_poweron_hpd, true);
 			ret = dcp_dptx_connect(dcp, 0);
 			if (ret)
 				dcp_queue_typec_reconnect(dcp, DPTX_RECONNECT_DELAY);
@@ -1587,6 +1835,7 @@ void dcp_poweron(struct platform_device *pdev)
 					dev_warn(dcp->dev,
 						 "Type-C IOMFB hotplug not ready on wake\n");
 			}
+			WRITE_ONCE(dcp->typec_poweron_hpd, false);
 		}
 	} else if (dcp->hdmi_hpd) {
 		bool connected = gpiod_get_value_cansleep(dcp->hdmi_hpd);
@@ -1625,6 +1874,9 @@ void dcp_poweroff(struct platform_device *pdev)
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 	bool display_gone = false;
 	int ret;
+
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P)
+		return dcp_poweroff_h17p(pdev);
 
 	cancel_delayed_work(&dcp->swap_watchdog_wq);
 	if (dcp->avep)
@@ -1955,10 +2207,18 @@ static int dcp_read_fw_version(struct device *dev, const char *name,
 
 static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 {
+	const struct apple_dcp_hw_data *hw = of_device_get_match_data(dev);
 	const struct dcp_v14_board *v14_board;
 	char compat_str[DCP_FW_VERSION_STR_LEN];
 	char fw_str[DCP_FW_VERSION_STR_LEN];
 	int ret;
+
+	/*
+	 * SoCs introduced with H17-generation firmware pin its interface; the
+	 * loader may not recognise their boot firmware version.
+	 */
+	if (hw && hw->firmware_compat != DCP_FIRMWARE_UNKNOWN)
+		return hw->firmware_compat;
 
 	/* firmware version is just informative */
 	dcp_read_fw_version(dev, "apple,firmware-version", fw_str);
@@ -2052,6 +2312,8 @@ static int dcp_connector_type_from_dt(struct device_node *np)
 
 static void dcp_disable_typec_work(struct apple_dcp *dcp, bool release_cable)
 {
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P)
+		return dcp_disable_typec_work_h17p(dcp, release_cable);
 	scoped_guard(mutex, &dcp->hpd_mutex) {
 		dcp->typec_work_enabled = false;
 		if (release_cable)
@@ -2061,6 +2323,9 @@ static void dcp_disable_typec_work(struct apple_dcp *dcp, bool release_cable)
 	/* Block new enqueues as well as draining users of the AFK endpoints. */
 	disable_delayed_work_sync(&dcp->typec_reconnect_wq);
 	disable_delayed_work_sync(&dcp->placeholder_edid_wq);
+	scoped_guard(spinlock_irqsave, &dcp->relink_lock)
+		dcp_relink_enable(&dcp->relink, false);
+	disable_delayed_work_sync(&dcp->typec_relink_wq);
 	disable_delayed_work_sync(&dcp->hdmi_settle_wq);
 	disable_delayed_work_sync(&dcp->hdmi_recheck_wq);
 	dcp_hdmi_disable(dcp);
@@ -2068,8 +2333,13 @@ static void dcp_disable_typec_work(struct apple_dcp *dcp, bool release_cable)
 
 static void dcp_enable_typec_work(struct apple_dcp *dcp)
 {
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P)
+		return dcp_enable_typec_work_h17p(dcp);
 	enable_delayed_work(&dcp->typec_reconnect_wq);
 	enable_delayed_work(&dcp->placeholder_edid_wq);
+	enable_delayed_work(&dcp->typec_relink_wq);
+	scoped_guard(spinlock_irqsave, &dcp->relink_lock)
+		dcp_relink_enable(&dcp->relink, true);
 	enable_delayed_work(&dcp->hdmi_settle_wq);
 	enable_delayed_work(&dcp->hdmi_recheck_wq);
 	dcp_hdmi_enable(dcp);
@@ -2285,6 +2555,9 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 	int ret;
 
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P)
+		return dcp_comp_bind_h17p(dev, main, data);
+
 	if (READ_ONCE(dcp->ext_dead))
 		return 0;
 	ret = dcp_comp_bind_pipe(dev, main, data);
@@ -2303,6 +2576,8 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 
+	if (dcp && dcp->fw_compat == DCP_FIRMWARE_H17P)
+		return dcp_comp_unbind_h17p(dev, main, data);
 	if (!dcp || READ_ONCE(dcp->ext_dead))
 		return;
 
@@ -2453,9 +2728,6 @@ static int dcp_native_routes_error(struct apple_dcp *dcp, int err)
 
 static int dcp_platform_probe_pipe(struct platform_device *pdev)
 {
-	if (of_machine_is_compatible("apple,t8140"))
-		return -ENODEV;
-
 	enum dcp_firmware_version fw_compat;
 	struct device *dev = &pdev->dev;
 	struct apple_dcp *dcp;
@@ -2500,7 +2772,7 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	mutex_init(&dcp->tb_lock);
 	dcp_fabric_init(dcp);
 	spin_lock_init(&dcp->mode_state.lock);
-	spin_lock_init(&dcp->dcpavserv.lock);
+	mutex_init(&dcp->dcpavserv.lock);
 	dcp->hw = *(struct apple_dcp_hw_data *)of_device_get_match_data(dev);
 	dcp->fixed_connector_type = dcp_connector_type_from_dt(dev->of_node);
 	dcp->connector_type = dcp->fixed_connector_type;
@@ -2513,9 +2785,12 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 			  dcp_typec_reconnect_work);
 	INIT_DELAYED_WORK(&dcp->placeholder_edid_wq,
 			  dcp_placeholder_edid_work);
+	INIT_DELAYED_WORK(&dcp->typec_relink_wq, dcp_typec_relink_work);
+	spin_lock_init(&dcp->relink_lock);
 	/* Balanced by enable at successful component bind. */
 	disable_delayed_work(&dcp->typec_reconnect_wq);
 	disable_delayed_work(&dcp->placeholder_edid_wq);
+	disable_delayed_work(&dcp->typec_relink_wq);
 	/*
 	 * A native external pipe's bind enables these; firmware callbacks may
 	 * come before it. The 14.7 panel never uses them, but suspend cancels
@@ -2802,12 +3077,34 @@ static int dcp_ext_route_suppliers(struct device *dev)
  * deferring while its suppliers may still appear (bounded by the deferred
  * probe timeout); on any other failure join as an unusable pipe.
  */
+static void dcp_unuse_dma_domain(void *data)
+{
+	iommu_device_unuse_default_domain(data);
+}
+
 static int dcp_platform_probe(struct platform_device *pdev)
 {
+	const struct apple_dcp_hw_data *hw = of_device_get_match_data(&pdev->dev);
 	struct device *dev = &pdev->dev;
 	struct apple_dcp *dcp;
 	void *group;
 	int ret;
+
+	if (hw && hw->firmware_compat == DCP_FIRMWARE_H17P)
+		return dcp_platform_probe_h17p(pdev);
+
+	/*
+	 * The driver manages DMA ownership itself (driver_managed_dma), so
+	 * that a retained H17P session keeps its domain use across unbind.
+	 * Every other processor uses its default domain while bound, as the
+	 * driver core would.
+	 */
+	ret = iommu_device_use_default_domain(dev);
+	if (ret)
+		return ret;
+	ret = devm_add_action_or_reset(dev, dcp_unuse_dma_domain, dev);
+	if (ret)
+		return ret;
 
 	if (!of_device_is_compatible(dev->of_node, "apple,t8122-dcpext"))
 		return dcp_platform_probe_pipe(pdev);
@@ -2871,6 +3168,9 @@ static void dcp_platform_remove(struct platform_device *pdev)
 static void dcp_platform_shutdown(struct platform_device *pdev)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	if (dcp && dcp->fw_compat == DCP_FIRMWARE_H17P)
+		return dcp_platform_shutdown_h17p(pdev);
 
 	if (dcp && dcp->external && !dcp->external_native)
 		return;
@@ -2955,6 +3255,8 @@ static int dcp_platform_suspend(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P)
+		return dcp_platform_suspend_h17p(dev);
 	if (READ_ONCE(dcp->ext_dead))
 		return 0;
 
@@ -3011,6 +3313,8 @@ static int dcp_platform_resume(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P)
+		return dcp_platform_resume_h17p(dev);
 	if (READ_ONCE(dcp->ext_dead))
 		return 0;
 
@@ -3021,6 +3325,2399 @@ static int dcp_platform_resume(struct device *dev)
 	/* Observe future edges before sampling any edges lost in sleep. */
 	if (dcp->hdmi_hpd_irq)
 		dcp_fabric_run_resume(&dcp_resume_ops, dcp);
+
+	if (dcp->avep)
+		av_service_connect(dcp);
+
+	return 0;
+}
+
+
+/* ---------------------------------------------------------------------------
+ * H17-generation firmware: T8140 (H17P, internal and the external dispext0)
+ * and T8142 (H17G). aurora-wip's processor lifecycle.
+ * ------------------------------------------------------------------------- */
+
+struct dcp_session_ref {
+	struct list_head link;
+	struct device *dev;
+	struct iommu_group *group;
+};
+
+static LIST_HEAD(dcp_retained_sessions);
+static DEFINE_MUTEX(dcp_retained_sessions_lock);
+
+static bool dcp_session_retained(struct device *dev)
+{
+	struct dcp_session_ref *session;
+	bool retained = false;
+
+	mutex_lock(&dcp_retained_sessions_lock);
+	list_for_each_entry(session, &dcp_retained_sessions, link) {
+		if (dev_fwnode(session->dev) == dev_fwnode(dev)) {
+			retained = true;
+			break;
+		}
+	}
+	mutex_unlock(&dcp_retained_sessions_lock);
+	return retained;
+}
+
+static int dcp_pin_live_session(struct apple_dcp *dcp)
+{
+	struct dcp_session_ref *session;
+
+	if ((!dcp->hw.adopt_live_session &&
+	     dcp->hw.iomfb_method_profile !=
+	     DCP_IOMFB_METHODS_H17P_EXTERNAL) ||
+	    dcp->fw_compat != DCP_FIRMWARE_H17P ||
+	    dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G || dcp->retain_dma)
+		return 0;
+	session = kzalloc_obj(*session);
+	if (!session)
+		return -ENOMEM;
+
+	/* Keep the DMA device, domain usage and driver code valid until reset. */
+	session->dev = get_device(dcp->dev);
+	session->group = iommu_group_get(dcp->dev);
+	__module_get(THIS_MODULE);
+	WRITE_ONCE(dcp->retain_dma, true);
+	mutex_lock(&dcp_retained_sessions_lock);
+	list_add_tail(&session->link, &dcp_retained_sessions);
+	mutex_unlock(&dcp_retained_sessions_lock);
+	dev_info(dcp->dev, "live H17P DMA resources retained until reboot; rebind unsupported\n");
+	return 0;
+}
+
+static void dcp_release_dma_domain(void *data)
+{
+	struct apple_dcp *dcp = data;
+
+	if (!dcp->retain_dma)
+		iommu_device_unuse_default_domain(dcp->dev);
+}
+
+static void dcp_release_context(void *data)
+{
+	struct apple_dcp *dcp = data;
+
+	if (!dcp->retain_dma)
+		kfree(dcp);
+}
+
+static void dcp_release_rtkit(void *data)
+{
+	struct apple_dcp *dcp = data;
+
+	if (dcp->retain_dma) {
+		WRITE_ONCE(dcp->quiescing, true);
+		apple_rtkit_free_retaining_buffers(dcp->rtk);
+	} else {
+		apple_rtkit_free(dcp->rtk);
+	}
+	dcp->rtk = NULL;
+}
+
+bool dcp_h17p_external_supported(struct device_node *np)
+{
+	u32 firmware[DCP_EXTERNAL_FW_CELLS], compat[DCP_EXTERNAL_FW_CELLS];
+	int firmware_cells, compat_cells;
+
+	if (!of_machine_is_compatible("apple,j700") ||
+	    !of_device_is_compatible(np, "apple,t8140-dcpext"))
+		return false;
+	firmware_cells = of_property_read_variable_u32_array(
+		np, "apple,firmware-version", firmware,
+		DCP_EXTERNAL_FW_CELLS, DCP_EXTERNAL_FW_CELLS);
+	compat_cells = of_property_read_variable_u32_array(
+		np, "apple,firmware-compat", compat,
+		DCP_EXTERNAL_FW_CELLS, DCP_EXTERNAL_FW_CELLS);
+	return apple_dcp_external_firmware_supported(firmware, firmware_cells,
+						    compat, compat_cells);
+}
+
+bool dcp_h17p_external_ready(struct device_node *np)
+{
+	struct platform_device *pdev;
+	struct apple_dcp *dcp;
+	bool ready = false;
+
+	if (!dcp_h17p_external_supported(np))
+		return false;
+	pdev = of_find_device_by_node(np);
+	if (!pdev)
+		return false;
+	/*
+	 * Called after component binding. component_add() may synchronously
+	 * bind the master before the platform probe itself returns, so the
+	 * driver core's bound flag is not a readiness condition here.
+	 */
+	dcp = platform_get_drvdata(pdev);
+	ready = dcp && READ_ONCE(dcp->external_prepared) &&
+		!READ_ONCE(dcp->quiescing) && !READ_ONCE(dcp->crashed);
+	put_device(&pdev->dev);
+	return ready;
+}
+
+static bool dcp_firmware_metadata_enabled(struct apple_dcp *dcp)
+{
+	return dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL;
+}
+
+void dcp_firmware_metadata_connection(struct apple_dcp *dcp, u64 generation, bool connected)
+{
+	unsigned long flags;
+
+	if (!dcp_firmware_metadata_enabled(dcp))
+		return;
+	spin_lock_irqsave(&dcp->metadata.lock, flags);
+	if (generation != dcp->metadata.epoch.generation || !connected) {
+		dcp->rate_proof.connection_sequence++;
+		dcp->rate_proof.sequence++;
+		dcp->rate_proof.rate.valid = false;
+		dcp->rate_proof.lanes.valid = false;
+		dcp->metadata.attributes_valid = false;
+		dcp->metadata.timing_valid = false;
+		dcp->metadata.hpd_seen = false;
+	}
+	dcp_metadata_epoch_connection(&dcp->metadata.epoch, generation, connected);
+	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
+}
+
+void dcp_firmware_metadata_hotplug(struct apple_dcp *dcp, bool connected)
+{
+	struct apple_connector *con = READ_ONCE(dcp->connector);
+	unsigned long flags;
+
+	if (!dcp_firmware_metadata_enabled(dcp))
+		return;
+	spin_lock_irqsave(&dcp->metadata.lock, flags);
+	if (connected) {
+		dcp->metadata.hpd_seen = true;
+		/*
+		 * Fresh proof may precede HPD assertion after a same-cable loss.
+		 * Keep invalidated firmware metadata and old receipt tickets revoked.
+		 */
+		if (READ_ONCE(dcp->typec_cable_connected) &&
+		    dcp->metadata.epoch.generation == READ_ONCE(dcp->typec_generation))
+			dcp->metadata.epoch.connected = true;
+	} else if (dcp->metadata.hpd_seen) {
+		dcp->metadata.hpd_seen = false;
+		dcp->rate_proof.connection_sequence++;
+		dcp->rate_proof.sequence++;
+		dcp->rate_proof.rate.valid = false;
+		dcp->rate_proof.lanes.valid = false;
+		if (con && READ_ONCE(con->dcp) == to_platform_device(dcp->dev))
+			WRITE_ONCE(con->edid_invalidation_pending, true);
+		dcp_metadata_epoch_connection(&dcp->metadata.epoch,
+					      dcp->metadata.epoch.generation, false);
+		dcp->metadata.attributes_valid = false;
+		dcp->metadata.timing_valid = false;
+	}
+	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
+	if (connected)
+		dcp_180hz_notify(dcp);
+}
+
+void dcp_firmware_metadata_begin(struct apple_dcp *dcp)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&dcp->metadata.lock, flags);
+	dcp->chunks.metadata_ticket = dcp_metadata_begin(&dcp->metadata.epoch);
+	dcp->chunks.received = 0;
+	dcp->chunks.contiguous = true;
+	dcp->chunks.payload_complete = false;
+	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
+}
+
+static void dcp_firmware_metadata_notify(struct apple_dcp *dcp)
+{
+	unsigned long flags;
+	bool ready;
+
+	spin_lock_irqsave(&dcp->metadata.lock, flags);
+	ready = dcp->metadata.attributes_valid && dcp->metadata.timing_valid &&
+		dcp_metadata_matches(&dcp->metadata.epoch, dcp->metadata.attributes_ticket) &&
+		dcp_metadata_matches(&dcp->metadata.epoch, dcp->metadata.timing_ticket);
+	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
+	if (ready && dcp->connector && READ_ONCE(dcp->connector->connected))
+		schedule_work(&dcp->connector->hotplug_wq);
+}
+
+static bool dcp_firmware_metadata_complete(struct apple_dcp *dcp)
+{
+	return dcp->chunks.contiguous && dcp->chunks.payload_complete &&
+	       dcp_metadata_matches(&dcp->metadata.epoch, dcp->chunks.metadata_ticket);
+}
+
+void dcp_firmware_metadata_attributes(struct apple_dcp *dcp,
+				      const struct dcp_display_metadata *attributes)
+{
+	unsigned long flags;
+
+	if (!dcp_firmware_metadata_enabled(dcp))
+		return;
+	spin_lock_irqsave(&dcp->metadata.lock, flags);
+	if (dcp_metadata_matches(&dcp->metadata.epoch, dcp->chunks.metadata_ticket)) {
+		dcp->metadata.attributes_valid = attributes && dcp_firmware_metadata_complete(dcp);
+		if (dcp->metadata.attributes_valid) {
+			dcp->metadata.attributes = *attributes;
+			dcp->metadata.attributes_ticket = dcp->chunks.metadata_ticket;
+		}
+	}
+	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
+	dcp_firmware_metadata_notify(dcp);
+}
+
+void dcp_firmware_metadata_timing(struct apple_dcp *dcp)
+{
+	unsigned long flags;
+	unsigned int i;
+
+	if (!dcp_firmware_metadata_enabled(dcp))
+		return;
+	spin_lock_irqsave(&dcp->metadata.lock, flags);
+	if (!dcp_metadata_matches(&dcp->metadata.epoch, dcp->chunks.metadata_ticket))
+		goto unlock;
+	dcp->metadata.timing_valid = false;
+	if (!dcp_firmware_metadata_complete(dcp))
+		goto unlock;
+	for (i = 0; i < dcp->nr_modes; i++) {
+		if (!(dcp->modes[i].mode.type & DRM_MODE_TYPE_PREFERRED) ||
+		    !dcp->modes[i].metadata_timing_valid)
+			continue;
+		dcp->metadata.preferred = dcp->modes[i].mode;
+		dcp->metadata.timing_ticket = dcp->chunks.metadata_ticket;
+		dcp->metadata.timing_valid = true;
+		break;
+	}
+unlock:
+	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
+	dcp_firmware_metadata_notify(dcp);
+}
+
+bool dcp_firmware_metadata_current(struct apple_dcp *dcp, u64 generation)
+{
+	unsigned long flags;
+	bool valid;
+
+	spin_lock_irqsave(&dcp->metadata.lock, flags);
+	valid = !dcp->metadata.epoch.invalidated && dcp->metadata.epoch.connected &&
+		generation == dcp->metadata.epoch.generation;
+	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
+	return valid;
+}
+
+const struct drm_edid *dcp_firmware_edid(struct apple_dcp *dcp, u64 *generation)
+{
+	struct dcp_display_metadata attributes;
+	struct drm_display_mode preferred;
+	const struct drm_edid *edid;
+	unsigned long flags;
+	bool valid;
+
+	if (!dcp_firmware_metadata_enabled(dcp))
+		return ERR_PTR(-ENODEV);
+	spin_lock_irqsave(&dcp->metadata.lock, flags);
+	valid = dcp->metadata.attributes_valid && dcp->metadata.timing_valid &&
+		dcp_metadata_matches(&dcp->metadata.epoch, dcp->metadata.attributes_ticket) &&
+		dcp_metadata_matches(&dcp->metadata.epoch, dcp->metadata.timing_ticket);
+	if (valid) {
+		attributes = dcp->metadata.attributes;
+		preferred = dcp->metadata.preferred;
+		*generation = dcp->metadata.epoch.generation;
+	}
+	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
+	if (!valid)
+		return ERR_PTR(-ENODATA);
+	edid = dcp_metadata_edid(&attributes, &preferred);
+	spin_lock_irqsave(&dcp->metadata.lock, flags);
+	valid = !dcp->metadata.epoch.invalidated && dcp->metadata.epoch.connected &&
+		*generation == dcp->metadata.epoch.generation;
+	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
+	if (!valid && !IS_ERR(edid)) {
+		drm_edid_free(edid);
+		return ERR_PTR(-ESTALE);
+	}
+	return edid;
+}
+
+/*
+ * H17P: deferred to the connector hotplug work, which updates the connector
+ * with dcp_update_connector_dimensions().
+ */
+void dcp_set_dimensions_h17p(struct apple_dcp *dcp)
+{
+	int i;
+	int width_mm = dcp->width_mm;
+	int height_mm = dcp->height_mm;
+
+	if (width_mm == 0 || height_mm == 0) {
+		width_mm = dcp->panel.width_mm;
+		height_mm = dcp->panel.height_mm;
+	}
+
+	/*
+	 * This callback runs on the ordered RTKit RX worker. A mode probe
+	 * can hold mode_config.mutex while waiting for an AFK reply which
+	 * that same worker still has to dispatch. Defer the DRM update.
+	 */
+	if (dcp->connector && !READ_ONCE(dcp->quiescing))
+		schedule_work(&dcp->connector->hotplug_wq);
+
+	/*
+	 * Fix up any probed modes. Modes are created when parsing
+	 * TimingElements, dimensions are calculated when parsing
+	 * DisplayAttributes, and TimingElements may be sent first
+	 */
+	for (i = 0; i < dcp->nr_modes; ++i) {
+		dcp->modes[i].mode.width_mm = width_mm;
+		dcp->modes[i].mode.height_mm = height_mm;
+	}
+}
+
+void dcp_update_connector_dimensions(struct apple_dcp *dcp,
+				     struct drm_connector *connector)
+{
+	int width_mm = READ_ONCE(dcp->width_mm);
+	int height_mm = READ_ONCE(dcp->height_mm);
+
+	lockdep_assert_held(&connector->dev->mode_config.mutex);
+	if (!width_mm || !height_mm) {
+		width_mm = dcp->panel.width_mm;
+		height_mm = dcp->panel.height_mm;
+	}
+	connector->display_info.width_mm = width_mm;
+	connector->display_info.height_mm = height_mm;
+}
+
+
+static struct apple_dcp_afkep *dcp_afkep(struct apple_dcp *dcp, u8 endpoint)
+{
+	/* DPAV 0x2a on H17P overlaps the legacy DPTX endpoint number. */
+	if (dcp->dcpavservep && endpoint == dcp->dcpavservep->endpoint)
+		return dcp->dcpavservep;
+	if (dcp->dptxep && endpoint == dcp->dptxep->endpoint)
+		return dcp->dptxep;
+	switch (endpoint) {
+	case AV_ENDPOINT:
+		return dcp->avep;
+	case SYSTEM_ENDPOINT:
+		return dcp->systemep;
+	case DISP0_ENDPOINT:
+		return dcp->ibootep;
+	case DPTX_CONTROLLER_ENDPOINT:
+		return dcp->dptx_controller_ep;
+	default:
+		return NULL;
+	}
+}
+
+
+static void dcp_recv_msg_h17p(struct apple_dcp *dcp, u8 endpoint, u64 message)
+{
+	struct apple_dcp_afkep *ep;
+
+	if (READ_ONCE(dcp->quiescing))
+		return;
+
+	trace_dcp_recv_msg(dcp, endpoint, message);
+
+	/*
+	 * H17P starts endpoints that have no AFK instance behind them (the
+	 * remote allocator endpoint, for one).  Log their messages rather than
+	 * dereferencing a NULL afkep or warning about an unknown endpoint.
+	 */
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P && endpoint != IOMFB_ENDPOINT &&
+	    !dcp_afkep(dcp, endpoint)) {
+		dev_dbg_ratelimited(dcp->dev, "ep %#04x: %#llx\n", endpoint,
+				    message);
+		return;
+	}
+
+	if (endpoint == IOMFB_ENDPOINT)
+		return iomfb_recv_msg(dcp, message);
+
+	ep = dcp_afkep(dcp, endpoint);
+
+	if (!ep) {
+		dev_warn_ratelimited(dcp->dev,
+				     "dropping message for unhandled endpoint %#x\n",
+				     endpoint);
+		return;
+	}
+
+	afk_receive_message(ep, message);
+}
+
+static void dcp_rtk_crashed_h17p(struct apple_dcp *dcp)
+{
+	if (READ_ONCE(dcp->quiescing))
+		return;
+
+	dcp->crashed = true;
+	dev_err(dcp->dev, "DCP has crashed\n");
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P &&
+	    dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) {
+		/* No in-place restart exists; the last scanout stays retained. */
+		dev_err(dcp->dev, "a reboot is required to restore the display\n");
+		/*
+		 * Nothing will complete a present that was in flight.  Before
+		 * the pipeline is linked there is no event to complete.
+		 */
+		if (READ_ONCE(dcp->crtc))
+			schedule_work(&dcp->vblank_wq);
+	}
+	if (dcp->connector) {
+		dcp->connector->connected = 0;
+		/* The cached EDID is owned under edid_lock. */
+		apple_connector_invalidate_edid(dcp->connector);
+		schedule_work(&dcp->connector->hotplug_wq);
+	}
+	complete(&dcp->start_done);
+}
+
+/*
+ * Check that every IOMMU page of [iova, iova + size) translates to the same
+ * offset from @phys as it has from @iova.
+ */
+static int dcp_check_iova_contiguous(struct iommu_domain *domain,
+				     dma_addr_t iova, size_t size,
+				     phys_addr_t phys)
+{
+	unsigned long pgsize = domain->pgsize_bitmap ?
+			       1UL << __ffs(domain->pgsize_bitmap) : PAGE_SIZE;
+	dma_addr_t end = iova + size;
+	dma_addr_t addr = iova;
+
+	while (addr < end) {
+		if (iommu_iova_to_phys(domain, addr) != phys + (addr - iova))
+			return -EINVAL;
+		addr = ALIGN_DOWN(addr, pgsize) + pgsize;
+	}
+
+	return 0;
+}
+
+static int dcp_rtk_shmem_setup_h17p(struct apple_dcp *dcp, struct apple_rtkit_shmem *bfr)
+{
+	int ret;
+
+	if (bfr->iova) {
+		struct iommu_domain *domain =
+			iommu_get_domain_for_dev(dcp->dev);
+		phys_addr_t phy_addr;
+
+		if (!domain)
+			return -ENOMEM;
+
+		// TODO: get map from device-tree
+		phy_addr = iommu_iova_to_phys(domain, bfr->iova);
+		if (!phy_addr)
+			return -ENOMEM;
+
+		/* memremap() below needs the whole buffer physically contiguous */
+		ret = dcp_check_iova_contiguous(domain, bfr->iova, bfr->size,
+						phy_addr);
+		if (ret) {
+			dev_err(dcp->dev,
+				"shmem_setup: iova %pad (%#zx bytes) is not physically contiguous\n",
+				&bfr->iova, bfr->size);
+			return ret;
+		}
+
+		/* Firmware writes without CPU cache maintenance. */
+		bfr->buffer = memremap(phy_addr, bfr->size, MEMREMAP_WC);
+		if (!bfr->buffer)
+			return -ENOMEM;
+
+		bfr->is_mapped = true;
+		dev_info(dcp->dev,
+			 "shmem_setup: iova: %lx -> pa: %lx -> iomem: %lx\n",
+			 (uintptr_t)bfr->iova, (uintptr_t)phy_addr,
+			 (uintptr_t)bfr->buffer);
+	} else {
+		bfr->buffer = dma_alloc_coherent(dcp->dev, bfr->size,
+						 &bfr->iova, GFP_KERNEL);
+		if (!bfr->buffer)
+			return -ENOMEM;
+
+		dev_info(dcp->dev, "shmem_setup: iova: %lx, buffer: %lx\n",
+			 (uintptr_t)bfr->iova, (uintptr_t)bfr->buffer);
+	}
+
+	return 0;
+}
+
+static const struct apple_rtkit_ops external_h17p_rtkit_ops = {
+	.flags = APPLE_RTKIT_COPROC_PLACES_BUFFERS,
+	.crashed = dcp_rtk_crashed,
+	.recv_message = dcp_recv_msg,
+	.shmem_setup = dcp_rtk_shmem_setup,
+	.shmem_destroy = dcp_rtk_shmem_destroy,
+};
+
+static int dcp_crtc_atomic_check_h17p(struct drm_crtc *crtc, struct drm_atomic_state *state)
+{
+	struct platform_device *pdev = to_apple_crtc(crtc)->dcp;
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+	struct drm_crtc_state *crtc_state;
+	bool needs_modeset;
+
+	if (dcp->crashed)
+		return -EINVAL;
+
+	crtc_state = drm_atomic_get_new_crtc_state(state, crtc);
+
+	/* External H17P does not program adaptive sync. */
+	if (dcp->hw.iomfb_method_profile ==
+	    DCP_IOMFB_METHODS_H17P_EXTERNAL &&
+	    crtc_state->vrr_enabled)
+		return -EINVAL;
+
+	needs_modeset = drm_atomic_crtc_needs_modeset(crtc_state) ||
+			!READ_ONCE(dcp->mode_state.valid);
+	if (!needs_modeset && (!dcp->connector || !dcp->connector->connected)) {
+		/*
+		 * Resume restores the mode before the firmware reports the
+		 * display back, so a plane-only commit lands here while the
+		 * connector is still marked disconnected.  Rejecting it makes
+		 * the compositor fail every flip and give up on the output;
+		 * dcp_flush() defers the commit until the link returns.
+		 */
+		dev_dbg(dcp->dev,
+			"crtc_atomic_check: deferring commit, link still down\n");
+	}
+
+	return 0;
+}
+
+static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *waiting_service)
+{
+	unsigned long timeout;
+	int ret = 0;
+
+	if (waiting_service)
+		*waiting_service = false;
+	if (!dcp->phy) {
+		dev_warn(dcp->dev, "dcp_dptx_connect: missing phy\n");
+		return -ENODEV;
+	}
+	dev_dbg(dcp->dev,
+		"%s(port=%d) target=%u:%u typec=%d route=%s conn_type=%d connected=%d\n",
+		__func__, port, dcp->dptx_die, dcp->dptx_phy,
+		dcp_is_typec_output(dcp),
+		dcp->active_typec_route ? "borrowed" : "fixed",
+		dcp->connector_type, dcp->dptxport[port].connected);
+
+	mutex_lock(&dcp->hpd_mutex);
+	if (!dptx_service_available(&dcp->dptxport[port])) {
+		dev_warn(dcp->dev, "dcp_dptx_connect: dptx service for port %d not enabled\n", port);
+		ret = -ENODEV;
+		/* No firmware request has been made; the first publication can retry. */
+		if (waiting_service && !READ_ONCE(dcp->dptxport[port].closed)) {
+			*waiting_service = true;
+			ret = -EAGAIN;
+		}
+		goto out_unlock;
+	}
+
+	if (dcp->dptxport[port].connected)
+		goto out_unlock;
+
+	reinit_completion(&dcp->dptxport[port].linkcfg_completion);
+	dcp->dptxport[port].atcphy = dcp->phy;
+	ret = dptxport_validate_connection(dcp->dptxport[port].service,
+					   dcp->dptx_dfp_port,
+					   dcp->dptx_phy, dcp->dptx_die);
+	if (ret) {
+		dev_err(dcp->dev,
+			"dcp_dptx_connect: failed to validate DPTX target %u:%u: %d\n",
+			dcp->dptx_die, dcp->dptx_phy, ret);
+		goto out_unlock;
+	}
+
+	ret = dptxport_connect(dcp->dptxport[port].service,
+			       dcp->dptx_dfp_port,
+			       dcp->dptx_phy, dcp->dptx_die,
+		       dcp_is_typec_output(dcp));
+	if (ret) {
+		dev_err(dcp->dev,
+			"dcp_dptx_connect: failed to connect DPTX target %u:%u: %d\n",
+			dcp->dptx_die, dcp->dptx_phy, ret);
+		goto out_unlock;
+	}
+
+	ret = dptxport_request_display(dcp->dptxport[port].service);
+	if (ret) {
+		dev_err(dcp->dev,
+			"dcp_dptx_connect: failed to request display: %d\n",
+			ret);
+		goto out_release;
+	}
+	dcp->dptxport[port].connected = true;
+	/* Not a T602x USB4 tunnel: the plain HPD assertion and timeout apply. */
+	if (dcp_is_typec_output(dcp)) {
+		ret = dptxport_set_hpd(dcp->dptxport[port].service, true);
+		if (ret) {
+			dev_err(dcp->dev,
+				"dcp_dptx_connect: failed to assert Type-C HPD: %d\n",
+				ret);
+			dcp->dptxport[port].connected = false;
+			goto out_release;
+		}
+	}
+
+	mutex_unlock(&dcp->hpd_mutex);
+	timeout = DPTX_CONNECT_TIMEOUT;
+	ret = wait_for_completion_timeout(&dcp->dptxport[port].linkcfg_completion,
+					  timeout);
+	if (!ret) {
+		dev_err(dcp->dev,
+			"dcp_dptx_connect: timed out waiting for port %u link configuration\n",
+			port);
+		ret = -ETIMEDOUT;
+		goto out_disconnect;
+	}
+
+	dev_dbg(dcp->dev, "dcp_dptx_connect: waited %d ms for link\n",
+		jiffies_to_msecs(timeout - ret));
+
+	usleep_range(5, 10);
+
+	if (dcp->connector_type == DRM_MODE_CONNECTOR_DisplayPort)
+		dptxport_set_hpd(dcp->dptxport[port].service, true);
+
+	if (dcp->avep)
+		av_service_connect(dcp);
+
+	return 0;
+
+out_disconnect:
+	mutex_lock(&dcp->hpd_mutex);
+	dcp->dptxport[port].connected = false;
+out_release:
+	dptxport_release_display(dcp->dptxport[port].service);
+
+out_unlock:
+	mutex_unlock(&dcp->hpd_mutex);
+	return ret;
+}
+
+static void dcp_external_report_disconnected(struct apple_dcp *dcp)
+{
+	unsigned int action;
+
+	guard(mutex)(&dcp->iomfb.lock);
+	/* A paused callback from the old sink must not be replayed on wake. */
+	dcp->external_hotplug_pending = false;
+	action = dcp_mode_hotplug(&dcp->mode_state, false,
+				  dcp->connector ? &dcp->connector->connected : NULL);
+	if (dcp->connector) {
+		WRITE_ONCE(dcp->connector->edid_invalidation_pending, true);
+		action |= DCP_HOTPLUG_NOTIFY;
+	}
+	/* The existing worker delivers DRM notifications outside our locks. */
+	dcp_handle_hotplug_actions(dcp, action);
+}
+
+static void dcp_external_publish_generation(struct apple_dcp *dcp)
+{
+	lockdep_assert_held(&dcp->external_lock);
+	guard(mutex)(&dcp->iomfb.lock);
+	dcp->external_rx_generation = dcp->external_generation;
+}
+
+/* external_lock is never taken by the serialized IOMFB receive callbacks. */
+static int dcp_external_link_locked(struct apple_dcp *dcp)
+{
+	bool waiting_service;
+	int ret;
+
+	lockdep_assert_held(&dcp->external_lock);
+	if (!dcp->external_prepared)
+		return -EAGAIN;
+	if (dcp->external_error)
+		return dcp->external_error;
+	if (!dcp->external_cable)
+		return -ENODEV;
+	ret = dcp_dptx_connect_raw(dcp, 0, &waiting_service);
+	if (ret && !waiting_service)
+		dcp->external_error = ret;
+	return ret;
+}
+
+static int dcp_external_start_locked(struct apple_dcp *dcp)
+{
+	int ret;
+
+	lockdep_assert_held(&dcp->external_lock);
+	ret = dcp_external_link_locked(dcp);
+	if (ret || dcp->external_running)
+		return ret;
+	iomfb_pause_presentation(dcp, true);
+	/* Even a timed-out first activation can have changed firmware state. */
+	dcp->external_power_attempted = true;
+	ret = iomfb_external_power_h17p(dcp, true);
+	if (ret) {
+		dcp->external_error = ret;
+		return ret;
+	}
+	dcp->external_running = true;
+	dcp->external_stopped = false;
+	WRITE_ONCE(dcp->pipe_enabled_h17p, true);
+	WRITE_ONCE(dcp->typec_crtc_off, false);
+	iomfb_pause_presentation(dcp, false);
+	return 0;
+}
+
+static int dcp_dptx_connect_h17p(struct apple_dcp *dcp, u32 port)
+{
+	if (!dcp_is_external_h17p(dcp))
+		return dcp_dptx_connect_raw(dcp, port, NULL);
+	guard(mutex)(&dcp->external_lock);
+	return dcp_external_link_locked(dcp);
+}
+
+/* The generation token belongs to the CRTC that was actually enabled. */
+static int dcp_external_stop_locked(struct apple_dcp *dcp, u64 generation)
+{
+	int ret;
+
+	lockdep_assert_held(&dcp->external_lock);
+	if (generation != dcp->external_generation)
+		return 0;
+	if (dcp->external_error)
+		return dcp->external_error;
+	if (dcp->external_stopped && !READ_ONCE(dcp->dptxport[0].connected))
+		return 0;
+	iomfb_pause_presentation(dcp, true);
+	dcp->external_running = false;
+	/* Route setup can call this before IOMFB or its shared memory exists. */
+	if (dcp->external_stopped || !dcp->external_power_attempted)
+		goto release_link;
+	ret = iomfb_queue_settle(dcp, msecs_to_jiffies(500));
+	if (!ret)
+		ret = iomfb_external_power_h17p(dcp, false);
+	if (!ret)
+		ret = iomfb_queue_settle(dcp, msecs_to_jiffies(500));
+	if (ret)
+		goto failed;
+	/* This is a transport acknowledgment, not permission to free scanout. */
+	WRITE_ONCE(dcp->pipe_enabled_h17p, false);
+release_link:
+	scoped_guard(mutex, &dcp->hpd_mutex) {
+		if (dcp->dptxport[0].connected) {
+			if (!dptx_service_available(&dcp->dptxport[0])) {
+				ret = -ENODEV;
+				goto failed;
+			}
+			ret = dptxport_set_hpd(dcp->dptxport[0].service, false);
+			if (!ret)
+				ret = dptxport_release_display(dcp->dptxport[0].service);
+			if (ret)
+				goto failed;
+			dcp->dptxport[0].connected = false;
+		}
+	}
+	dcp->external_stopped = true;
+	WRITE_ONCE(dcp->typec_crtc_off, true);
+	if (dcp->avep)
+		av_service_disconnect(dcp);
+	return 0;
+failed:
+	/* A retry could race a late reply. Keep this session blocked and owned. */
+	dcp->external_error = ret;
+	return ret;
+}
+
+static int dcp_external_disconnect(struct apple_dcp *dcp, bool physical)
+{
+	int ret;
+
+	cancel_delayed_work_sync(&dcp->typec_reconnect_wq);
+	cancel_delayed_work_sync(&dcp->placeholder_edid_wq);
+	guard(mutex)(&dcp->external_lock);
+	/* Invalidate physical EDID before waiting for firmware power/link teardown. */
+	if (physical) {
+		WRITE_ONCE(dcp->external_physically_absent, true);
+		scoped_guard(mutex, &dcp->hpd_mutex) {
+			WRITE_ONCE(dcp->typec_cable_connected, false);
+			dcp->typec_generation++;
+			dcp_firmware_metadata_connection(dcp, dcp->typec_generation, false);
+		}
+		/* HPD is fenced; retire the AV owner after releasing hpd_mutex. */
+		dpavservep_detach(dcp);
+	}
+	ret = dcp_external_stop_locked(dcp, dcp->external_generation);
+	if (physical) {
+		dcp->external_cable = false;
+		dcp->external_generation++;
+		dcp_external_publish_generation(dcp);
+		/* A missing cable is reported even when its hardware remains owned. */
+		dcp_external_report_disconnected(dcp);
+	}
+	return ret;
+}
+
+static void dcp_external_stop_work(struct work_struct *work)
+{
+	struct apple_dcp *dcp = container_of(work, struct apple_dcp, external_stop_work);
+
+	u64 generation;
+
+	scoped_guard(mutex, &dcp->iomfb.lock)
+		generation = dcp->external_stop_generation;
+	cancel_delayed_work_sync(&dcp->typec_reconnect_wq);
+	cancel_delayed_work_sync(&dcp->placeholder_edid_wq);
+	guard(mutex)(&dcp->external_lock);
+	if (generation == dcp->external_generation) {
+		/* The deferred disconnect also covers missing out-of-band HPD. */
+		dpavservep_detach(dcp);
+		dcp_external_stop_locked(dcp, generation);
+		dcp_external_report_disconnected(dcp);
+	}
+}
+
+bool dcp_external_hotplug(struct apple_dcp *dcp, bool connected)
+{
+	if (!dcp_is_external_h17p(dcp))
+		return false;
+	/* No lifecycle or HPD mutex may be acquired from the RX callback. */
+	lockdep_assert_held(&dcp->iomfb.lock);
+	if (READ_ONCE(dcp->quiescing) || READ_ONCE(dcp->external_physically_absent))
+		return true;
+	if (dcp->iomfb.presentation_paused) {
+		dcp->external_hotplug_pending = true;
+		dcp->external_hotplug_connected = connected;
+		/* Publish initial/new-cable discovery, never same-cable DPMS wake. */
+		if (connected && READ_ONCE(dcp->external_cable) &&
+		    !READ_ONCE(dcp->external_error) &&
+		    (!READ_ONCE(dcp->external_power_attempted) ||
+		     (READ_ONCE(dcp->external_stopped) &&
+		      READ_ONCE(dcp->external_rx_generation) !=
+		      READ_ONCE(dcp->external_crtc_generation) &&
+		      READ_ONCE(dcp->dptxport[0].connected)))) {
+			unsigned int action = dcp_mode_hotplug(&dcp->mode_state, true,
+							     dcp->connector ?
+							     &dcp->connector->connected : NULL);
+
+			dcp_handle_hotplug_actions(dcp, action);
+		}
+		return true;
+	}
+	if (!connected && !READ_ONCE(dcp->iomfb.presentation_paused)) {
+		/* Fence admission in RX before a busy actor can delay teardown. */
+		dcp_firmware_metadata_hotplug(dcp, false);
+		dcp->external_stop_generation = dcp->external_rx_generation;
+		schedule_work(&dcp->external_stop_work);
+		return true;
+	}
+	return READ_ONCE(dcp->iomfb.presentation_paused);
+}
+
+
+static void dcp_placeholder_edid_work_h17p(struct work_struct *work)
+{
+	struct apple_dcp *dcp =
+		container_of(to_delayed_work(work), struct apple_dcp,
+			     placeholder_edid_wq);
+	struct apple_epic_service *service;
+	u64 generation;
+	int ret;
+
+	mutex_lock(&dcp->hpd_mutex);
+	generation = dcp->placeholder_generation;
+	if (!dcp->typec_cable_connected || !dcp->dptxport[0].connected ||
+	    !dptx_service_available(&dcp->dptxport[0]) || generation != dcp->typec_generation)
+		goto out_unlock;
+	service = dcp->dptxport[0].service;
+
+	/*
+	 * Some adapters answer the first connection with a 1024x768
+	 * placeholder and publish the panel EDID only after HPD drops
+	 * and returns. One pulse; a second placeholder is left alone.
+	 */
+	ret = dptxport_set_hpd(service, false);
+	if (ret) {
+		dev_info(dcp->dev, "placeholder EDID: HPD drop failed: %d\n",
+			 ret);
+		goto out_unlock;
+	}
+	mutex_unlock(&dcp->hpd_mutex);
+
+	msleep(1000);
+
+	mutex_lock(&dcp->hpd_mutex);
+	if (!dcp->typec_cable_connected || !dcp->dptxport[0].connected ||
+	    generation != dcp->typec_generation)
+		goto out_unlock;
+
+	ret = dptxport_set_hpd(service, true);
+	if (ret)
+		dev_info(dcp->dev, "placeholder EDID: HPD assert failed: %d\n",
+			 ret);
+out_unlock:
+	mutex_unlock(&dcp->hpd_mutex);
+}
+
+static void dcp_typec_reconnect_work_h17p(struct work_struct *work)
+{
+	struct apple_dcp *dcp =
+		container_of(to_delayed_work(work), struct apple_dcp,
+			     typec_reconnect_wq);
+	int ret;
+
+	if (!READ_ONCE(dcp->typec_cable_connected))
+		return;
+
+	ret = dcp_dptx_connect(dcp, 0);
+	if (!ret) {
+		dcp->typec_reconnect_tries = 0;
+		return;
+	}
+
+	/* Not a T602x USB4 tunnel: the full retry budget applies. */
+	if (++dcp->typec_reconnect_tries < DPTX_RECONNECT_RETRIES) {
+		mod_delayed_work(system_freezable_wq, &dcp->typec_reconnect_wq,
+				 DPTX_RECONNECT_DELAY);
+		return;
+	}
+
+	dev_err(dcp->dev, "Type-C DPTX reconnect failed after %u retries: %d\n",
+		dcp->typec_reconnect_tries, ret);
+}
+
+static void disconnected_hpd_event_h17p(struct apple_connector *con)
+{
+	if (!con)
+		return;
+
+	/* May run with DRM modeset locks held; defer property/cache cleanup. */
+	WRITE_ONCE(con->connected, false);
+	WRITE_ONCE(con->edid_invalidation_pending, true);
+	schedule_work(&con->hotplug_wq);
+}
+
+static int dcp_dptx_disconnect_h17p(struct apple_dcp *dcp, u32 port)
+{
+	if (dcp_is_external_h17p(dcp))
+		return dcp_external_disconnect(dcp, false);
+
+	dev_info(dcp->dev, "%s(port=%d)\n", __func__, port);
+
+	mutex_lock(&dcp->hpd_mutex);
+	if (dptx_service_available(&dcp->dptxport[port]) && dcp->dptxport[port].connected) {
+		dptxport_release_display(dcp->dptxport[port].service);
+		dcp->dptxport[port].connected = false;
+	}
+	mutex_unlock(&dcp->hpd_mutex);
+
+	return 0;
+}
+
+static int dcp_dptx_connect_oob_h17p(struct platform_device *pdev, u32 port)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+	int ret;
+
+	if (dcp_is_external_h17p(dcp)) {
+		bool new_cable;
+
+		cancel_delayed_work_sync(&dcp->typec_reconnect_wq);
+		cancel_delayed_work_sync(&dcp->placeholder_edid_wq);
+		cancel_work_sync(&dcp->external_stop_work);
+		guard(mutex)(&dcp->external_lock);
+		new_cable = !dcp->external_cable;
+		if (new_cable)
+			dcp->external_generation++;
+		dcp->external_cable = true;
+		WRITE_ONCE(dcp->external_physically_absent, false);
+		dcp_external_publish_generation(dcp);
+		scoped_guard(mutex, &dcp->hpd_mutex) {
+			WRITE_ONCE(dcp->typec_cable_connected, true);
+			if (new_cable) {
+				dcp->typec_generation++;
+				dcp_firmware_metadata_connection(dcp, dcp->typec_generation, true);
+			}
+			dcp->placeholder_retried = false;
+		}
+		return dcp_external_link_locked(dcp);
+	}
+
+	if (dcp_is_typec_output(dcp)) {
+		cancel_delayed_work_sync(&dcp->placeholder_edid_wq);
+		guard(mutex)(&dcp->hpd_mutex);
+		dcp->typec_generation++;
+		WRITE_ONCE(dcp->typec_cable_connected, true);
+		dcp_firmware_metadata_connection(dcp, dcp->typec_generation, true);
+		dcp->typec_reconnect_tries = 0;
+		dcp->placeholder_retried = false;
+		cancel_delayed_work(&dcp->typec_reconnect_wq);
+	}
+
+	ret = dcp_dptx_connect(dcp, port);
+	if (ret && dcp_is_typec_output(dcp))
+		mod_delayed_work(system_freezable_wq, &dcp->typec_reconnect_wq,
+				 DPTX_RECONNECT_DELAY);
+
+	return ret;
+}
+
+static int dcp_dptx_disconnect_oob_h17p(struct platform_device *pdev, u32 port)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	if (dcp_is_external_h17p(dcp))
+		return dcp_external_disconnect(dcp, true);
+
+	if (dcp_is_typec_output(dcp)) {
+		scoped_guard(mutex, &dcp->hpd_mutex) {
+			WRITE_ONCE(dcp->typec_cable_connected, false);
+			dcp->typec_generation++;
+			dcp_firmware_metadata_connection(dcp, dcp->typec_generation, false);
+		}
+		WRITE_ONCE(dcp->typec_crtc_off, false);
+		reinit_completion(&dcp->typec_iomfb_hpd_ready);
+		cancel_delayed_work_sync(&dcp->typec_reconnect_wq);
+		cancel_delayed_work_sync(&dcp->placeholder_edid_wq);
+	}
+
+	disconnected_hpd_event_h17p(dcp->connector);
+
+	if (dcp->avep)
+		av_service_disconnect(dcp);
+
+	if (dptx_service_available(&dcp->dptxport[port]))
+		dptxport_set_hpd(dcp->dptxport[port].service, false);
+
+	return dcp_dptx_disconnect(dcp, port);
+}
+
+static int dcp_start_h17p(struct platform_device *pdev)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+	int ret;
+
+	if (!dcp->rtk)
+		return -ENODEV;
+
+	init_completion(&dcp->start_done);
+
+	/*
+	 * The coprocessor start can fail (or be recovered from) without tearing
+	 * the DRM side down, so this can be reached with no RTKit instance at
+	 * all.  Starting an endpoint then dereferences NULL inside
+	 * apple_rtkit_start_ep() and takes the machine with it.
+	 */
+	if (!dcp->rtk || IS_ERR(dcp->rtk)) {
+		dev_err(dcp->dev,
+			"cannot start endpoints: RTKit is not initialised\n");
+		return -ENODEV;
+	}
+
+	/* Make the H17P allocator available before external service discovery. */
+	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL) {
+		ret = apple_rtkit_start_ep(dcp->rtk, REMOTE_ALLOC_ENDPOINT);
+		if (ret)
+			return dev_err_probe(dcp->dev, ret, "Failed to start remote allocator\n");
+	}
+
+	/* start RTKit endpoints */
+	ret = systemep_init(dcp);
+	if (ret)
+		dev_warn(dcp->dev, "Failed to start system endpoint: %d\n", ret);
+
+	if (unstable_edid && !dcp_has_panel(dcp)) {
+		ret = dpavservep_init(dcp);
+		if (ret)
+			dev_warn(dcp->dev, "Failed to start DPAVSERV endpoint: %d",
+				 ret);
+	}
+
+	if (dcp->phy && dcp->fw_compat >= DCP_FIRMWARE_V_13_5) {
+		ret = ibootep_init(dcp);
+		if (ret)
+			dev_warn(dcp->dev, "Failed to start IBOOT endpoint: %d\n",
+				 ret);
+
+		if (dcp->hw.iomfb_method_profile ==
+		    DCP_IOMFB_METHODS_H17P_EXTERNAL) {
+			ret = dptx_controller_init(dcp);
+			if (ret)
+				return dev_err_probe(dcp->dev, ret,
+						     "Failed to start DPTX controller\n");
+		}
+
+		ret = dptxep_init(dcp);
+		if (ret) {
+			dev_warn(dcp->dev, "Failed to start DPTX endpoint: %d\n",
+				 ret);
+#ifdef DCP_DPTX_DISCONNECT_ON_INIT
+		/*
+		 * This disconnect / connect cycle on init is only necessary
+		 * when using dcp0 on j473, j474s and presumedly j475c.
+		 * Since dcp0 is not used at the moment let's avoid this
+		 * since it is possibly the cause for startup issues.
+		 */
+		} else if (dptx_service_available(&dcp->dptxport[0])) {
+			bool connected;
+			/* force disconnect on start - necessary if the display
+			 * is already up from m1n1
+			 */
+			dptxport_set_hpd(dcp->dptxport[0].service, false);
+			dptxport_release_display(dcp->dptxport[0].service);
+			usleep_range(10 * USEC_PER_MSEC, 25 * USEC_PER_MSEC);
+
+			connected = gpiod_get_value_cansleep(dcp->hdmi_hpd);
+			dev_info(dcp->dev, "%s: DP2HDMI HPD connected:%d\n", __func__, connected);
+
+			// necessary on j473/j474 but not on j314c
+			if (connected)
+				dcp_dptx_connect(dcp, 0);
+#endif
+		}
+	} else if (dcp->phy) {
+		dev_warn(dcp->dev, "OS firmware incompatible with dptxport EP\n");
+	}
+	ret = iomfb_start_rtkit(dcp);
+	if (ret)
+		dev_err(dcp->dev, "Failed to start IOMFB endpoint: %d\n", ret);
+
+#if IS_ENABLED(CONFIG_DRM_APPLE_AUDIO)
+	if (hdmi_audio) {
+		ret = avep_init(dcp);
+		if (ret)
+			dev_warn(dcp->dev, "Failed to start AV endpoint: %d", ret);
+		ret = 0;
+	}
+#endif
+
+	return ret;
+}
+
+#define DCP_BL_FALLBACK_DELAY msecs_to_jiffies(2000)
+
+static bool dcp_uses_soft_dpms(struct apple_dcp *dcp)
+{
+	return (dcp_backlight_active(dcp) && dcp_has_panel(dcp)) ||
+	       (dcp->fw_compat == DCP_FIRMWARE_H17P &&
+		dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G &&
+		dcp->connector_type == DRM_MODE_CONNECTOR_eDP);
+}
+
+static void dcp_poweron_h17p(struct platform_device *pdev)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+	bool wait_for_typec_hpd = false;
+	unsigned long remaining;
+	int ret;
+
+	if (dcp_is_external_h17p(dcp)) {
+		cancel_delayed_work_sync(&dcp->typec_reconnect_wq);
+		cancel_delayed_work_sync(&dcp->placeholder_edid_wq);
+		cancel_work_sync(&dcp->external_stop_work);
+		guard(mutex)(&dcp->external_lock);
+		ret = dcp_external_start_locked(dcp);
+		if (!ret)
+			dcp->external_crtc_generation = dcp->external_generation;
+		else
+			dev_err(dcp->dev, "external display activation failed: %d\n", ret);
+		return;
+	}
+
+	if (dcp_uses_soft_dpms(dcp)) {
+		if (dcp->fw_compat == DCP_FIRMWARE_H17P &&
+		    dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G &&
+		    !READ_ONCE(dcp->pipe_enabled_h17p)) {
+			iomfb_poweron_h17p(dcp);
+			if (!READ_ONCE(dcp->pipe_enabled_h17p)) {
+				dev_err(dcp->dev, "initial display pipe enable failed\n");
+				WRITE_ONCE(dcp->crashed, true);
+				return;
+			}
+			/* The powerlog takeover report normally precedes this. */
+			if (dcp_has_panel(dcp))
+				queue_delayed_work(system_freezable_wq,
+						   &dcp->bl_fallback_wq,
+						   DCP_BL_FALLBACK_DELAY);
+		}
+		ret = dcp_backlight_dpms(dcp, true);
+		if (ret)
+			dev_warn(dcp->dev, "backlight restore unavailable: %d\n", ret);
+		return;
+	}
+
+	if (dcp_is_typec_output(dcp)) {
+		wait_for_typec_hpd = READ_ONCE(dcp->typec_crtc_off) &&
+				    READ_ONCE(dcp->typec_cable_connected);
+		WRITE_ONCE(dcp->typec_crtc_off, false);
+
+		/*
+		 * A Type-C CRTC disable releases its DPTX session. Re-establish it
+		 * synchronously before IOMFB is powered back on.
+		 */
+		if (READ_ONCE(dcp->typec_cable_connected)) {
+			cancel_delayed_work(&dcp->typec_reconnect_wq);
+			dcp->typec_reconnect_tries = 0;
+			ret = dcp_dptx_connect(dcp, 0);
+			if (ret)
+				mod_delayed_work(system_freezable_wq,
+						 &dcp->typec_reconnect_wq,
+						 DPTX_RECONNECT_DELAY);
+			else if (wait_for_typec_hpd) {
+				remaining = wait_for_completion_timeout(
+					&dcp->typec_iomfb_hpd_ready,
+					msecs_to_jiffies(3000));
+				if (!remaining)
+					dev_warn(dcp->dev,
+						 "Type-C IOMFB hotplug not ready on wake\n");
+			}
+		}
+	} else if (dcp->hdmi_hpd) {
+		bool connected = gpiod_get_value_cansleep(dcp->hdmi_hpd);
+		dev_info(dcp->dev, "%s: DP2HDMI HPD connected:%d\n", __func__, connected);
+
+		if (connected)
+			dcp_dptx_connect(dcp, 0);
+	}
+
+	switch (dcp->fw_compat) {
+	case DCP_FIRMWARE_V_12_3:
+		iomfb_poweron_v12_3(dcp);
+		break;
+	case DCP_FIRMWARE_V_13_5:
+		iomfb_poweron_v13_3(dcp);
+		break;
+	case DCP_FIRMWARE_H17P:
+		iomfb_poweron_h17p(dcp);
+		break;
+	default:
+		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
+		break;
+	}
+	if (dcp->avep)
+		av_service_connect(dcp);
+}
+
+/* Same-CRTC helper dependencies order this token refresh before later disables. */
+void dcp_external_recover(struct platform_device *pdev)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	if (dcp_is_external_h17p(dcp))
+		dcp_poweron(pdev);
+}
+
+static void dcp_poweroff_h17p(struct platform_device *pdev)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+	int ret;
+
+	if (dcp_is_external_h17p(dcp)) {
+		cancel_delayed_work_sync(&dcp->typec_reconnect_wq);
+		cancel_delayed_work_sync(&dcp->placeholder_edid_wq);
+		guard(mutex)(&dcp->external_lock);
+		ret = dcp_external_stop_locked(dcp, dcp->external_crtc_generation);
+		if (ret)
+			dev_err(dcp->dev, "external display stop failed: %d\n", ret);
+		return;
+	}
+
+	cancel_delayed_work(&dcp->swap_watchdog_wq);
+
+	/* Internal H17P DPMS is a brightness present, never a pipe stop. */
+	if (dcp_uses_soft_dpms(dcp)) {
+		ret = dcp_backlight_dpms(dcp, false);
+		if (ret)
+			dev_warn(dcp->dev, "backlight blank unavailable: %d\n", ret);
+		return;
+	}
+
+	if (dcp->avep)
+		av_service_disconnect(dcp);
+
+	/*
+	 * Powering a Type-C CRTC off drops DCP's synthetic HPD, and the firmware
+	 * reports that as an unplug. The display is still attached: keep the
+	 * connector connected (see dcpep_cb_hotplug()) and let dcp_poweron()
+	 * re-establish the DPTX session. Recreating it here instead makes the
+	 * display vanish and come back, and compositors light a returning
+	 * display, so DPMS off never sticks. Cable removal is reported through
+	 * the Type-C mux.
+	 */
+	if (dcp_is_typec_output(dcp)) {
+		reinit_completion(&dcp->typec_iomfb_hpd_ready);
+		if (READ_ONCE(dcp->typec_cable_connected))
+			WRITE_ONCE(dcp->typec_crtc_off, true);
+		/* dcp_poweron() reconnects the link on DPMS wake. */
+		cancel_delayed_work(&dcp->typec_reconnect_wq);
+	}
+
+	_dcp_poweroff(dcp);
+
+	if (dcp_is_typec_output(dcp)) {
+		/* DCP owns a synthetic HPD for Type-C. Release it with the CRTC. */
+		if (dptx_service_available(&dcp->dptxport[0]) && dcp->dptxport[0].connected) {
+			ret = dptxport_set_hpd(dcp->dptxport[0].service, false);
+			if (ret)
+				dev_warn(dcp->dev,
+					 "failed to deassert Type-C DPTX HPD: %d\n", ret);
+			dcp_dptx_disconnect(dcp, 0);
+		}
+	} else if (dcp->hdmi_hpd) {
+		bool connected = gpiod_get_value_cansleep(dcp->hdmi_hpd);
+		if (!connected) {
+			disconnected_hpd_event_h17p(dcp->connector);
+			dcp_dptx_disconnect(dcp, 0);
+		}
+	}
+}
+
+static void dcp_work_register_backlight_h17p(struct work_struct *work)
+{
+	int ret;
+	struct apple_dcp *dcp;
+
+	dcp = container_of(work, struct apple_dcp, bl_register_wq);
+
+	mutex_lock(&dcp->bl_register_mutex);
+	if (dcp->brightness.bl_dev)
+		goto out_unlock;
+
+	/* try to register backlight device, */
+	ret = dcp_backlight_register(dcp);
+	if (ret == -ENODATA)
+		goto out_unlock;
+	if (ret) {
+		dev_err(dcp->dev, "Unable to register backlight device: %d\n", ret);
+		/*
+		 * The H17P policy encodes the panel ceiling into every present
+		 * and keeps working without a class device; only older
+		 * firmware stops sending brightness here.
+		 */
+		if (!dcp_backlight_active(dcp))
+			dcp->brightness.maximum = 0;
+	}
+
+out_unlock:
+	mutex_unlock(&dcp->bl_register_mutex);
+}
+
+/*
+ * H17P never publishes the panel level, and the loader's level arrives only
+ * as an optional powerlog report.  Without one, register the backlight at
+ * the middle of the panel range.  That value is only reported: no level is
+ * presented until userspace writes one, so the panel keeps the loader's
+ * level.
+ */
+static void dcp_work_backlight_fallback(struct work_struct *work)
+{
+	struct apple_dcp *dcp = container_of(to_delayed_work(work),
+					     struct apple_dcp, bl_fallback_wq);
+	u32 nits = dcp->brightness.maximum / 2;
+	int ret;
+
+	if (READ_ONCE(dcp->quiescing) || READ_ONCE(dcp->crashed) ||
+	    dcp_backlight_active(dcp))
+		return;
+
+	ret = iomfb_configure_backlight_h17p(dcp, dcp->brightness.maximum,
+					     false, 0, true, nits);
+	if (!ret)
+		dev_info(dcp->dev,
+			 "no loader brightness reported; backlight starts at %u nits without a panel change\n",
+			 nits);
+	else if (ret != -EBUSY)
+		dev_warn(dcp->dev, "backlight registration failed: %d\n", ret);
+}
+
+static void dcp_release_piodma_iommu_dev(struct apple_dcp *dcp)
+{
+	if (dcp->retain_dma) {
+		WRITE_ONCE(dcp->quiescing, true);
+		return;
+	}
+	if (dcp->piodma) {
+		if (dcp->piodma_created)
+			of_platform_device_destroy(&dcp->piodma->dev, NULL);
+		else
+			put_device(&dcp->piodma->dev);
+	}
+	dcp->piodma = NULL;
+	dcp->iommu_dom = NULL;
+	dcp->piodma_created = false;
+}
+
+void dcp_retain_framebuffer(struct platform_device *pdev,
+			    struct dcp_fb_reference *entry)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	mutex_lock(&dcp->swapped_out_fbs_lock);
+	list_add_tail(&entry->head, &dcp->swapped_out_fbs);
+	mutex_unlock(&dcp->swapped_out_fbs_lock);
+}
+
+void dcp_arm_retained_framebuffers(struct apple_dcp *dcp, u32 swap_id)
+{
+	struct dcp_fb_reference *entry;
+
+	mutex_lock(&dcp->swapped_out_fbs_lock);
+	list_for_each_entry(entry, &dcp->swapped_out_fbs, head) {
+		if (entry->armed)
+			continue;
+		entry->swap_id = swap_id;
+		entry->armed = true;
+	}
+	mutex_unlock(&dcp->swapped_out_fbs_lock);
+}
+
+void dcp_unarm_retained_framebuffers(struct apple_dcp *dcp, u32 swap_id)
+{
+	struct dcp_fb_reference *entry;
+
+	mutex_lock(&dcp->swapped_out_fbs_lock);
+	list_for_each_entry(entry, &dcp->swapped_out_fbs, head)
+		if (entry->armed && entry->swap_id == swap_id)
+			entry->armed = false;
+	mutex_unlock(&dcp->swapped_out_fbs_lock);
+}
+
+void dcp_release_retained_framebuffers(struct apple_dcp *dcp, u32 swap_id)
+{
+	struct dcp_fb_reference *entry, *tmp;
+	LIST_HEAD(completed);
+
+	mutex_lock(&dcp->swapped_out_fbs_lock);
+	list_for_each_entry_safe(entry, tmp, &dcp->swapped_out_fbs, head) {
+		if (!entry->armed || entry->swap_id != swap_id)
+			continue;
+		list_move_tail(&entry->head, &completed);
+	}
+	mutex_unlock(&dcp->swapped_out_fbs_lock);
+
+	list_for_each_entry_safe(entry, tmp, &completed, head) {
+		list_del(&entry->head);
+		drm_framebuffer_put(entry->fb);
+		kfree(entry);
+	}
+}
+
+void dcp_release_all_retained_framebuffers(struct apple_dcp *dcp)
+{
+	struct dcp_fb_reference *entry, *tmp;
+	LIST_HEAD(completed);
+
+	mutex_lock(&dcp->swapped_out_fbs_lock);
+	list_splice_init(&dcp->swapped_out_fbs, &completed);
+	mutex_unlock(&dcp->swapped_out_fbs_lock);
+
+	list_for_each_entry_safe(entry, tmp, &completed, head) {
+		list_del(&entry->head);
+		drm_framebuffer_put(entry->fb);
+		kfree(entry);
+	}
+}
+
+
+static int dcp_create_piodma_iommu_dev_h17p(struct apple_dcp *dcp)
+{
+	int ret;
+	struct device_node *node __free(device_node) = of_get_child_by_name(dcp->dev->of_node, "piodma");
+
+	if (!node)
+		return dev_err_probe(dcp->dev, -ENODEV,
+				     "Failed to get piodma child DT node\n");
+
+	dcp->piodma = of_find_device_by_node(node);
+	dcp->piodma_created = !dcp->piodma;
+	if (dcp->piodma_created)
+		dcp->piodma = of_platform_device_create(node, NULL, dcp->dev);
+	if (!dcp->piodma)
+		return dev_err_probe(dcp->dev, -ENODEV,
+				     "Failed to create piodma pdev for %pOF\n", node);
+
+	ret = dma_set_mask_and_coherent(&dcp->piodma->dev, DMA_BIT_MASK(42));
+	if (ret)
+		goto err_destroy_pdev;
+
+	ret = of_dma_configure(&dcp->piodma->dev, node, true);
+	if (ret) {
+		ret = dev_err_probe(dcp->dev, ret,
+			"Failed to configure IOMMU child DMA\n");
+		goto err_destroy_pdev;
+	}
+
+	dcp->iommu_dom = iommu_get_domain_for_dev(&dcp->piodma->dev);
+	if (IS_ERR(dcp->iommu_dom)) {
+		ret = dev_err_probe(dcp->dev, PTR_ERR(dcp->iommu_dom),
+				    "Failed to get default iommu domain for "
+				    "piodma device\n");
+		dcp->iommu_dom = NULL;
+		goto err_destroy_pdev;
+	}
+
+	return 0;
+err_destroy_pdev:
+	dcp_release_piodma_iommu_dev(dcp);
+	return ret;
+}
+
+static int dcp_get_disp_regs_h17p(struct apple_dcp *dcp)
+{
+	struct platform_device *pdev = to_platform_device(dcp->dev);
+	int count = 0;
+	int i, ret;
+	char name[16];
+	const char *reg_name;
+	struct resource *res;
+
+	if (of_property_present(dcp->dev->of_node, "reg-names")) {
+		ret = of_property_count_strings(dcp->dev->of_node, "reg-names");
+		if (ret < 0)
+			return ret;
+
+		for (i = 0; i < ret; i++) {
+			if (of_property_read_string_index(dcp->dev->of_node,
+							  "reg-names", i, &reg_name))
+				return -EINVAL;
+			if (!strncmp(reg_name, "disp-", 5))
+				count++;
+		}
+	} else {
+		count = pdev->num_resources - 1;
+	}
+
+	if (count <= 0 || count > MAX_DISP_REGISTERS)
+		return -EINVAL;
+
+	for (i = 0; i < count; ++i) {
+		if (of_property_present(dcp->dev->of_node, "reg-names")) {
+			snprintf(name, sizeof(name), "disp-%d", i);
+			res = platform_get_resource_byname(pdev, IORESOURCE_MEM,
+							   name);
+		} else {
+			res = platform_get_resource(pdev, IORESOURCE_MEM, 1 + i);
+		}
+		if (!res)
+			return -EINVAL;
+		dcp->disp_registers[i] = res;
+	}
+
+	if (dcp->hw.firmware_clock) {
+		unsigned int windows = dcp->hw.firmware_display_windows;
+		bool external = dcp->hw.iomfb_method_profile ==
+			DCP_IOMFB_METHODS_H17P_EXTERNAL;
+
+		if (!windows || windows >= MAX_DISP_REGISTERS)
+			return -EINVAL;
+		if (external) {
+			/* The external clock aperture is already described by disp-4. */
+			if (count != windows + 1)
+				return -EINVAL;
+			res = dcp->disp_registers[windows];
+			if (!apple_dcp_external_clock_window(res->start,
+							     resource_size(res),
+							     dcp->hw.firmware_clock->start,
+							     resource_size(dcp->hw.firmware_clock)))
+				return -EINVAL;
+			count = windows;
+		}
+		if (count != windows || resource_size(dcp->hw.firmware_clock) < 4 ||
+		    dcp->hw.firmware_scratch > resource_size(dcp->hw.firmware_clock) - 4 ||
+		    dcp->hw.firmware_request > resource_size(dcp->hw.firmware_clock) - 4)
+			return -EINVAL;
+
+		dcp->disp_bw_scratch_res = *dcp->hw.firmware_clock;
+		dcp->disp_bw_scratch_index = count;
+		dcp->disp_bw_scratch_offset = dcp->hw.firmware_scratch;
+		dcp->disp_bw_doorbell_res = dcp->disp_bw_scratch_res;
+		dcp->disp_bw_doorbell_res.start += dcp->hw.firmware_request;
+		dcp->disp_bw_doorbell_res.end = dcp->disp_bw_doorbell_res.start + 3;
+		dcp->disp_registers[count] = &dcp->disp_bw_scratch_res;
+		dcp->nr_disp_registers = count + 1;
+		return 0;
+	}
+
+	/* load pmgr bandwidth scratch resource and offset */
+	ret = dcp_get_bw_scratch_reg(dcp, count);
+	if (ret < 0)
+		return ret;
+	count += 1;
+
+	/* load pmgr bandwidth doorbell resource if present (only on t8103) */
+	if (of_property_present(dcp->dev->of_node, "apple,bw-doorbell")) {
+		ret = dcp_get_bw_doorbell_reg(dcp, count);
+		if (ret < 0)
+			return ret;
+		count += 1;
+	}
+
+	dcp->nr_disp_registers = count;
+	return 0;
+}
+
+static void dcp_disable_typec_work_h17p(struct apple_dcp *dcp, bool release_cable)
+{
+	scoped_guard(mutex, &dcp->hpd_mutex) {
+		if (release_cable)
+			WRITE_ONCE(dcp->typec_cable_connected, false);
+		dcp->typec_generation++;
+		dcp_firmware_metadata_connection(dcp, dcp->typec_generation, false);
+	}
+	if (release_cable && dcp_is_external_h17p(dcp))
+		dpavservep_detach(dcp);
+	/* Block new enqueues as well as draining users of the AFK endpoints. */
+	disable_delayed_work_sync(&dcp->typec_reconnect_wq);
+	disable_delayed_work_sync(&dcp->placeholder_edid_wq);
+	cancel_work_sync(&dcp->external_stop_work);
+}
+
+static void dcp_enable_typec_work_h17p(struct apple_dcp *dcp)
+{
+	enable_delayed_work(&dcp->typec_reconnect_wq);
+	enable_delayed_work(&dcp->placeholder_edid_wq);
+	/* A cable can be routed before the DRM component binds. */
+	if (READ_ONCE(dcp->typec_cable_connected))
+		mod_delayed_work(system_freezable_wq, &dcp->typec_reconnect_wq, 0);
+}
+
+static bool dcp_external_is_idle(struct apple_dcp *dcp)
+{
+	u32 control = readl_relaxed(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
+	u32 status = readl_relaxed(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_STATUS);
+
+	/* Same externally inherited idle state accepted by the public loader. */
+	return (control & APPLE_DCP_COPROC_CPU_CONTROL_RUN) &&
+	       (status & APPLE_DCP_COPROC_CPU_STATUS_STOPPED) &&
+	       (status & APPLE_DCP_COPROC_CPU_STATUS_IDLE);
+}
+
+static int dcp_comp_bind_h17p(struct device *dev, struct device *main, void *data)
+{
+	struct device_node *panel_np;
+	struct apple_dcp *dcp = dev_get_drvdata(dev);
+	u32 cpu_ctrl;
+	int ret;
+
+	if (READ_ONCE(dcp->quiescing))
+		return dev_err_probe(dev, -EBUSY,
+				     "Live DCP session cannot be rebound; reboot required\n");
+
+	if (dcp->external_prepared)
+		return 0;
+
+	/* A timed-out prior session may still scan these mappings. */
+	mutex_lock(&dcp->swapped_out_fbs_lock);
+	ret = list_empty(&dcp->swapped_out_fbs) ? 0 : -EBUSY;
+	mutex_unlock(&dcp->swapped_out_fbs_lock);
+	if (ret)
+		return dev_err_probe(dev, ret,
+				     "Previous scanout has not been stopped\n");
+
+	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(42));
+	if (ret)
+		return ret;
+
+	dcp->coproc_reg = devm_platform_ioremap_resource_byname(to_platform_device(dev), "coproc");
+	if (IS_ERR(dcp->coproc_reg))
+		return PTR_ERR(dcp->coproc_reg);
+
+	/*
+	 * Display coprocessors running H17-generation firmware are left running
+	 * by the bootloader with their firmware mapped through a locked DART.
+	 * Linux attaches to that session with a standard RTKit INIT/HELLO
+	 * exchange and must not stop or restart the ASC.
+	 */
+	if (dcp->hw.adopt_live_session) {
+		cpu_ctrl = readl_relaxed(dcp->coproc_reg +
+					 APPLE_DCP_COPROC_CPU_CONTROL);
+		if (!(cpu_ctrl & APPLE_DCP_COPROC_CPU_CONTROL_RUN))
+			return dev_err_probe(dev, -EOPNOTSUPP,
+					     "DCP was not left running by the bootloader\n");
+	}
+
+	if (dcp->hw.iomfb_method_profile ==
+	    DCP_IOMFB_METHODS_H17P_EXTERNAL &&
+	    !dcp_external_is_idle(dcp))
+		return dev_err_probe(dev, -EBUSY,
+				     "External DCP is not in the inherited idle state\n");
+
+	if (dcp->index || dcp->dptx_phy || dcp->dptx_die)
+		dev_info(dev, "DCP index:%u dptx target phy: %u dptx die: %u\n",
+			 dcp->index, dcp->dptx_phy, dcp->dptx_die);
+
+	if (!show_notch)
+		ret = of_property_read_u32(dev->of_node, "apple,notch-height",
+					   &dcp->notch_height);
+
+	if (dcp->notch_height > MAX_NOTCH_HEIGHT)
+		dcp->notch_height = MAX_NOTCH_HEIGHT;
+	if (dcp->notch_height > 0)
+		dev_info(dev, "Detected display with notch of %u pixel\n", dcp->notch_height);
+
+	/* initialize brightness scale to a sensible default to avoid divide by 0*/
+	dcp->brightness.scale = 65536;
+	panel_np = of_get_compatible_child(dev->of_node, "apple,panel-mini-led");
+	if (panel_np)
+		dcp->panel.has_mini_led = true;
+	else
+		panel_np = of_get_compatible_child(dev->of_node, "apple,panel");
+
+	if (panel_np) {
+		const char height_prop[2][16] = { "adj-height-mm", "height-mm" };
+
+		if (of_device_is_available(panel_np)) {
+			ret = of_property_read_u32(panel_np, "apple,max-brightness",
+						   &dcp->brightness.maximum);
+			if (ret)
+				dev_err(dev, "Missing property 'apple,max-brightness'\n");
+		}
+
+		of_property_read_u32(panel_np, "width-mm", &dcp->panel.width_mm);
+		/* use adjusted height as long as the notch is hidden */
+		of_property_read_u32(panel_np, height_prop[!dcp->notch_height],
+				     &dcp->panel.height_mm);
+
+		of_node_put(panel_np);
+		dcp->fixed_connector_type = DRM_MODE_CONNECTOR_eDP;
+		dcp->connector_type = DRM_MODE_CONNECTOR_eDP;
+		INIT_WORK(&dcp->bl_register_wq, dcp_work_register_backlight_h17p);
+		mutex_init(&dcp->bl_register_mutex);
+		INIT_WORK(&dcp->bl_update_wq, dcp_work_update_backlight);
+	}
+
+	ret = dcp_create_piodma_iommu_dev_h17p(dcp);
+	if (ret)
+		return dev_err_probe(dev, ret,
+				     "Failed to create PIODMA iommu child device\n");
+	if (!dcp->iommu_dom) {
+		ret = dev_err_probe(dev, -EPROBE_DEFER,
+				    "PIODMA iommu domain is unavailable\n");
+		goto err_piodma;
+	}
+
+	ret = dcp_get_disp_regs_h17p(dcp);
+	if (ret) {
+		dev_err(dev, "failed to find display registers\n");
+		goto err_piodma;
+	}
+
+	dcp->clk = devm_clk_get(dev, NULL);
+	if (IS_ERR(dcp->clk)) {
+		ret = dev_err_probe(dev, PTR_ERR(dcp->clk),
+				    "Unable to find clock\n");
+		goto err_piodma;
+	}
+	dcp->clk_194 = devm_clk_get_optional(dev, "clock-194");
+	if (IS_ERR(dcp->clk_194)) {
+		ret = dev_err_probe(dev, PTR_ERR(dcp->clk_194),
+				    "Unable to find clock 0x194\n");
+		goto err_piodma;
+	}
+
+	if (dcp->hw.iomfb_method_profile ==
+	    DCP_IOMFB_METHODS_H17P_EXTERNAL &&
+	    (!dcp->clk_194 || !clk_get_rate(dcp->clk) ||
+	     !clk_get_rate(dcp->clk_194))) {
+		ret = dev_err_probe(dev, -EINVAL,
+				    "External display clocks are unavailable\n");
+		goto err_piodma;
+	}
+
+	bitmap_zero(dcp->memdesc_map, DCP_MAX_MAPPINGS);
+	// TDOD: mem_desc IDs start at 1, for simplicity just skip '0' entry
+	set_bit(0, dcp->memdesc_map);
+
+	INIT_WORK(&dcp->vblank_wq, dcp_delayed_vblank);
+	INIT_DELAYED_WORK(&dcp->swap_watchdog_wq, dcp_swap_watchdog);
+
+	if (dcp->hw.iomfb_method_profile ==
+	    DCP_IOMFB_METHODS_H17P_EXTERNAL) {
+		/* Pin before the first write or mailbox wake can expose DMA. */
+		ret = dcp_pin_live_session(dcp);
+		if (ret)
+			goto err_piodma;
+		if (!dcp_external_is_idle(dcp)) {
+			ret = dev_err_probe(dev, -EBUSY,
+					    "External DCP changed state before startup\n");
+			goto err_piodma;
+		}
+	}
+
+	if (!dcp->hw.adopt_live_session) {
+		cpu_ctrl =
+			readl_relaxed(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
+		writel_relaxed(cpu_ctrl | APPLE_DCP_COPROC_CPU_CONTROL_RUN,
+			       dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
+	}
+
+	/* Registering the mailbox can already expose RTKit buffer requests. */
+	ret = dcp_pin_live_session(dcp);
+	if (ret)
+		goto err_piodma;
+	/* External H17P supplies shared-buffer addresses during RTKit startup. */
+	if (dcp->hw.iomfb_method_profile ==
+	    DCP_IOMFB_METHODS_H17P_EXTERNAL)
+		dcp->rtk = apple_rtkit_init(dev, dcp, "mbox", 0,
+					    &external_h17p_rtkit_ops);
+	else
+		dcp->rtk = apple_rtkit_init(dev, dcp, "mbox", 0, &rtkit_ops);
+	if (IS_ERR(dcp->rtk)) {
+		ret = dev_err_probe(dev, PTR_ERR(dcp->rtk),
+				    "Failed to initialize RTKit\n");
+		goto err_piodma;
+	}
+	ret = devm_add_action_or_reset(dev, dcp_release_rtkit, dcp);
+	if (ret)
+		goto err_piodma;
+
+	if (dcp->hw.adopt_live_session)
+		dev_info(dev, "negotiating RTKit with the running DCP\n");
+
+	/* Announce host readiness before awaiting external IOP readiness. */
+	if (dcp->hw.iomfb_method_profile ==
+	    DCP_IOMFB_METHODS_H17P_EXTERNAL)
+		ret = apple_rtkit_wake_early_ap(dcp->rtk);
+	else
+		ret = apple_rtkit_wake(dcp->rtk);
+	if (ret) {
+		ret = dev_err_probe(dev, ret, "Failed to boot RTKit: %d\n", ret);
+		goto err_piodma;
+	}
+	dcp_enable_typec_work_h17p(dcp);
+	return 0;
+
+err_piodma:
+	dcp_release_piodma_iommu_dev(dcp);
+	return ret;
+}
+
+/*
+ * We need to shutdown DCP before tearing down the display subsystem. Otherwise
+ * the DCP will crash and briefly flash a green screen of death.
+ */
+static void dcp_comp_unbind_h17p(struct device *dev, struct device *main, void *data)
+{
+	struct apple_dcp *dcp = dev_get_drvdata(dev);
+
+	if (!dcp)
+		return;
+
+	if (dcp->retain_dma) {
+		/* No firmware stop is acknowledged: detach host users, never DMA. */
+		scoped_guard(mutex, &dcp->iomfb.lock)
+			WRITE_ONCE(dcp->quiescing, true);
+		cancel_work_sync(&dcp->external_stop_work);
+		if (dcp->crtc && !dcp->drm_retained) {
+			drm_dev_get(dcp->crtc->base.dev);
+			dcp->drm_retained = true;
+		}
+		iomfb_queue_stop(dcp);
+		afk_quiesce(dcp->avep);
+		afk_quiesce(dcp->dptxep);
+		afk_quiesce(dcp->dptx_controller_ep);
+		afk_quiesce(dcp->ibootep);
+		afk_quiesce(dcp->systemep);
+		afk_quiesce(dcp->dcpavservep);
+		cancel_delayed_work_sync(&dcp->bl_fallback_wq);
+		dcp_backlight_stop(dcp);
+		if (dcp->connector_type == DRM_MODE_CONNECTOR_eDP) {
+			cancel_work_sync(&dcp->bl_register_wq);
+			cancel_work_sync(&dcp->bl_update_wq);
+		}
+		cancel_delayed_work_sync(&dcp->typec_reconnect_wq);
+		cancel_work_sync(&dcp->vblank_wq);
+		if (dcp->connector)
+			cancel_work_sync(&dcp->connector->hotplug_wq);
+		if (dcp->typec_connector && dcp->typec_connector != dcp->connector)
+			cancel_work_sync(&dcp->typec_connector->hotplug_wq);
+		dev_warn(dev, "retaining live DCP DMA resources after unbind; reboot required\n");
+		return;
+	}
+
+	if (dcp->hdmi_hpd_irq)
+		disable_irq(dcp->hdmi_hpd_irq);
+
+	dcp_disable_typec_work_h17p(dcp, true);
+	typec_mux_put(dcp->typec_mux);
+
+	if (dcp->avep) {
+		av_service_disconnect(dcp);
+		afk_shutdown(dcp->avep);
+		dcp->avep = NULL;
+	}
+
+	if (dcp->dptxep) {
+		afk_shutdown(dcp->dptxep);
+		dcp->dptxep = NULL;
+	}
+
+	if (!IS_ERR_OR_NULL(dcp->dptx_controller_ep)) {
+		afk_shutdown(dcp->dptx_controller_ep);
+		dcp->dptx_controller_ep = NULL;
+	}
+
+	if (dcp->ibootep) {
+		afk_shutdown(dcp->ibootep);
+		dcp->ibootep = NULL;
+	}
+
+	if (dcp->systemep) {
+		afk_shutdown(dcp->systemep);
+		dcp->systemep = NULL;
+	}
+
+	if (dcp->dcpavservep) {
+		afk_shutdown(dcp->dcpavservep);
+		dpavservep_detach(dcp);
+		dcp->dcpavservep = NULL;
+	}
+
+	if (dcp->shmem)
+		iomfb_shutdown(dcp);
+
+	iomfb_queue_stop(dcp);
+	dcp_release_piodma_iommu_dev(dcp);
+
+	cancel_delayed_work_sync(&dcp->bl_fallback_wq);
+	dcp_backlight_stop(dcp);
+	if (dcp->connector_type == DRM_MODE_CONNECTOR_eDP) {
+		cancel_work_sync(&dcp->bl_register_wq);
+		cancel_work_sync(&dcp->bl_update_wq);
+	}
+	cancel_delayed_work_sync(&dcp->swap_watchdog_wq);
+	cancel_work_sync(&dcp->vblank_wq);
+
+	devm_clk_put(dev, dcp->clk);
+	dcp->clk = NULL;
+	/* optional and possibly NULL, released with the bind's devres group */
+	dcp->clk_194 = NULL;
+}
+
+static int dcp_platform_probe_h17p(struct platform_device *pdev)
+{
+	const struct apple_dcp_hw_data *hw = of_device_get_match_data(&pdev->dev);
+	enum dcp_firmware_version fw_compat;
+	struct device *dev = &pdev->dev;
+	struct apple_dcp *dcp;
+	int ret, surf, num_surfs;
+	u32 surf_en;
+	u32 mux_index;
+
+	if (dcp_session_retained(dev))
+		return dev_err_probe(dev, -EBUSY, "Previous live DCP session requires a reboot\n");
+
+	/* Reject unsupported external firmware before replacing the boot display. */
+	if (of_device_is_compatible(dev->of_node, "apple,t8140-dcpext") &&
+	    !dcp_h17p_external_supported(dev->of_node)) {
+		dev_err(dev, "Unsupported external display hardware or firmware handoff\n");
+		return -ENODEV;
+	}
+
+	fw_compat = dcp_check_firmware_version(dev);
+	if (fw_compat == DCP_FIRMWARE_UNKNOWN)
+		return -ENODEV;
+
+	/* Check for "apple,bw-scratch" to avoid probing appledrm with outdated
+	 * device trees. This prevents replacing simpledrm and ending up without
+	 * display.
+	 */
+	if (!of_property_present(dev->of_node, "apple,bw-scratch") &&
+	    !hw->firmware_clock)
+		return dev_err_probe(dev, -ENODEV, "Incompatible devicetree! "
+			"Use devicetree matching this kernel.\n");
+
+	dcp = kzalloc_obj(*dcp);
+	if (!dcp)
+		return -ENOMEM;
+	ret = devm_add_action_or_reset(dev, dcp_release_context, dcp);
+	if (ret)
+		return ret;
+
+	INIT_LIST_HEAD(&dcp->swapped_out_fbs);
+	mutex_init(&dcp->swapped_out_fbs_lock);
+	ret = dcp_backlight_init(dcp, dev);
+	if (ret)
+		return ret;
+	iomfb_queue_init(dcp);
+
+	dcp->fw_compat = fw_compat;
+	dcp->dev = dev;
+	/*
+	 * Type-C and Thunderbolt routes can be activated as soon as they are
+	 * registered below, before the DRM device binds.
+	 */
+	/* The shared Type-C fabric takes the catalog lock and HDMI presence. */
+	dcp_modes_init(dcp);
+	ret = devm_add_action_or_reset(dev, dcp_modes_release, dcp);
+	if (ret)
+		return ret;
+	dcp_fabric_init(dcp);
+	mutex_init(&dcp->hpd_mutex);
+	mutex_init(&dcp->external_lock);
+	INIT_WORK(&dcp->external_stop_work, dcp_external_stop_work);
+	mutex_init(&dcp->tb_lock);
+	spin_lock_init(&dcp->mode_state.lock);
+	spin_lock_init(&dcp->metadata.lock);
+	mutex_init(&dcp->dcpavserv.lock);
+	dcp->hw = *(struct apple_dcp_hw_data *)of_device_get_match_data(dev);
+	if (dcp->hw.iomfb_method_profile ==
+	    DCP_IOMFB_METHODS_H17P_EXTERNAL) {
+		if (!dcp->hw.firmware_clock ||
+		    !apple_dcp_external_bw_valid(resource_size(dcp->hw.firmware_clock),
+					 dcp->hw.firmware_scratch,
+					 dcp->hw.firmware_request))
+			return dev_err_probe(dev, -EINVAL,
+					     "Invalid external profile bandwidth resources\n");
+		iomfb_pause_presentation(dcp, true);
+	}
+
+
+	/* The domain use must survive driver-core DMA cleanup for a live session. */
+	ret = iommu_device_use_default_domain(dev);
+	if (ret)
+		return ret;
+	ret = devm_add_action_or_reset(dev, dcp_release_dma_domain, dcp);
+	if (ret)
+		return ret;
+	dcp->fixed_connector_type = dcp_connector_type_from_dt(dev->of_node);
+	dcp->connector_type = dcp->fixed_connector_type;
+	of_property_read_u32(dev->of_node, "apple,dcp-index", &dcp->index);
+	of_property_read_u32(dev->of_node, "apple,dptx-phy", &dcp->dptx_phy);
+	of_property_read_u32(dev->of_node, "apple,dptx-die", &dcp->dptx_die);
+	dcp->fixed_dptx_phy = dcp->dptx_phy;
+	init_completion(&dcp->typec_iomfb_hpd_ready);
+	INIT_DELAYED_WORK(&dcp->typec_reconnect_wq,
+			  dcp_typec_reconnect_work_h17p);
+	INIT_DELAYED_WORK(&dcp->placeholder_edid_wq,
+			  dcp_placeholder_edid_work_h17p);
+	INIT_DELAYED_WORK(&dcp->bl_fallback_wq, dcp_work_backlight_fallback);
+	/* Balanced by enable at successful component bind. */
+	disable_delayed_work(&dcp->typec_reconnect_wq);
+	disable_delayed_work(&dcp->placeholder_edid_wq);
+
+	platform_set_drvdata(pdev, dcp);
+
+	dcp->phy = devm_phy_optional_get(dev, "dp-phy");
+	if (IS_ERR(dcp->phy)) {
+		dev_err(dev, "Failed to get dp-phy: %ld\n", PTR_ERR(dcp->phy));
+		return PTR_ERR(dcp->phy);
+	}
+	dcp->fixed_phy = dcp->phy;
+
+	bitmap_zero(dcp->iomfb_surfaces, DCP_MAX_PLANES);
+	if (!of_property_present(dev->of_node, "apple,iomfb-surfaces"))
+		num_surfs = 0;
+	else
+		num_surfs = of_property_count_elems_of_size(dev->of_node,
+						    "apple,iomfb-surfaces",
+						    sizeof(u32));
+
+	if (num_surfs == 0 || num_surfs == -ENODATA) {
+		set_bit(0, dcp->iomfb_surfaces);
+		set_bit(1, dcp->iomfb_surfaces);
+	} else if (num_surfs < 0) {
+		return num_surfs;
+	} else if (num_surfs > DCP_MAX_PLANES) {
+		dev_err(dev, "Number of iomfb-surfaces (%d) exceeds DCP_MAX_PLANES\n",
+			num_surfs);
+		return -EINVAL;
+	}
+
+	surf = 0;
+	of_property_for_each_u32(dev->of_node, "apple,iomfb-surfaces", surf_en) {
+		if (surf_en)
+			set_bit(surf, dcp->iomfb_surfaces);
+		surf++;
+	}
+	/* The J700 loader names surface zero rather than enabling it. */
+	if (of_machine_is_compatible("apple,j700") &&
+	    of_device_is_compatible(dev->of_node, "apple,t8140-dcp") &&
+	    num_surfs == 1 &&
+	    !of_property_read_u32(dev->of_node, "apple,iomfb-surfaces", &surf_en) &&
+	    surf_en == 0)
+		set_bit(0, dcp->iomfb_surfaces);
+
+	if (dcp->phy) {
+		int ret;
+		/*
+		 * Request DP2HDMI related GPIOs as optional for DP-altmode
+		 * compatibility. J180D misses a dp2hdmi-pwren GPIO in the
+		 * template ADT. TODO: check device ADT
+		 */
+		dcp->hdmi_hpd = devm_gpiod_get_optional(dev, "hdmi-hpd", GPIOD_IN);
+		if (IS_ERR(dcp->hdmi_hpd))
+			return PTR_ERR(dcp->hdmi_hpd);
+		if (dcp->hdmi_hpd) {
+			int irq = gpiod_to_irq(dcp->hdmi_hpd);
+			if (irq < 0) {
+				dev_err(dev, "failed to translate HDMI hpd GPIO to IRQ\n");
+				return irq;
+			}
+			dcp->hdmi_hpd_irq = irq;
+
+			ret = devm_request_threaded_irq(dev, dcp->hdmi_hpd_irq,
+						NULL, dcp_dp2hdmi_hpd,
+						IRQF_ONESHOT | IRQF_NO_AUTOEN |
+						IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING,
+						"dp2hdmi-hpd-irq", dcp);
+			if (ret < 0) {
+				dev_err(dev, "failed to request HDMI hpd irq %d: %d\n",
+					irq, ret);
+				return ret;
+			}
+		}
+
+		/*
+		 * Power DP2HDMI on as it is required for the HPD irq.
+		 * TODO: check if one is sufficient for the hpd to save power
+		 *       on battery powered Macbooks.
+		 */
+		dcp->hdmi_pwren = devm_gpiod_get_optional(dev, "hdmi-pwren", GPIOD_OUT_HIGH);
+		if (IS_ERR(dcp->hdmi_pwren))
+			return PTR_ERR(dcp->hdmi_pwren);
+
+		dcp->dp2hdmi_pwren = devm_gpiod_get_optional(dev, "dp2hdmi-pwren", GPIOD_OUT_HIGH);
+		if (IS_ERR(dcp->dp2hdmi_pwren))
+			return PTR_ERR(dcp->dp2hdmi_pwren);
+
+		/*
+		 * A DCP may have both a fixed HDMI/DP route and allocatable Type-C
+		 * routes. Keep the fixed route selected until the allocator borrows
+		 * this otherwise-idle pipeline for a Type-C display.
+		 */
+		ret = dcp->fixed_phy ?
+			of_property_read_u32(dev->of_node, "mux-index", &mux_index) :
+			-ENODATA;
+		if (!ret) {
+			dcp->fixed_mux_index = mux_index;
+			dcp->xbar = devm_mux_control_get(dev, "dp-xbar");
+			if (IS_ERR(dcp->xbar)) {
+				dev_err(dev, "Failed to get dp-xbar: %ld\n", PTR_ERR(dcp->xbar));
+				return PTR_ERR(dcp->xbar);
+			}
+			ret = mux_control_select(dcp->xbar, mux_index);
+			if (ret)
+				dev_warn(dev, "mux_control_select failed: %d\n", ret);
+			else
+				dcp->fixed_route_selected = true;
+
+			/*
+			 * Switch atcphy to DP-only. should move to a Macbook Pro
+			 * 14-/16-inch specific DP-to-HDMI drm_bridge.
+			 */
+			dcp->typec_mux = fwnode_typec_mux_get(dev_fwnode(dcp->dev));
+			if (!IS_ERR_OR_NULL(dcp->typec_mux)) {
+				struct typec_altmode alt = {
+					.svid = USB_TYPEC_DP_SID,
+				};
+				struct typec_mux_state state = {
+					.alt = &alt,
+					.mode = TYPEC_DP_STATE_C,
+				};
+				int ret = typec_mux_set(dcp->typec_mux, &state);
+				dev_info(dev, "typec_mux_set() returned: %d\n", ret);
+				if (!ret)
+					dcp->phy_managed_by_typec = true;
+			} else {
+				dev_info(dev, "fwnode_typec_mux_get() returned: %ld\n",
+						IS_ERR(dcp->typec_mux) ? PTR_ERR(dcp->typec_mux) : 0);
+				dcp->typec_mux = NULL;
+			}
+		}
+	}
+
+	ret = dcp_register_typec_routes(dcp);
+	if (ret)
+		return ret;
+
+	if (dcp->hw.iomfb_method_profile ==
+	    DCP_IOMFB_METHODS_H17P_EXTERNAL) {
+		/* Complete optional startup before the DRM master can depend on it. */
+		ret = dcp_comp_bind_h17p(dev, NULL, NULL);
+		if (ret) {
+			dcp_disable_typec_work_h17p(dcp, true);
+			return ret;
+		}
+		WRITE_ONCE(dcp->external_prepared, true);
+	}
+
+	ret = component_add(&pdev->dev, &dcp_comp_ops);
+	if (ret && dcp->external_prepared) {
+		dcp_disable_typec_work_h17p(dcp, true);
+	}
+	return ret;
+}
+
+static void dcp_platform_shutdown_h17p(struct platform_device *pdev)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	if (dcp && dcp->retain_dma && dcp->hw.iomfb_method_profile ==
+	    DCP_IOMFB_METHODS_H17P_EXTERNAL) {
+		dcp_comp_unbind_h17p(&pdev->dev, NULL, NULL);
+		return;
+	}
+
+	if (dcp && dcp->hw.adopt_live_session &&
+	    dcp->fw_compat == DCP_FIRMWARE_H17P &&
+	    dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) {
+		/*
+		 * This firmware keeps scanning across soft DPMS and has no
+		 * known stop sequence. Component unbind releases the RTKit
+		 * devres group and the piodma domain while firmware may still
+		 * access them. Stop host submissions but keep the component and
+		 * its DMA resources alive until the system resets.
+		 */
+		iomfb_queue_stop(dcp);
+		cancel_delayed_work_sync(&dcp->bl_fallback_wq);
+		dcp_backlight_stop(dcp);
+		cancel_work_sync(&dcp->bl_register_wq);
+		cancel_work_sync(&dcp->bl_update_wq);
+		return;
+	}
+
+	component_del(&pdev->dev, &dcp_comp_ops);
+}
+
+/*
+ * The display stays powered across system sleep, and the blanking present
+ * queued by the DRM and backlight suspend handlers must reach the firmware
+ * before its mailbox interrupt is suspended.
+ */
+static void dcp_drain_for_sleep(struct apple_dcp *dcp)
+{
+	int pass;
+
+	if (!dcp->hw.adopt_live_session || dcp->fw_compat != DCP_FIRMWARE_H17P ||
+	    dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G)
+		return;
+
+	/*
+	 * A completed present can schedule one more brightness present, and a
+	 * rejected one a delayed retry; run a pending retry now instead of
+	 * letting it fire after the mailbox has suspended.  Four passes cover
+	 * the first attempt and the policy's three retries.  A fade still
+	 * running ends at its target first.
+	 */
+	if (dcp_has_panel(dcp))
+		dcp_backlight_finish_fade(dcp);
+	for (pass = 0; pass < 4; pass++) {
+		flush_delayed_work(&dcp->iomfb.backlight_retry);
+		if (dcp_has_panel(dcp))
+			flush_work(&dcp->bl_update_wq);
+		if (!iomfb_queue_drain(dcp, msecs_to_jiffies(500))) {
+			dev_warn(dcp->dev, "display updates still pending at suspend\n");
+			return;
+		}
+		/*
+		 * A crashed or stopped DCP takes no more presents, so a level
+		 * still pending there can never be sent and is not waited for.
+		 * Checking after the drain, which returns at once for such a
+		 * DCP, also covers a crash during the pass.
+		 */
+		if (READ_ONCE(dcp->crashed) || READ_ONCE(dcp->iomfb.stopped))
+			return;
+		if (!dcp_backlight_active(dcp) || !dcp_backlight_pending(dcp))
+			return;
+	}
+	dev_warn(dcp->dev, "brightness change still pending at suspend\n");
+}
+
+/*
+ * DPMS off leaves the internal H17P pipe scanning out (see dcp_poweroff()),
+ * and while it scans out the firmware publishes a property to the AP on every
+ * frame.  The mailbox interrupt is not suspended, so each of those messages
+ * wakes a CPU out of suspend-to-idle about 60 times a second.  Hold the
+ * messages in the mailbox for system sleep and process them at resume.
+ * apple-drm is a consumer of this device, so its suspend handler has blanked
+ * the panel before this runs and its resume handler restores the CRTC after.
+ */
+static void dcp_hold_for_sleep(struct apple_dcp *dcp)
+{
+	if (!dcp_uses_soft_dpms(dcp) || dcp->fw_compat != DCP_FIRMWARE_H17P ||
+	    dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G ||
+	    READ_ONCE(dcp->crashed))
+		return;
+
+	iomfb_pause_presentation(dcp, true);
+	if (iomfb_queue_settle(dcp, msecs_to_jiffies(500))) {
+		iomfb_pause_presentation(dcp, false);
+		return;
+	}
+	apple_rtkit_hold_rx(dcp->rtk);
+	dcp->rx_held = true;
+}
+
+static void dcp_release_after_sleep(struct apple_dcp *dcp)
+{
+	if (!dcp->rx_held)
+		return;
+	dcp->rx_held = false;
+	apple_rtkit_resume_rx(dcp->rtk);
+	iomfb_pause_presentation(dcp, false);
+}
+
+static int dcp_platform_suspend_h17p(struct device *dev)
+{
+	struct apple_dcp *dcp = dev_get_drvdata(dev);
+
+	if (dcp_is_external_h17p(dcp)) {
+		int ret;
+
+		dcp_disable_typec_work_h17p(dcp, false);
+		ret = dcp_external_disconnect(dcp, false);
+		if (ret) {
+			dcp_enable_typec_work_h17p(dcp);
+			return ret;
+		}
+		device_set_wakeup_path(dev);
+		return 0;
+	}
+
+	dcp_drain_for_sleep(dcp);
+	/*
+	 * The Type-C route reports cable removal through
+	 * dcp_dptx_disconnect_oob(). A DP tunnel kept through the sleep stays
+	 * connected, and resume powers the CRTC back up through dcp_poweron()
+	 * as after DPMS off.
+	 */
+	dcp_disable_typec_work_h17p(dcp, false);
+	cancel_delayed_work_sync(&dcp->swap_watchdog_wq);
+
+	if (dcp->avep)
+		av_service_disconnect(dcp);
+
+	if (dcp->hdmi_hpd_irq) {
+		disable_irq(dcp->hdmi_hpd_irq);
+		if (!dcp->active_typec_route) {
+			disconnected_hpd_event_h17p(dcp->connector);
+			dcp_dptx_disconnect_h17p(dcp, 0);
+		}
+	}
+	/*
+	 * Set the device as a wakeup device, which forces its power
+	 * domains to stay on. We need this as we do not support full
+	 * shutdown properly yet.
+	 */
+	device_set_wakeup_path(dev);
+	/* Last: the steps above still talk to the coprocessor. */
+	dcp_hold_for_sleep(dcp);
+
+	return 0;
+}
+
+static int dcp_platform_resume_h17p(struct device *dev)
+{
+	struct apple_dcp *dcp = dev_get_drvdata(dev);
+
+	dcp_release_after_sleep(dcp);
+	dcp_enable_typec_work_h17p(dcp);
+	if (dcp->hdmi_hpd_irq)
+		enable_irq(dcp->hdmi_hpd_irq);
 
 	if (dcp->avep)
 		av_service_connect(dcp);
@@ -3078,6 +5775,44 @@ static const struct apple_dcp_hw_data apple_dcp_hw_dcpext = {
 	.num_dptx_ports = 2,
 };
 
+/* The internal T8140 endpoint uses the H17P method profile. */
+static const struct resource t8140_firmware_clock =
+	DEFINE_RES_MEM(0x302800000, 0xbc000);
+
+static const struct apple_dcp_hw_data apple_dcp_hw_t8140 = {
+	.num_dptx_ports = 0,
+	.adopt_live_session = true,
+	.firmware_compat = DCP_FIRMWARE_H17P,
+	.firmware_clock = &t8140_firmware_clock,
+	.firmware_display_windows = 5,
+	.firmware_scratch = 0x20000,
+	.firmware_request = 0x68000,
+};
+
+/* Separate from the established internal-panel H17P profile. */
+static const struct apple_dcp_hw_data apple_dcp_hw_t8140_external = {
+	.num_dptx_ports = 1,
+	.iomfb_method_profile = DCP_IOMFB_METHODS_H17P_EXTERNAL,
+	.adopt_live_session = false,
+	.firmware_compat = DCP_FIRMWARE_H17P,
+	.firmware_clock = &t8140_firmware_clock,
+	.firmware_display_windows = 4,
+	/* PMGR BWR agent 2 and boost agent 3 for DISPEXT0. */
+	.firmware_scratch = 0x28000,
+	.firmware_request = 0x70000,
+};
+
+/*
+ * M5 (T8142) runs H17-generation DCP firmware with the H17G method numbering
+ * and is left running by the bootloader.
+ */
+static const struct apple_dcp_hw_data apple_dcp_hw_t8142 = {
+	.num_dptx_ports = 0,
+	.iomfb_method_profile = DCP_IOMFB_METHODS_H17G,
+	.adopt_live_session = true,
+	.firmware_compat = DCP_FIRMWARE_H17P,
+};
+
 static const struct of_device_id of_match[] = {
 	{ .compatible = "apple,t6020-dcp", .data = &apple_dcp_hw_t6020,  },
 	{ .compatible = "apple,t6020-dcpext", .data = &apple_dcp_hw_t6020_dcpext, },
@@ -3087,6 +5822,9 @@ static const struct of_device_id of_match[] = {
 	{ .compatible = "apple,t8122-dcp", .data = &apple_dcp_hw_t8122, },
 	{ .compatible = "apple,t6031-dcp", .data = &apple_dcp_hw_t6031, },
 	{ .compatible = "apple,t8122-dcpext", .data = &apple_dcp_hw_t8122_dcpext, },
+	{ .compatible = "apple,t8140-dcp", .data = &apple_dcp_hw_t8140,  },
+	{ .compatible = "apple,t8140-dcpext", .data = &apple_dcp_hw_t8140_external, },
+	{ .compatible = "apple,t8142-dcp", .data = &apple_dcp_hw_t8142,  },
 	{ .compatible = "apple,dcp",       .data = &apple_dcp_hw_dcp,    },
 	{ .compatible = "apple,dcpext",    .data = &apple_dcp_hw_dcpext, },
 	{}
@@ -3094,6 +5832,7 @@ static const struct of_device_id of_match[] = {
 MODULE_DEVICE_TABLE(of, of_match);
 
 static struct platform_driver apple_platform_driver = {
+	.driver_managed_dma = true,
 	.probe		= dcp_platform_probe,
 	.remove		= dcp_platform_remove,
 	.shutdown	= dcp_platform_shutdown,

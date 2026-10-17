@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 // Copyright 2026 Dj
+// Copyright 2026 Ryan Murray
 //! Driver for the Apple SEP (Secure Enclave Processor): attaches to a running
 //! SEP over the AP mailbox, drives Touch ID enrol/verify via `/dev/sep-bio`,
 //! and registers a hwrng and a SEP-backed `trusted` key source.
@@ -24,6 +25,7 @@ mod profile;
 mod proto;
 mod refkey;
 mod refkey_seal;
+mod registration;
 mod rxring;
 mod sbio;
 mod scrd;
@@ -63,7 +65,8 @@ use kernel::{
         Arc,
         CondVar,
         CondVarTimeoutResult,
-        Mutex, //
+        Mutex,
+        MutexGuard, //
     },
     time,
     types::ForeignOwnable,
@@ -112,6 +115,11 @@ const SBIO_TIMEOUT_MS: time::Msecs = 5000;
 // request in flight, plus the capture loop's interrupt-wait backstop.
 const SLEEP_DRAIN_MS: u32 = 6000;
 static_assert!(SLEEP_DRAIN_MS as u64 > SBIO_TIMEOUT_MS as u64);
+
+// How long an open or a capture start waits for the last enrol or verify work
+// item to stop once its operation has ended. It is stopped in the same way,
+// so it gets the same bound as a capture draining before sleep.
+const WORKER_EXIT_WAIT_MS: time::Msecs = SLEEP_DRAIN_MS;
 
 const SKS_ALLOC: usize = 0x8000;
 
@@ -244,9 +252,9 @@ enum SbioOutcome {
     Other,
 }
 
-const BRINGUP_FRESH: u32 = 0;
-const BRINGUP_IDENTIFIED: u32 = 1;
-const BRINGUP_ESTABLISHED: u32 = 2;
+const BRINGUP_FRESH: u32 = registration::FRESH;
+const BRINGUP_IDENTIFIED: u32 = registration::IDENTIFIED;
+const BRINGUP_ESTABLISHED: u32 = registration::ESTABLISHED;
 
 pub(crate) struct PatchLoaded(());
 
@@ -586,6 +594,11 @@ struct SepData {
     #[pin]
     dma_ring: Mutex<Option<shmem::ShMem>>,
 
+    // One SBIO request/reply exchange at a time: the endpoint has a single
+    // out-of-line buffer and `sbio_rx` tracks a single transfer.
+    #[pin]
+    sbio_exchange_lock: Mutex<()>,
+
     #[pin]
     sbio_rx: Mutex<transfer::Reassembly>,
 
@@ -599,6 +612,7 @@ struct SepData {
     cold_restore_candidate: Atomic<bool>,
 
     sensor_calibrated: Atomic<bool>,
+    sensor_key_loaded: Atomic<bool>,
 
     enrol_open: Atomic<bool>,
 
@@ -615,6 +629,10 @@ struct SepData {
 
     last_capture_end_ns: Atomic<u64>,
 
+    // Boot-time clock at the start of the last sensor power cycle, for
+    // reporting how far into a bring-up a step failed.
+    sensor_power_ns: Atomic<u64>,
+
     device_view_synced: Atomic<bool>,
 
     keybag_designated: Atomic<bool>,
@@ -624,6 +642,9 @@ struct SepData {
     touchid_failed: Atomic<bool>,
 
     bringup: Atomic<u32>,
+    // The enclave accepted an identification of the sensor since it booted,
+    // even if the registration it began then failed.
+    sensor_held: Atomic<bool>,
 
     #[pin]
     ool_sks: Mutex<Option<OolPair>>,
@@ -686,6 +707,7 @@ struct SepData {
     registered: Atomic<bool>,
 
     shutting_down: Atomic<bool>,
+    capture_epoch: Atomic<u64>,
 
     // The system is going to sleep: no capture may start. Changed under the
     // bio session lock; `sleep_over` is signalled when it clears.
@@ -708,6 +730,10 @@ struct SepData {
     // deletion durable failed; the next deletion retries the save. Changed
     // only under `catacomb_writer`.
     deletion_unsaved: Atomic<bool>,
+
+    // Signalled when an enrol or verify work item has stopped.
+    #[pin]
+    worker_gone: CondVar,
 
     #[pin]
     rx_work: Work<SepData>,
@@ -831,6 +857,7 @@ impl SepData {
                 sks_initialized: Atomic::new(false),
                 sks_wedged: Atomic::new(0),
                 bringup: Atomic::new(BRINGUP_FRESH),
+                sensor_held: Atomic::new(false),
                 keybag_designated: Atomic::new(false),
                 bringup_started: Atomic::new(false),
                 touchid_started: Atomic::new(false),
@@ -839,11 +866,13 @@ impl SepData {
                 xart_refusal_logged: Atomic::new(false),
                 capture_refusal_logged: Atomic::new(false),
                 sensor_calibrated: Atomic::new(false),
+                sensor_key_loaded: Atomic::new(false),
                 templates_restored: Atomic::new(false),
                 cold_restore_candidate: Atomic::new(false),
                 enrol_material <- new_mutex!(None),
                 enrol_identity_candidates <- new_mutex!(KVec::new()),
                 last_capture_end_ns: Atomic::new(0),
+                sensor_power_ns: Atomic::new(0),
                 device_view_synced: Atomic::new(false),
                 phase: Atomic::new(PHASE_ATTACH),
                 ool_xarm <- new_mutex!(Some(ool_xarm)),
@@ -856,6 +885,7 @@ impl SepData {
                 scrd_probe <- new_mutex!(ScrdProbe::new()),
                 scrd_wq <- new_condvar!("SepData::scrd_wq"),
                 dma_ring <- new_mutex!(Some(dma_ring)),
+                sbio_exchange_lock <- new_mutex!(()),
                 sbio_rx <- new_mutex!(transfer::Reassembly::new()),
                 sbio_wq <- new_condvar!("SepData::sbio_wq"),
                 sbio_ready: Atomic::new(false),
@@ -878,11 +908,13 @@ impl SepData {
                 settle_idle_ticks: Atomic::new(0),
                 registered: Atomic::new(false),
                 shutting_down: Atomic::new(false),
+                capture_epoch: Atomic::new(0),
                 suspending: Atomic::new(false),
                 sleep_over <- new_condvar!("SepData::sleep_over"),
                 captures_running: Atomic::new(0),
                 catacomb_writer <- new_mutex!(()),
                 deletion_unsaved: Atomic::new(false),
+                worker_gone <- new_condvar!("SepData::worker_gone"),
                 rx_work <- new_work!("SepData::rx_work"),
                 enrol_work <- new_work!("SepData::enrol_work"),
                 verify_work <- new_work!("SepData::verify_work"),
@@ -1076,6 +1108,9 @@ impl SepData {
     }
 
     fn send(&self, msg: Message) -> Result<()> {
+        if self.shutting_down.load(Relaxed) {
+            return Err(ENODEV);
+        }
         self.mbox.lock().as_ref().ok_or(ENODEV)?.send(msg, false)
     }
 
@@ -1092,6 +1127,10 @@ impl SepData {
         let mut remaining = time::msecs_to_jiffies(op.timeout_ms());
         let mut guard = self.control.lock();
         loop {
+            if self.shutting_down.load(Relaxed) {
+                guard.abandon(idx);
+                return Err(ENODEV);
+            }
             if let Some(reply) = guard.take_reply(idx) {
                 guard.release(idx);
                 drop(guard);
@@ -1546,7 +1585,8 @@ impl SepData {
         let mut remaining = time::msecs_to_jiffies(ms);
         let mut guard = self.scrd_probe.lock();
         loop {
-            if guard.captured.len() >= until || remaining == 0 {
+            if self.shutting_down.load(Relaxed)
+                || guard.captured.len() >= until || remaining == 0 {
                 return;
             }
             match self
@@ -2053,20 +2093,21 @@ impl SepData {
 
     fn remove(&self) {
         self.shutting_down.store(true, Relaxed);
+        bio::release(&mut self.bio_session.lock());
+        self.worker_gone.notify_all();
+        self.rng_shutdown.store(true, Relaxed);
+        self.control_wq.notify_all();
+        self.sbio_wq.notify_all();
+        self.sks_wq.notify_all();
+        self.scrd_wq.notify_all();
         pm::unregister();
         // Release any capture start still held for a resume that will not be
         // reported now.
         self.sleep_finished();
-        self.release_firmware_mapping();
         trusted::unregister();
         self.unregister_fv_kernel();
 
         let dev = self.bio_dev.lock().take();
-        if dev.is_some() {
-            bio::release(&mut self.bio_session.lock());
-            sensor::power(false);
-            sensor::unregister_driver();
-        }
         drop(dev);
 
         self.rng_shutdown.store(true, Relaxed);
@@ -2090,6 +2131,10 @@ impl SepData {
                 DelayedWork::raw_as_work(core::ptr::addr_of!(self.settle_work)).cast(),
             );
         }
+
+        sensor::power(false);
+        sensor::unregister_driver();
+        self.release_firmware_mapping();
 
         let _ = self.store.lock().take();
         let _ = self.host_store.lock().take();
@@ -2243,14 +2288,17 @@ impl WorkItem<ENROL_WORK_ID> for SepData {
     type Pointer = Arc<SepData>;
 
     fn run(this: Arc<SepData>) {
-        // Taken before `capture_begin`, so the sleep drain never counts the
-        // wait for it.
-        let _writer = this.catacomb_writer.lock();
-        if this.shutting_down.load(Relaxed) || !this.capture_begin() {
-            return;
+        let epoch = this.capture_epoch.load(Relaxed);
+        {
+            // Taken before `capture_begin`, so the sleep drain never counts the
+            // wait for it.
+            let _writer = this.catacomb_writer.lock();
+            if !this.shutting_down.load(Relaxed) && this.capture_begin() {
+                this.run_enrolment();
+                this.capture_end();
+            }
         }
-        this.run_enrolment();
-        this.capture_end();
+        this.capture_worker_stopped(epoch);
     }
 }
 
@@ -2258,18 +2306,25 @@ impl WorkItem<VERIFY_WORK_ID> for SepData {
     type Pointer = Arc<SepData>;
 
     fn run(this: Arc<SepData>) {
-        let _writer = this.catacomb_writer.lock();
-        if this.shutting_down.load(Relaxed) || !this.capture_begin() {
-            return;
+        let epoch = this.capture_epoch.load(Relaxed);
+        {
+            let _writer = this.catacomb_writer.lock();
+            if !this.shutting_down.load(Relaxed) && this.capture_begin() {
+                this.run_verify();
+                this.capture_end();
+            }
         }
-        this.run_verify();
-        this.capture_end();
+        this.capture_worker_stopped(epoch);
     }
 }
 
 
 struct SepDriver(Arc<SepData>);
 
+// Deliberately not exported as a module alias: udev must not load the driver
+// on its own. The loader service loads it once the iBoot system container's
+// partition link exists, which the xART store needs at probe, and only after
+// the owner has enabled it (or chosen read-only) for this Mac.
 const OF_TABLE: kernel::device_id::IdArray<of::DeviceId, (), 1> =
     kernel::device_id::IdArray::new([(of::DeviceId::new(c"apple,sep"), ())]);
 
@@ -2405,7 +2460,7 @@ module! {
         },
         provision_keybag: u8 {
             default: 1,
-            description: "Create the Linux identity keybag when none exists; requires xart_writes=1",
+            description: "Create the Linux identity keybag when none exists; set to 0 to disable first-boot provisioning; requires xart_writes=1",
         },
         os_uuid_hi: u64 {
             default: 0,
@@ -2414,6 +2469,10 @@ module! {
         os_uuid_lo: u64 {
             default: 0,
             description: "Low 64 bits of an explicit xART OS UUID",
+        },
+        sensor_trace: u8 {
+            default: 0,
+            description: "Trace Touch ID sensor registration steps and timing, never sensor data",
         },
         xarm_trace: u8 {
             default: 0,

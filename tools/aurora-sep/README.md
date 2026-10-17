@@ -34,12 +34,29 @@ systemctl daemon-reload
 systemctl enable aurora-sep.service
 ```
 
-`xart_writes=0` remains the default. `load-driver` explicitly opts into writes
-and must only be enabled on a machine whose APFS `.gl` extent passes the
-driver's narrow ownership checks: one physical extent, no snapshots or revert
+The loader waits up to 120 s for the enclave to seal and unseal a trusted key,
+then up to 60 s for `/dev/sep-bio`, and logs how long each took. On J700 the
+enclave's key store arrives around 43 s after boot. To change a wait, set
+`AURORA_SEP_READY_TIMEOUT` or `AURORA_SEP_DEVICE_TIMEOUT` in whole seconds,
+for example with `systemctl edit aurora-sep.service`:
+
+```ini
+[Service]
+Environment=AURORA_SEP_READY_TIMEOUT=180
+```
+
+The driver defaults to `xart_writes=1`. It exports no module alias, so udev
+never loads it on its own: the service above loads it, once the iBoot system
+container is reachable. Writes are accepted only when the APFS `.gl`
+extent passes the driver's narrow ownership checks: one physical extent, no snapshots or revert
 state, and a single extent reference owned by the `.gl` inode. The kernel
 resolves that extent from checksum-validated APFS metadata; unsupported layouts
-fail closed. The opt-in has been tested on m2 with identity-keybag provisioning,
+fail closed. Set `options apple_sep xart_writes=0 provision_keybag=0` in a
+modprobe configuration to retain read-only operation. `provision_keybag=1`
+is also the default: first boot creates the Linux identity needed for trusted
+keys, and later boots recover that identity and its machine reference key.
+An existing unreadable or invalid identity is not silently replaced.
+Enabling writes has been tested on m2 with identity-keybag provisioning,
 trusted-key seal/unseal, and reboot reload. The raw iBoot container hash did not
 change in those tests, so an actual xART write was **not** validated. Do not
 infer that all SEP or Touch ID operations work with a read-only GigaLocker.
@@ -73,6 +90,10 @@ meson setup build -Dprefix=/usr -Ddrivers=default -Dintrospection=false \
 ninja -C build
 meson test -C build --print-errorlogs
 ```
+
+The aurora driver for libfprint is also maintained in
+https://github.com/aurora-silicon/aurora-sep-userspace, as source and as
+distribution packages.
 
 Adjust the patch path for your checkout. The patch includes a fix for an
 upstream Meson test loop when introspection is disabled. In the Aurora
@@ -144,3 +165,125 @@ On Omarchy, run `omarchy-apply-lock` once after enrollment. The Quickshell
 lock screen then selects `omarchy-lock-fingerprint` automatically and accepts
 Touch ID through fprintd. Hyprlock's separate fingerprint switch is not used
 by the Quickshell lock screen.
+
+## Packages
+
+`packaging/` builds `aurora-sep`, with the loader, its service and the fprintd
+policy, as a distribution package. libfprint with the aurora driver comes from
+https://github.com/aurora-silicon/aurora-sep-userspace; install both. Installing
+`aurora-sep` lets fprintd load the driver with xART writes on, as above.
+
+On Fedora, `packaging/fedora/build.sh` builds `aurora-sep`. It installs build
+dependencies, so run it in a throwaway container from the top of this tree:
+
+```sh
+mkdir rpms
+podman run --rm -v "$PWD":/src:ro,z -v "$PWD/rpms":/out:z \
+    registry.fedoraproject.org/fedora:45 \
+    /src/tools/aurora-sep/packaging/fedora/build.sh /out
+sudo dnf install rpms/aurora-sep-1-*.noarch.rpm
+```
+
+On Arch Linux and Arch Linux ARM, build `aurora-sep`:
+
+```sh
+cd tools/aurora-sep/packaging/arch/aurora-sep && makepkg -si
+```
+
+fprintd starts the loader the first time it runs. Loading the driver at boot
+instead has the enclave ready before the login screen asks for a fingerprint.
+The Fedora package enables that with a systemd preset when it is first
+installed; on Arch, enable it yourself:
+
+```sh
+sudo systemctl enable aurora-sep.service
+```
+
+The driver attaches to the enclave once per boot, so reboot rather than
+restarting the service or reloading `apple_sep`. To move from the manual
+install above, remove `/usr/local/sbin/aurora-sep-load`,
+`/etc/systemd/system/aurora-sep.service`,
+`/etc/systemd/system/fprintd.service.d/aurora.conf` and any drop-in that points
+fprintd at another libfprint, then run `systemctl daemon-reload` and
+`systemctl reenable aurora-sep.service`. To go back to the distribution's
+libfprint, remove `aurora-sep` and run `dnf distro-sync libfprint` or
+`pacman -S libfprint`.
+
+## Desktop integration
+
+The first open of `/dev/sep-bio` activates Touch ID: the driver restores the
+enrolled fingerprints from the enclave before the open returns, which takes
+a few seconds. `aurora-sep-ready.service`, which `aurora-sep.service` pulls
+in, makes that open at boot, before fprintd starts. The lock screen, sudo
+and polkit then find the reader and the fingerprints ready, and the first
+fingerprint request does not wait for the restore. A failed open is only
+logged. The packages install it; by hand:
+
+```sh
+install -Dm755 aurora-sep-ready /usr/local/sbin/aurora-sep-ready
+install -Dm644 aurora-sep-ready.service /etc/systemd/system/aurora-sep-ready.service
+systemctl daemon-reload
+```
+
+fprintd exits after 30 s without a client, and each new start probes the
+reader again, while the login and lock screens ask for the reader as they
+come up. `fprintd-no-timeout.conf.in` keeps it running so that it answers
+them at once. The packages fill in where the distribution keeps fprintd; by
+hand, with `/usr/lib/fprintd` on Arch:
+
+```sh
+sed 's|@FPRINTD@|/usr/libexec/fprintd|' fprintd-no-timeout.conf.in \
+    >/etc/systemd/system/fprintd.service.d/aurora-sep-no-timeout.conf
+```
+
+The Touch ID sensor is the power button. A touch to authenticate goes to the
+enclave and never reaches logind as a key press, but a press does, and logind
+cannot tell a press meant for the sensor from one meant for the button. Its
+default is to power off. `logind-aurora-sep.conf` makes a short press
+suspend instead, so pressing while authenticating loses nothing and the next
+press wakes the machine, and holding the button for 5 s powers off cleanly.
+GNOME sessions and the GDM login screen handle a short press themselves
+(`power-button-action`, `suspend` by default); the setting covers consoles
+and other desktops. It takes effect at the next boot. By hand:
+
+```sh
+install -Dm644 logind-aurora-sep.conf /etc/systemd/logind.conf.d/aurora-sep.conf
+```
+
+GNOME Shell 51 offers fingerprint only on the lock screen, never on the
+login screen, and `org.gnome.login-screen enable-fingerprint-authentication`
+(true by default) cannot change that: the greeter connects its fingerprint
+reader only when it re-authenticates a running session. That is GNOME's
+choice, because a fingerprint cannot unlock the login keyring: after a
+fingerprint login, the first application that wants a stored secret asks
+for the password. `aurora-sep-greeter-fingerprint.service` lifts the
+restriction for those who want it. At boot it copies the one greeter source
+file that holds the check out of the installed GNOME Shell, drops the check,
+and serves the copy to the login screen's shell alone through a GResource
+overlay. When the check is not exactly as expected, for example after a
+GNOME update, it changes nothing. The enable key above still applies.
+
+The login screen asks fprintd for the reader once, as it comes up, so the
+same unit also holds it back until `aurora-sep-ready.service` has finished:
+a few seconds on a healthy boot, but as long as the enclave takes when it is
+slow, up to 90 s after boot. Without fingerprint at the login screen that
+wait buys nothing, which is why both are one switch, off by default. It
+needs `gresource` from glib2-devel. With the packages, or after installing
+it by hand, turn it on with `systemctl enable`:
+
+```sh
+install -Dm755 aurora-sep-greeter-fingerprint /usr/local/sbin/aurora-sep-greeter-fingerprint
+install -Dm644 aurora-sep-greeter-fingerprint.service /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable aurora-sep-greeter-fingerprint.service
+```
+
+Disabling it and rebooting returns the login screen to GNOME's behaviour.
+
+## Biometric userspace header
+
+The canonical ioctl ABI is `include/uapi/linux/apple-sep.h`. Export this
+checkout's headers with `make headers_install INSTALL_HDR_PATH=<directory>`
+and add that directory's `include` to the libfprint build include path. The
+aurora driver in aurora-sep-userspace uses `<linux/apple-sep.h>` directly; it
+has no copied ABI header. Interface version, ioctl numbers and fixed-width layouts are unchanged.

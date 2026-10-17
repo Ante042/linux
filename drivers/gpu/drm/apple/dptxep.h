@@ -30,6 +30,7 @@ enum dptx_apcall {
 	DPTX_APCALL_DEVICE_NOT_RESPONDING = 22,
 	DPTX_APCALL_DEVICE_BUSY_TIMEOUT = 23,
 	DPTX_APCALL_DEVICE_NOT_STARTED = 24,
+	DPTX_APCALL_GET_VIRTUAL_DEVICE_MODE = 26,
 };
 
 #define DCPDPTX_REMOTE_PORT_CORE GENMASK(3, 0)
@@ -49,6 +50,8 @@ struct apple_epic_service;
 
 struct dptx_port {
 	bool enabled, connected;
+	/* A published session closed; unlike initial discovery, this is terminal. */
+	bool closed;
 	struct completion enable_completion;
 	struct completion linkcfg_completion;
 	u32 unit;
@@ -59,6 +62,7 @@ struct dptx_port {
 	u32 lane_count;
 	u32 link_rate, pending_link_rate;
 	u32 drive_settings[2];
+	u32 trained_voltage[4], trained_pre[4];
 	/*
 	 * Per-boot invocation counters for the validate/connect/request/
 	 * release AFK calls, used together with the caller return address

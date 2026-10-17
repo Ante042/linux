@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0-only */
+// SPDX-License-Identifier: GPL-2.0-only
 #include "mt7932.h"
 
 static bool mt_bss_tx_allowed(struct mt7932 *m);
@@ -35,6 +35,25 @@ void mt_data_clean_locked(struct mt7932 *m)
 		netif_wake_queue(m->netdev);
 }
 
+/*
+ * The stack marks a packet that has another one right behind it with
+ * netdev_xmit_more(), so the TX0 doorbell is rung once per burst instead of
+ * once per packet, and at least every MT7932_TX_BATCH packets so that the
+ * device starts on a long burst early.
+ */
+#define MT7932_TX_BATCH 64
+
+/* data_lock held: hand every published TX0 descriptor to the device. */
+void mt_data_kick_locked(struct mt7932 *m)
+{
+	struct mt7932_ring *q = &m->tx[0];
+
+	if (!m->data_unkicked)
+		return;
+	m->data_unkicked = 0;
+	mt_write(m, q->reg + 8, q->head);
+}
+
 void mt_data_clean(struct mt7932 *m)
 {
 	unsigned long flags;
@@ -42,6 +61,10 @@ void mt_data_clean(struct mt7932 *m)
 	if (!READ_ONCE(m->data_ready))
 		return;
 	spin_lock_irqsave(&m->data_lock, flags);
+	/* The queue can be stopped from outside ndo_start_xmit() in the middle
+	 * of a burst; no descriptor waits longer than the next interrupt.
+	 */
+	mt_data_kick_locked(m);
 	mt_data_clean_locked(m);
 	spin_unlock_irqrestore(&m->data_lock, flags);
 }
@@ -59,10 +82,12 @@ void mt_bss_presence(struct mt7932 *m, const struct mt7932_event *event)
 	spin_lock_irqsave(&m->data_lock, flags);
 	m->bss_absent = !!body[1];
 	m->bss_quota = body[2];
-	if (!mt_bss_tx_allowed(m))
+	if (!mt_bss_tx_allowed(m)) {
 		netif_stop_queue(m->netdev);
-	else if (READ_ONCE(m->data_ready))
+		mt_data_kick_locked(m);
+	} else if (READ_ONCE(m->data_ready)) {
 		mt_data_clean_locked(m);
+	}
 	spin_unlock_irqrestore(&m->data_lock, flags);
 	dev_dbg_ratelimited(&m->pdev->dev, "BSS_PRESENCE: absent=%u quota=%u\n",
 			    !!body[1], body[2]);
@@ -122,6 +147,7 @@ netdev_tx_t mt_net_xmit(struct sk_buff *skb, struct net_device *netdev)
 	slot = q->head;
 	if (!mt_bss_tx_allowed(m) || m->data_live[slot] || q->queued >= q->count - 1) {
 		netif_stop_queue(netdev);
+		mt_data_kick_locked(m);
 		spin_unlock_irqrestore(&m->data_lock, flags);
 		return NETDEV_TX_BUSY;
 	}
@@ -147,21 +173,47 @@ netdev_tx_t mt_net_xmit(struct sk_buff *skb, struct net_device *netdev)
 	q->head = (slot + 1) % q->count;
 	q->queued++;
 	dma_wmb();
-	mt_write(m, q->reg + 8, q->head);
+	m->data_unkicked++;
 	mt_bss_tx_account(m);
 	m->station_tx_packets++;
 	m->station_tx_bytes += skb->len;
 	if (!mt_bss_tx_allowed(m) || m->data_live[q->head] || q->queued >= q->count - 1)
 		netif_stop_queue(netdev);
+	if (!netdev_xmit_more() || netif_queue_stopped(netdev) ||
+	    m->data_unkicked >= MT7932_TX_BATCH)
+		mt_data_kick_locked(m);
 	spin_unlock_irqrestore(&m->data_lock, flags);
 	netdev->stats.tx_packets++;
 	netdev->stats.tx_bytes += skb->len;
 	dev_kfree_skb_any(skb);
 	return NETDEV_TX_OK;
 drop:
+	/* The burst ends here: publish what earlier packets queued. */
+	if (!netdev_xmit_more() && READ_ONCE(m->data_ready)) {
+		spin_lock_irqsave(&m->data_lock, flags);
+		mt_data_kick_locked(m);
+		spin_unlock_irqrestore(&m->data_lock, flags);
+	}
 	netdev->stats.tx_dropped++;
 	dev_kfree_skb_any(skb);
 	return NETDEV_TX_OK;
+}
+
+/* Width in MHz of a rate decoded by mt7932_rx_rate(). */
+static int mt_rate_width(enum rate_info_bw bw)
+{
+	switch (bw) {
+	case RATE_INFO_BW_20:
+		return 20;
+	case RATE_INFO_BW_40:
+		return 40;
+	case RATE_INFO_BW_80:
+		return 80;
+	case RATE_INFO_BW_160:
+		return 160;
+	default:
+		return INT_MAX;
+	}
 }
 
 void mt_data_receive(struct mt7932 *m, const struct mt7932_rx_frame *frame)
@@ -182,6 +234,13 @@ void mt_data_receive(struct mt7932 *m, const struct mt7932_rx_frame *frame)
 		m->netdev->stats.rx_dropped++;
 		goto unlock;
 	}
+	if (!mt7932_rx_protection_ok(frame, m->connect_open)) {
+		m->netdev->stats.rx_dropped++;
+		dev_dbg_ratelimited(&m->pdev->dev,
+				    "RX_UNPROTECTED_DROPPED: cipher=%u mismatch=%u\n",
+				    frame->sec_mode, frame->cipher_mismatch);
+		goto unlock;
+	}
 	skb = netdev_alloc_skb_ip_align(m->netdev, frame->length);
 	if (!skb) {
 		m->netdev->stats.rx_dropped++;
@@ -200,19 +259,15 @@ void mt_data_receive(struct mt7932 *m, const struct mt7932_rx_frame *frame)
 	if (frame->signal_valid && signal > -128) {
 		m->station_signal = signal;
 		m->station_signal_valid = true;
+		mt_cqm_signal(m, signal);
 	}
 	if (frame->unicast && frame->rate_valid) {
-		m->station_rx_rate_valid = mt7932_rx_rate(frame->rxv, m->phy_cap[4],
-						       &m->station_rx_rate);
-		/* Report only RX widths admitted by the negotiated channel.
-		 * The qualified decoder already bounds mode/MCS/NSS/GI; the
-		 * association remains 20 MHz on 2 GHz and at most 80 MHz on 5 GHz.
-		 */
-		if (((frame->rxv >> 12) & 7) >
-		    (m->connect_chandef.width == NL80211_CHAN_WIDTH_80 ? 2 :
-		     m->connect_chandef.width == NL80211_CHAN_WIDTH_40 ? 1 : 0) ||
-		    (frame->channel <= 14 && ((frame->rxv >> 12) & 7)) ||
-		    (frame->channel > 14 && !((frame->rxv >> 24) & 15)))
+		struct rate_info *rate = &m->station_rx_rate;
+
+		m->station_rx_rate_valid = mt7932_rx_rate(frame->rxv, m->phy_cap[4], rate);
+		/* No CCK on 5 GHz, and no rate wider than the associated channel. */
+		if ((frame->channel > 14 && !((frame->rxv >> 24) & 15)) ||
+		    mt_rate_width(rate->bw) > cfg80211_chandef_get_width(&m->connect_chandef))
 			m->station_rx_rate_valid = false;
 		m->station_rx_rate_time = jiffies;
 	}
@@ -265,10 +320,10 @@ int mt_data_prepare(struct mt7932 *m)
 	/* The selected response parser establishes sequence completion only,
 	 * not a command-specific firmware status. No payload-status invention.
 	 */
-	dev_info(&m->pdev->dev, "MAC_RTS_RESPONSE: sequence matched, EID=%02x length=%zu\n",
-		 m->reply[28], m->reply_length);
+	dev_dbg(&m->pdev->dev, "MAC_RTS_RESPONSE: sequence matched, EID=%02x length=%zu\n",
+		m->reply[28], m->reply_length);
 	/* Publish the initialized data_lock and DMA state to failure handlers. */
 	smp_store_release(&m->data_ready, true);
-	dev_info(&m->pdev->dev, "ETHERNET_PREPARED: TX0 retained coherent slots=512, RX translation enabled\n");
+	dev_dbg(&m->pdev->dev, "ETHERNET_PREPARED: TX0 retained coherent slots=512, RX translation enabled\n");
 	return 0;
 }

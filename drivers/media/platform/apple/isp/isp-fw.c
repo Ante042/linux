@@ -96,7 +96,7 @@ static void apple_isp_power_down_domains(struct apple_isp *isp)
 		ret = pm_runtime_put_sync(isp->pd_dev[i]);
 		if (ret < 0)
 			dev_err(isp->dev,
-				"Failed to power up power domain %d: %d\n", i, ret);
+				"Failed to power down power domain %d: %d\n", i, ret);
 	}
 
 	isp->pds_active = false;
@@ -456,7 +456,11 @@ void apple_isp_free_firmware_surface(struct apple_isp *isp)
 
 static void isp_firmware_shutdown_stage2(struct apple_isp *isp)
 {
+	if (!isp->extra_surf)
+		return;
+
 	isp_free_surface(isp, isp->extra_surf);
+	isp->extra_surf = NULL;
 }
 
 static void isp_write_bootargs(struct apple_isp *isp, void *virt,
@@ -499,13 +503,12 @@ static void isp_write_bootargs_h16(struct apple_isp *isp, void *virt,
 
 static int isp_firmware_boot_stage2(struct apple_isp *isp)
 {
-	bool h16 = isp->hw->fw_abi == ISP_FW_ABI_H17;
-	size_t args_size = h16 ? sizeof(struct isp_firmware_bootargs_h16) :
+	bool h17 = isp->hw->fw_abi == ISP_FW_ABI_H17;
+	size_t args_size = h17 ? sizeof(struct isp_firmware_bootargs_h16) :
 				 sizeof(struct isp_firmware_bootargs);
 	size_t cmd_size = ISP_CMD_AREA_SIZE(isp_num_capmeta(isp));
 	dma_addr_t args_iova, cmd_iova;
 	void *args_virt, *cmd_virt;
-	int err;
 
 	u32 num_ipc_chans = isp_gpio_read32(isp, ISP_GPIO_0);
 	u32 args_offset = isp_gpio_read32(isp, ISP_GPIO_1);
@@ -524,7 +527,7 @@ static int isp_firmware_boot_stage2(struct apple_isp *isp)
 			 num_ipc_chans);
 
 	/* Only hand the H16 descriptor to firmware that asks for it. */
-	if (h16 && !(desc_flags & ISP_GPIO2_H16_DESCRIPTOR)) {
+	if (h17 && !(desc_flags & ISP_GPIO2_H16_DESCRIPTOR)) {
 		dev_err(isp->dev,
 			"firmware did not request the H16 boot descriptor (0x%x)\n",
 			desc_flags);
@@ -562,7 +565,7 @@ static int isp_firmware_boot_stage2(struct apple_isp *isp)
 	isp->ipc_boot_size = args_size + 0x40 + cmd_size;
 	isp->cmd_virt = cmd_virt;
 
-	if (h16)
+	if (h17)
 		isp_write_bootargs_h16(isp, args_virt, args_offset);
 	else
 		isp_write_bootargs(isp, args_virt, args_iova);
@@ -578,19 +581,18 @@ static int isp_firmware_boot_stage2(struct apple_isp *isp)
 	/* Wait for ISP_GPIO_7 to 0xf7fbdff9 -> 0x8042006 */
 	isp_gpio_write32(isp, ISP_GPIO_7, 0xf7fbdff9);
 
+	/*
+	 * The firmware may already use the extra heap: it is freed only once
+	 * the coprocessor has stopped, see isp_firmware_boot().
+	 */
 	if (isp_gpio_wait(isp, ISP_GPIO_7, 0x8042006)) {
 		isp_err(isp,
 			"never received second magic number from firmware\n");
-		err = -ENODEV;
-		goto free_extra;
+		return -ENODEV;
 	}
 	isp_dbg(isp, "got second magic number from firmware\n");
 
 	return 0;
-
-free_extra:
-	isp_free_surface(isp, isp->extra_surf);
-	return err;
 }
 
 static inline struct isp_channel *isp_get_chan_index(struct apple_isp *isp,
@@ -893,32 +895,49 @@ static void isp_collect_gc_surface(struct apple_isp *isp)
 	}
 }
 
+/*
+ * Stop the coprocessor and power its domains down, then release the memory
+ * the firmware may still be using: its channel table, extra heap and the
+ * surfaces it requested.
+ */
+static void isp_firmware_stop(struct apple_isp *isp)
+{
+	isp_firmware_shutdown_stage1(isp);
+
+	isp_firmware_shutdown_stage3(isp);
+	isp_firmware_shutdown_stage2(isp);
+	isp_collect_gc_surface(isp);
+}
+
 static int isp_firmware_boot(struct apple_isp *isp)
 {
 	int err;
 
 	err = isp_firmware_boot_stage1(isp);
 	if (err < 0) {
+		/* Stage 1 stops the coprocessor and powers it down itself. */
 		isp_err(isp, "failed firmware boot stage 1: %d\n", err);
-		goto garbage_collect;
+		isp_collect_gc_surface(isp);
+		return err;
 	}
 
+	/* From here on the firmware runs, and may use what it was given. */
 	err = isp_firmware_boot_stage2(isp);
 	if (err < 0) {
 		isp_err(isp, "failed firmware boot stage 2: %d\n", err);
-		goto shutdown_stage1;
+		goto stop;
 	}
 
 	err = isp_firmware_boot_stage3(isp);
 	if (err < 0) {
 		isp_err(isp, "failed firmware boot stage 3: %d\n", err);
-		goto shutdown_stage2;
+		goto stop;
 	}
 
 	err = isp_enable_irq(isp);
 	if (err < 0) {
 		isp_err(isp, "failed to enable interrupts: %d\n", err);
-		goto shutdown_stage3;
+		goto stop;
 	}
 
 	err = isp_start_command_processor(isp);
@@ -933,14 +952,8 @@ static int isp_firmware_boot(struct apple_isp *isp)
 
 disable_irqs:
 	isp_disable_irq(isp);
-shutdown_stage3:
-	isp_firmware_shutdown_stage3(isp);
-shutdown_stage2:
-	isp_firmware_shutdown_stage2(isp);
-shutdown_stage1:
-	isp_firmware_shutdown_stage1(isp);
-garbage_collect:
-	isp_collect_gc_surface(isp);
+stop:
+	isp_firmware_stop(isp);
 	return err;
 }
 
@@ -955,11 +968,7 @@ static void isp_firmware_shutdown(struct apple_isp *isp)
 	if (isp_stop_command_processor(isp))
 		dev_warn(isp->dev, "firmware did not suspend, stopping it\n");
 	isp_disable_irq(isp);
-	isp_firmware_shutdown_stage1(isp);
-
-	isp_firmware_shutdown_stage3(isp);
-	isp_firmware_shutdown_stage2(isp);
-	isp_collect_gc_surface(isp);
+	isp_firmware_stop(isp);
 }
 
 /*

@@ -182,7 +182,7 @@ static struct dcp_display_mode *parse_blob(struct parser_blob *blob,
 	if (ret)
 		return ERR_PTR(ret);
 	ctx.dcp = &parser_dcp;
-	return enumerate_modes(&ctx, count, 500, 300, notch, internal);
+	return enumerate_modes(&ctx, count, 500, 300, notch, internal, false);
 }
 
 static void parser_score_presence(struct kunit *test)
@@ -819,8 +819,9 @@ static void parser_route_programming_guard(struct kunit *test)
 	dcp->typec_follow_gen = 4;
 	KUNIT_EXPECT_FALSE(test, dcp_crtc_needs_route_start(dcp));
 	dcp->typec_follow_gen = 5;
+	/* A moved Thunderbolt tunnel starts its link as a direct route does. */
 	dcp->active_typec_route->tunnel = true;
-	KUNIT_EXPECT_FALSE(test, dcp_crtc_needs_route_start(dcp));
+	KUNIT_EXPECT_TRUE(test, dcp_crtc_needs_route_start(dcp));
 	dcp->active_typec_route->tunnel = false;
 	KUNIT_EXPECT_FALSE(test, dcp_crtc_route_ready(&crtc->base, &state, true));
 	crtc_state.connector_mask = 0;

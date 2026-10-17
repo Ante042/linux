@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 // Copyright 2026 Dj
+// Copyright 2026 Ryan Murray
 
 //! Typed platform profiles for the SEP driver.
 //!
@@ -146,6 +147,8 @@ pub(crate) struct PlatformProfile {
     pub(crate) firmware_region: &'static CStr,
     /// Identity keybag CREATE_KEYBAG field encoding (per-SoC; see [`KeybagCreate`]).
     pub(crate) keybag_create: KeybagCreate,
+    /// Require nonce authentication and signed sensor material before capture.
+    pub(crate) nonce_session: bool,
     /// Key-store protocol generation (see [`KeyStore`]).
     pub(crate) key_store: KeyStore,
     /// Platforms with reboot-tested owner export and user-before-master saves.
@@ -183,6 +186,7 @@ const T8103: PlatformProfile = PlatformProfile {
         cpx_encryption_mode: 2,
     },
     persistent_enrol: true,
+    nonce_session: false,
 };
 
 /// M1 Pro (J316s). The M1 family cold-boots its SEP like T8103, so the boot
@@ -219,6 +223,7 @@ const T6000: PlatformProfile = PlatformProfile {
         cpx_encryption_mode: 2,
     },
     persistent_enrol: true,
+    nonce_session: false,
 };
 
 const T6020: PlatformProfile = PlatformProfile {
@@ -248,6 +253,7 @@ const T6020: PlatformProfile = PlatformProfile {
     },
     key_store: KeyStore::Variant5,
     persistent_enrol: true,
+    nonce_session: false,
 };
 
 /// M2 Pro/Max on system firmware before 26.3. Their enclave refuses the
@@ -299,6 +305,7 @@ const T8140: PlatformProfile = PlatformProfile {
         bag_type: 0,
         arg: -1,
     },
+    nonce_session: true,
 };
 
 /// MacBook Air M2 (J413, J415). iBoot leaves the SEP running and the Mesa
@@ -340,6 +347,7 @@ const T8112: PlatformProfile = PlatformProfile {
     },
     key_store: KeyStore::Variant5,
     persistent_enrol: true,
+    nonce_session: false,
 };
 
 /// MacBook Air M3 (J613, J615). The J613 and J615 ADTs (26.6.2, 25G83) are
@@ -385,7 +393,7 @@ static_assert!(T8122.wide_dma_mask);
 ///
 /// The root property is a NUL-separated list, so whole entries are compared
 /// instead of substrings: `apple,t8103` cannot match a longer unrelated value.
-fn machine_has(compatible: &[u8]) -> bool {
+pub(crate) fn machine_has(compatible: &[u8]) -> bool {
     let Some(root) = of::root() else {
         return false;
     };

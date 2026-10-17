@@ -596,9 +596,12 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 	scoped_guard(mutex, &appledwc->lock)
 		ret = dwc3_apple_init(appledwc, DWC3_APPLE_HOST);
 	if (ret) {
-		/* dwc3_apple_init() has already undone the core initialisation */
+		/*
+		 * dwc3_apple_init() has already undone the core initialisation:
+		 * release the core's resources without a second shutdown.
+		 */
 		if (appledwc->state != DWC3_APPLE_PROBE_PENDING)
-			dwc3_core_remove(&appledwc->dwc);
+			dwc3_core_remove_no_shutdown(&appledwc->dwc);
 		usb_role_switch_unregister(appledwc->role_sw);
 		return dev_err_probe(dev, ret, "Failed to start host mode\n");
 	}
@@ -621,7 +624,15 @@ static void dwc3_apple_remove(struct platform_device *pdev)
 	 * dwc3_apple_exit can be called unconditionally because it checks the state itself.
 	 */
 	dwc3_apple_exit(appledwc);
-	if (appledwc->state != DWC3_APPLE_PROBE_PENDING)
+	if (appledwc->state == DWC3_APPLE_PROBE_PENDING)
+		return;
+	/*
+	 * dwc3_apple_exit() has stopped the host and the core of a fixed-hub
+	 * controller: release its resources without running either exit twice.
+	 */
+	if (appledwc->fixed_hub)
+		dwc3_core_remove_no_shutdown(&appledwc->dwc);
+	else
 		dwc3_core_remove(&appledwc->dwc);
 }
 

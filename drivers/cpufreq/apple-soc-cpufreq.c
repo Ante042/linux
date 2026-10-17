@@ -13,7 +13,7 @@
 #include <linux/ktime.h>
 #include <linux/math64.h>
 #include <linux/pm_qos.h>
-#include <linux/soc/apple/pmp-report-neo.h>
+#include <linux/soc/apple/pmp-report.h>
 #include <linux/spinlock.h>
 #include <linux/tick.h>
 #include <linux/timer.h>
@@ -525,7 +525,7 @@ static void apple_fast_die_sample(struct apple_fast_die *fd)
 	u8 effort;
 	int ret;
 
-	ret = apple_neo_pmp_report_fast_die_effort(fd->report, fd->lane, &effort);
+	ret = apple_pmp_report_fast_die_effort(fd->report, fd->lane, &effort);
 	if (!ret) {
 		limit = apple_fast_die_limit(fd, effort);
 		fd->waiting = false;

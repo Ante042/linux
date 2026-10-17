@@ -552,6 +552,65 @@ pub(crate) struct GpuManager {
     garbage_contexts: Mutex<KVec<KBox<fw::types::GpuObject<fw::workqueue::GpuContextData>>>>,
 }
 
+/// Operations the G17P runtime (`g17::Gpu`) provides to the DRM driver.
+///
+/// `drm_gpu` adapts it to [`crate::drm_gpu::DrmGpu`]; the G13/G14 and M3 runtimes use that
+/// trait directly.
+pub(crate) trait Gpu: Send + Sync {
+    // `g17::Gpu` implements these three; the DRM layer selects that runtime through
+    // `drm_gpu::Backend::G17` instead of downcasting, so nothing calls them.
+    /// Cast as an Any type.
+    #[allow(dead_code)]
+    fn as_any(&self) -> &dyn Any;
+    /// Cast Arc<Self> as an Any type.
+    #[allow(dead_code)]
+    fn arc_as_any(self: Arc<Self>) -> Arc<dyn Any + Sync + Send>;
+    /// Return the G13/G14 firmware manager, if this GPU uses that firmware interface.
+    #[allow(dead_code)]
+    fn manager(&self) -> Option<&dyn GpuManager>;
+    /// Initialize the GPU.
+    fn init(&self) -> Result;
+    /// Return a reference to the global `SequenceIDs` instance.
+    fn ids(&self) -> &SequenceIDs;
+    /// Check whether the GPU is crashed
+    fn is_crashed(&self) -> bool;
+    /// Fill in the hardware description reported to userspace.
+    fn get_params(&self, params: &mut kernel::uapi::drm_asahi_params_global) -> Result;
+    /// Whether user VMs retain a sticky error and support a userspace mirror.
+    fn supports_vm_status(&self) -> bool {
+        false
+    }
+    /// Limits for independently executing queues, if supported by this GPU.
+    fn queue_limits(&self) -> Option<kernel::uapi::drm_asahi_queue_limits> {
+        None
+    }
+    /// Temporary capacity hint and validity in milliseconds for subsequent syncobj waits.
+    fn syncobj_wait_hint(&self) -> Option<(u32, u32)> {
+        None
+    }
+    /// Frequency of the CPU timer that GPU timestamps are derived from.
+    fn base_clock_hz(&self) -> u32;
+    /// Return the GPU address space geometry.
+    fn uat_geometry(&self) -> mmu::UatGeometry;
+    /// Create a new `Vm` with the given range reserved for kernel-managed objects.
+    fn new_vm(&self, kernel_range: Range<u64>) -> Result<mmu::Vm>;
+    /// Create a new user command queue.
+    fn new_queue(
+        &self,
+        vm: mmu::Vm,
+        ualloc: Arc<Mutex<alloc::DefaultAllocator>>,
+        ualloc_priv: Arc<Mutex<alloc::DefaultAllocator>>,
+        priority: u32,
+        usc_exec_base: u64,
+    ) -> Result<KBox<dyn queue::Queue>>;
+    /// Map a BO as a timestamp buffer
+    fn map_timestamp_buffer(
+        &self,
+        bo: gem::ObjectRef,
+        range: Range<usize>,
+    ) -> Result<mmu::KernelMapping>;
+}
+
 /// Trait used to abstract the firmware/GPU-dependent variants of the GpuManager.
 pub(crate) trait GpuManager: Send + Sync {
     /// Cast as an Any type.
@@ -1460,7 +1519,7 @@ impl GpuManager::ver {
         let map_kernel_to_user = false;
 
         Ok(KBox::new(
-            mmu::Uat::new(dev, cfg, map_kernel_to_user)?,
+            mmu::Uat::new_for_config(dev, cfg, map_kernel_to_user)?,
             GFP_KERNEL,
         )?)
     }

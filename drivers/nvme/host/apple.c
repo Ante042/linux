@@ -116,6 +116,7 @@ struct apple_nvmmu_tcb {
 
 #define APPLE_ANS_TCB_DMA_FROM_DEVICE BIT(0)
 #define APPLE_ANS_TCB_DMA_TO_DEVICE   BIT(1)
+#define APPLE_ANS_TCB_AES             BIT(2)
 	u8 dma_flags;
 
 	u8 command_id;
@@ -209,7 +210,6 @@ struct apple_nvme {
 	/* Protects reset_ready against RTKit crash callbacks. */
 	spinlock_t event_lock;
 	bool reset_ready;
-	bool handoff_disabled;
 	struct list_head quarantine_node;
 	resource_size_t controller_start;
 	bool quarantined;
@@ -336,33 +336,15 @@ static bool apple_nvme_can_adopt_rtkit(struct apple_nvme *anv)
 		return false;
 	cc = readl(anv->mmio_nvme + NVME_REG_CC);
 	csts = readl(anv->mmio_nvme + NVME_REG_CSTS);
-	if (csts & NVME_CSTS_CFS)
-		return false;
 
 	/*
-	 * CPU_RUN/BOOT_STATUS alone survive inactive sessions. A disabled
-	 * controller requires the producer's explicit live-session contract.
-	 * Borrowed buffers still require reserved RAM and protected SART ranges.
+	 * CPU_RUN and BOOT_STATUS alone survive a session that has gone
+	 * inactive. Only a controller that the previous owner left enabled
+	 * and ready identifies a live session. Borrowed buffers still require
+	 * reserved RAM and protected SART ranges.
 	 */
-	if (anv->handoff_disabled)
-		return !(cc & NVME_CC_ENABLE) && !(csts & NVME_CSTS_RDY);
-	return (cc & NVME_CC_ENABLE) && (csts & NVME_CSTS_RDY);
-}
-
-static int apple_nvme_read_handoff(struct apple_nvme *anv)
-{
-	const char *handoff;
-	int ret;
-
-	ret = of_property_read_string(anv->dev->of_node, "apple,rtkit-handoff",
-				      &handoff);
-	if (ret == -EINVAL)
-		return 0;
-	if (ret || !anv->hw->needs_ioq_registers ||
-	    strcmp(handoff, "nvme-disabled-v1"))
-		return -EINVAL;
-	anv->handoff_disabled = true;
-	return apple_nvme_can_adopt_rtkit(anv) ? 0 : -EIO;
+	return (cc & NVME_CC_ENABLE) && (csts & NVME_CSTS_RDY) &&
+	       !(csts & NVME_CSTS_CFS);
 }
 
 static inline struct apple_nvme *queue_to_apple_nvme(struct apple_nvme_queue *q)
@@ -585,8 +567,6 @@ static void apple_nvme_submit_cmd_t8103(struct apple_nvme_queue *q,
 				  struct request *req)
 {
 	struct apple_nvme *anv = queue_to_apple_nvme(q);
-	const u8 *key = NULL;
-	u64 dun = 0;
 	u32 tag = nvme_tag_from_cid(cmd->common.command_id);
 	struct apple_nvmmu_tcb *tcb = &q->tcbs[tag];
 
@@ -604,16 +584,10 @@ static void apple_nvme_submit_cmd_t8103(struct apple_nvme_queue *q,
 		tcb->dma_flags = APPLE_ANS_TCB_DMA_FROM_DEVICE;
 
 	if (unlikely(req->crypt_ctx)) {
-		const struct blk_crypto_key *blk_key = req->crypt_ctx->bc_key;
+		const u8 *key = req->crypt_ctx->bc_key->bytes;
+		__le64 dun_le = cpu_to_le64(req->crypt_ctx->bc_dun[0]);
 
-		key = blk_key->bytes;
-		dun = req->crypt_ctx->bc_dun[0];
-	}
-
-	if (key) {
-		__le64 dun_le = cpu_to_le64(dun);
-
-		tcb->dma_flags |= BIT(2);
+		tcb->dma_flags |= APPLE_ANS_TCB_AES;
 		memcpy(tcb->aes_iv, &dun_le, sizeof(dun_le));
 		memset(tcb->_aes_unk, 0, sizeof(tcb->_aes_unk));
 		memcpy(tcb->_aes_unk, key, 4);
@@ -876,12 +850,15 @@ static __always_inline void apple_nvme_unmap_rq(struct request *req)
 
 	if (blk_rq_nr_phys_segments(req))
 		apple_nvme_unmap_data(anv, req);
+	if (!anv->hw->has_lsq_nvmmu)
+		return;
+
 	tag = nvme_tag_from_cid(iod->cmd.common.command_id);
 	tcb = &iod->q->tcbs[tag];
-	if (unlikely(tcb->dma_flags & BIT(2))) {
+	if (unlikely(tcb->dma_flags & APPLE_ANS_TCB_AES)) {
 		memzero_explicit(tcb->aes_iv, sizeof(tcb->aes_iv));
 		memzero_explicit(tcb->_aes_unk, sizeof(tcb->_aes_unk));
-		tcb->dma_flags &= ~BIT(2);
+		tcb->dma_flags &= ~APPLE_ANS_TCB_AES;
 	}
 }
 
@@ -2314,12 +2291,6 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 		anv->mmio_nvmmu = anv->mmio_nvme;
 	}
 
-	ret = apple_nvme_read_handoff(anv);
-	if (ret) {
-		dev_err_probe(dev, ret, "Invalid live firmware handoff\n");
-		goto out_detach_genpd;
-	}
-
 	if (anv->hw->has_lsq_nvmmu) {
 		anv->adminq.sq_db = anv->mmio_nvme + APPLE_ANS_LINEAR_ASQ_DB;
 		anv->adminq.cq_db = anv->mmio_nvme + APPLE_ANS_ACQ_DB;
@@ -2444,6 +2415,7 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 
 	/* Released by apple_nvme_free_ctrl(), including asynchronous users. */
 	kref_get(&anv->ref);
+
 	if (anv->hw->has_lsq_nvmmu)
 		anv->ctrl.crypto_profile = &anv->crypto_profile;
 
@@ -2578,6 +2550,28 @@ static int apple_nvme_resume(struct device *dev)
 	return nvme_reset_ctrl(&anv->ctrl);
 }
 
+/*
+ * The ANS stays up across system sleep on post-M4 hardware, and it keeps
+ * using its PCIe link while it runs. genpd, however, switches a domain off
+ * in the noirq phase once every device attached to it has suspended, no
+ * matter what runtime PM says. Put the devices that hold the controller's
+ * domains on the awake path so that genpd leaves those domains powered
+ * until resume.
+ */
+static void apple_nvme_keep_link_powered(struct apple_nvme *anv)
+{
+	int i;
+
+	/* A single domain is attached to the controller device itself. */
+	if (anv->pd_count <= 1) {
+		device_set_awake_path(anv->dev);
+		return;
+	}
+
+	for (i = 0; i < anv->pd_count; i++)
+		device_set_awake_path(anv->pd_dev[i]);
+}
+
 static int apple_nvme_suspend(struct device *dev)
 {
 	struct apple_nvme *anv = dev_get_drvdata(dev);
@@ -2597,6 +2591,7 @@ static int apple_nvme_suspend(struct device *dev)
 	 */
 	if (anv->hw->needs_ioq_registers) {
 		cancel_work_sync(&anv->recovery_work);
+		apple_nvme_keep_link_powered(anv);
 		return 0;
 	}
 

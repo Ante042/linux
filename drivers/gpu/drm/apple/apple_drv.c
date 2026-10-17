@@ -42,6 +42,7 @@
 
 #include <linux/soc/apple/pmgr-misc.h>
 
+#include "apple_resume.h"
 #include "dcp.h"
 #include "plane.h"
 
@@ -68,6 +69,29 @@ static int apple_drm_gem_dumb_create(struct drm_file *file_priv,
 	return drm_gem_dma_dumb_create_internal(file_priv, drm, args);
 }
 
+#ifdef CONFIG_DRM_FBDEV_EMULATION
+static int apple_drm_fbdev_probe(struct drm_fb_helper *helper,
+				 struct drm_fb_helper_surface_size *sizes)
+{
+	struct drm_crtc *crtc;
+
+	drm_for_each_crtc(crtc, helper->dev) {
+		struct apple_dcp *dcp;
+
+		dcp = platform_get_drvdata(to_apple_crtc(crtc)->dcp);
+		if (dcp->fw_compat == DCP_FIRMWARE_H17P &&
+		    dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) {
+			/* H17P applies the stored fourth byte as straight alpha. */
+			sizes->surface_bpp = 32;
+			sizes->surface_depth = 32;
+			break;
+		}
+	}
+
+	return drm_fbdev_dma_driver_fbdev_probe(helper, sizes);
+}
+#endif
+
 /*
  * A compositor or boot splash is closing the device.  drm_release() has
  * already taken its file off the file list, so the Type-C fabric can tell
@@ -81,7 +105,11 @@ static void apple_drm_postclose(struct drm_device *drm, struct drm_file *file)
 
 static const struct drm_driver apple_drm_driver = {
 	DRM_GEM_DMA_DRIVER_OPS_WITH_DUMB_CREATE(apple_drm_gem_dumb_create),
+#ifdef CONFIG_DRM_FBDEV_EMULATION
+	.fbdev_probe		= apple_drm_fbdev_probe,
+#else
 	DRM_FBDEV_DMA_DRIVER_OPS,
+#endif
 	.postclose		= apple_drm_postclose,
 	.name			= DRIVER_NAME,
 	.desc			= DRIVER_DESC,
@@ -145,7 +173,8 @@ static void apple_crtc_atomic_enable(struct drm_crtc *crtc,
 	}
 	if (crtc_state->active && !dcp_crtc_route_ready(crtc, state, true))
 		goto failed;
-	if (crtc_state->active && !dcp->main_display && !apple_crtc->fabric_held) {
+	if (crtc_state->active && !dcp->main_display && !apple_crtc->fabric_held &&
+	    dcp->fw_compat != DCP_FIRMWARE_H17P) {
 		/* Raise the fabric before external scanout starts. */
 		if (apple_pmgr_fabric_hold())
 			dev_warn(dcp->dev, "fabric raise not confirmed before scanout\n");
@@ -155,6 +184,9 @@ static void apple_crtc_atomic_enable(struct drm_crtc *crtc,
 	    (crtc_state->active_changed || dcp_crtc_needs_route_start(dcp))) {
 		dcp_poweron(apple_crtc->dcp);
 		crtc_state->color_mgmt_changed = true;
+	} else if (crtc_state->active && drm_atomic_crtc_needs_modeset(crtc_state)) {
+		/* A cable generation can change while the CRTC stays active. */
+		dcp_external_recover(to_apple_crtc(crtc)->dcp);
 	}
 	if (crtc_state->active)
 		dcp_crtc_atomic_modeset(crtc, state);
@@ -177,10 +209,11 @@ static void apple_crtc_atomic_disable(struct drm_crtc *crtc,
 				      struct drm_atomic_state *state)
 {
 	struct drm_crtc_state *crtc_state;
+	struct apple_crtc *apple_crtc = to_apple_crtc(crtc);
+
 	crtc_state = drm_atomic_get_new_crtc_state(state, crtc);
 
 	if (crtc_state->active_changed && !crtc_state->active) {
-		struct apple_crtc *apple_crtc = to_apple_crtc(crtc);
 		dcp_poweroff(apple_crtc->dcp);
 		if (apple_crtc->fabric_held) {
 			apple_crtc->fabric_held = false;
@@ -317,8 +350,29 @@ static const struct drm_mode_config_funcs apple_mode_config_funcs = {
 	.fb_create		= drm_gem_fb_create,
 };
 
+static void apple_atomic_commit_tail(struct drm_atomic_state *state)
+{
+	struct drm_plane *plane;
+	struct drm_plane_state *old, *new;
+	int i;
+
+	/* Retain displaced scanout even when the CRTC stays inactive. */
+	for_each_oldnew_plane_in_state(state, plane, old, new, i) {
+		struct apple_plane_state *apple_state = to_apple_plane_state(new);
+		struct dcp_fb_reference *entry = apple_state->retirement;
+
+		if (!entry)
+			continue;
+
+		apple_state->retirement = NULL;
+		dcp_retain_framebuffer(to_apple_crtc(old->crtc)->dcp, entry);
+	}
+
+	drm_atomic_helper_commit_tail_rpm(state);
+}
+
 static const struct drm_mode_config_helper_funcs apple_mode_config_helpers = {
-	.atomic_commit_tail	= drm_atomic_helper_commit_tail_rpm,
+	.atomic_commit_tail	= apple_atomic_commit_tail,
 };
 
 static void appledrm_connector_cleanup(struct drm_connector *connector)
@@ -372,6 +426,7 @@ apple_connector_atomic_best_encoder(struct drm_connector *conn,
 				    struct drm_atomic_state *state)
 {
 	struct apple_connector *apple_connector = to_apple_connector(conn);
+	struct drm_connector_state *conn_state;
 	struct drm_encoder *encoder;
 
 	/*
@@ -380,9 +435,23 @@ apple_connector_atomic_best_encoder(struct drm_connector *conn,
 	 * the fabric routes within: on dual-stream machines, and where the
 	 * route follows the CRTC (see dcp_typec_follow_crtc()).  So it is the
 	 * only answer there is.
+	 *
+	 * H17P (T8140, T8142): Type-C tunnels are routed before the modeset
+	 * and cannot move here. Reject stale topology and explicit assignments
+	 * to another pipeline.
 	 */
-	if (apple_connector->port_encoder)
+	if (apple_connector->port_encoder) {
+		struct apple_dcp *target;
+
+		conn_state = drm_atomic_get_new_connector_state(state, conn);
+		target = conn_state && conn_state->crtc ?
+			platform_get_drvdata(to_apple_crtc(conn_state->crtc)->dcp) : NULL;
+		if (target && target->fw_compat == DCP_FIRMWARE_H17P &&
+		    READ_ONCE(apple_connector->dcp) !=
+		    to_apple_crtc(conn_state->crtc)->dcp)
+			return NULL;
 		return apple_connector->port_encoder;
+	}
 
 	drm_connector_for_each_possible_encoder(conn, encoder)
 		return encoder;
@@ -473,7 +542,15 @@ static int apple_probe_per_dcp(struct device *dev,
 	u32 surf;
 	int zpos = 0;
 	bool supports_l10r = !dcp_fw_compat_is_12_x(dcp);
+	struct apple_dcp *dcp_data = platform_get_drvdata(dcp);
+	bool supports_xrgb2101010;
 	enum drm_plane_type plane_type;
+
+	supports_xrgb2101010 = dcp_data->fw_compat != DCP_FIRMWARE_H17P ||
+		dcp_data->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G;
+	if (dcp_data->fw_compat == DCP_FIRMWARE_H17P &&
+	    bitmap_empty(iomfb_surfaces, DCP_MAX_PLANES))
+		return dev_err_probe(dev, -EINVAL, "No usable display surfaces\n");
 
 	if (dcp_fw_compat_is_14_7(dcp)) {
 		planes[0] = apple_plane_init_v14_7(drm, 1U << num, 0,
@@ -491,7 +568,9 @@ static int apple_probe_per_dcp(struct device *dev,
 			break;
 		plane_type = (zpos == 0) ? DRM_PLANE_TYPE_PRIMARY : DRM_PLANE_TYPE_OVERLAY;
 		planes[zpos] = apple_plane_init(drm, 1U << num, surf,
-						supports_l10r, plane_type);
+						supports_l10r,
+						supports_xrgb2101010,
+						plane_type);
 		if (IS_ERR(planes[zpos]))
 			return PTR_ERR(planes[zpos]);
 
@@ -509,6 +588,8 @@ static int apple_probe_per_dcp(struct device *dev,
 	 * knows what to do with overlays.
 	 */
 	crtc = kzalloc(sizeof(*crtc), GFP_KERNEL);
+	if (!crtc)
+		return -ENOMEM;
 	ret = drm_crtc_init_with_planes(drm, &crtc->base, planes[0], NULL,
 					&apple_crtc_funcs, NULL);
 	if (ret)
@@ -730,6 +811,28 @@ static void apple_drm_quiesce_connectors(struct drm_device *drm)
 	drm_connector_list_iter_end(&iter);
 }
 
+/* Does any pipeline of @drm run H17-generation firmware (T8140, T8142)? */
+static bool apple_drm_has_h17p(struct drm_device *drm)
+{
+	struct drm_crtc *crtc;
+
+	drm_for_each_crtc(crtc, drm) {
+		struct apple_dcp *dcp = platform_get_drvdata(to_apple_crtc(crtc)->dcp);
+
+		if (dcp && dcp->fw_compat == DCP_FIRMWARE_H17P)
+			return true;
+	}
+	return false;
+}
+
+/* A supported firmware-described external provider participates in component matching. */
+static bool apple_dcp_usable(struct device_node *np)
+{
+	return of_device_is_available(np) &&
+	       (!of_device_is_compatible(np, "apple,t8140-dcpext") ||
+		dcp_h17p_external_supported(np));
+}
+
 static int apple_drm_init_dcp(struct device *dev)
 {
 	struct apple_drm_private *apple = dev_get_drvdata(dev);
@@ -742,17 +845,20 @@ static int apple_drm_init_dcp(struct device *dev)
 
 	for_each_matching_node(np, apple_dcp_id_tbl) {
 		bool dcp_ext;
-		if (!apple_dcp_in_drm(np))
+		if (!apple_dcp_in_drm(np) || !apple_dcp_usable(np))
 			continue;
-		if (!of_device_is_available(np)) {
-			of_node_put(np);
-			continue;
-		}
 		dcp_ext = of_device_is_compatible(np, "apple,dcpext") ||
+		          of_device_is_compatible(np, "apple,t8140-dcpext") ||
 		          of_property_present(np, "phys");
 
+		/* component_bind_all() established the matched provider lifetime. */
+		if (of_device_is_compatible(np, "apple,t8140-dcpext") &&
+		    !dcp_h17p_external_ready(np)) {
+			of_node_put(np);
+			return -ENODEV;
+		}
+
 		dcp[num_dcp] = of_find_device_by_node(np);
-		of_node_put(np);
 		if (!dcp[num_dcp])
 			continue;
 		/* A failed T8122 dcpext: bound, but no pipeline. */
@@ -768,8 +874,14 @@ static int apple_drm_init_dcp(struct device *dev)
 		ret = apple_probe_per_dcp(dev, &apple->drm, dcp[num_dcp],
 					  num_dcp, dcp_ext, &encoder[num_dcp],
 					  &crtc_mask[num_dcp]);
-		if (ret)
+		if (ret) {
+			if (of_device_is_compatible(np, "apple,t8140-dcpext")) {
+				put_device(&dcp[num_dcp]->dev);
+				of_node_put(np);
+				return ret;
+			}
 			continue;
+		}
 
 		num_dcp++;
 	}
@@ -906,7 +1018,11 @@ static void apple_drm_uninit(struct device *dev)
 	struct apple_drm_private *apple = dev_get_drvdata(dev);
 
 	apple_drm_quiesce_connectors(&apple->drm);
-	drm_dev_unregister(&apple->drm);
+	/* H17P keeps its live scanout across unbind: unplug, as aurora-wip. */
+	if (apple_drm_has_h17p(&apple->drm))
+		drm_dev_unplug(&apple->drm);
+	else
+		drm_dev_unregister(&apple->drm);
 	drm_atomic_helper_shutdown(&apple->drm);
 
 	component_unbind_all(dev, NULL);
@@ -937,7 +1053,7 @@ static int add_dcp_components(struct device *dev,
 	int num = 0;
 
 	for_each_matching_node(np, apple_dcp_id_tbl) {
-		if (apple_dcp_in_drm(np) && of_device_is_available(np)) {
+		if (apple_dcp_in_drm(np) && apple_dcp_usable(np)) {
 			drm_of_component_match_add(dev, matchptr,
 						   component_compare_of, np);
 			num++;
@@ -971,7 +1087,6 @@ static int add_dcp_components(struct device *dev,
 				of_node_put(port);
 			}
 		}
-		of_node_put(np);
 	}
 
 	return num;
@@ -979,9 +1094,6 @@ static int add_dcp_components(struct device *dev,
 
 static int apple_platform_probe(struct platform_device *pdev)
 {
-	if (of_machine_is_compatible("apple,t8140"))
-		return -ENODEV;
-
 	struct device *mdev = &pdev->dev;
 	struct component_match *match = NULL;
 	int num_dcp;
@@ -1004,6 +1116,8 @@ static const struct of_device_id of_match[] = {
 	{ .compatible = "apple,t6030-display-subsystem" },
 	{ .compatible = "apple,t8122-display-subsystem" },
 	{ .compatible = "apple,t6031-display-subsystem" },
+	{ .compatible = "apple,t8140-display-subsystem" },
+	{ .compatible = "apple,t8142-display-subsystem" },
 	{}
 };
 MODULE_DEVICE_TABLE(of, of_match);
@@ -1022,9 +1136,18 @@ static int apple_platform_suspend(struct device *dev)
 static int apple_platform_resume(struct device *dev)
 {
 	struct apple_drm_private *apple = dev_get_drvdata(dev);
+	bool dropped = false;
 
-	if (apple)
+	if (apple) {
+		/* H17P (T8140, T8142) only, as on aurora-wip. */
+		if (apple->drm.mode_config.suspend_state &&
+		    apple_drm_has_h17p(&apple->drm))
+			dropped = apple_drm_drop_stale_crtcs(apple->drm.mode_config.suspend_state);
 		drm_mode_config_helper_resume(&apple->drm);
+		/* Have userspace set the mode of a CRTC resumed disabled again. */
+		if (dropped)
+			drm_kms_helper_hotplug_event(&apple->drm);
+	}
 
 	return 0;
 }

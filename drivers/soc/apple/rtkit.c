@@ -754,6 +754,17 @@ static void apple_rtkit_oslog_rx(struct apple_rtkit *rtk, u64 msg)
 	u8 type = FIELD_GET(APPLE_RTKIT_OSLOG_TYPE, msg);
 	int err;
 
+	/*
+	 * T8140 and T8142 co-processors send notifications 2 to 5 during
+	 * normal operation; they expect no reply and keep running without one.
+	 */
+	if (type >= APPLE_RTKIT_OSLOG_LOG && type <= 5 &&
+	    (of_machine_is_compatible("apple,t8140") ||
+	     of_machine_is_compatible("apple,t8142"))) {
+		dev_dbg(rtk->dev, "RTKit: oslog notification: %016llx\n", msg);
+		return;
+	}
+
 	switch (type) {
 	case APPLE_RTKIT_OSLOG_BUFFER_REQUEST:
 		apple_rtkit_common_rx_get_buffer(rtk, &rtk->oslog_buffer,
@@ -982,6 +993,18 @@ void apple_rtkit_flush_rx(struct apple_rtkit *rtk)
 	flush_work(&rtk->sync_ack_work);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_flush_rx);
+
+void apple_rtkit_hold_rx(struct apple_rtkit *rtk)
+{
+	apple_mbox_hold_rx(rtk->mbox);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_hold_rx);
+
+void apple_rtkit_resume_rx(struct apple_rtkit *rtk)
+{
+	apple_mbox_release_rx(rtk->mbox);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_resume_rx);
 
 bool apple_rtkit_has_endpoint(struct apple_rtkit *rtk, u8 ep)
 {

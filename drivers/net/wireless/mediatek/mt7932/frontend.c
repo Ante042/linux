@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0-only */
+// SPDX-License-Identifier: GPL-2.0-only
 #include "mt7932.h"
 
 static void mt_scan_finish_work(struct work_struct *work);
@@ -14,9 +14,6 @@ struct mt7932 *mt_from_wiphy(struct wiphy *wiphy)
 {
 	return *(struct mt7932 **)wiphy_priv(wiphy);
 }
-
-
-
 
 static void mt_scan_finish_work(struct work_struct *work)
 {
@@ -64,8 +61,8 @@ static void mt_scan_finish_work(struct work_struct *work)
 	}
 	mutex_unlock(&m->command_mutex);
 	if (request) {
-		dev_info(&m->pdev->dev, "SCAN_FINISHED: seq=%u aborted=%u received-BSS=%llu\n",
-			 cancel[0], info.aborted, m->beacons);
+		dev_dbg(&m->pdev->dev, "SCAN_FINISHED: seq=%u aborted=%u received-BSS=%llu\n",
+			cancel[0], info.aborted, m->beacons);
 		cfg80211_scan_done(request, &info);
 	}
 }
@@ -89,7 +86,7 @@ void mt_scan_event(struct mt7932 *m, const struct mt7932_event *event)
 	if (m->stopping)
 		return;
 	/* Abort completes userspace locally, not by an invented cancel ACK.
-	 * Keep the sequence reserved until an actual old-campaign done arrives.
+	 * Keep the sequence reserved until the old scan's own done event arrives.
 	 */
 	if (event->length >= 37 && m->retired_scan_seq &&
 	    event->packet[36] == m->retired_scan_seq) {
@@ -126,15 +123,35 @@ void mt_abort_scan(struct wiphy *wiphy, struct wireless_dev *wdev)
 	spin_unlock_irqrestore(&m->response_lock, flags);
 }
 
+/* Wait at most @timeout in total for a cancelled scan to retire. Callers
+ * may hold RTNL, so this never waits longer than asked. A stopping driver
+ * completes scan_done for good, which would turn the wait into a spin.
+ */
+static void mt_scan_retire_wait(struct mt7932 *m, unsigned long timeout)
+{
+	unsigned long deadline = jiffies + timeout;
+	long left;
+
+	mt_abort_scan(m->wiphy, &m->wdev);
+	flush_work(&m->scan_finish_work);
+	while (READ_ONCE(m->retired_scan_seq) && !READ_ONCE(m->stopping)) {
+		left = (long)(deadline - jiffies);
+		if (left <= 0 || !wait_for_completion_timeout(&m->scan_done, left))
+			break;
+	}
+}
+
 /* No command/response lock held. The caller closes new scan admission first.
- * Natural EID0d completion fences the campaign; a local cancel alone does not.
+ * Natural EID0d completion fences the scan; a local cancel alone does not.
+ * The batch awaited here may already have been followed by the next one,
+ * which the abort then cancels: give the firmware time to end that one too,
+ * rather than declaring the link unrecoverable while its cancel is in flight.
  */
 int mt_scan_quiesce(struct mt7932 *m)
 {
 	if (READ_ONCE(m->scan_request) || READ_ONCE(m->retired_scan_seq))
 		wait_for_completion_timeout(&m->scan_done, msecs_to_jiffies(5000));
-	mt_abort_scan(m->wiphy, &m->wdev);
-	flush_work(&m->scan_finish_work);
+	mt_scan_retire_wait(m, msecs_to_jiffies(2000));
 	return READ_ONCE(m->retired_scan_seq) ? -EBUSY : 0;
 }
 
@@ -146,7 +163,7 @@ static int mt_scan_submit_next(struct mt7932 *m)
 {
 	struct cfg80211_scan_request *request = m->scan_request;
 	const struct cfg80211_ssid *ssid = NULL;
-	u8 body[0x4d4], channels[13];
+	u8 body[0x4d4], channels[MT7932_CHANNELS_5G];
 	unsigned int count = 0, i;
 	unsigned long flags;
 	bool passive = false;
@@ -160,11 +177,15 @@ static int mt_scan_submit_next(struct mt7932 *m)
 		passive = !(m->scan_batch & 1);
 		for (i = 0; i < request->n_channels; i++) {
 			struct ieee80211_channel *channel = request->channels[i];
-			bool listen = !request->n_ssids ||
+			bool radar = channel->flags & IEEE80211_CHAN_RADAR;
+			bool listen = !request->n_ssids || radar ||
 				      (channel->flags & IEEE80211_CHAN_NO_IR);
 
+			/* Radar channels are never joined; while associated,
+			 * a passive dwell there only delays the home channel.
+			 */
 			if (mt7932_channel_band(channel->hw_value) != m->scan_band ||
-			    listen != passive)
+			    listen != passive || (radar && m->scan_home_channel))
 				continue;
 			if (channel->flags & (IEEE80211_CHAN_DISABLED | IEEE80211_CHAN_NO_20MHZ) ||
 			    count == ARRAY_SIZE(channels))
@@ -204,8 +225,8 @@ static int mt_scan_submit_next(struct mt7932 *m)
 		ret = mt_request(m, 3, true, true, false, body, sizeof(body));
 	}
 	if (!ret)
-		dev_info(&m->pdev->dev, "SCAN_SUBMITTED: seq=%u band=%u channels=%u passive=%u\n",
-			 m->scan_seq, m->scan_band, count, passive);
+		dev_dbg(&m->pdev->dev, "SCAN_SUBMITTED: seq=%u band=%u channels=%u passive=%u\n",
+			m->scan_seq, m->scan_band, count, passive);
 	return ret;
 }
 
@@ -216,7 +237,7 @@ static int mt_scan_submit_next(struct mt7932 *m)
  */
 int mt_connect_discover(struct mt7932 *m)
 {
-	u8 body[0x4d4], channels[13], cancel[4] = {};
+	u8 body[0x4d4], channels[MT7932_CHANNELS_5G], cancel[4] = {};
 	unsigned long flags;
 	unsigned int attempt, band, i, count;
 	int ret = 0;
@@ -237,7 +258,8 @@ int mt_connect_discover(struct mt7932 *m)
 
 			if (m->connect_channel_req && channel != m->connect_channel_req)
 				continue;
-			if (channel->flags & (IEEE80211_CHAN_DISABLED | IEEE80211_CHAN_NO_20MHZ))
+			if (channel->flags & (IEEE80211_CHAN_DISABLED | IEEE80211_CHAN_NO_20MHZ |
+					      IEEE80211_CHAN_RADAR))
 				continue;
 			passive |= !!(channel->flags & IEEE80211_CHAN_NO_IR);
 			channels[count++] = channel->hw_value;
@@ -327,10 +349,14 @@ int mt_scan(struct wiphy *wiphy, struct cfg80211_scan_request *request)
 	if (request->wdev != &m->wdev)
 		return -ENODEV;
 	mt_retry_missing_policy(m);
-	dev_info_ratelimited(&m->pdev->dev, "SCAN_REQUEST: channels=%u ssids=%d ies=%zu flags=%08x duration=%u/%u\n",
-		 request->n_channels, request->n_ssids, request->ie_len, request->flags,
-		 request->duration, request->duration_mandatory);
-	if (!request->n_channels || request->n_channels > 17 || request->ie_len > 600 ||
+	dev_dbg(&m->pdev->dev,
+		"SCAN_REQUEST: channels=%u ssids=%d ies=%zu flags=%08x duration=%u/%u\n",
+		request->n_channels, request->n_ssids, request->ie_len, request->flags,
+		request->duration, request->duration_mandatory);
+	/* cfg80211 lists each advertised channel at most once. */
+	if (request->n_channels > MT7932_CHANNELS)
+		return -EOPNOTSUPP;
+	if (!request->n_channels || request->ie_len > 600 ||
 	    request->duration_mandatory ||
 	    (request->flags & ~(NL80211_SCAN_FLAG_FLUSH | NL80211_SCAN_FLAG_COLOCATED_6GHZ)) || request->n_ssids > 1 ||
 	    (request->n_ssids && request->ssids[0].ssid_len > 32))
@@ -364,6 +390,9 @@ int mt_scan(struct wiphy *wiphy, struct cfg80211_scan_request *request)
 		spin_unlock_irqrestore(&m->response_lock, flags);
 		cancel_delayed_work(&m->scan_timeout_work);
 	} else {
+		/* Nothing eligible to submit: complete the request. */
+		if (ret)
+			schedule_work(&m->scan_finish_work);
 		ret = 0;
 	}
 out:
@@ -450,12 +479,20 @@ static int mt_set_mac_address(struct net_device *netdev, void *address)
 
 	/* No live-MAC change: the next BSS activation and connect commands use
 	 * this address together. A failed retirement must not change identity.
+	 * NetworkManager takes the interface down before changing the address,
+	 * which cancels any scan; let that scan retire instead of failing.
 	 */
+	if (!netif_running(netdev))
+		mt_scan_retire_wait(m, msecs_to_jiffies(2000));
 	mutex_lock(&m->command_mutex);
 	spin_lock_irqsave(&m->response_lock, flags);
 	if (m->stopping || m->link_failed || m->bss_active || m->connecting ||
 	    m->connected || m->disconnecting || m->peer_valid ||
 	    m->scan_request || m->retired_scan_seq || m->discovering) {
+		dev_dbg(&m->pdev->dev,
+			"address change refused: bss=%u connecting=%u connected=%u peer=%u scan=%u retired=%u\n",
+			m->bss_active, m->connecting, m->connected, m->peer_valid,
+			!!m->scan_request, m->retired_scan_seq);
 		ret = -EBUSY;
 	} else {
 		ret = eth_mac_addr(netdev, address);
@@ -510,7 +547,8 @@ static void mt_cal_work(struct work_struct *work)
 				       m->preload_version);
 		if (ret)
 			break;
-		dev_info(&m->pdev->dev, "D7_CALIBRATION_COMPLETE: channel=%u\n", get_unaligned_le32(request + 12));
+		dev_dbg(&m->pdev->dev, "D7_CALIBRATION_COMPLETE: channel=%u\n",
+			get_unaligned_le32(request + 12));
 	}
 	release_firmware(oca);
 	if (!ret)
@@ -564,7 +602,8 @@ int mt_register_interface(struct mt7932 *m)
 		free_netdev(netdev);
 		return ret;
 	}
-	dev_info(&m->pdev->dev, "CFG80211_INTERFACE_READY: %s, RF awaits country policy\n", netdev->name);
+	dev_dbg(&m->pdev->dev, "CFG80211_INTERFACE_READY: %s, RF awaits country policy\n",
+		netdev->name);
 	return 0;
 }
 
@@ -600,7 +639,8 @@ int mt_enable_scan(struct mt7932 *m)
 		return ret;
 	}
 	WRITE_ONCE(m->rf_ready, true);
-	dev_info(&m->pdev->dev, "CFG80211_SCAN_READY: %s, carrier off until WPA2 authorization\n", m->netdev->name);
+	dev_dbg(&m->pdev->dev, "CFG80211_SCAN_READY: %s, carrier off until WPA2 authorization\n",
+		m->netdev->name);
 	schedule_work(&m->cal_work);
 	spin_unlock_irqrestore(&m->response_lock, flags);
 	return 0;
@@ -632,11 +672,14 @@ void mt_packet_receive(struct mt7932 *m, const u8 *packet, size_t length)
 		unsigned long flags;
 
 		spin_lock_irqsave(&m->response_lock, flags);
-		if (tim && tim->datalen >= 4 && m->connected && !m->disconnecting &&
-		    !m->stopping && !m->power_tim && frame.channel == m->connect_channel &&
+		if (m->connected && !m->disconnecting && !m->stopping &&
+		    frame.channel == m->connect_channel &&
 		    ether_addr_equal(frame.data + 16, m->connect_bssid)) {
-			m->power_tim = true;
-			schedule_work(&m->power_work);
+			mt_cqm_signal(m, mt7932_rx_signal(&frame, m->antenna_mask));
+			if (tim && tim->datalen >= 4 && !m->power_tim) {
+				m->power_tim = true;
+				schedule_work(&m->power_work);
+			}
 		}
 		spin_unlock_irqrestore(&m->response_lock, flags);
 	}

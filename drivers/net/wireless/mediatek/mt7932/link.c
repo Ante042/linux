@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0-only */
+// SPDX-License-Identifier: GPL-2.0-only
 #include "mt7932.h"
 
 static int mt_peer_reserve(struct mt7932 *m);
@@ -71,11 +71,17 @@ void mt_rf_fail_locked(struct mt7932 *m, int error)
 		complete_all(&m->assoc_done);
 		complete_all(&m->discovery_done);
 	} else if (m->connected) {
-		/* Hardware ownership is uncertain: report failure, retain the peer. */
+		/* Hardware ownership is uncertain: report failure, retain the peer.
+		 * A connect worker still publishing the connection reports this
+		 * after it, so that cfg80211 sees the two in order.
+		 */
 		m->connected = false;
 		m->disconnecting = true;
-		cfg80211_disconnected(m->netdev, WLAN_REASON_UNSPECIFIED,
-				      NULL, 0, true, GFP_ATOMIC);
+		if (m->connect_publishing)
+			m->connect_lost = true;
+		else
+			cfg80211_disconnected(m->netdev, WLAN_REASON_UNSPECIFIED,
+					      NULL, 0, true, GFP_ATOMIC);
 	}
 	if (m->scan_request) {
 		m->scan_aborted = true;
@@ -113,11 +119,11 @@ void mt_link_event(struct mt7932 *m, const struct mt7932_event *event)
 	selector = get_unaligned_le32(event->packet + 40);
 	body = event->packet + 48;
 	length = event->length - 48;
-	dev_info(&m->pdev->dev, "LINK_EVENT: selector=%02x length=%zu\n", selector, length);
+	dev_dbg(&m->pdev->dev, "LINK_EVENT: selector=%02x length=%zu\n", selector, length);
 	if (selector == 0x44) {
 		if (length < 5 || (!m->connecting && !m->connected && !m->disconnecting))
 			return;
-		dev_info(&m->pdev->dev, "DISCONNECT_EVENT: metadata=%u deferred=%u reason-index=%u\n",
+		dev_dbg(&m->pdev->dev, "DISCONNECT_EVENT: metadata=%u deferred=%u reason-index=%u\n",
 			body[0], body[3], body[4]);
 		if (m->disconnect_seen)
 			return;
@@ -179,18 +185,18 @@ void mt_link_event(struct mt7932 *m, const struct mt7932_event *event)
 			 * rate-control setting. Bounds were checked by the exporter.
 			 */
 			if (he)
-				dev_info(&m->pdev->dev,
-					 "ASSOC_HE_CAPABILITIES: epoch=%u rx-map=%04x tx-map=%04x\n",
-					 m->connection_generation,
-					 get_unaligned_le16(he->data + 18),
-					 get_unaligned_le16(he->data + 20));
+				dev_dbg(&m->pdev->dev,
+					"ASSOC_HE_CAPABILITIES: epoch=%u rx-map=%04x tx-map=%04x\n",
+					m->connection_generation,
+					get_unaligned_le16(he->data + 18),
+					get_unaligned_le16(he->data + 20));
 		}
 		break;
 	}
 	case 0x4d:
 		if (length >= 20)
-			dev_info(&m->pdev->dev, "ASSOC_START: band=%u width=%u channel=%u extension=%u\n",
-				 get_unaligned_le32(body + 12), body[16], body[17], body[19]);
+			dev_dbg(&m->pdev->dev, "ASSOC_START: band=%u width=%u channel=%u extension=%u\n",
+				get_unaligned_le32(body + 12), body[16], body[17], body[19]);
 		if (!mt_channel_event(m, body, length)) {
 			m->connect_error = -EPROTO;
 			complete(&m->assoc_done);
@@ -199,9 +205,10 @@ void mt_link_event(struct mt7932 *m, const struct mt7932_event *event)
 		break;
 	case 0x40:
 		if (length >= 52)
-			dev_info(&m->pdev->dev, "ASSOC_REPORT: status=%u band=%u channel=%u bss=%u bmc=%u station=%u peer=%u cipher=%08x\n",
-				 get_unaligned_le16(body), body[11], body[12], body[16], body[17], body[20], body[21],
-				 get_unaligned_le32(body + 48));
+			dev_dbg(&m->pdev->dev,
+				"ASSOC_REPORT: status=%u band=%u channel=%u bss=%u bmc=%u station=%u peer=%u cipher=%08x\n",
+				get_unaligned_le16(body), body[11], body[12], body[16], body[17],
+				body[20], body[21], get_unaligned_le32(body + 48));
 		/* OPEN reports retain cipher as numeric metadata only; it neither
 		 * installs a key nor changes the immutable requested security mode.
 		 */
@@ -215,12 +222,13 @@ void mt_link_event(struct mt7932 *m, const struct mt7932_event *event)
 		m->peer_valid = true;
 		/* HOST decoder confirms the RSN suite namespace, not request enum10. */
 		m->event_cipher = get_unaligned_le32(body + 48);
-		dev_info(&m->pdev->dev, "ASSOCIATED: peer=%u station=%u cipher-raw=%u\n",
-			 m->peer_wtbl, body[20], m->event_cipher);
+		dev_dbg(&m->pdev->dev, "ASSOCIATED: peer=%u station=%u cipher-raw=%u\n",
+			m->peer_wtbl, body[20], m->event_cipher);
 		break;
 	case 0x42:
 		if (length >= 2)
-			dev_info(&m->pdev->dev, "CONNECT_REPORT: status=%u peer-owned=%u\n", get_unaligned_le16(body), m->peer_valid);
+			dev_dbg(&m->pdev->dev, "CONNECT_REPORT: status=%u peer-owned=%u\n",
+				get_unaligned_le16(body), m->peer_valid);
 		if (length < 2 || get_unaligned_le16(body) || !m->peer_valid)
 			m->connect_error = -ECONNREFUSED;
 		complete(&m->assoc_done);
@@ -283,8 +291,12 @@ static int mt_retire_connection(struct mt7932 *m)
 		return -ESHUTDOWN;
 	netif_carrier_off(m->netdev);
 	netif_tx_disable(m->netdev);
-	/* ndo_start_xmit rechecks the closed admission gate under data_lock. */
+	/* ndo_start_xmit rechecks the closed admission gate under data_lock.
+	 * The queue may have stopped in the middle of a burst; hand the device
+	 * what it already holds so that the drain below can complete.
+	 */
 	spin_lock_irqsave(&m->data_lock, flags);
+	mt_data_kick_locked(m);
 	spin_unlock_irqrestore(&m->data_lock, flags);
 	flush_work(&m->cal_work);
 	mutex_lock(&m->command_mutex);
@@ -350,8 +362,9 @@ static int mt_retire_connection(struct mt7932 *m)
 		m->link_failed = true; /* uncertain ownership: recovery required */
 	spin_unlock_irqrestore(&m->response_lock, flags);
 	mutex_unlock(&m->command_mutex);
-	dev_info(&m->pdev->dev, "CONNECTION_RETIRED: status=%d%s\n", ret,
-		 ret ? "; recovery required, DMA ownership retained" : "; old TX drained, six IDs released");
+	dev_dbg(&m->pdev->dev, "CONNECTION_RETIRED: status=%d%s\n", ret,
+		ret ? "; recovery required, DMA ownership retained" :
+		      "; old TX drained, six IDs released");
 	return ret;
 }
 
@@ -383,7 +396,8 @@ void mt_connect_work(struct work_struct *work)
 	struct cfg80211_connect_resp_params response = {};
 	u8 *body, mac[8] = {}, queue[32];
 	unsigned long flags;
-	bool submitted = false, peer_owned = false;
+	bool submitted = false, peer_owned = false, cancelled;
+	u16 reason;
 	int ret;
 
 	mutex_lock(&m->command_mutex);
@@ -396,13 +410,13 @@ void mt_connect_work(struct work_struct *work)
 		goto free;
 	}
 	if (!m->connect_bss) {
-		dev_info(&m->pdev->dev, "CONNECT_DISCOVERY: refreshing missing scan candidate\n");
+		dev_dbg(&m->pdev->dev, "CONNECT_DISCOVERY: refreshing missing scan candidate\n");
 		ret = mt_connect_discover(m);
 		if (ret)
 			goto free;
 	}
 	if (m->connect_bss->channel->flags & (IEEE80211_CHAN_DISABLED | IEEE80211_CHAN_NO_IR |
-					    IEEE80211_CHAN_NO_20MHZ)) {
+					    IEEE80211_CHAN_NO_20MHZ | IEEE80211_CHAN_RADAR)) {
 		ret = -EINVAL;
 		goto free;
 	}
@@ -418,7 +432,7 @@ void mt_connect_work(struct work_struct *work)
 		goto free;
 	/* Initial station policy: framework M=0 branch and no optional flags.
 	 * This yields flag2 independently of credentials; no scan-result count
-	 * belongs in this field. The recovered framework uses listen interval20.
+	 * belongs in this field. The original driver uses listen interval 20.
 	 * Other platform flag policies remain unsupported, not guessed mappings.
 	 */
 	ret = mt7932_connect_body(body, 856, m->connect_ssid, m->connect_ssid_length,
@@ -442,7 +456,8 @@ free:
 	memzero_explicit(m->connect_pmk, sizeof(m->connect_pmk));
 	if (ret)
 		goto report;
-	dev_info(&m->pdev->dev, "CONNECT_SUBMITTED: BSSID=%pM channel=%u\n", m->connect_bssid, m->connect_channel);
+	dev_dbg(&m->pdev->dev, "CONNECT_SUBMITTED: BSSID=%pM channel=%u\n",
+		m->connect_bssid, m->connect_channel);
 	/* Genuine D7 requests must remain serviceable during asynchronous waits. */
 	mutex_unlock(&m->command_mutex);
 	ret = wait_for_completion_timeout(&m->assoc_start, msecs_to_jiffies(5000)) ? 0 : -ETIMEDOUT;
@@ -458,8 +473,8 @@ free:
 	ret = ret ?: READ_ONCE(m->connect_error);
 	if (ret)
 		goto report;
-	dev_info(&m->pdev->dev, "ASSOCIATION_CALIBRATED: primary=%u center=%u\n",
-		 m->connect_channel, m->connect_center);
+	dev_dbg(&m->pdev->dev, "ASSOCIATION_CALIBRATED: primary=%u center=%u\n",
+		m->connect_channel, m->connect_center);
 	mt7932_peer_queue(queue, m->peer_ids.station[0], true);
 	ret = mt_request(m, 0x6b, true, true, false, queue, sizeof(queue));
 	if (ret)
@@ -498,7 +513,10 @@ report:
 	}
 	/* Serialize the final outcome with cancellation. In particular, a late
 	 * firmware success must not publish carrier/authorization after .deauth.
-	 * cfg80211 queues these notifications; GFP_ATOMIC keeps this IRQ-safe.
+	 * The cfg80211 calls may take bottom-half locks, so they are made after
+	 * response_lock is dropped. command_mutex keeps the disconnect worker,
+	 * which retires the connection before reporting its end, behind them;
+	 * an RF failure in the meantime leaves its report to this worker.
 	 */
 	spin_lock_irqsave(&m->response_lock, flags);
 	if (!ret && (m->connect_error || !mt_rf_allowed(m))) {
@@ -533,34 +551,54 @@ report:
 		m->station_connected = jiffies;
 		m->station_signal_valid = false;
 		m->station_rx_rate_valid = false;
-		m->station_tx_rate_valid = false;
 		spin_unlock(&m->data_lock);
+		mt_cqm_reset(m);
 	}
 	m->connected = !ret;
 	m->disconnecting = false;
-	if (m->connect_cancelled) {
-		if (response.links[0].bss)
-			cfg80211_put_bss(m->wiphy, response.links[0].bss);
-		cfg80211_disconnected(m->netdev, m->disconnect_reason, NULL, 0, true, GFP_ATOMIC);
-	} else {
-		cfg80211_connect_done(m->netdev, &response, GFP_ATOMIC);
-	}
+	cancelled = m->connect_cancelled;
+	reason = m->disconnect_reason;
+	m->connect_publishing = true;
 	if (!ret) {
 		schedule_work(&m->power_work);
 		if (READ_ONCE(m->data_ready)) {
 			netif_carrier_on(m->netdev);
 			netif_wake_queue(m->netdev);
 		}
-		if (m->connect_open) {
-			dev_info(&m->pdev->dev, "OPEN_CONNECTED: owned peer, firmware completion; Ethernet=%u\n", m->data_ready);
-		} else {
-			cfg80211_port_authorized(m->netdev, m->connect_bssid, NULL, 0, GFP_ATOMIC);
-			dev_info(&m->pdev->dev, "WPA2_AUTHORIZED: firmware handshake complete; Ethernet=%u\n", m->data_ready);
-		}
-	} else {
-		dev_err(&m->pdev->dev, "CONNECT_FAILED: %d; recovery-required=%u\n", ret, m->link_failed);
 	}
 	spin_unlock_irqrestore(&m->response_lock, flags);
+
+	if (cancelled) {
+		if (response.links[0].bss)
+			cfg80211_put_bss(m->wiphy, response.links[0].bss);
+		cfg80211_disconnected(m->netdev, reason, NULL, 0, true, GFP_KERNEL);
+	} else {
+		cfg80211_connect_done(m->netdev, &response, GFP_KERNEL);
+	}
+	if (!ret && !m->connect_open)
+		cfg80211_port_authorized(m->netdev, m->connect_bssid, NULL, 0, GFP_KERNEL);
+
+	spin_lock_irqsave(&m->response_lock, flags);
+	m->connect_publishing = false;
+	if (m->connect_lost) {
+		m->connect_lost = false;
+		cfg80211_disconnected(m->netdev, WLAN_REASON_UNSPECIFIED,
+				      NULL, 0, true, GFP_ATOMIC);
+	}
+	spin_unlock_irqrestore(&m->response_lock, flags);
+	if (!ret && m->connect_open)
+		dev_dbg(&m->pdev->dev,
+			"OPEN_CONNECTED: owned peer, firmware completion; Ethernet=%u\n",
+			READ_ONCE(m->data_ready));
+	else if (!ret)
+		dev_dbg(&m->pdev->dev,
+			"WPA2_AUTHORIZED: firmware handshake complete; Ethernet=%u\n",
+			READ_ONCE(m->data_ready));
+	else if (cancelled)
+		dev_dbg(&m->pdev->dev, "CONNECT_CANCELLED: %d\n", ret);
+	else
+		dev_err(&m->pdev->dev, "CONNECT_FAILED: %d; recovery-required=%u\n",
+			ret, READ_ONCE(m->link_failed));
 	mutex_unlock(&m->command_mutex);
 }
 
@@ -597,9 +635,11 @@ int mt_connect(struct wiphy *wiphy, struct net_device *netdev,
 		mt_retry_missing_policy(m);
 	if (!mt_rf_allowed(m) || !m->bss_active || netdev != m->netdev)
 		return -EAGAIN;
-	dev_info_ratelimited(&m->pdev->dev, "CONNECT_REQUEST: WPA=%u pairwise-count=%d group=%08x AKM-count=%d PMK-present=%u MFP=%u IE-bytes=%zu\n",
-		 params->crypto.wpa_versions, params->crypto.n_ciphers_pairwise, params->crypto.cipher_group,
-		 params->crypto.n_akm_suites, !!params->crypto.psk, params->mfp, params->ie_len);
+	dev_dbg(&m->pdev->dev,
+		"CONNECT_REQUEST: WPA=%u pairwise-count=%d group=%08x AKM-count=%d PMK-present=%u MFP=%u IE-bytes=%zu\n",
+		params->crypto.wpa_versions, params->crypto.n_ciphers_pairwise,
+		params->crypto.cipher_group, params->crypto.n_akm_suites,
+		!!params->crypto.psk, params->mfp, params->ie_len);
 	if (!params->ssid_len || params->ssid_len > 32)
 		return -EINVAL;
 	if (!open && (params->crypto.wpa_versions != NL80211_WPA_VERSION_2 ||
@@ -643,8 +683,6 @@ int mt_connect(struct wiphy *wiphy, struct net_device *netdev,
 	m->connect_center = 0;
 	memset(&m->connect_chandef, 0, sizeof(m->connect_chandef));
 	m->connection_generation++;
-	m->station_rate_query_failed = false;
-	m->station_rate_query_time = jiffies - HZ;
 	m->connect_cancelled = false;
 	m->peer_valid = false;
 	m->connecting = true;
@@ -677,8 +715,9 @@ void mt_disconnect_work(struct work_struct *work)
 	spin_lock_irqsave(&m->response_lock, flags);
 	m->disconnecting = false;
 	cfg80211_disconnected(m->netdev, reason, NULL, 0, local, GFP_ATOMIC);
+	mt_reg_apply_deferred_locked(m);
 	spin_unlock_irqrestore(&m->response_lock, flags);
-	dev_info(&m->pdev->dev, "DISCONNECTED: teardown=%d local=%u\n", ret, local);
+	dev_dbg(&m->pdev->dev, "DISCONNECTED: teardown=%d local=%u\n", ret, local);
 }
 
 int mt_disconnect(struct wiphy *wiphy, struct net_device *netdev, u16 reason)

@@ -52,6 +52,7 @@ use kernel::{
     },
     error::from_err_ptr,
     module_platform_driver,
+    new_mutex,
     new_spinlock,
     of,
     platform,
@@ -73,6 +74,7 @@ use kernel::{
         },
         Arc,
         ArcBorrow,
+        Mutex,
         SpinLock, //
     },
     types::{ForeignOwnable, Opaque},
@@ -432,6 +434,14 @@ struct StreamState {
 // sets it and close clears it under the same lock.
 unsafe impl Send for StreamState {}
 
+/// The holders of the low-power microphone's `runn` state: its own PCM
+/// while prepared, and every service startup that raises the fabric.
+struct LpaiRun {
+    users: u32,
+    /// `runn` is the last state the firmware confirmed.
+    running: bool,
+}
+
 #[pin_data]
 struct SndSocT8140AopData {
     dev: ARef<device::Device>,
@@ -440,7 +450,7 @@ struct SndSocT8140AopData {
     ring: Arc<SourceRing>,
     ring_bytes: Atomic<u32>,
     sequence: Atomic<u32>,
-    /// lpai is in `runn`.
+    /// The low-power microphone PCM holds a reference on `lpai_run`.
     powered: AtomicFlag,
     /// A low-power microphone report arrived since the last run request.
     reported: AtomicFlag,
@@ -478,6 +488,10 @@ struct SndSocT8140AopData {
     hpai_start_work: Work<Self, HPAI_START_WORK>,
     #[pin]
     stream: SpinLock<StreamState>,
+    /// Every lpai power request goes through here, see
+    /// [`SndSocT8140AopData::lpai_run_get`].
+    #[pin]
+    lpai_run: Mutex<LpaiRun>,
 }
 
 const SPKR_START_WORK: u64 = 0;
@@ -680,6 +694,39 @@ impl SndSocT8140AopData {
         Ok(())
     }
 
+    /// Takes a reference on the low-power microphone's `runn` state,
+    /// requesting it for the first holder.
+    ///
+    /// The PCM and the fabric raises share the stream, and every power
+    /// request is checked against the state the firmware reports back: a
+    /// raise that returns lpai to `idle` while another service starts up
+    /// makes that one read `idle` after requesting `runn`, and idles a
+    /// capture the PCM just started.  So they count their holds here and
+    /// only the first and last holder change the state.
+    fn lpai_run_get(&self) -> Result<()> {
+        let mut run = self.lpai_run.lock();
+        if !run.running {
+            self.reported.store(false, Relaxed);
+            self.set_power(POWER_STATE_RUN)?;
+            run.running = true;
+        }
+        run.users += 1;
+        Ok(())
+    }
+
+    /// Drops a reference taken by [`Self::lpai_run_get`], returning lpai to
+    /// `idle` after the last holder.  If that fails, the next holder finds
+    /// it still running.
+    fn lpai_run_put(&self) -> Result<()> {
+        let mut run = self.lpai_run.lock();
+        run.users -= 1;
+        if run.users == 0 && run.running {
+            self.set_power(POWER_STATE_IDLE)?;
+            run.running = false;
+        }
+        Ok(())
+    }
+
     // ---- the back-end services ----
 
     /// Property 202 with the service's sequence and a 24 MHz timestamp;
@@ -785,14 +832,10 @@ impl SndSocT8140AopData {
     /// does not do that (measured: `audio_p` stays gated for the whole leaf
     /// retry window), only a running stream does, after which a service in
     /// `pw0 ` keeps it up only while its stream runs. The low-power
-    /// microphone is attached for the firmware's lifetime, so run it briefly
-    /// around `f` when it is idle, once its first report has arrived.
+    /// microphone is attached for the firmware's lifetime, so hold it in
+    /// `runn` around `f`, once its first report has arrived.
     fn with_fabric_raised<R>(&self, f: impl FnOnce() -> Result<R>) -> Result<R> {
-        if self.powered.load(Relaxed) {
-            return f();
-        }
-        self.reported.store(false, Relaxed);
-        self.set_power(POWER_STATE_RUN)?;
+        self.lpai_run_get()?;
         let mut polls = 0;
         while !self.reported.load(Relaxed) && polls < FABRIC_RAISE_POLLS {
             kernel::time::delay::fsleep(kernel::time::Delta::from_millis(FABRIC_RAISE_POLL_MS));
@@ -802,8 +845,12 @@ impl SndSocT8140AopData {
             dev_warn!(self.dev, "lpai: no report while raising the fabric\n");
         }
         let ret = f();
-        if let Err(e) = self.set_power(POWER_STATE_IDLE) {
-            dev_warn!(self.dev, "lpai: unable to idle after raising the fabric: {:?}\n", e);
+        if let Err(e) = self.lpai_run_put() {
+            dev_warn!(
+                self.dev,
+                "lpai: unable to idle after raising the fabric: {:?}\n",
+                e
+            );
         }
         ret
     }
@@ -1192,12 +1239,11 @@ unsafe extern "C" fn lpai_pcm_close(substream: *mut bindings::snd_pcm_substream)
         let mut st = data.stream.lock();
         st.substream = ptr::null_mut();
     }
-    if data.powered.load(Relaxed) {
-        if let Err(e) = data.set_power(POWER_STATE_IDLE) {
+    if data.powered.xchg(false, Relaxed) {
+        if let Err(e) = data.lpai_run_put() {
             dev_err!(data.dev, "unable to return lpai to idle\n");
             return e.to_errno();
         }
-        data.powered.store(false, Relaxed);
     }
     0
 }
@@ -1221,7 +1267,7 @@ unsafe extern "C" fn lpai_pcm_prepare(substream: *mut bindings::snd_pcm_substrea
         data.hw_ptr_frames.store(0, Relaxed);
     }
     if !data.powered.load(Relaxed) {
-        if let Err(e) = data.set_power(POWER_STATE_RUN) {
+        if let Err(e) = data.lpai_run_get() {
             dev_err!(data.dev, "unable to run lpai\n");
             return e.to_errno();
         }
@@ -1254,6 +1300,24 @@ unsafe extern "C" fn lpai_pcm_trigger(
         }
         _ => EINVAL.to_errno(),
     }
+}
+
+/// Called after a stop, without the ALSA stream lock, before the buffer is
+/// reallocated or freed (hw_params, hw_free) or the counters are reset
+/// (prepare).  The trigger only clears the run flag, so a report that saw
+/// the stream running may still be copying into the buffer: it holds the
+/// stream lock for the whole copy, so taking that lock waits for it, and
+/// every report after it sees the flag clear.
+///
+/// # Safety
+///
+/// Called by ALSA with a live substream of this card's PCM, whose private
+/// data is the driver's `Arc`.
+unsafe extern "C" fn lpai_pcm_sync_stop(substream: *mut bindings::snd_pcm_substream) -> i32 {
+    // SAFETY: ALSA calls this op with a live substream of the LPAI PCM.
+    let data = unsafe { pcm_data(substream) };
+    drop(data.stream.lock());
+    0
 }
 
 /// # Safety
@@ -1372,6 +1436,19 @@ unsafe extern "C" fn hpai_pcm_trigger(
         _ => data.hpai_want_run.store(false, Relaxed),
     }
     0
+}
+
+/// The trigger stops the DMA asynchronously: wait for the channel to stop
+/// and for its completion callbacks to finish before ALSA reuses or frees
+/// the buffer.
+///
+/// # Safety
+///
+/// Called by ALSA with a live substream of this card's PCM.
+unsafe extern "C" fn hpai_pcm_sync_stop(substream: *mut bindings::snd_pcm_substream) -> i32 {
+    // SAFETY: the substream is live and its dmaengine runtime was set up by
+    // `snd_dmaengine_pcm_open` in `hpai_pcm_open`.
+    unsafe { bindings::snd_dmaengine_pcm_sync_stop(substream) }
 }
 
 /// # Safety
@@ -1834,8 +1911,8 @@ fn f32_bits_of_q31(v: i32) -> u32 {
     }
     let sign = if v < 0 { 1u32 << 31 } else { 0 };
     let m = v.unsigned_abs();
-    let p = 31 - m.leading_zeros(); // position of the leading one, 0..=31
-                                    // value = m * 2^-31 = 1.f * 2^(p - 31)
+    // The position of the leading one, 0..=31: |v| / 2^31 = 1.f * 2^(p - 31).
+    let p = 31 - m.leading_zeros();
     let exp = (p as i32 - 31 + 127) as u32;
     let mant = if p >= 23 {
         (m >> (p - 23)) & 0x7f_ffff
@@ -1951,6 +2028,28 @@ unsafe extern "C" fn asoc_pcm_trigger(
     // SAFETY: the substream is live and its dmaengine runtime was set up by
     // `snd_dmaengine_pcm_open` in `asoc_pcm_open`.
     unsafe { bindings::snd_dmaengine_pcm_trigger(substream, cmd) }
+}
+
+/// Front-end stop synchronization, as for the microphone array: the trigger
+/// stops the DMA asynchronously, so wait for the channel to stop and for its
+/// completion callbacks to finish before ALSA reuses or frees the buffer.
+///
+/// # Safety
+///
+/// Called by ASoC on this driver's registered component, with live
+/// arguments belonging to one of its links.
+unsafe extern "C" fn asoc_pcm_sync_stop(
+    _component: *mut bindings::snd_soc_component,
+    substream: *mut bindings::snd_pcm_substream,
+) -> i32 {
+    // SAFETY: ASoC hands its ops a live substream whose private data is the
+    // `snd_soc_pcm_runtime` of one of this component's links.
+    if unsafe { rtd_is_be(substream_rtd(substream)) } {
+        return 0;
+    }
+    // SAFETY: the substream is live and its dmaengine runtime was set up by
+    // `snd_dmaengine_pcm_open` in `asoc_pcm_open`.
+    unsafe { bindings::snd_dmaengine_pcm_sync_stop(substream) }
 }
 
 /// # Safety
@@ -2389,6 +2488,7 @@ impl AsocContext {
             hw_params: Some(asoc_pcm_hw_params),
             prepare: Some(asoc_pcm_prepare),
             trigger: Some(asoc_pcm_trigger),
+            sync_stop: Some(asoc_pcm_sync_stop),
             pointer: Some(asoc_pcm_pointer),
             copy: Some(asoc_pcm_copy),
             ..Default::default()
@@ -2432,7 +2532,7 @@ impl SndSocT8140AopDriver {
         ioctl: None,
         hw_params: None,
         hw_free: None,
-        sync_stop: None,
+        sync_stop: Some(lpai_pcm_sync_stop),
         get_time_info: None,
         fill_silence: None,
         copy: None,
@@ -2450,7 +2550,7 @@ impl SndSocT8140AopDriver {
         ioctl: None,
         hw_params: Some(hpai_pcm_hw_params),
         hw_free: None,
-        sync_stop: None,
+        sync_stop: Some(hpai_pcm_sync_stop),
         get_time_info: None,
         fill_silence: None,
         copy: None,
@@ -2620,8 +2720,10 @@ impl SndSocT8140AopDriver {
             // SAFETY: the card is freed once, while the binding remains live.
             unsafe { bindings::snd_card_free(self.card) };
         }
-        if self.data.powered.load(Relaxed) && self.data.set_power(POWER_STATE_IDLE).is_ok() {
-            self.data.powered.store(false, Relaxed);
+        // Every stream is closed now; retry an idle request that failed then.
+        let mut run = self.data.lpai_run.lock();
+        if run.running && self.data.set_power(POWER_STATE_IDLE).is_ok() {
+            run.running = false;
         }
     }
 }
@@ -2750,6 +2852,10 @@ impl platform::Driver for SndSocT8140AopDriver {
                     period_acc: 0,
                     buffer_bytes: 0,
                 }),
+                lpai_run <- new_mutex!(LpaiRun {
+                    users: 0,
+                    running: false,
+                }),
             }),
             GFP_KERNEL,
         )?;
@@ -2766,4 +2872,91 @@ module_platform_driver! {
     name: "snd_soc_t8140_aop_audio",
     description: "Apple T8140 AOP audio: microphones, headphone jack and speakers",
     license: "Dual MIT/GPL",
+}
+
+/// The speaker ceiling and the copy-path conversion are the whole digital
+/// protection of the J700 speakers below the daemon: check them where they
+/// are built, without the hardware.
+#[kunit_tests(snd_soc_t8140_aop_audio_speaker)]
+mod tests {
+    use super::*;
+
+    /// macaudio's level for the J700 while no daemon holds the lock:
+    /// MAX98360A_DB(safe_vol = -20).
+    const LOCKED_VOLUME: usize = 87;
+    /// 10^(0.5 / 20) in parts per 10^9.
+    const HALF_DB_PPB: u128 = 1_059_253_725;
+    /// 0.5 as a float32: the amplifier's full scale on the wire.
+    const F32_HALF: u32 = 0x3f00_0000;
+
+    #[test]
+    fn the_top_of_the_volume_range_is_the_amplifier_full_scale() {
+        assert_eq!(
+            SPKR_VOLUME_Q31[SPKR_VOLUME_MAX as usize] as i64,
+            SPKR_CEILING_Q31
+        );
+        assert_eq!(SPKR_CEILING_Q31, 1 << 30);
+        assert_eq!(f32_bits_of_q31(SPKR_CEILING_Q31 as i32), F32_HALF);
+    }
+
+    #[test]
+    fn the_volume_table_falls_in_half_db_steps_to_mute() {
+        assert_eq!(SPKR_VOLUME_Q31[0], 0);
+        for i in 2..=SPKR_VOLUME_MAX as usize {
+            let (lo, hi) = (SPKR_VOLUME_Q31[i - 1] as u128, SPKR_VOLUME_Q31[i] as u128);
+            assert!(hi > lo);
+            // hi / lo == 10^(0.5/20) to within the table's rounding
+            let expect = lo * HALF_DB_PPB / 1_000_000_000;
+            assert!(hi.abs_diff(expect) <= 2);
+        }
+    }
+
+    #[test]
+    fn the_locked_level_is_20_db_below_full_scale() {
+        let locked = SPKR_VOLUME_Q31[LOCKED_VOLUME] as i64;
+        // 10 * locked == ceiling to within the table's rounding (0.1 ppm)
+        assert!((10 * locked - SPKR_CEILING_Q31).abs() <= 10);
+    }
+
+    #[test]
+    fn no_sample_at_any_volume_exceeds_the_full_scale() {
+        for &gain in SPKR_VOLUME_Q31.iter() {
+            for sample in [
+                i32::MAX,
+                i32::MIN,
+                i32::MAX - 1,
+                i32::MIN + 1,
+                1 << 30,
+                -(1 << 30),
+                1,
+                -1,
+                0,
+            ] {
+                let bits = spkr_f32_bits(sample, gain);
+                assert!(bits & 0x7fff_ffff <= F32_HALF);
+            }
+        }
+        // the extremes at full volume: just under and exactly at full scale
+        assert_eq!(
+            spkr_f32_bits(i32::MAX, SPKR_CEILING_Q31 as u32),
+            0x3eff_ffff
+        );
+        assert_eq!(
+            spkr_f32_bits(i32::MIN, SPKR_CEILING_Q31 as u32),
+            0x8000_0000 | F32_HALF
+        );
+        // and 20 dB down at the locked level
+        let locked = spkr_f32_bits(i32::MIN, SPKR_VOLUME_Q31[LOCKED_VOLUME]);
+        // 0.05 as a float32 is 0x3d4c_cccd; the conversion truncates
+        assert!(locked & 0x7fff_ffff <= 0x3d4c_cccd && locked & 0x7fff_ffff > 0x3d4c_cccd - 64);
+    }
+
+    #[test]
+    fn the_float_conversion_is_exact_on_powers_of_two() {
+        assert_eq!(f32_bits_of_q31(0), 0);
+        assert_eq!(f32_bits_of_q31(1 << 29), 0x3e80_0000); // 0.25
+        assert_eq!(f32_bits_of_q31(-(1 << 30)), 0xbf00_0000); // -0.5
+        assert_eq!(f32_bits_of_q31(1), 0x3000_0000); // 2^-31
+        assert_eq!(f32_bits_of_q31(i32::MIN), 0xbf80_0000); // -1.0
+    }
 }

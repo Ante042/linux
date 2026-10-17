@@ -52,6 +52,8 @@
 			power-domains = <&ps_disp_cpu>;
 			/* Format properties will be added by loader */
 			status = "disabled";
+			panel = <&panel>;
+			post-init-providers = <&panel>;
 		};
 	};
 
@@ -381,52 +383,6 @@
 				};
 			};
 		};
-
-		/*
-		 * Once the PMP knows the GPU is on, it votes the DRAM controller
-		 * (DCS) up with GPU load, and the GPU and memory system draw up
-		 * to 2.4 W more. The CPU zones above cannot hold that back: on a
-		 * GPU-bound load the CPUs request little power, so with the
-		 * performance governor the die passed 95 C within 35 s and
-		 * reached 104 C before they throttled. This zone limits the DCS
-		 * vote instead, through the PMC. With it the same load peaks at
-		 * 97 C, as it does without any DCS vote, and a ten-minute
-		 * balanced GPU load loses 1-2% of its throughput.
-		 *
-		 * Tp0t reads at or above every CPU die sensor under GPU load,
-		 * and leads them by about 1 C when the CPUs also run hot. The
-		 * sustainable power is the whole DCS range, so the vote is only
-		 * trimmed above the control trip; the PID gains follow from it
-		 * and the 6 C between the trips.
-		 */
-		soc-dcs-thermal {
-			polling-delay-passive = <500>;
-			polling-delay = <500>;
-			thermal-sensors = <&smc_hwmon 6>;	/* Tp0t */
-			sustainable-power = <2407>;
-
-			trips {
-				soc_dcs_alert: trip-alert {
-					temperature = <89000>;
-					hysteresis = <2000>;
-					type = "passive";
-				};
-
-				soc_dcs_control: trip-control {
-					temperature = <95000>;
-					hysteresis = <2000>;
-					type = "passive";
-				};
-			};
-
-			cooling-maps {
-				map0 {
-					trip = <&soc_dcs_control>;
-					cooling-device =
-						<&pmc THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
-				};
-			};
-		};
 	};
 };
 
@@ -470,8 +426,12 @@
 
 &pmc {
 	/*
-	 * System power above DCS state 0 at each DCS state, measured with
-	 * glmark2's terrain scene, GPU-bound, on the J700.
+	 * System power above DCS state 0 at each DCS state, GPU-bound.
+	 *
+	 * No thermal zone limits the DCS rail: the PMP drops its DCS vote
+	 * when the GPU idles, and a power allocator zone on Tp0t made the
+	 * limit oscillate between states 1 and 4 under GPU load. Without
+	 * it Tp0t stays below the 110 C critical trips of the CPU zones.
 	 */
 	apple,dcs-power-microwatt = <0 919000 1453000 2058000 2407000>;
 	status = "okay";
@@ -500,8 +460,6 @@
 		compatible = "jedec,spi-nor";
 		reg = <0>;
 		spi-max-frequency = <25000000>;
-		spi-rx-bus-width = <4>;
-		spi-tx-bus-width = <4>;
 
 		partitions {
 			compatible = "fixed-partitions";
@@ -676,7 +634,7 @@
 	 * the SMC key groups and are not otherwise verified.
 	 */
 
-	/* Channel 6, the sensor of soc-dcs-thermal: keep it first here. */
+	/* Channel 6: reads at or above every CPU die sensor under GPU load. */
 	temperature-Tp0t {
 		apple,key-id = "Tp0t";
 		label = "SMC Tp0t";
@@ -1866,7 +1824,7 @@
 #include "hwmon-laptop.dtsi"
 
 &pcie0 {
-	/* Experiment: guard stays closed until the retained bootstrap succeeds. */
+	/* The PIODMA guard stays closed until the retained bootstrap succeeds. */
 	apple,piodma = <&pcie0_piodma_diag>;
 	iommu-map = <0x100 &pcie0_dart 1 2>;
 	iommu-map-mask = <0xffff>;
@@ -1888,7 +1846,7 @@
 	};
 };
 
-/* Experimental SID17 bootstrap; arena ownership lasts until full reset. */
+/* SID17 bootstrap; the arena stays owned until a full reset. */
 &pcie0_dart {
 	status = "okay";
 	apple,dma-range = /bits/ 64 <0 0x1000000000>;
@@ -1917,4 +1875,32 @@
 		/* Public m1n1 supplies this device's address at boot. */
 		local-mac-address = [00 00 00 00 00 00];
 	};
+};
+
+/* The loader publishes external resources after validating their firmware. */
+#include "t8140-j700-dcpext.dtsi"
+
+&display {
+	iommus = <&disp0_dart 0>, <&dispext0_dart 0>;
+};
+
+&dcpext {
+	clocks = <&clk_disp0_154>, <&clk_disp0_194>;
+	clock-names = "clock-154", "clock-194";
+	phys = <&atcphy0 PHY_TYPE_DP>;
+	phy-names = "typec0";
+	mux-controls = <&dpxbar0 0>;
+	mux-control-names = "typec0";
+	apple,typec-mux-indices = <2>;
+	apple,typec-dptx-phys = <0>;
+	apple,dcp-index = <1>;
+};
+
+&{/soc/dcp@416e00000/typec-routes/route@0} {
+	status = "okay";
+};
+
+/* Allocate scanout buffers in the window used by the inherited firmware. */
+&dcpext0_dart {
+	apple,dma-range = <0x100 0x0 0x10 0x0>;
 };

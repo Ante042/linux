@@ -61,6 +61,13 @@ mod render;
 
 /// Trait implemented by all versioned queues.
 pub(crate) trait Queue: Send + Sync {
+    /// Reserve render ray query scratch for the given vertex and fragment layouts. Only the
+    /// G17P runtime supports render ray queries; every other queue accepts only zero.
+    fn reserve_render_scs(&mut self, layouts: [u64; 2]) -> Result {
+        if layouts != [0; 2] { return Err(EINVAL); }
+        Ok(())
+    }
+
     fn submit(
         &mut self,
         id: u64,
@@ -193,7 +200,12 @@ pub(crate) struct QueueJob {
     fence: UserFence<JobFence::ver>,
     notifier: Arc<GpuObject<fw::event::Notifier::ver>>,
     notification_count: u32,
-    did_run: bool,
+    id: u64,
+}
+
+/// Timeout state of a [`QueueJob`], owned by the scheduler's timeout worker.
+pub(crate) struct QueueTimeout {
+    dev: AsahiDevRef,
     id: u64,
 }
 
@@ -241,7 +253,13 @@ impl QueueJob::ver {
 
 #[versions(AGX)]
 impl sched::JobImpl for QueueJob::ver {
-    fn prepare(job: &mut sched::Job<Self>) -> Option<Fence> {
+    type TimeoutData = QueueTimeout;
+
+    fn timeout_data(&self) -> QueueTimeout {
+        QueueTimeout { dev: self.dev.clone(), id: self.id }
+    }
+
+    fn prepare(job: &mut Self) -> Option<Fence> {
         mod_dev_dbg!(job.dev, "QueueJob {}: Checking runnability\n", job.id);
 
         if let Some(sj) = job.sj_vtx.as_ref() {
@@ -278,7 +296,7 @@ impl sched::JobImpl for QueueJob::ver {
     }
 
     #[allow(unused_assignments)]
-    fn run(job: &mut sched::Job<Self>) -> Result<Option<dma_fence::Fence>> {
+    fn run(job: &mut Self) -> Result<Option<dma_fence::Fence>> {
         mod_dev_dbg!(job.dev, "QueueJob {}: Running Job\n", job.id);
 
         // We can only increase the notifier threshold here, now that we are
@@ -397,22 +415,22 @@ impl sched::JobImpl for QueueJob::ver {
         mod_dev_dbg!(job.dev, "QueueJob {}: Drop fragment job\n", job.id);
         core::mem::drop(frag_job);
 
-        job.did_run = true;
-
         Ok(Some(Fence::from_fence(&job.fence)))
     }
 
-    fn timed_out(job: &mut sched::Job<Self>) -> sched::Status {
+    fn timed_out(job: &mut QueueTimeout, _finished: bool) -> sched::Status {
         // FIXME: Handle timeouts properly
+        // The timeout worker no longer sees the job itself, so it cannot tell whether run()
+        // completed.
         dev_err!(
             job.dev.as_ref(),
-            "QueueJob {}: Job timed out on the DRM scheduler, things will probably break (ran: {})\n",
-            job.id, job.did_run
+            "QueueJob {}: Job timed out on the DRM scheduler, things will probably break\n",
+            job.id
         );
         sched::Status::NoDevice
     }
 
-    fn cancel(job: &mut sched::Job<Self>) {
+    fn cancel(job: &mut Self) {
         dev_info!(
             job.dev.as_ref(),
             "QueueJob {}: Job canceled on DRM scheduler teardown\n",
@@ -571,6 +589,13 @@ impl Queue::ver {
 const SQ_RENDER: usize = 0;
 const SQ_COMPUTE: usize = 1;
 const SQ_COUNT: usize = 2;
+
+/// Bytes of a render command this queue implements. The fields from `prior_vdm` on belong to
+/// other runtimes and must be zero here, as must any bytes beyond the kernel's structure.
+const RENDER_SUPPORTED_SIZE: usize = core::mem::offset_of!(uapi::drm_asahi_cmd_render, prior_vdm);
+/// Bytes of a compute command this queue implements; see [`RENDER_SUPPORTED_SIZE`].
+const COMPUTE_SUPPORTED_SIZE: usize =
+    core::mem::offset_of!(uapi::drm_asahi_cmd_compute, scs_layout);
 
 // SAFETY: All bit patterns are valid by construction.
 unsafe impl AnyBitPattern for uapi::drm_asahi_cmd_header {}
@@ -748,7 +773,6 @@ impl Queue for Queue::ver {
                 // notification count for the job.
                 notification_count: (2 * nr_render) + nr_compute,
 
-                did_run: false,
                 id,
             },
         )?;
@@ -833,7 +857,11 @@ impl Queue for Queue::ver {
 
             match header.cmd_type as u32 {
                 uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_RENDER => {
-                    let render: uapi::drm_asahi_cmd_render = cmdbuf.read_up_to(header_size)?;
+                    let render: uapi::drm_asahi_cmd_render = cmdbuf
+                        .read_supported(header_size, RENDER_SUPPORTED_SIZE)
+                        .inspect_err(|_| {
+                            cls_pr_debug!(Errors, "Unsupported render command fields\n")
+                        })?;
 
                     self.inner.submit_render(
                         &mut job,
@@ -858,7 +886,11 @@ impl Queue for Queue::ver {
                     )?;
                 }
                 uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_COMPUTE => {
-                    let compute: uapi::drm_asahi_cmd_compute = cmdbuf.read_up_to(header_size)?;
+                    let compute: uapi::drm_asahi_cmd_compute = cmdbuf
+                        .read_supported(header_size, COMPUTE_SUPPORTED_SIZE)
+                        .inspect_err(|_| {
+                            cls_pr_debug!(Errors, "Unsupported compute command fields\n")
+                        })?;
 
                     self.inner.submit_compute(
                         &mut job,

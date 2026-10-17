@@ -21,6 +21,9 @@ struct apple_atomic_state {
 
 #define to_apple_atomic_state(s) container_of(s, struct apple_atomic_state, base)
 
+bool dcp_h17p_external_supported(struct device_node *np);
+bool dcp_h17p_external_ready(struct device_node *np);
+
 struct apple_crtc {
 	struct drm_crtc base;
 	struct drm_pending_vblank_event *event;
@@ -44,6 +47,7 @@ struct apple_encoder {
 void dcp_poweroff(struct platform_device *pdev);
 int dcp_typec_prepare_route(struct apple_dcp *dcp);
 void dcp_poweron(struct platform_device *pdev);
+void dcp_external_recover(struct platform_device *pdev);
 int dcp_set_crc(struct drm_crtc *crtc, bool enabled);
 int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state *state);
 int dcp_get_connector_type(struct platform_device *pdev);
@@ -54,6 +58,12 @@ unsigned long* dcp_get_iomfb_surfaces(struct platform_device *pdev);
 int dcp_start(struct platform_device *pdev);
 int dcp_wait_ready(struct platform_device *pdev, u64 timeout);
 void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_state *state);
+void dcp_retain_framebuffer(struct platform_device *pdev,
+			    struct dcp_fb_reference *entry);
+void dcp_arm_retained_framebuffers(struct apple_dcp *dcp, u32 swap_id);
+void dcp_unarm_retained_framebuffers(struct apple_dcp *dcp, u32 swap_id);
+void dcp_release_retained_framebuffers(struct apple_dcp *dcp, u32 swap_id);
+void dcp_release_all_retained_framebuffers(struct apple_dcp *dcp);
 bool dcp_is_initialized(struct platform_device *pdev);
 void apple_crtc_vblank(struct apple_crtc *apple);
 void dcp_drm_crtc_vblank(struct apple_crtc *crtc);
@@ -71,6 +81,10 @@ bool dcp_crtc_mode_fixup(struct drm_crtc *crtc,
 			 const struct drm_display_mode *mode,
 			 struct drm_display_mode *adjusted_mode);
 void dcp_set_dimensions(struct apple_dcp *dcp, u64 generation);
+/* H17P (T8140, T8142) */
+void dcp_set_dimensions_h17p(struct apple_dcp *dcp);
+void dcp_update_connector_dimensions(struct apple_dcp *dcp,
+				     struct drm_connector *connector);
 void dcp_send_message(struct apple_dcp *dcp, u8 endpoint, u64 message);
 
 int dcp_dptx_connect_oob(struct platform_device *pdev, u32 port);
@@ -93,6 +107,7 @@ void iomfb_recv_msg(struct apple_dcp *dcp, u64 message);
 
 int systemep_init(struct apple_dcp *dcp);
 int dptxep_init(struct apple_dcp *dcp);
+int dptx_controller_init(struct apple_dcp *dcp);
 int ibootep_init(struct apple_dcp *dcp);
 int dpavservep_init(struct apple_dcp *dcp);
 int avep_init(struct apple_dcp *dcp);

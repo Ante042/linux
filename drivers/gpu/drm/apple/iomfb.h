@@ -156,6 +156,7 @@ enum dcpep_method {
 	dcpep_flush_supports_power,
 	dcpep_set_power_state,
 	dcpep_first_client_open,
+	dcpep_register_dfb_surface,
 	dcpep_set_parameter_dcp,
 	dcpep_enable_disable_video_power_savings,
 	dcpep_is_main_display,
@@ -166,18 +167,51 @@ enum dcpep_method {
 	iomfbep_last_client_close,
 	iomfbep_abort_swaps_dcp,
 	iomfbep_set_matrix,
+	/*
+	 * H17P default-framebuffer queries, issued from inside
+	 * start_hardware_boot (D121) between create_default_fb and
+	 * setup_video_limits.
+	 */
+	dcpep_get_dfb_compression_info,
+	dcpep_get_dfb_info,
+	dcpep_get_dfb_layout,
+	dcpep_get_dfb_state,
+	dcpep_set_dfb_dimensions,
+	dcpep_commit_dfb_info,
+	dcpep_dfb_query,
+	dcpep_dfb_ready_query,
+	/*
+	 * H17P pipe-configuration calls made before the first swap.  Most
+	 * names are unknown; they are identified by method number.
+	 */
+	dcpep_pipe_cfg_415,
+	dcpep_pipe_cfg_031,
+	dcpep_pipe_cfg_414,
+	dcpep_pipe_query_478,
+	dcpep_pipe_query_474,
+	dcpep_pipe_set_476,
+	dcpep_pipe_set_428,
 	dcpep_num_methods
 };
 
 #define IOMFB_METHOD(tag, name) [name] = { #name, { tag[0], tag[1], tag[2], tag[3] } }
+#define IOMFB_METHOD_H17(tag, h17g, name) [name] = { #name, \
+	{ tag[0], tag[1], tag[2], tag[3] }, \
+	{ h17g[0], h17g[1], h17g[2], h17g[3] } }
 
 struct dcp_method_entry {
 	const char *name;
 	char tag[4];
+	/* H17G shares the H17P transport but changes selected method IDs. */
+	char tag_h17g[4];
 };
 
 #define IOMFB_MAX_CB (1000)
+
+bool iomfb_validate_callback_h17p(int tag, u32 in_len, u32 out_len);
 struct apple_dcp;
+bool iomfb_check_callback_h17p(struct apple_dcp *dcp, int tag, u32 in_len,
+			       u32 out_len);
 
 typedef bool (*iomfb_cb_handler)(struct apple_dcp *, int, void *, void *);
 
@@ -196,6 +230,7 @@ struct dcp_map_buf_req {
 	u8 dva_null;
 } __packed;
 
+/* 12.3, 13.5 and 14.7; H17P's is in iomfb_template.h. */
 struct dcp_map_buf_resp {
 	u64 vaddr;
 	u64 dva;
@@ -242,6 +277,7 @@ struct dcp_map_physical_resp {
 	u32 mem_desc_id;
 } __packed;
 
+/* 12.3, 13.5 and 14.7; H17P's are in iomfb_template.h. */
 struct dcp_swap_start_req {
 	u32 swap_id;
 	struct dcp_iouserclient client;
@@ -284,6 +320,7 @@ struct iomfb_set_fx_prop_req {
 	u32 value;
 } __packed;
 
+/* 12.3, 13.5 and 14.7; H17P's is in iomfb_template.h. */
 struct dcp_set_power_state_req {
 	u64 unklong;
 	u8 unkbool;

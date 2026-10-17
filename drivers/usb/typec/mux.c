@@ -398,24 +398,83 @@ void typec_mux_put(struct typec_mux *mux)
 }
 EXPORT_SYMBOL_GPL(typec_mux_put);
 
+/* Abort, in reverse, the providers whose prepare stage was reached. */
+static void typec_mux_abort(struct typec_mux *mux, unsigned int prepared,
+			    struct typec_mux_state *state)
+{
+	struct typec_mux_dev *mux_dev;
+
+	while (prepared--) {
+		mux_dev = mux->mux_devs[prepared];
+		if (mux_dev->abort)
+			mux_dev->abort(mux_dev, state);
+	}
+}
+
+/**
+ * typec_mux_set - Set the state of the muxes of a connector
+ * @mux: USB Type-C Connector Multiplexer/DeMultiplexer
+ * @state: New state
+ *
+ * Sets every mux of the connector. Providers that register transaction
+ * phases (struct typec_mux_desc) take part in one transaction: every
+ * provider's prepare runs before any provider's set, and every finish, then
+ * every commit, after all of them. A failure in prepare, set or finish calls
+ * abort, in reverse order, on the providers whose prepare stage was reached.
+ * A provider that registers only set is just set, in connection order, as
+ * before.
+ */
 int typec_mux_set(struct typec_mux *mux, struct typec_mux_state *state)
 {
 	struct typec_mux_dev *mux_dev;
+	unsigned int prepared = 0;
 	unsigned int i;
 	int ret;
 
 	if (IS_ERR_OR_NULL(mux))
 		return 0;
 
+	/* Quiesce every consumer before any provider changes the route. */
+	for (i = 0; i < mux->num_mux_devs; i++) {
+		mux_dev = mux->mux_devs[i];
+		prepared = i + 1;
+		if (!mux_dev->prepare)
+			continue;
+		ret = mux_dev->prepare(mux_dev, state);
+		if (ret)
+			goto abort;
+	}
+
 	for (i = 0; i < mux->num_mux_devs; i++) {
 		mux_dev = mux->mux_devs[i];
 
 		ret = mux_dev->set(mux_dev, state);
 		if (ret && ret != -EOPNOTSUPP)
-			return ret;
+			goto abort;
+	}
+
+	/* Finalizers can fail, but must not release their reservation. */
+	for (i = 0; i < mux->num_mux_devs; i++) {
+		mux_dev = mux->mux_devs[i];
+		if (!mux_dev->finish)
+			continue;
+		ret = mux_dev->finish(mux_dev, state);
+		if (ret)
+			goto abort;
+	}
+
+	/* Only this phase, which cannot fail, may release a reservation. */
+	for (i = 0; i < mux->num_mux_devs; i++) {
+		mux_dev = mux->mux_devs[i];
+		if (mux_dev->commit)
+			mux_dev->commit(mux_dev, state);
 	}
 
 	return 0;
+
+abort:
+	typec_mux_abort(mux, prepared, state);
+	return ret;
 }
 EXPORT_SYMBOL_GPL(typec_mux_set);
 
@@ -453,6 +512,10 @@ typec_mux_register(struct device *parent, const struct typec_mux_desc *desc)
 		return ERR_PTR(-ENOMEM);
 
 	mux_dev->set = desc->set;
+	mux_dev->prepare = desc->prepare;
+	mux_dev->finish = desc->finish;
+	mux_dev->commit = desc->commit;
+	mux_dev->abort = desc->abort;
 
 	device_initialize(&mux_dev->dev);
 	mux_dev->dev.parent = parent;

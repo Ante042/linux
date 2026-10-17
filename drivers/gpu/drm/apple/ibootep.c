@@ -734,9 +734,28 @@ static const struct apple_epic_service_ops ibootep_ops[] = {
 	{}
 };
 
+static const struct apple_epic_service_ops external_ibootep_ops[] = {
+	{
+		.name = "dispext-service",
+		.init = disp_service_init,
+	},
+	{}
+};
+
 int ibootep_init(struct apple_dcp *dcp)
 {
+	const struct apple_epic_service_ops *ops = ibootep_ops;
 	int ret;
+
+	/* H17P firmware (T8140, T8142): aurora-wip's service ops and errors. */
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P) {
+		if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL)
+			ops = external_ibootep_ops;
+		dcp->ibootep = afk_init(dcp, DISP0_ENDPOINT, ops);
+		if (IS_ERR(dcp->ibootep))
+			return PTR_ERR(dcp->ibootep);
+		return afk_start(dcp->ibootep);
+	}
 
 	if (!of_machine_is_compatible("apple,t6030") &&
 	    !of_machine_is_compatible("apple,t6031") &&

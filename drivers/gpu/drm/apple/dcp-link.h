@@ -761,27 +761,33 @@ apple_dcp_h17p_rt_bw_encode(struct apple_dcp_h17p_rt_bw_config *config,
 	config->clock_request = cpu_to_le64(clock_request);
 }
 
+/* D003: fill in the bandwidth config unless the firmware passed it as null */
 static inline int
-apple_dcp_h17p_rt_bw_encode_reply(struct apple_dcp_link_rpc_view *view,
+apple_dcp_h17p_rt_bw_encode_reply(const struct apple_dcp_h17p_rt_bw_request *request,
+				  struct apple_dcp_h17p_rt_bw_reply *reply,
 				  u64 scratch, u64 clock_request)
 {
-	const struct apple_dcp_h17p_rt_bw_request *request;
-	struct apple_dcp_h17p_rt_bw_reply *reply;
-
-	if (!view || view->call != APPLE_DCP_LINK_CALL_D003)
-		return -EINVAL;
-	if (view->input_size < sizeof(*request) ||
-	    view->output_size < sizeof(*reply))
-		return -EMSGSIZE;
-
-	request = view->input;
 	if (le32_to_cpu(request->config_null) & 1)
 		return -EINVAL;
 
-	reply = view->output;
 	apple_dcp_h17p_rt_bw_encode(&reply->config, scratch, clock_request);
 	reply->status = cpu_to_le32(0);
 	return 0;
+}
+
+/* The same, for a call record seen through a DCPLink RPC view. */
+static inline int
+apple_dcp_h17p_rt_bw_encode_reply_view(struct apple_dcp_link_rpc_view *view,
+				       u64 scratch, u64 clock_request)
+{
+	if (!view || view->call != APPLE_DCP_LINK_CALL_D003)
+		return -EINVAL;
+	if (view->input_size < sizeof(struct apple_dcp_h17p_rt_bw_request) ||
+	    view->output_size < sizeof(struct apple_dcp_h17p_rt_bw_reply))
+		return -EMSGSIZE;
+
+	return apple_dcp_h17p_rt_bw_encode_reply(view->input, view->output,
+						 scratch, clock_request);
 }
 
 #endif /* __APPLE_DCP_LINK_H__ */

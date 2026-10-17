@@ -73,6 +73,20 @@ const SLOT_ENTRY_SIZE: usize = 24;
 const INTENT_NONE: u8 = 0;
 const INTENT_WRITE: u8 = 1;
 
+/// Why an existing file is refused. It is logged, so it never carries record
+/// contents.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Damage {
+    /// The file is shorter than the store.
+    Size,
+    /// The magic, version or geometry is not this format's.
+    Header,
+    /// The slot's record is longer than its block.
+    Slot(usize),
+    /// The pending write intent names a block that holds a committed record.
+    Intent,
+}
+
 // Not internally locked; the caller holds a mutex around all access.
 pub(crate) struct Store {
     file: shim::StoreFile,
@@ -92,9 +106,39 @@ fn le64(buf: &[u8], off: usize) -> u64 {
     u64::from_le_bytes(v)
 }
 
+/// Describes an existing file that holds no store as "empty" or "all zero".
+/// That is all an interrupted creation leaves, and such a file holds nothing
+/// to keep; anything else may be what is left of a store. Reads at most a
+/// store's worth of the file.
+fn describe(file: &shim::StoreFile, size: u64) -> Option<&'static str> {
+    if size == 0 {
+        return Some("empty");
+    }
+    if size > STORE_SIZE as u64 {
+        return None;
+    }
+    let mut buf = KVec::new();
+    buf.resize(BLOCK_SIZE, 0, GFP_KERNEL).ok()?;
+    let mut off = 0;
+    while off < size {
+        let len = (size - off).min(BLOCK_SIZE as u64) as usize;
+        file.read_exact(off, &mut buf[..len]).ok()?;
+        if buf[..len].iter().any(|&b| b != 0) {
+            return None;
+        }
+        off += len as u64;
+    }
+    Some("all zero")
+}
+
 impl Store {
     pub(crate) fn open() -> Result<Store> {
-        let file = shim::StoreFile::open(STORE_PATH)?;
+        Self::open_at(STORE_PATH)
+    }
+
+    /// [`Store::open`] on the file at `path`.
+    fn open_at(path: &CStr) -> Result<Store> {
+        let (file, created) = shim::StoreFile::open_host(path)?;
 
         let mut store = Store {
             file,
@@ -104,10 +148,18 @@ impl Store {
             fresh: false,
         };
 
+        // A new file is initialised, and so is an existing one that holds
+        // nothing (see `init_blank`). Any other file may hold the only copy of
+        // the host state, so one that this driver cannot use is refused and
+        // left as it is.
         let size = store.file.size()?;
-        if size < STORE_SIZE as u64 {
+        if created && size == 0 {
             store.create()?;
+            pr_info!("created a new host-state store\n");
             return Ok(store);
+        }
+        if size < STORE_SIZE as u64 {
+            return store.init_blank(Damage::Size, size);
         }
 
         let mut sb = KVec::with_capacity(BLOCK_SIZE, GFP_KERNEL)?;
@@ -119,8 +171,7 @@ impl Store {
             || le32(&sb, SB_SLOT_COUNT) as usize != SLOT_COUNT
             || le32(&sb, SB_BLOCK_SIZE) as usize != BLOCK_SIZE
         {
-            store.create()?;
-            return Ok(store);
+            return store.init_blank(Damage::Header, size);
         }
 
         store.generation = le64(&sb, SB_GENERATION);
@@ -134,6 +185,10 @@ impl Store {
                 uuid,
                 len: le32(&sb, off + 18),
             };
+            // A longer record would be read from the blocks of the next slots.
+            if store.slots[i].used && store.slots[i].len as usize > MAX_VALUE {
+                return Err(store.refuse(Damage::Slot(i)));
+            }
         }
 
         // Crash recovery: writes are copy-on-write, so discard the intent, never complete it.
@@ -142,12 +197,47 @@ impl Store {
             store.recovered = true;
             let slot = u16::from_le_bytes([sb[SB_INTENT_SLOT], sb[SB_INTENT_SLOT + 1]]) as usize;
             if intent_kind == INTENT_WRITE && slot < SLOT_COUNT {
+                // The intent names the free block that was being filled. One
+                // that names a committed record is damage, and freeing that
+                // block would discard the record.
+                if store.slots[slot].used {
+                    return Err(store.refuse(Damage::Intent));
+                }
                 store.slots[slot] = Slot::FREE;
             }
             store.commit()?;
         }
 
         Ok(store)
+    }
+
+    /// An existing file that is too short or has no valid header. If it is
+    /// empty or all zero it holds no host state: that is all a creation
+    /// interrupted before its superblock was written leaves, and every boot
+    /// after one would otherwise find Touch ID off until the file is removed
+    /// by hand. Such a file is initialised like a new one, as earlier
+    /// releases did. Anything else may be what is left of a store, and is
+    /// refused without writing to it.
+    fn init_blank(mut self, damage: Damage, size: u64) -> Result<Store> {
+        let Some(what) = describe(&self.file, size) else {
+            return Err(self.refuse(damage));
+        };
+        pr_warn!(
+            "host-state store file is {} and holds no state; initialising it\n",
+            what
+        );
+        self.create()?;
+        Ok(self)
+    }
+
+    /// Logs why the existing file is refused, and returns the error. Nothing
+    /// is written to the file.
+    fn refuse(&self, damage: Damage) -> Error {
+        pr_err!(
+            "host-state store failed validation ({:?}), refusing it\n",
+            damage
+        );
+        EIO
     }
 
     fn create(&mut self) -> Result<()> {
@@ -287,3 +377,91 @@ pub(crate) const fn crc16_ccitt_false(data: &[u8]) -> u16 {
 
 // Canonical CCITT-FALSE check value; guards against a reflected/XOR variant.
 static_assert!(crc16_ccitt_false(b"123456789") == 0x29B1);
+
+#[kernel::macros::kunit_tests(apple_sep_host_store)]
+mod tests {
+    use super::*;
+
+    // In the root of the test kernel's in-memory root file system.
+    const PATH: &CStr = c"/apple-sep-host-store-test.bin";
+
+    /// Replaces the test file's contents with `len` bytes of `byte`.
+    fn fill(len: usize, byte: u8) -> Result {
+        let file = shim::StoreFile::open_trunc(PATH)?;
+        let mut buf = KVec::new();
+        buf.resize(BLOCK_SIZE, byte, GFP_KERNEL)?;
+        let mut off = 0;
+        while off < len {
+            let n = (len - off).min(BLOCK_SIZE);
+            file.write_all(off as u64, &buf[..n])?;
+            off += n;
+        }
+        file.sync()
+    }
+
+    /// The test file's size and its first byte (0 when empty).
+    fn peek() -> Result<(u64, u8)> {
+        let file = shim::StoreFile::open_readonly(PATH)?;
+        let size = file.size()?;
+        let mut first = [0u8; 1];
+        if size > 0 {
+            file.read_exact(0, &mut first)?;
+        }
+        Ok((size, first[0]))
+    }
+
+    /// Opens the test file as a store, expecting a newly initialised one.
+    fn opens_fresh() -> Result<bool> {
+        let store = Store::open_at(PATH)?;
+        Ok(store.fresh && store.slots.iter().all(|slot| !slot.used))
+    }
+
+    #[test]
+    fn an_existing_empty_file_is_initialised() -> Result {
+        fill(0, 0)?;
+        assert!(opens_fresh()?);
+        assert_eq!(peek()?, (STORE_SIZE as u64, MAGIC[0]));
+        Ok(())
+    }
+
+    #[test]
+    fn an_all_zero_file_is_initialised() -> Result {
+        // Short, as a creation interrupted while zero-filling leaves it.
+        fill(BLOCK_SIZE + 100, 0)?;
+        assert!(opens_fresh()?);
+        assert_eq!(peek()?, (STORE_SIZE as u64, MAGIC[0]));
+        // Full size, interrupted before the superblock was written.
+        fill(STORE_SIZE, 0)?;
+        assert!(opens_fresh()?);
+        assert_eq!(peek()?, (STORE_SIZE as u64, MAGIC[0]));
+        Ok(())
+    }
+
+    #[test]
+    fn a_short_file_with_data_is_refused_untouched() -> Result {
+        fill(100, 0x5a)?;
+        assert!(Store::open_at(PATH).err() == Some(EIO));
+        assert_eq!(peek()?, (100, 0x5a));
+        Ok(())
+    }
+
+    #[test]
+    fn a_bad_header_with_data_is_refused_untouched() -> Result {
+        fill(STORE_SIZE, 0x5a)?;
+        assert!(Store::open_at(PATH).err() == Some(EIO));
+        assert_eq!(peek()?, (STORE_SIZE as u64, 0x5a));
+        Ok(())
+    }
+
+    #[test]
+    fn a_valid_store_keeps_its_records() -> Result {
+        let key = Key::root(0xf0);
+        fill(0, 0)?;
+        Store::open_at(PATH)?.write(&key, b"kept")?;
+        let mut store = Store::open_at(PATH)?;
+        assert!(!store.fresh);
+        let value = store.read(&key)?.ok_or(ENOENT)?;
+        assert_eq!(&value[..], b"kept");
+        Ok(())
+    }
+}

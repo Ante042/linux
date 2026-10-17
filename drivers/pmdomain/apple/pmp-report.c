@@ -7,6 +7,7 @@
 
 #include <linux/bitfield.h>
 #include <linux/completion.h>
+#include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/hwmon.h>
 #include <linux/io.h>
@@ -20,7 +21,9 @@
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
+#include <linux/rculist.h>
 #include <linux/regmap.h>
+#include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/pmp-report.h>
 #include <linux/soc/apple/pmp-temps.h>
@@ -48,6 +51,19 @@ struct apple_pmp_report_offsets {
 	bool temps;
 	/* With starts_pmp: soc-device record i holds device id i + 1. */
 	bool devices_ordered;
+	/*
+	 * The report is published in apple_pmp_reports, where the fast
+	 * die-temperature reader and the power callbacks of its entries look
+	 * it up by node, and its teardown withdraws the entries first (T8140).
+	 */
+	bool published;
+	/*
+	 * With published: 32-bit word holding the fast die-temperature effort
+	 * of each CPU cluster, one byte per lane; 0 if the SoC has none.
+	 */
+	u32 fast_die;
+	/* With fast_die: number of lanes at fast_die, at most 4. */
+	u32 fast_die_lanes;
 };
 
 struct apple_pmp_report {
@@ -56,6 +72,10 @@ struct apple_pmp_report {
 	void __iomem *base;
 	void __iomem *temp_sram;
 	spinlock_t lock;
+
+	/* Only with offsets->published */
+	struct list_head list;
+	struct dentry *debugfs;
 
 	/* Only with offsets->starts_pmp */
 	struct device_node *pmp;
@@ -1086,6 +1106,128 @@ int apple_pmp_report_wait_supplier_ready(struct device *supplier, unsigned int t
 }
 EXPORT_SYMBOL_GPL(apple_pmp_report_wait_supplier_ready);
 
+/* Bound published report regions, protected by RCU until managed teardown drains readers. */
+static LIST_HEAD(apple_pmp_reports);
+static DEFINE_MUTEX(apple_pmp_reports_lock);
+static struct dentry *apple_pmp_report_debugfs;
+
+/**
+ * apple_pmp_report_fast_die_effort() - read the fast die-temperature effort
+ *	of a CPU cluster
+ * @np: device tree node of the report region
+ * @lane: lane of the cluster in the fast die-temperature report
+ * @effort: set to the effort on success
+ *
+ * The PMP of some SoCs runs a control loop on its own die-temperature sensors
+ * and publishes an 8-bit effort for each CPU cluster: 0 requests no limit,
+ * and the effort rises towards 255 as the die exceeds the firmware's target.
+ * The effort is only valid while the PMP reports that it is running; a
+ * stopped PMP reads 0.
+ *
+ * Context: Any context.
+ * Return: 0 on success, -EPROBE_DEFER if the region is not bound (yet) or
+ * is not a published region (only T8140 regions are), -EOPNOTSUPP if the
+ * SoC's PMP publishes no such effort, -EINVAL if @lane is out of range, or
+ * -EAGAIN if the PMP does not report that it is running.
+ */
+int apple_pmp_report_fast_die_effort(const struct device_node *np,
+				     unsigned int lane, u8 *effort)
+{
+	const struct apple_pmp_report_offsets *offs;
+	const struct apple_pmp_report *rep;
+	int ret = -EPROBE_DEFER;
+
+	rcu_read_lock();
+	list_for_each_entry_rcu(rep, &apple_pmp_reports, list) {
+		if (rep->dev->of_node != np)
+			continue;
+
+		offs = rep->offsets;
+		if (!offs->fast_die) {
+			ret = -EOPNOTSUPP;
+		} else if (lane >= offs->fast_die_lanes) {
+			ret = -EINVAL;
+		} else if (!(readl(rep->base + offs->status) & PMP_REPORT_READY)) {
+			ret = -EAGAIN;
+		} else {
+			*effort = readl(rep->base + offs->fast_die) >>
+				  (lane * BITS_PER_BYTE);
+			ret = 0;
+		}
+		break;
+	}
+	rcu_read_unlock();
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_pmp_report_fast_die_effort);
+
+/* Read only the documented status and fast-die entries, never the aperture. */
+static int apple_pmp_report_status_show(struct seq_file *s, void *unused)
+{
+	struct apple_pmp_report *rep = s->private;
+	const struct apple_pmp_report_offsets *offs = rep->offsets;
+	u32 status = readl(rep->base + offs->status);
+	unsigned int lane;
+	u32 effort;
+
+	seq_printf(s, "running: %u\n", !!(status & PMP_REPORT_READY));
+	if (!(status & PMP_REPORT_READY) || !offs->fast_die)
+		return 0;
+
+	effort = readl(rep->base + offs->fast_die);
+	for (lane = 0; lane < offs->fast_die_lanes; lane++)
+		seq_printf(s, "lane%u: %u\n", lane,
+			   (effort >> (lane * BITS_PER_BYTE)) & 0xff);
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(apple_pmp_report_status);
+
+static void apple_pmp_report_release(void *data)
+{
+	struct apple_pmp_report *rep = data;
+
+	/* Withdraw child providers while their power callbacks can still use MMIO. */
+	of_platform_depopulate(rep->dev);
+	mutex_lock(&apple_pmp_reports_lock);
+	if (!list_empty(&rep->list))
+		list_del_rcu(&rep->list);
+	mutex_unlock(&apple_pmp_reports_lock);
+	synchronize_rcu();
+	/* The debugfs proxy drains active reads and rejects subsequent accesses. */
+	debugfs_remove(rep->debugfs);
+}
+
+/*
+ * With offsets->published: publish the region before its children are
+ * populated, and withdraw it again on teardown, children first.
+ */
+static int apple_pmp_report_publish(struct apple_pmp_report *rep)
+{
+	struct device *dev = rep->dev;
+	int ret;
+
+	INIT_LIST_HEAD(&rep->list);
+	ret = devm_add_action_or_reset(dev, apple_pmp_report_release, rep);
+	if (ret)
+		return ret;
+
+	mutex_lock(&apple_pmp_reports_lock);
+	list_add_tail_rcu(&rep->list, &apple_pmp_reports);
+	/* Only SoCs with a fast die-temperature report have the directory. */
+	if (rep->offsets->fast_die && !apple_pmp_report_debugfs)
+		apple_pmp_report_debugfs = debugfs_create_dir("apple-pmp-report", NULL);
+	mutex_unlock(&apple_pmp_reports_lock);
+
+	if (rep->offsets->fast_die)
+		rep->debugfs = debugfs_create_file(dev_name(dev), 0400,
+						   apple_pmp_report_debugfs, rep,
+						   &apple_pmp_report_status_fops);
+
+	return 0;
+}
+
 static int apple_pmp_report_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -1132,6 +1274,12 @@ static int apple_pmp_report_probe(struct platform_device *pdev)
 	}
 	if (of_device_is_compatible(np, "apple,t8132-pmp-v2-report")) {
 		ret = apple_pmp_temp_register(rep);
+		if (ret)
+			return ret;
+	}
+	if (rep->offsets->published) {
+		/* Publish the region before child power callbacks start looking it up. */
+		ret = apple_pmp_report_publish(rep);
 		if (ret)
 			return ret;
 	}
@@ -1234,6 +1382,17 @@ static const struct apple_pmp_report_offsets apple_pmp_offsets_t6031 = {
 	.devices_ordered = true,
 };
 
+/* The fast die-temperature report is the low two bytes of entry 0x1c1. */
+static const struct apple_pmp_report_offsets apple_pmp_offsets_t8140 = {
+	.tgt_read = 0x1880,
+	.tgt_write = 0x10c40,
+	.actual = 0x18c0,
+	.status = 0x10,
+	.published = true,
+	.fast_die = 0x1c10,
+	.fast_die_lanes = 2,
+};
+
 /* Same PTD apertures; startup belongs to the native PMP supplier. */
 static const struct apple_pmp_report_offsets apple_pmp_offsets_j613_25g83 = {
 	.tgt_read = 0x1000,
@@ -1251,6 +1410,7 @@ static const struct of_device_id apple_pmp_report_of_match[] = {
 	{ .compatible = "apple,t6030-pmp-v2-report", .data = &apple_pmp_offsets_t6030 },
 	{ .compatible = "apple,t8122-pmp-v2-report", .data = &apple_pmp_offsets_t8122 },
 	{ .compatible = "apple,t6031-pmp-v2-report", .data = &apple_pmp_offsets_t6031 },
+	{ .compatible = "apple,t8140-pmp-v2-report", .data = &apple_pmp_offsets_t8140 },
 	{}
 };
 
@@ -1269,16 +1429,23 @@ struct apple_pmp_report_entry {
 	u32 id;
 	/* The PMP does not acknowledge this request. */
 	bool no_ack;
+
+	/*
+	 * Only for an entry of a published report (T8140), which owns this
+	 * storage and looks its report up by node: see apple_pmp_t8140_entry_probe().
+	 */
+	struct device_node *node;
+	struct device_node *report_node;
+	bool removed;
 };
 
 #define genpd_to_apple_pmp_report_entry(_genpd) \
 	container_of(_genpd, struct apple_pmp_report_entry, genpd)
 
-static int apple_pmp_report_set_state(struct generic_pm_domain *genpd, bool enable)
+static int apple_pmp_report_request(struct apple_pmp_report *rep, u32 id,
+				    bool enable, bool no_ack)
 {
-	struct apple_pmp_report_entry *ent = genpd_to_apple_pmp_report_entry(genpd);
-	struct apple_pmp_report *rep = dev_get_drvdata(ent->dev->parent);
-	u64 bit_val = BIT_ULL(ent->id);
+	u64 bit_val = BIT_ULL(id);
 	u64 val;
 	unsigned long flags;
 
@@ -1290,7 +1457,7 @@ static int apple_pmp_report_set_state(struct generic_pm_domain *genpd, bool enab
 	writeq(val, rep->base + rep->offsets->tgt_write);
 	spin_unlock_irqrestore(&rep->lock, flags);
 	val = readq(rep->base + rep->offsets->status);
-	if ((val & PMP_REPORT_READY) == 0 || ent->no_ack)
+	if ((val & PMP_REPORT_READY) == 0 || no_ack)
 		return 0;
 	return readq_poll_timeout_atomic(
 		rep->base + rep->offsets->actual,
@@ -1298,6 +1465,14 @@ static int apple_pmp_report_set_state(struct generic_pm_domain *genpd, bool enab
 		!!(val & bit_val) == !!enable,
 		100,
 		50000);
+}
+
+static int apple_pmp_report_set_state(struct generic_pm_domain *genpd, bool enable)
+{
+	struct apple_pmp_report_entry *ent = genpd_to_apple_pmp_report_entry(genpd);
+	struct apple_pmp_report *rep = dev_get_drvdata(ent->dev->parent);
+
+	return apple_pmp_report_request(rep, ent->id, enable, ent->no_ack);
 }
 
 static int apple_pmp_report_entry_power_on(struct generic_pm_domain *genpd)
@@ -1310,15 +1485,175 @@ static int apple_pmp_report_entry_power_off(struct generic_pm_domain *genpd)
 	return apple_pmp_report_set_state(genpd, false);
 }
 
-static int apple_pmp_report_entry_probe(struct platform_device *pdev)
+static int apple_pmp_t8140_entry_set_state(struct generic_pm_domain *genpd, bool enable)
+{
+	struct apple_pmp_report_entry *ent = genpd_to_apple_pmp_report_entry(genpd);
+	struct apple_pmp_report *rep;
+	int ret = -ENODEV;
+
+	if (READ_ONCE(ent->removed))
+		return ret;
+
+	rcu_read_lock();
+	list_for_each_entry_rcu(rep, &apple_pmp_reports, list) {
+		if (rep->dev->of_node == ent->report_node) {
+			ret = apple_pmp_report_request(rep, ent->id, enable, false);
+			break;
+		}
+	}
+	rcu_read_unlock();
+	return ret;
+}
+
+static int apple_pmp_t8140_entry_power_on(struct generic_pm_domain *genpd)
+{
+	return apple_pmp_t8140_entry_set_state(genpd, true);
+}
+
+static int apple_pmp_t8140_entry_power_off(struct generic_pm_domain *genpd)
+{
+	return apple_pmp_t8140_entry_set_state(genpd, false);
+}
+
+static void apple_pmp_report_entry_free(struct apple_pmp_report_entry *ent)
+{
+	of_node_put(ent->report_node);
+	of_node_put(ent->node);
+	kfree(ent->genpd.name);
+	kfree(ent);
+}
+
+static void apple_pmp_report_entry_remove(struct platform_device *pdev)
+{
+	struct apple_pmp_report_entry *ent = platform_get_drvdata(pdev);
+
+	/* Only entries of a published report (T8140) are withdrawn. */
+	if (!ent)
+		return;
+
+	WRITE_ONCE(ent->removed, true);
+	of_genpd_del_provider(ent->node);
+	if (pm_genpd_remove(&ent->genpd)) {
+		/* The core still owns this domain. Keep its now inert storage alive. */
+		dev_warn(&pdev->dev, "retaining busy power domain %s\n", ent->genpd.name);
+		return;
+	}
+	apple_pmp_report_entry_free(ent);
+}
+
+/*
+ * An entry of a published report (T8140). Its storage, name and node
+ * references are its own, not the device's: if genpd refuses to remove a
+ * busy domain, they stay alive with callbacks that return -ENODEV.
+ */
+static int apple_pmp_t8140_entry_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct device_node *node = dev->of_node;
 	struct apple_pmp_report_entry *ent;
 	int ret;
+	const char *name;
+	struct of_phandle_iterator it;
+
+	ent = kzalloc_obj(*ent);
+	if (!ent)
+		return -ENOMEM;
+
+	ent->node = of_node_get(node);
+	ent->report_node = of_node_get(dev->parent->of_node);
+
+	ret = of_property_read_u32(node, "reg", &ent->id);
+	if (ret) {
+		ret = dev_err_probe(dev, ret, "missing reg property\n");
+		goto err_free;
+	}
+	if (ent->id >= 64) {
+		ret = -EINVAL;
+		goto err_free;
+	}
+
+	ret = of_property_read_string(node, "label", &name);
+	if (ret < 0) {
+		ret = dev_err_probe(dev, ret, "missing label property\n");
+		goto err_free;
+	}
+	ent->genpd.name = kstrdup(name, GFP_KERNEL);
+	if (!ent->genpd.name) {
+		ret = -ENOMEM;
+		goto err_free;
+	}
+
+	if (of_property_read_bool(node, "apple,always-on")) {
+		ent->genpd.flags |= GENPD_FLAG_ACTIVE_WAKEUP;
+		apple_pmp_t8140_entry_set_state(&ent->genpd, true);
+	}
+
+	ent->genpd.power_on = apple_pmp_t8140_entry_power_on;
+	ent->genpd.power_off = apple_pmp_t8140_entry_power_off;
+
+	ret = pm_genpd_init(&ent->genpd, NULL, true);
+	if (ret) {
+		ret = dev_err_probe(dev, ret, "pm_genpd_init failed\n");
+		goto err_free;
+	}
+
+	ret = of_genpd_add_provider_simple(node, &ent->genpd);
+	if (ret) {
+		ret = dev_err_probe(dev, ret, "of_genpd_add_provider_simple failed\n");
+		goto err_remove_domain;
+	}
+
+	of_for_each_phandle(&it, ret, node, "power-domains", "#power-domain-cells", -1) {
+		struct of_phandle_args parent, child;
+
+		parent.np = it.node;
+		parent.args_count = of_phandle_iterator_args(&it, parent.args, MAX_PHANDLE_ARGS);
+		child.np = node;
+		child.args_count = 0;
+		ret = of_genpd_add_subdomain(&parent, &child);
+
+		if (ret == -EPROBE_DEFER) {
+			of_node_put(parent.np);
+			goto err_remove;
+		} else if (ret < 0) {
+			dev_err(dev, "failed to add to parent domain: %d (%s -> %s)\n",
+				ret, it.node->name, node->name);
+			of_node_put(parent.np);
+			goto err_remove;
+		}
+	}
+
+	pm_genpd_remove_device(dev);
+	platform_set_drvdata(pdev, ent);
+
+	return 0;
+err_remove:
+	of_genpd_del_provider(node);
+err_remove_domain:
+	WRITE_ONCE(ent->removed, true);
+	if (pm_genpd_remove(&ent->genpd)) {
+		dev_warn(dev, "retaining busy power domain %s\n", ent->genpd.name);
+		return ret;
+	}
+err_free:
+	apple_pmp_report_entry_free(ent);
+	return ret;
+}
+
+static int apple_pmp_report_entry_probe(struct platform_device *pdev)
+{
+	struct device *dev = &pdev->dev;
+	struct device_node *node = dev->of_node;
+	const struct apple_pmp_report *rep = dev_get_drvdata(dev->parent);
+	struct apple_pmp_report_entry *ent;
+	int ret;
 	bool record;
 	const char *name;
 	struct of_phandle_iterator it;
+
+	/* Entries of a published report (T8140) look it up by node. */
+	if (rep->offsets->published)
+		return apple_pmp_t8140_entry_probe(pdev);
 
 	ent = devm_kzalloc(dev, sizeof(*ent), GFP_KERNEL);
 	if (!ent)
@@ -1384,11 +1719,14 @@ err_remove:
 
 static const struct of_device_id apple_pmp_report_entry_of_match[] = {
 	{ .compatible = "apple,t6000-pmp-v2-report-entry" },
+	/* Probed through apple_pmp_t8140_entry_probe() by its report. */
+	{ .compatible = "apple,t8140-pmp-v2-report-entry" },
 	{}
 };
 
 static struct platform_driver apple_pmp_report_entry_driver = {
 	.probe = apple_pmp_report_entry_probe,
+	.remove = apple_pmp_report_entry_remove,
 	.driver = {
 		.name = "apple-pmp-report-entry",
 		.of_match_table = apple_pmp_report_entry_of_match,
@@ -1409,6 +1747,7 @@ static void __exit apple_pmp_report_exit(void)
 {
 	platform_driver_unregister(&apple_pmp_report_entry_driver);
 	platform_driver_unregister(&apple_pmp_report_driver);
+	debugfs_remove_recursive(apple_pmp_report_debugfs);
 }
 
 module_init(apple_pmp_report_init);

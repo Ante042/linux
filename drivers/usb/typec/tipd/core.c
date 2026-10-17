@@ -29,7 +29,6 @@
 
 /* Register offsets */
 #define TPS_REG_VID			0x00
-#define TPS_REG_MODE			0x03
 #define TPS_REG_CMD1			0x08
 #define TPS_REG_DATA1			0x09
 #define TPS_REG_VERSION			0x0F
@@ -93,10 +92,6 @@ struct tps6598x_rx_identity_reg {
 	struct usb_pd_identity identity;
 } __packed;
 
-/* Standard Task return codes */
-#define TPS_TASK_TIMEOUT		1
-#define TPS_TASK_REJECTED		3
-
 /* Debounce delay for mode changes, in milliseconds */
 #define CD321X_DEBOUNCE_DELAY_MS 500
 
@@ -106,6 +101,7 @@ enum {
 	TPS_MODE_BIST,
 	TPS_MODE_DISC,
 	TPS_MODE_PTCH,
+	TPS_MODE_DBMA,
 };
 
 static const char *const modes[] = {
@@ -114,6 +110,7 @@ static const char *const modes[] = {
 	[TPS_MODE_BIST]	= "BIST",
 	[TPS_MODE_DISC]	= "DISC",
 	[TPS_MODE_PTCH] = "PTCH",
+	[TPS_MODE_DBMA] = "DBMa",
 };
 
 /* Unrecognized commands will be replaced with "!CMD" */
@@ -126,14 +123,7 @@ static enum power_supply_property tps6598x_psy_props[] = {
 
 static const char *tps6598x_psy_name_prefix = "tps6598x-source-psy-";
 
-/*
- * Max data bytes for Data1, Data2, and other registers. See ch 1.3.2:
- * https://www.ti.com/lit/ug/slvuan1a/slvuan1a.pdf
- */
-#define TPS_MAX_LEN	64
-
-static int
-tps6598x_block_read(struct tps6598x *tps, u8 reg, void *val, size_t len)
+int tps6598x_block_read(struct tps6598x *tps, u8 reg, void *val, size_t len)
 {
 	u8 data[TPS_MAX_LEN + 1];
 	int ret;
@@ -299,10 +289,10 @@ static void tps6598x_disconnect(struct tps6598x *tps, u32 status)
 	power_supply_changed(tps->psy);
 }
 
-static int tps6598x_exec_cmd_tmo(struct tps6598x *tps, const char *cmd,
-			     size_t in_len, const u8 *in_data,
-			     size_t out_len, u8 *out_data,
-			     u32 cmd_timeout_ms, u32 res_delay_ms)
+int tps6598x_exec_cmd_tmo(struct tps6598x *tps, const char *cmd,
+			  size_t in_len, const u8 *in_data,
+			  size_t out_len, u8 *out_data,
+			  u32 cmd_timeout_ms, u32 res_delay_ms)
 {
 	unsigned long timeout;
 	u32 val;
@@ -553,6 +543,20 @@ static void tps6598x_handle_plug_event(struct tps6598x *tps, u32 status)
 }
 
 /*
+ * The interrupt mask of this controller. T8140 and T8142 leave the SN201202x
+ * DP status event masked: the display handling these machines were brought
+ * up with never used it (see h17_display).
+ */
+static u64 tipd_irq_mask1(const struct tps6598x *tps)
+{
+	u64 mask = tps->data->irq_mask1;
+
+	if (tps->h17_display)
+		mask &= ~SN201202X_INT_DP_SID_UPDATE;
+	return mask;
+}
+
+/*
  * The HPD level of a DisplayPort partner. DATA_STATUS reports it. An
  * SN201202x also signals every new DP status of the partner, and a DP-to-HDMI
  * converter can keep DATA_STATUS at HPD high while the display behind it is
@@ -667,7 +671,9 @@ static int cd321x_typec_update_mode(struct tps6598x *tps,
 		ret = typec_thunderbolt_switch_set(cd321x->tbt_switch, &tbt_switch_data);
 	} else if (st->data_status & TPS_DATA_STATUS_DP_CONNECTION) {
 		struct typec_displayport_data dp_data;
+		enum cd321x_dp_send send;
 		unsigned long mode;
+		bool hpd_pulse;
 
 		switch (TPS_DATA_STATUS_DP_SPEC_PIN_ASSIGNMENT(st->data_status)) {
 		case TPS_DATA_STATUS_DP_SPEC_PIN_ASSIGNMENT_A:
@@ -700,10 +706,27 @@ static int cd321x_typec_update_mode(struct tps6598x *tps,
 		else
 			dp_data.status &= ~DP_STATUS_HPD_STATE;
 
+		/*
+		 * The sink dropped HPD and raised it again within the debounce
+		 * window, as a monitor does after losing the link. The coalesced
+		 * state looks unchanged, so the display side would never hear of
+		 * it: report the pulse as IRQ_HPD. A port with a "displayport"
+		 * reference reports the pulse out of band instead, as a
+		 * disconnect and a connect (see cd321x_update_work()).
+		 */
+		hpd_pulse = !(IS_REACHABLE(CONFIG_DRM) && cd321x->connector_fwnode) &&
+			    (st->data_status_changed & CD321X_DATA_STATUS_HPD_LEVEL) &&
+			    (dp_data.status & DP_STATUS_HPD_STATE) &&
+			    (cd321x->dp_status & DP_STATUS_HPD_STATE);
+		if (hpd_pulse)
+			dp_data.status |= DP_STATUS_IRQ_HPD;
+
 		if (cd321x->state_valid && cd321x->state.alt == cd321x->port_altmode_dp &&
-		    cd321x->state.mode == mode &&
-		    cd321x->dp_status == dp_data.status &&
-		    cd321x->dp_conf == dp_data.conf)
+		    cd321x->state.mode == mode && cd321x->dp_conf == dp_data.conf)
+			send = cd321x_dp_send(cd321x->dp_status, dp_data.status, hpd_pulse);
+		else
+			send = CD321X_DP_SEND;
+		if (send == CD321X_DP_SEND_NONE)
 			return 0;
 
 		cd321x->state.alt = cd321x->port_altmode_dp;
@@ -712,8 +735,23 @@ static int cd321x_typec_update_mode(struct tps6598x *tps,
 		ret = typec_thunderbolt_switch_set(cd321x->tbt_switch, &tbt_switch_data);
 		if (ret)
 			goto out;
+		if (send == CD321X_DP_SEND_EDGE) {
+			struct typec_displayport_data edge = {
+				.status = dp_data.status & ~DP_STATUS_IRQ_HPD,
+				.conf = dp_data.conf,
+			};
+
+			cd321x->state.data = &edge;
+			ret = typec_mux_set(cd321x->mux, &cd321x->state);
+			cd321x->state.data = &dp_data;
+			if (ret) {
+				*display_busy = cd321x_display_taken(ret, tps->h17_display);
+				goto out;
+			}
+			cd321x->dp_status = edge.status;
+		}
 		ret = typec_mux_set(cd321x->mux, &cd321x->state);
-		*display_busy = ret == -EBUSY;
+		*display_busy = cd321x_display_taken(ret, tps->h17_display);
 		if (!ret) {
 			cd321x->dp_status = dp_data.status;
 			cd321x->dp_conf = dp_data.conf;
@@ -776,6 +814,8 @@ static void cd321x_dp_sid_replay(struct cd321x *cd321x, const struct cd321x_stat
 	} else {
 		return;
 	}
+	/* Not the HPD pulse: the update that follows reports that, once. */
+	edge.data_status_changed &= ~CD321X_DATA_STATUS_HPD_LEVEL;
 	cd321x_typec_update_mode(&cd321x->tps, &edge, &display_busy);
 }
 
@@ -791,7 +831,13 @@ static int cd321x_dp_release_first(struct cd321x *cd321x)
 	struct typec_mux_state state;
 	int ret;
 
-	if (cd321x->tps.data != &tipd_sn201202x_data || !cd321x->display_route_active ||
+	/*
+	 * T8140/T8142 keep the teardown they were brought up with: there the
+	 * display route releases the display itself, in the prepare phase of
+	 * the SAFE transaction, before the PHY changes.
+	 */
+	if (cd321x->tps.data != &tipd_sn201202x_data || cd321x->tps.h17_display ||
+	    !cd321x->display_route_active ||
 	    cd321x->state.alt != cd321x->port_altmode_dp ||
 	    !(cd321x->dp_status & DP_STATUS_HPD_STATE))
 		return 0;
@@ -935,10 +981,11 @@ static void cd321x_update_work(struct work_struct *work)
 	 * Every Type-C port references the same external DCP connector.  Only the
 	 * port which successfully acquired the shared display route may report a
 	 * disconnect.  A second DP sink can negotiate Alt Mode even though its mux
-	 * request is rejected with -EBUSY; treating that sink as the connector
-	 * owner would tear down the display carried by the first port.
+	 * request is rejected with -EBUSY (-ENOSPC on T8140/T8142); treating that
+	 * sink as the connector owner would tear down the display carried by the
+	 * first port.
 	 */
-	if (cd321x->connector_fwnode &&
+	if (IS_REACHABLE(CONFIG_DRM) && cd321x->connector_fwnode &&
 	    dp_route_was_active &&
 	    (!new_connected || was_disconnected || !dp_connected || !dp_hpd ||
 	     dp_hpd_changed || dp_mode_changed)) {
@@ -1033,7 +1080,8 @@ static void cd321x_update_work(struct work_struct *work)
 	if (ret)
 		goto retry;
 
-	if (cd321x->connector_fwnode && cd321x->display_route_active && dp_hpd)
+	if (IS_REACHABLE(CONFIG_DRM) && cd321x->connector_fwnode &&
+	    cd321x->display_route_active && dp_hpd)
 		drm_connector_oob_hotplug_event(cd321x->connector_fwnode, connector_status_connected);
 
 	power_supply_changed(tps->psy);
@@ -1237,9 +1285,9 @@ static int cd321x_check_setup(struct cd321x *cd321x, u64 event)
 
 	lockdep_assert_held(&tps->lock);
 	if (cd321x->pm.phase == CD321X_PM_REMOVED ||
-	    (!cd321x->pm.setup_pending && !(event & ~tps->data->irq_mask1)))
+	    (!cd321x->pm.setup_pending && !(event & ~tipd_irq_mask1(tps))))
 		return 0;
-	ret = cd321x_setup_run(&cd321x->pm, event, tps->data->irq_mask1,
+	ret = cd321x_setup_run(&cd321x->pm, event, tipd_irq_mask1(tps),
 			       &cd321x_setup_ops, cd321x);
 	if (cd321x->pm.phase == CD321X_PM_PREPARED ||
 	    cd321x->pm.phase == CD321X_PM_INITIALIZING)
@@ -1302,10 +1350,10 @@ static irqreturn_t cd321x_interrupt(int irq, void *data)
 	}
 
 	if (event & (APPLE_CD_REG_INT_DATA_STATUS_UPDATE |
-		     (tps->data->irq_mask1 & SN201202X_INT_DP_SID_UPDATE)))
+		     (tipd_irq_mask1(tps) & SN201202X_INT_DP_SID_UPDATE)))
 		if (!tps->data->read_data_status(tps))
 			goto err_unlock;
-	if (event & tps->data->irq_mask1 & SN201202X_INT_DP_SID_UPDATE)
+	if (event & tipd_irq_mask1(tps) & SN201202X_INT_DP_SID_UPDATE)
 		cd321x_dp_sid_event(container_of(tps, struct cd321x, tps));
 
 	/* Can be called uncondtionally since it will check for any changes itself */
@@ -1472,6 +1520,14 @@ static int tps6598x_check_mode(struct tps6598x *tps)
 		return ret;
 	case TPS_MODE_BOOT:
 		dev_warn(tps->dev, "dead-battery condition\n");
+		return ret;
+	case TPS_MODE_DBMA:
+		/*
+		 * Apple firmware only: the application firmware runs in its
+		 * debug mode (entered with LOCK + "DBMa"), in which it still
+		 * handles the port and additionally accepts VDMs/DVEn. A boot
+		 * loader arming Apple Debug USB on this port leaves it here.
+		 */
 		return ret;
 	case TPS_MODE_BIST:
 	case TPS_MODE_DISC:
@@ -1754,7 +1810,18 @@ cd321x_register_port(struct tps6598x *tps, struct fwnode_handle *fwnode)
 	cd321x->state.alt = NULL;
 	cd321x->state.mode = TYPEC_STATE_SAFE;
 	cd321x->state.data = NULL;
-	cd321x->state_valid = !typec_set_mode(tps->port, TYPEC_STATE_SAFE);
+	ret = typec_set_mode(tps->port, TYPEC_STATE_SAFE);
+	cd321x->state_valid = !ret;
+	/*
+	 * A fixed host can register its SuperSpeed root after the mux provider
+	 * (the T8140 ATC PHY reports this as -EAGAIN). Wait for that consumer at
+	 * probe instead of exhausting the cable retry budget before it exists.
+	 * Host startup does not depend on this port.
+	 */
+	if (ret == -EAGAIN) {
+		ret = -EPROBE_DEFER;
+		goto err_put_switch;
+	}
 
 	cd321x->tbt_notifier.notifier_call = cd321x_tbt_notify;
 	ret = typec_thunderbolt_switch_register_notifier(cd321x->tbt_switch,
@@ -1769,6 +1836,9 @@ err_put_switch:
 	typec_thunderbolt_switch_put(cd321x->tbt_switch);
 	cd321x->tbt_switch = NULL;
 err_unregister_mux:
+	/* A deferred probe must not leak the connector reference on every retry. */
+	fwnode_handle_put(cd321x->connector_fwnode);
+	cd321x->connector_fwnode = NULL;
 	typec_mux_put(cd321x->mux);
 	cd321x->mux = NULL;
 err_unregister_altmodes:
@@ -1793,6 +1863,8 @@ cd321x_unregister_port(struct tps6598x *tps)
 	struct cd321x *cd321x = container_of(tps, struct cd321x, tps);
 
 	cd321x_stop_work(cd321x);
+	fwnode_handle_put(cd321x->connector_fwnode);
+	cd321x->connector_fwnode = NULL;
 	typec_thunderbolt_switch_put(cd321x->tbt_switch);
 	cd321x->tbt_switch = NULL;
 	typec_mux_put(cd321x->mux);
@@ -2253,6 +2325,14 @@ int tipd_init(struct tps6598x *tps)
 	if (tps->reset)
 		msleep(TPS_SETUP_MS);
 
+	/*
+	 * The T8140 and T8142 display routes report a display taken by another
+	 * port as -ENOSPC, and these machines were brought up without the
+	 * SN201202x DP status event; keep that display handling there.
+	 */
+	tps->h17_display = of_machine_is_compatible("apple,t8140") ||
+			   of_machine_is_compatible("apple,t8142");
+
 	if (!device_is_compatible(tps->dev, "ti,tps25750")) {
 		ret = tps6598x_read32(tps, TPS_REG_VID, &vid);
 		if (ret < 0 || !vid)
@@ -2276,7 +2356,18 @@ int tipd_init(struct tps6598x *tps)
 			return ret;
 	}
 
-	ret = tps6598x_write64(tps, TPS_REG_INT_MASK1, tps->data->irq_mask1);
+	/*
+	 * A controller found in "DBMa" is used as it is. Nothing below issues a
+	 * 4CC command (the S0 power state switch above only does if the
+	 * controller is not in S0 already), so probing neither leaves the debug
+	 * mode nor disturbs a Debug USB or serial route set up before Linux.
+	 * Remember it, so that the debugfs interface never tears that mode down.
+	 */
+	tps->dbma_at_probe = ret == TPS_MODE_DBMA;
+	if (tps->dbma_at_probe)
+		dev_info(tps->dev, "controller in debug mode \"DBMa\", leaving it there\n");
+
+	ret = tps6598x_write64(tps, TPS_REG_INT_MASK1, tipd_irq_mask1(tps));
 	if (ret)
 		goto err_reset_controller;
 
@@ -2344,6 +2435,7 @@ int tipd_init(struct tps6598x *tps)
 		enable_irq_wake(tps->irq);
 	}
 
+	tipd_debugfs_register(tps);
 	if (tps->data->ready)
 		tps->data->ready(tps);
 
@@ -2369,6 +2461,8 @@ EXPORT_SYMBOL_GPL(tipd_init);
 
 void tipd_remove(struct tps6598x *tps)
 {
+	tipd_debugfs_unregister(tps);
+
 	if (!tps->irq)
 		cancel_delayed_work_sync(&tps->wq_poll);
 	else
@@ -2541,6 +2635,12 @@ const struct tipd_data tipd_sn201202x_data = {
 	.resume_reverify = cd321x_resume_reverify,
 };
 EXPORT_SYMBOL_GPL(tipd_sn201202x_data);
+
+static void __exit tipd_core_exit(void)
+{
+	tipd_debugfs_exit();
+}
+module_exit(tipd_core_exit);
 
 MODULE_AUTHOR("Heikki Krogerus <heikki.krogerus@linux.intel.com>");
 MODULE_LICENSE("GPL v2");
