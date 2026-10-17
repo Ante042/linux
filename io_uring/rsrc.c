@@ -645,7 +645,7 @@ static bool headpage_already_acct(struct io_ring_ctx *ctx, struct page **pages,
 			continue;
 		imu = node->buf;
 		/* Other backing owners have independent charge lifetimes. */
-		if (imu->release != io_release_ubuf)
+		if (IS_ENABLED(CONFIG_MM_SUBPAGE) && imu->release != io_release_ubuf)
 			continue;
 		for (j = 0; j < imu->nr_bvecs; j++) {
 			if (!PageCompound(imu->bvec[j].bv_page))
