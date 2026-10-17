@@ -37,19 +37,22 @@ config DRM_APPLE_DEBUG
 config DRM_APPLE_KUNIT_TEST
 	tristate "KUnit tests for Apple display controller" if !KUNIT_ALL_TESTS
 	depends on KUNIT
+	depends on DRM_APPLE || !DRM_APPLE
 	select DRM_KUNIT_TEST_HELPERS if DRM_APPLE
 	default KUNIT_ALL_TESTS
 	help
 	  Test modeset and hotplug state transitions without display hardware,
 	  including link changes that race with a modeset and recovery after
 	  failed modesets. These tests can run on other architectures and do
-	  not require the Apple display driver to be enabled. Also test service
-	  ownership and pending commands across disconnect and reannouncement.
-	  With the Apple display driver enabled, also build tests for its AFK
-	  ring parser (header strides used by older firmware and larger rings,
-	  malformed ring size combinations), the H17P backlight policy
-	  (takeover, DPMS, suspend, fades and present completion) and the
-	  system resume of a CRTC whose mode is no longer admissible.
+	  not require the Apple display driver to be enabled.
+	  With the Apple display driver enabled, also build tests for AFK
+	  service ownership and pending commands across disconnect and
+	  reannouncement, for its AFK ring parser (header strides used by
+	  older firmware and larger rings, malformed ring size combinations),
+	  the H17P backlight policy (takeover, DPMS, suspend, fades and
+	  present completion) and the system resume of a CRTC whose mode is
+	  no longer admissible. These tests use the driver, so with the
+	  driver built as a module they can only be built as modules too.
 
 config DRM_APPLE_DISPLAY_KUNIT_TEST
 	bool "KUnit tests for Apple display mode probing" if !KUNIT_ALL_TESTS
