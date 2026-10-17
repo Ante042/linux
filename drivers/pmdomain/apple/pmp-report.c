@@ -1719,6 +1719,8 @@ err_remove:
 
 static const struct of_device_id apple_pmp_report_entry_of_match[] = {
 	{ .compatible = "apple,t6000-pmp-v2-report-entry" },
+	/* Probed through apple_pmp_t8140_entry_probe() by its report. */
+	{ .compatible = "apple,t8140-pmp-v2-report-entry" },
 	{}
 };
 
