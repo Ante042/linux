@@ -1,7 +1,7 @@
 .. SPDX-License-Identifier: GPL-2.0-only
 
 Experimental T8140 video encoding
-================================
+=================================
 
 The J700 AVE driver exposes a root-only debugfs firmware transport for
 hardware encoding experiments. It is not a V4L2 encoder, has no stable

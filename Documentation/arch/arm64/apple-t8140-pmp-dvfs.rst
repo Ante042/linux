@@ -1,7 +1,7 @@
 .. SPDX-License-Identifier: GPL-2.0-only
 
 T8140 PMP DVFS diagnostics
-=========================
+==========================
 
 The existing PMP report provider exposes a read-only ``dvfs`` file under
 ``/sys/kernel/debug/apple-pmp-<device>/`` on T8140. The provider must be
