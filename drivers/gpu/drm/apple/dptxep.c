@@ -1048,13 +1048,12 @@ static int dptxport_v2_group_call(struct apple_epic_service *service, u16 group,
 
 /*
  * Group 1 calls 3 and 4 come around link (re)configuration, audio prepare
- * included. They carry a lane count at +0x10 in (1, 3) and at +0x00 in
- * (1, 4); the J700 code reads (1, 3) as drive settings with levels per
- * lane from +0x20, and its group 0 GET (0, 4) has the count at +0x00.
- * Both are acked with the request, (1, 3) with +0x00..0x03
- * cleared and (1, 4) with +0x10..0x13 and +0x20 to the end cleared, so
- * what DCP left there does not go back. Tested on t6020 with 13.5
- * firmware: TV through a USB-C to HDMI adapter, Dell over TB.
+ * included. Handled as group 0's SET and GET_DRIVE_SETTINGS, which have
+ * the same numbers, they stored addresses from their payload as drive
+ * settings, and DCP then refused to start audio to a TV behind a USB-C to
+ * HDMI adapter (M2 Pro, 13.5 firmware). Answer each with its request, with
+ * +0x00..0x03 cleared for (1, 3), and +0x10..0x13 and everything from +0x20
+ * cleared for (1, 4).
  */
 static int dptxport_call_group1(u32 command, const void *data,
 				size_t data_size, void *reply, size_t reply_size)
@@ -1114,12 +1113,28 @@ static void dptxport_teardown(struct apple_epic_service *service)
 	dptx_service_unbind(service);
 }
 
+/*
+ * 12.3 and 13.5 firmware: every call goes to dptxport_call() by its
+ * command, whatever its group, except group 1 calls 3 and 4 on 13.5, see
+ * dptxport_call_group1(). Only that has been tested; 12.3 has not.
+ */
+static int dptxport_legacy_call(struct apple_epic_service *service, u16 group,
+				u32 command, const void *data, size_t size,
+				void *reply, size_t room)
+{
+	if (group == 1 && (command == 3 || command == 4) &&
+	    service->ep->dcp->fw_compat == DCP_FIRMWARE_V_13_5)
+		return dptxport_call_group1(command, data, size, reply, room);
+	return dptxport_call(service, command, data, size, reply, room);
+}
+
 /* 12.3 and 13.5 firmware. */
 static const struct apple_epic_service_ops dptxep_ops[] = {
 	{
 		.name = "AppleDCPDPTXRemotePort",
 		.init = dptxport_init,
 		.call = dptxport_call,
+		.call_v2 = dptxport_legacy_call,
 	},
 	{}
 };
