@@ -21,7 +21,7 @@ use crate::SepData;
 static SEP: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
 
 extern "C" {
-    fn sep_pm_register(event: unsafe extern "C" fn(bool) -> c_int) -> c_int;
+    fn sep_pm_register(event: unsafe extern "C" fn(bool)) -> c_int;
     fn sep_pm_unregister();
     fn sep_pm_keep_domains(dev: *mut c_void) -> c_int;
 }
@@ -41,25 +41,20 @@ pub(crate) fn keep_domains(dev: &kernel::device::Device) -> Result<()> {
 
 /// # Safety
 /// Called by `pm_shim.c` from the PM notifier chain, in process context.
-unsafe extern "C" fn pm_event(entering: bool) -> c_int {
+unsafe extern "C" fn pm_event(entering: bool) {
     let ptr = SEP.load(Ordering::Acquire);
     if ptr.is_null() {
-        return 0;
+        return;
     }
     // SAFETY: produced by `into_foreign` in `register`, and reclaimed by
     // `unregister` only after `sep_pm_unregister` has waited out any running
     // notifier call, so it is live for this borrow.
     let sep = unsafe { <Arc<SepData> as ForeignOwnable>::borrow(ptr) };
     if entering {
-        if let Err(error) = sep.sleep_prepare() {
-            // A failing notifier is not included in the PM chain's rollback.
-            sep.sleep_finished();
-            return error.to_errno();
-        }
+        sep.sleep_prepare();
     } else {
         sep.sleep_finished();
     }
-    0
 }
 
 pub(crate) fn register(sep: Arc<SepData>) -> Result<()> {
