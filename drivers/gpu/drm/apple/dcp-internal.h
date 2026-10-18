@@ -18,6 +18,7 @@
 
 #include "dcp-fabric.h"
 #include "dcp-fabric-session.h"
+#include "dcp-relink.h"
 #include "dptxep.h"
 #include "dcp_backlight.h"
 #include "dcp-announce.h"
@@ -390,18 +391,18 @@ struct apple_dcp {
 	/* One HPD pulse after a placeholder EDID, per Type-C connection. */
 	bool placeholder_retried;
 	u64 typec_generation;	/* hpd_mutex: identifies the current connection */
-	/* hpd_mutex: Type-C displays unplugged so far; see dcp_poweroff() */
+	/* hpd_mutex: Type-C display sessions released; see dcp_poweroff() */
 	u64 typec_unplugs;
-	/* typec_unplugs when the CRTC was last powered on */
+	/* typec_unplugs when the CRTC last claimed its display session */
 	u64 crtc_unplugs;
 	u64 placeholder_generation;
 	struct delayed_work placeholder_edid_wq;
 	/* replugs replayed for a Type-C sink that lost its link */
-	u32 relink_tries;
-	bool relink_active;
-	unsigned long relink_done;
-	u64 relink_generation;
+	spinlock_t relink_lock;
+	struct dcp_relink_state relink;
 	struct delayed_work typec_relink_wq;
+	/* The driver holds the sink HPD low itself; hpd_mutex. */
+	bool typec_hpd_held;
 	bool use_timestamps;
 	bool vrr_enabled;
 	struct dcp_set_digital_out_mode_req mode;

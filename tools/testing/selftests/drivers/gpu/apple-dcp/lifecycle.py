@@ -39,7 +39,9 @@ def disconnect(root):
 #define BIT(n) (1U << (n))
 #endif
 #define CD321X_DATA_STATUS_HPD_IRQ (1U << 9)
+#ifndef DP_STATUS_IRQ_HPD
 #define DP_STATUS_IRQ_HPD BIT(8)
+#endif
 #define trace_cd321x_dp_hotplug(...) ((void)0)
 ''' + dp + '\n'
     notify = (('drivers/usb/typec/tipd/core.c', 'cd321x_dp_notify'),) if dp else ()
@@ -105,7 +107,7 @@ typedef uint32_t u32; typedef uint64_t u64;
 #define DCP_HOTPLUG_NOTIFY 1
 struct work_struct { bool pending; };
 struct delayed_work { struct work_struct work; };
-static int system_freezable_wq, system_wq;
+static int system_freezable_wq, system_dfl_wq;
 #define DCP_SWAP_WATCHDOG_MS 1000
 #define DCP_EXTERNAL_STOP_RETRIES 3
 static int schedule_work(struct work_struct *w) { w->pending = true; return 1; }
@@ -118,6 +120,7 @@ struct apple_connector { bool connected, edid_invalidation_pending; };
 struct dcp_announce { int ends; };
 struct apple_dcp {
  int external_lock, hpd_mutex;
+ int relink_lock, relink;
  struct { int lock; bool presentation_paused; } iomfb;
  struct { bool connected; void *service; } dptxport[1];
  struct apple_connector *connector;
@@ -146,7 +149,7 @@ static int dcp_dptx_connect_raw(struct apple_dcp *d, u32 port, bool *waiting)
  if (!raw_error) d->dptxport[0].connected = true;
  return raw_error; }
 static bool dcp_is_typec_output(struct apple_dcp *d) { (void)d; return true; }
-static int dcp_dptx_connect(struct apple_dcp *d, u32 port) { (void)d; (void)port; return 0; }
+static int __attribute__((unused)) dcp_dptx_connect(struct apple_dcp *d, u32 port) { (void)d; (void)port; return 0; }
 #define DPTX_RECONNECT_DELAY 500
 static int settle_error, power_error, hpd_error, release_error;
 static int settles, powers, releases, detaches, notices;
@@ -441,8 +444,21 @@ int main(void)
             ' const struct dcp_fabric_session *session, bool cable, bool recovery)\n'
             '{ assert(port == 0); assert(!session && !cable && !recovery); *waiting = false; raw_links++;')
         prefix += ('/* Only a Type-C (non-H17P) output queues the session reconnect. */\n'
-                   'static void dcp_queue_typec_reconnect(struct apple_dcp *d, unsigned long delay)\n'
+                   'static void __attribute__((unused)) dcp_queue_typec_reconnect(struct apple_dcp *d, unsigned long delay)\n'
                    '{ (void)d; (void)delay; assert(!"Type-C session reconnect for H17P"); }\n')
+    # Shared out-of-band connect also contains the legacy relink branch.
+    # These scenarios are native H17P: reaching that branch is a test failure.
+    if 'dcp_typec_attach_locked(dcp)' in funcs:
+        prefix += r"""
+static void dcp_typec_attach_locked(struct apple_dcp *d)
+{ (void)d; assert(!"legacy Type-C attachment in an H17P scenario"); }
+static int dcp_dptx_connect_attached(struct apple_dcp *d, u32 port)
+{ (void)d; (void)port; assert(!"legacy Type-C connect in an H17P scenario"); return -EINVAL; }
+static void dcp_relink_attach(int *s, u64 generation)
+{ (void)s; (void)generation; assert(!"legacy relink in an H17P scenario"); }
+static void __attribute__((unused)) dcp_relink_link_up(int *s, u64 generation, unsigned long now)
+{ (void)s; (void)generation; (void)now; assert(!"legacy relink timestamp in an H17P scenario"); }
+"""
     # How long a held mux has been retried is measured on the driver's clock.
     if 'jiffies_to_msecs(jiffies)' in funcs:
         shim += ('\nstatic unsigned long jiffies;\n'
@@ -501,6 +517,7 @@ typedef uint8_t u8;
 #define dev_dbg(...) ((void)0)
 #define dev_info(...) ((void)0)
 #define DRM_MODE_CONNECTOR_DisplayPort 10
+#define DCP_FIRMWARE_H17P 17
 #define DPTX_CONNECT_TIMEOUT 2000
 #define DPTX_TUNNEL_CONNECT_TIMEOUT 8000
 static void mutex_lock(int *m) { (void)m; }
@@ -645,11 +662,118 @@ int main(void)
                      '/* Never reached: the H17P external link passes no session. */\n'
                      'static bool dcp_session_valid_locked(struct apple_dcp *d, struct dcp_fabric_session s, bool cable)\n'
                      '{ (void)d; (void)s; (void)cable; assert(!"session check for a sessionless link"); return false; }\n')
+    if 'static unsigned long jiffies;' not in unit:
+        firmware += '\nstatic unsigned long jiffies;\n'
     # unless the update work already needed the clock
     clock = 'static unsigned jiffies_to_msecs(unsigned long t) { return t; }\n'
     if clock in unit:
         firmware = firmware.replace(clock, '')
     return unit + firmware + raw + '\n' + tests
+
+
+def poweroff_replug(root):
+    """An old disconnect's CRTC-off must not release a replacement link."""
+    poweroff = apple_function(root, 'dcp_poweroff')
+    assert poweroff, 'dcp_poweroff'
+    iomfb = (root / 'drivers/gpu/drm/apple/iomfb.c').read_text()
+    modeset = block(iomfb, iomfb.index('int dcp_crtc_atomic_modeset('))
+    assert 'dcp->crtc_unplugs = dcp->typec_unplugs;' in modeset
+
+    return r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <errno.h>
+typedef uint32_t u32; typedef uint64_t u64;
+#define READ_ONCE(x) (x)
+#define WRITE_ONCE(x, v) ((x) = (v))
+#define guard(x) fake_guard
+#define fake_guard(x) ((void)(x))
+#define scoped_guard(x, y) for (int once = ((void)(y), 1); once; once = 0)
+#define dev_dbg(...) ((void)0)
+#define dev_warn(...) ((void)0)
+#define dev_err(...) ((void)0)
+struct delayed_work { bool pending; };
+struct completion { int done; };
+struct apple_connector { bool connected; };
+struct dptx_port { bool enabled, connected, available; void *service; };
+struct apple_dcp {
+ void *dev, *avep, *hdmi_hpd;
+ int external_lock, hpd_mutex;
+ struct delayed_work typec_reconnect_wq, placeholder_edid_wq, swap_watchdog_wq;
+ struct completion typec_iomfb_hpd_ready;
+ struct dptx_port dptxport[2];
+ struct apple_connector *connector;
+ struct { bool active; } split;
+ bool external_h17p, external_stop_deferred, soft_dpms, typec_output;
+ bool typec_cable_connected, typec_crtc_off, external_native;
+ u64 external_crtc_generation, typec_unplugs, crtc_unplugs;
+};
+struct platform_device { struct apple_dcp *data; };
+static struct apple_dcp *platform_get_drvdata(struct platform_device *p) { return p->data; }
+static int poweroffs, hpd_drops, disconnects, retries, av_disconnects;
+static void cancel_delayed_work_sync(struct delayed_work *w) { w->pending = false; }
+static void cancel_delayed_work(struct delayed_work *w) { w->pending = false; }
+static bool dcp_is_external_h17p(struct apple_dcp *d) { return d->external_h17p; }
+static int dcp_external_stop_locked(struct apple_dcp *d, u64 generation)
+{ (void)d; (void)generation; return 0; }
+static void dcp_external_crtc_released(struct apple_dcp *d) { (void)d; }
+static bool dcp_uses_soft_dpms(struct apple_dcp *d) { return d->soft_dpms; }
+static int dcp_backlight_dpms(struct apple_dcp *d, bool on)
+{ (void)d; (void)on; return 0; }
+static void av_service_disconnect(struct apple_dcp *d)
+{ (void)d; av_disconnects++; }
+static bool dcp_is_typec_output(struct apple_dcp *d) { return d->typec_output; }
+static void _dcp_poweroff(struct apple_dcp *d) { (void)d; poweroffs++; }
+static void reinit_completion(struct completion *c) { c->done = 0; }
+static bool dptx_service_available(struct dptx_port *p) { return p->available; }
+static int dptxport_set_hpd(void *service, bool on)
+{ (void)service; assert(!on); hpd_drops++; return 0; }
+static int dcp_dptx_disconnect(struct apple_dcp *d, u32 port)
+{ disconnects++; d->dptxport[port].connected = false; return 0; }
+static void dcp_external_retry(struct apple_dcp *d, const char *why, int error, int delay)
+{ (void)d; (void)why; (void)error; (void)delay; retries++; }
+static bool gpiod_get_value_cansleep(void *gpio) { (void)gpio; return false; }
+static void disconnected_hpd_event(struct apple_connector *connector) { (void)connector; }
+''' + poweroff + r'''
+static struct apple_dcp dcp;
+static struct apple_connector connector;
+static struct platform_device pdev = { .data = &dcp };
+static void init(u64 released, u64 claimed)
+{
+ dcp = (struct apple_dcp){
+  .typec_output = true, .typec_cable_connected = true,
+  .typec_unplugs = released, .crtc_unplugs = claimed,
+  .connector = &connector,
+ };
+ dcp.dptxport[0].available = dcp.dptxport[0].connected = true;
+ dcp.typec_reconnect_wq.pending = true;
+ connector.connected = true;
+ poweroffs = hpd_drops = disconnects = retries = av_disconnects = 0;
+}
+int main(void)
+{
+ /* M1/M2: the old sink left and a replacement link is already starting. */
+ init(4, 3); dcp_poweroff(&pdev);
+ assert(poweroffs == 1 && av_disconnects == 0);
+ assert(hpd_drops == 0 && disconnects == 0 && retries == 0);
+ assert(dcp.dptxport[0].connected && dcp.typec_reconnect_wq.pending);
+ assert(!dcp.typec_crtc_off);
+
+ /* Ordinary DPMS of the session the CRTC owns still releases that link. */
+ init(4, 4); dcp_poweroff(&pdev);
+ assert(poweroffs == 1 && hpd_drops == 1 && disconnects == 1);
+ assert(!dcp.dptxport[0].connected && !dcp.typec_reconnect_wq.pending);
+ assert(dcp.typec_crtc_off);
+
+ /* A successful replacement modeset refreshes the token before later DPMS. */
+ init(5, 4); dcp.crtc_unplugs = dcp.typec_unplugs; dcp_poweroff(&pdev);
+ assert(poweroffs == 1 && hpd_drops == 1 && disconnects == 1);
+ puts("stale CRTC power-off ownership passed");
+ return 0;
+}
+'''
 
 def dropped(root):
     """A dock leaves during the first mode set, and the next swap is dropped.
