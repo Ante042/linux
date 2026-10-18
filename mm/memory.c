@@ -1099,7 +1099,9 @@ copy_present_page(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma
 	}
 
 	*prealloc = NULL;
-	folio_ref_add(new_folio, mm_pte_native_pages(dst_vma->vm_mm) - 1);
+	/* Only a larger user granule maps more than one native page. */
+	if (mm_pte_native_pages(dst_vma->vm_mm) > 1)
+		folio_ref_add(new_folio, mm_pte_native_pages(dst_vma->vm_mm) - 1);
 	__folio_mark_uptodate(new_folio);
 	folio_add_new_anon_rmap(new_folio, dst_vma, addr, RMAP_EXCLUSIVE);
 	folio_add_lru_vma(new_folio, dst_vma);
@@ -2835,6 +2837,7 @@ out:
 	return ret;
 }
 
+#ifdef CONFIG_MM_SUBPAGE
 static int insert_pages(struct vm_area_struct *vma, unsigned long addr,
 			struct page **pages, unsigned long *num, pgprot_t prot)
 {
@@ -2848,6 +2851,79 @@ static int insert_pages(struct vm_area_struct *vma, unsigned long addr,
 	*num = DIV_ROUND_UP(length, PAGE_SIZE);
 	return ret;
 }
+#else
+static int insert_page_in_batch_locked(struct vm_area_struct *vma, pte_t *pte,
+			unsigned long addr, struct page *page, pgprot_t prot)
+{
+	int err;
+
+	err = validate_page_before_insert(vma, page);
+	if (err)
+		return err;
+	return insert_page_into_pte_locked(vma, pte, addr, page, prot, false, 0);
+}
+
+/* insert_pages() amortizes the cost of spinlock operations
+ * when inserting pages in a loop.
+ */
+static int insert_pages(struct vm_area_struct *vma, unsigned long addr,
+			struct page **pages, unsigned long *num, pgprot_t prot)
+{
+	pmd_t *pmd = NULL;
+	pte_t *start_pte, *pte;
+	spinlock_t *pte_lock;
+	struct mm_struct *const mm = vma->vm_mm;
+	unsigned long curr_page_idx = 0;
+	unsigned long remaining_pages_total = *num;
+	unsigned long pages_to_write_in_pmd;
+	int ret;
+more:
+	ret = -EFAULT;
+	pmd = walk_to_pmd(mm, addr);
+	if (!pmd)
+		goto out;
+
+	pages_to_write_in_pmd = min_t(unsigned long,
+		remaining_pages_total, PTRS_PER_PTE - pte_index(addr));
+
+	/* Allocate the PTE if necessary; takes PMD lock once only. */
+	ret = -ENOMEM;
+	if (pte_alloc(mm, pmd))
+		goto out;
+
+	while (pages_to_write_in_pmd) {
+		int pte_idx = 0;
+		const int batch_size = min_t(int, pages_to_write_in_pmd, 8);
+
+		start_pte = pte_offset_map_lock(mm, pmd, addr, &pte_lock);
+		if (!start_pte) {
+			ret = -EFAULT;
+			goto out;
+		}
+		for (pte = start_pte; pte_idx < batch_size; ++pte, ++pte_idx) {
+			int err = insert_page_in_batch_locked(vma, pte,
+				addr, pages[curr_page_idx], prot);
+			if (unlikely(err)) {
+				pte_unmap_unlock(start_pte, pte_lock);
+				ret = err;
+				remaining_pages_total -= pte_idx;
+				goto out;
+			}
+			addr += PAGE_SIZE;
+			++curr_page_idx;
+		}
+		pte_unmap_unlock(start_pte, pte_lock);
+		pages_to_write_in_pmd -= batch_size;
+		remaining_pages_total -= batch_size;
+	}
+	if (remaining_pages_total)
+		goto more;
+	ret = 0;
+out:
+	*num = remaining_pages_total;
+	return ret;
+}
+#endif
 
 /**
  * vm_insert_pages_range - map a byte range from a native-page array
@@ -2906,6 +2982,7 @@ int vm_insert_pages(struct vm_area_struct *vma, unsigned long addr,
 			struct page **pages, unsigned long *num)
 {
 	const unsigned long nr_pages = *num;
+#ifdef CONFIG_MM_SUBPAGE
 	unsigned long length, end;
 
 	if (!IS_ALIGNED(addr, mm_page_size(vma->vm_mm)) ||
@@ -2913,6 +2990,12 @@ int vm_insert_pages(struct vm_area_struct *vma, unsigned long addr,
 	    check_add_overflow(addr, length, &end) ||
 	    !range_in_vma(vma, addr, end))
 		return -EFAULT;
+#else
+	const unsigned long end = addr + PAGE_SIZE * nr_pages;
+
+	if (!range_in_vma(vma, addr, end))
+		return -EFAULT;
+#endif
 	if (!(vma->vm_flags & VM_MIXEDMAP)) {
 		VM_WARN_ON_ONCE(mmap_read_trylock(vma->vm_mm));
 		VM_WARN_ON_ONCE(vma->vm_flags & VM_PFNMAP);
@@ -2936,11 +3019,17 @@ int map_kernel_pages_prepare(struct vm_area_desc *desc)
 	}
 
 	nr_pages = action->map_kernel.nr_pages;
+#ifdef CONFIG_MM_SUBPAGE
 	if (!IS_ALIGNED(addr, mm_page_size(desc->mm)) ||
 	    check_mul_overflow(nr_pages, PAGE_SIZE, &end) ||
 	    check_add_overflow(addr, end, &end) ||
 	    !range_in_vma_desc(desc, addr, end))
 		return -EFAULT;
+#else
+	end = addr + PAGE_SIZE * nr_pages;
+	if (!range_in_vma_desc(desc, addr, end))
+		return -EFAULT;
+#endif
 
 	return 0;
 }
@@ -3044,6 +3133,7 @@ static int __vm_map_pages(struct vm_area_struct *vma, struct page **pages,
 			 unsigned long num, unsigned long offset,
 			 unsigned int subpage_offset)
 {
+#ifdef CONFIG_MM_SUBPAGE
 	unsigned long bytes, available;
 
 	if (offset >= num ||
@@ -3057,6 +3147,20 @@ static int __vm_map_pages(struct vm_area_struct *vma, struct page **pages,
 		return -ENXIO;
 	return vm_insert_pages_range(vma, vma->vm_start, pages, num, bytes,
 				     vma->vm_end - vma->vm_start);
+#else
+	unsigned long count = vma_pages(vma);
+	unsigned long uaddr = vma->vm_start;
+
+	/* Fail if the user requested offset is beyond the end of the object */
+	if (offset >= num)
+		return -ENXIO;
+
+	/* Fail if the user requested size exceeds available object size */
+	if (count > num - offset)
+		return -ENXIO;
+
+	return vm_insert_pages(vma, uaddr, pages + offset, &count);
+#endif
 }
 
 /**
@@ -3155,6 +3259,33 @@ out_unlock:
 	return VM_FAULT_NOPAGE;
 }
 
+static vm_fault_t __vmf_insert_pfn_prot_mkwrite(struct vm_area_struct *vma,
+			unsigned long addr, unsigned long pfn, pgprot_t pgprot,
+			bool mkwrite, unsigned int offset)
+{
+	/*
+	 * Technically, architectures with pte_special can avoid all these
+	 * restrictions (same for remap_pfn_range).  However we would like
+	 * consistency in testing and feature parity among all, so we should
+	 * try to keep these invariants in place for everybody.
+	 */
+	BUG_ON(!(vma->vm_flags & (VM_PFNMAP|VM_MIXEDMAP)));
+	BUG_ON((vma->vm_flags & (VM_PFNMAP|VM_MIXEDMAP)) ==
+						(VM_PFNMAP|VM_MIXEDMAP));
+	BUG_ON((vma->vm_flags & VM_PFNMAP) && is_cow_mapping(vma->vm_flags));
+	BUG_ON((vma->vm_flags & VM_MIXEDMAP) && pfn_valid(pfn));
+
+	if (addr < vma->vm_start || addr >= vma->vm_end)
+		return VM_FAULT_SIGBUS;
+
+	if (!pfn_modify_allowed(pfn, pgprot))
+		return VM_FAULT_SIGBUS;
+
+	pfnmap_setup_cachemode_pfn(pfn, &pgprot);
+
+	return insert_pfn(vma, addr, pfn, pgprot, mkwrite, offset);
+}
+
 /**
  * vmf_insert_pfn_prot_mkwrite - insert single pfn into user vma with specified pgprot
  * @vma: user vma to map to
@@ -3202,32 +3333,6 @@ out_unlock:
  * Context: Process context.  May allocate using %GFP_KERNEL.
  * Return: vm_fault_t value.
  */
-static vm_fault_t __vmf_insert_pfn_prot_mkwrite(struct vm_area_struct *vma,
-			unsigned long addr, unsigned long pfn, pgprot_t pgprot,
-			bool mkwrite, unsigned int offset)
-{
-	/*
-	 * Technically, architectures with pte_special can avoid all these
-	 * restrictions (same for remap_pfn_range).  However we would like
-	 * consistency in testing and feature parity among all, so we should
-	 * try to keep these invariants in place for everybody.
-	 */
-	BUG_ON(!(vma->vm_flags & (VM_PFNMAP|VM_MIXEDMAP)));
-	BUG_ON((vma->vm_flags & (VM_PFNMAP|VM_MIXEDMAP)) ==
-						(VM_PFNMAP|VM_MIXEDMAP));
-	BUG_ON((vma->vm_flags & VM_PFNMAP) && is_cow_mapping(vma->vm_flags));
-	BUG_ON((vma->vm_flags & VM_MIXEDMAP) && pfn_valid(pfn));
-
-	if (addr < vma->vm_start || addr >= vma->vm_end)
-		return VM_FAULT_SIGBUS;
-
-	if (!pfn_modify_allowed(pfn, pgprot))
-		return VM_FAULT_SIGBUS;
-
-	pfnmap_setup_cachemode_pfn(pfn, &pgprot);
-
-	return insert_pfn(vma, addr, pfn, pgprot, mkwrite, offset);
-}
 vm_fault_t vmf_insert_pfn_prot_mkwrite(struct vm_area_struct *vma,
 			unsigned long addr, unsigned long pfn, pgprot_t pgprot,
 			bool mkwrite)
@@ -3554,10 +3659,14 @@ static int remap_pfn_range_track(struct vm_area_struct *vma, unsigned long addr,
 	int err;
 
 	size = mm_page_align(vma->vm_mm, size);
+#ifdef CONFIG_MM_SUBPAGE
 	if (check_add_overflow(size, (unsigned long)offset, &track_size) ||
 	    track_size > ULONG_MAX - (PAGE_SIZE - 1))
 		return -EINVAL;
 	track_size = PAGE_ALIGN(track_size);
+#else
+	track_size = size;
+#endif
 
 	/*
 	 * If we cover the full VMA, we'll perform actual tracking, and
@@ -3707,6 +3816,7 @@ int remap_pfn_range_complete(struct vm_area_struct *vma,
 	return do_remap_pfn_range(vma, start, pfn, mmap_action_remap_offset(action), size, prot);
 }
 
+#ifdef CONFIG_MM_SUBPAGE
 static int __simple_ioremap_prep(struct mm_struct *mm, unsigned long vm_len,
 				 struct vm_page_offset pos,
 				 phys_addr_t start_phys, unsigned long size,
@@ -3743,18 +3853,52 @@ static int __simple_ioremap_prep(struct mm_struct *mm, unsigned long vm_len,
 		return -EINVAL;
 	return 0;
 }
+#else
+static int __simple_ioremap_prep(unsigned long vm_len, pgoff_t vm_pgoff,
+				 phys_addr_t start_phys, unsigned long size,
+				 unsigned long *pfnp)
+{
+	unsigned long pfn, pages;
+
+	/* Check that the physical memory area passed in looks valid */
+	if (start_phys + size < start_phys)
+		return -EINVAL;
+	/*
+	 * You *really* shouldn't map things that aren't page-aligned,
+	 * but we've historically allowed it because IO memory might
+	 * just have smaller alignment.
+	 */
+	size += start_phys & ~PAGE_MASK;
+	pfn = start_phys >> PAGE_SHIFT;
+	pages = (size + ~PAGE_MASK) >> PAGE_SHIFT;
+	if (pfn + pages < pfn)
+		return -EINVAL;
+
+	/* We start the mapping 'vm_pgoff' pages into the area */
+	if (vm_pgoff > pages)
+		return -EINVAL;
+	pfn += vm_pgoff;
+	pages -= vm_pgoff;
+
+	/* Can we fit all of the mapping? */
+	if ((vm_len >> PAGE_SHIFT) > pages)
+		return -EINVAL;
+
+	*pfnp = pfn;
+	return 0;
+}
+#endif
 
 int simple_ioremap_prepare(struct vm_area_desc *desc)
 {
 	struct mmap_action *action = &desc->action;
 	const phys_addr_t start = action->simple_ioremap.start_phys_addr;
 	const unsigned long size = action->simple_ioremap.size;
+#ifdef CONFIG_MM_SUBPAGE
 	struct vm_page_offset physical, pos = { .index = desc->pgoff };
 	int err;
 
-#ifdef CONFIG_MM_SUBPAGE
 	pos.offset = desc->subpage_offset;
-#endif
 	err = __simple_ioremap_prep(desc->mm, vma_desc_size(desc), pos,
 				    start, size, &physical);
 	if (err)
@@ -3762,8 +3906,18 @@ int simple_ioremap_prepare(struct vm_area_desc *desc)
 
 	/* The I/O remap logic does the heavy lifting. */
 	mmap_action_ioremap_full(desc, physical.index);
-#ifdef CONFIG_MM_SUBPAGE
 	action->remap.offset = physical.offset;
+#else
+	unsigned long pfn;
+	int err;
+
+	err = __simple_ioremap_prep(vma_desc_size(desc), desc->pgoff,
+				    start, size, &pfn);
+	if (err)
+		return err;
+
+	/* The I/O remap logic does the heavy lifting. */
+	mmap_action_ioremap_full(desc, pfn);
 #endif
 	return io_remap_pfn_range_prepare(desc);
 }
@@ -3788,6 +3942,7 @@ int vm_iomap_memory(struct vm_area_struct *vma, phys_addr_t start, unsigned long
 	const unsigned long vm_start = vma->vm_start;
 	const unsigned long vm_end = vma->vm_end;
 	const unsigned long vm_len = vm_end - vm_start;
+#ifdef CONFIG_MM_SUBPAGE
 	struct vm_page_offset physical;
 	int err;
 
@@ -3799,6 +3954,17 @@ int vm_iomap_memory(struct vm_area_struct *vma, phys_addr_t start, unsigned long
 	/* Ok, let it rip */
 	return io_remap_pfn_range_offset(vma, vm_start, physical.index, physical.offset,
 					vm_len, vma->vm_page_prot);
+#else
+	unsigned long pfn;
+	int err;
+
+	err = __simple_ioremap_prep(vm_len, vma->vm_pgoff, start, len, &pfn);
+	if (err)
+		return err;
+
+	/* Ok, let it rip */
+	return io_remap_pfn_range(vma, vma->vm_start, pfn, vm_len, vma->vm_page_prot);
+#endif
 }
 EXPORT_SYMBOL(vm_iomap_memory);
 
@@ -4448,7 +4614,8 @@ static vm_fault_t wp_page_copy(struct vm_fault *vmf)
 		 * some TLBs while the old PTE remains in others.
 		 */
 		ptep_clear_flush(vma, vmf->address, vmf->pte);
-		folio_ref_add(new_folio, mm_pte_native_pages(mm) - 1);
+		if (mm_pte_native_pages(mm) > 1)
+			folio_ref_add(new_folio, mm_pte_native_pages(mm) - 1);
 		folio_add_new_anon_rmap(new_folio, vma, vmf->address, RMAP_EXCLUSIVE);
 		folio_add_lru_vma(new_folio, vma);
 		BUG_ON(unshare && pte_write(entry));
@@ -8794,6 +8961,7 @@ int generic_access_phys(struct vm_area_struct *vma, unsigned long addr,
 		.allow_subpage = true
 	};
 
+#ifdef CONFIG_MM_SUBPAGE
 	if (len <= 0)
 		return 0;
 	if (addr < vma->vm_start || addr >= vma->vm_end)
@@ -8802,6 +8970,7 @@ int generic_access_phys(struct vm_area_struct *vma, unsigned long addr,
 	len = min_t(unsigned long, len, vma->vm_end - addr);
 	len = min_t(unsigned long, len, mm_page_size(vma->vm_mm) -
 			(addr & ~mm_page_mask(vma->vm_mm)));
+#endif
 retry:
 	if (follow_pfnmap_start(&args))
 		return -EINVAL;

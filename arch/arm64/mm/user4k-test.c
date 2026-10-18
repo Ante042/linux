@@ -15,6 +15,7 @@
 #include <linux/cgroup.h>
 #include <linux/delay.h>
 #include <linux/binfmts.h>
+#include <linux/hugetlb.h>
 #include <linux/init.h>
 #include <linux/io.h>
 #include <linux/iova_bitmap.h>
@@ -33,6 +34,8 @@
 #include <linux/memcontrol.h>
 #include <linux/pagemap.h>
 #include <linux/pagewalk.h>
+#include <linux/personality.h>
+#include <linux/prctl.h>
 #include <linux/perf_event.h>
 #include <linux/preempt.h>
 #include <linux/rmap.h>
@@ -42,6 +45,7 @@
 #include <linux/umh.h>
 #include <linux/userfaultfd_k.h>
 #include <linux/uio.h>
+#include <linux/syscalls.h>
 
 #include <asm/cpufeature.h>
 #include <asm/daifflags.h>
@@ -5375,6 +5379,165 @@ static void user4k_exec_arguments_test(struct kunit *test)
 		KUNIT_EXPECT_EQ(test, bprm->argc, 0);
 		KUNIT_EXPECT_EQ(test, bprm->vma_pages, 0UL);
 	}
+}
+
+/* Stage two strings at the top of a fresh exec stack in @mm. */
+static unsigned long test_stage_exec_strings(struct kunit *test,
+		struct linux_binprm *bprm, struct mm_struct *mm)
+{
+	unsigned long initial;
+
+	bprm->mm = mm;
+	KUNIT_ASSERT_EQ(test, create_init_stack_vma(mm, &bprm->vma, &bprm->p), 0);
+	initial = bprm->p;
+	bprm->argmin = initial - SZ_2M;
+	bprm->rlim_stack.rlim_cur = SZ_8M;
+	bprm->rlim_stack.rlim_max = RLIM_INFINITY;
+	KUNIT_ASSERT_EQ(test, copy_string_kernel("arg", bprm), 0);
+	KUNIT_ASSERT_EQ(test, copy_string_kernel("setid-image", bprm), 0);
+	return initial - bprm->p;
+}
+
+static void test_expect_exec_strings(struct kunit *test,
+		struct linux_binprm *bprm, unsigned long copied)
+{
+	char buf[16] = {};
+
+	KUNIT_ASSERT_EQ(test, copied, sizeof("setid-image") + sizeof("arg"));
+	KUNIT_ASSERT_EQ(test, access_remote_vm(bprm->mm, bprm->p, buf, copied, 0),
+			(int)copied);
+	KUNIT_EXPECT_STREQ(test, buf, "setid-image");
+	KUNIT_EXPECT_STREQ(test, buf + sizeof("setid-image"), "arg");
+}
+
+/*
+ * A set-user-ID, set-group-ID or secure-exec image must not run with the
+ * caller's unprivileged granule preference: it is restaged at the granule
+ * it gets without one, with the staged arguments intact.
+ */
+static void user4k_exec_privileged_test(struct kunit *test)
+{
+	unsigned int privileged;
+
+	if (!user4k_test_enabled && !IS_ENABLED(CONFIG_KASAN)) {
+		kunit_skip(test, "borrowed-mm stack setup requires hardware opt-in");
+		return;
+	}
+	for (privileged = 0; privileged < 3; privileged++) {
+		struct linux_binprm *bprm = kunit_kzalloc(test, sizeof(*bprm), GFP_KERNEL);
+		struct mm_struct *mm = test_vma_mm(test);
+		unsigned long copied;
+
+		KUNIT_ASSERT_NOT_NULL(test, bprm);
+		KUNIT_ASSERT_NOT_NULL(test, mm);
+		copied = test_stage_exec_strings(test, bprm, mm);
+		bprm->secure_page_shift = PAGE_SHIFT;
+		if (privileged == 1)
+			bprm->per_clear = PER_CLEAR_ON_SETID;
+		else if (privileged == 2)
+			bprm->secureexec = 1;
+		/* A replacement drops the staging mm's reference. */
+		mmget(mm);
+		KUNIT_ASSERT_EQ(test, bprm_secure_page_size(bprm), 0);
+		if (bprm->mm != mm)
+			KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
+					user4k_vma_mm_free, bprm->mm), 0);
+		else
+			mmput(mm);
+		KUNIT_EXPECT_EQ(test, mm_page_shift(bprm->mm),
+				privileged ? PAGE_SHIFT : 12U);
+		KUNIT_EXPECT_PTR_EQ(test, bprm->vma->vm_mm, bprm->mm);
+		test_expect_exec_strings(test, bprm, copied);
+	}
+}
+
+/* The arch selection records the preference-free granule for begin_new_exec(). */
+static void user4k_exec_secure_granule_test(struct kunit *test)
+{
+	unsigned int saved = current->exec_page_shift;
+	unsigned int compat;
+
+	if (!user4k_test_enabled && !IS_ENABLED(CONFIG_KASAN)) {
+		kunit_skip(test, "borrowed-mm stack setup requires hardware opt-in");
+		return;
+	}
+	if (!cpus_have_final_cap(ARM64_HAS_USER4K_GRANULE)) {
+		kunit_skip(test, "no 4K translation granule");
+		return;
+	}
+	for (compat = 0; compat < 2; compat++) {
+		struct linux_binprm *bprm = kunit_kzalloc(test, sizeof(*bprm), GFP_KERNEL);
+		struct mm_struct *mm = mm_alloc_exec_page_shift(PAGE_SHIFT);
+		unsigned long copied;
+		int ret;
+
+		KUNIT_ASSERT_NOT_NULL(test, bprm);
+		KUNIT_ASSERT_NOT_NULL(test, mm);
+		copied = test_stage_exec_strings(test, bprm, mm);
+		current->exec_page_shift = 12;
+		ret = arm64_bprm_prepare_mm(bprm, compat);
+		current->exec_page_shift = saved;
+		KUNIT_ASSERT_EQ(test, ret, 0);
+		KUNIT_EXPECT_EQ(test, mm_page_shift(bprm->mm), 12U);
+		/* AArch32 always uses 4K when available; AArch64 defaults to native. */
+		KUNIT_EXPECT_EQ(test, bprm->secure_page_shift, compat ? 12U : PAGE_SHIFT);
+		bprm->per_clear = PER_CLEAR_ON_SETID;
+		mm = bprm->mm;
+		/* Keep the staging mm alive across a possible replacement. */
+		mmget(mm);
+		KUNIT_ASSERT_EQ(test, bprm_secure_page_size(bprm), 0);
+		mmput(mm);
+		KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, user4k_vma_mm_free,
+				bprm->mm), 0);
+		KUNIT_EXPECT_EQ(test, mm_page_shift(bprm->mm), compat ? 12U : PAGE_SHIFT);
+		test_expect_exec_strings(test, bprm, copied);
+	}
+}
+
+/* HugeTLB tables use native geometry; a small-granule mm must not map them. */
+static void user4k_hugetlb_refused_test(struct kunit *test)
+{
+#ifdef CONFIG_HUGETLBFS
+	const unsigned long prot = PROT_READ | PROT_WRITE;
+	const unsigned long flags = MAP_SHARED | MAP_NORESERVE | MAP_FIXED_NOREPLACE;
+	const unsigned long addr = SZ_1G;
+	struct mm_struct *small, *native;
+	unsigned long len, result[3];
+	struct file *file;
+
+	if (!user4k_test_enabled && !IS_ENABLED(CONFIG_KASAN)) {
+		kunit_skip(test, "borrowed-mm mapping fixture requires hardware opt-in");
+		return;
+	}
+	len = huge_page_size(&default_hstate);
+	file = hugetlb_file_setup(HUGETLB_ANON_FILE, len, mk_vma_flags(VMA_NORESERVE_BIT),
+				  HUGETLB_ANONHUGE_INODE, 0);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, file);
+	small = test_vma_mm(test);
+	native = mm_alloc();
+	KUNIT_ASSERT_NOT_NULL(test, small);
+	KUNIT_ASSERT_NOT_NULL(test, native);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, user4k_vma_mm_free, native), 0);
+
+	kthread_use_mm(small);
+	result[0] = vm_mmap(file, addr, len, prot, flags, 0);
+	result[1] = ksys_mmap_pgoff(addr, len, prot, MAP_PRIVATE | MAP_ANONYMOUS |
+				    MAP_HUGETLB | MAP_NORESERVE | MAP_FIXED_NOREPLACE,
+				    -1, 0);
+	kthread_unuse_mm(small);
+	kthread_use_mm(native);
+	result[2] = vm_mmap(file, addr, len, prot, flags, 0);
+	kthread_unuse_mm(native);
+	fput(file);
+
+	KUNIT_EXPECT_EQ(test, result[0], (unsigned long)-EINVAL);
+	KUNIT_EXPECT_EQ(test, result[1], (unsigned long)-EINVAL);
+	KUNIT_EXPECT_EQ(test, small->map_count, 0);
+	/* The same mapping is accepted with native tables. */
+	KUNIT_EXPECT_EQ(test, result[2], addr);
+#else
+	kunit_skip(test, "requires CONFIG_HUGETLBFS");
+#endif
 }
 
 static struct vm_area_struct *test_special_vma(struct mm_struct *mm,
@@ -13583,6 +13746,141 @@ static void user4k_exec_granule_policy_test(struct kunit *test)
 	}
 }
 
+/* Exec page-size requests are refused unless booted with user4k=on. */
+static void user4k_page_size_request_test(struct kunit *test)
+{
+	static const struct {
+		unsigned long size;
+		int off, on, on_no4k;
+	} cases[] = {
+		{ 0, 0, 0, 0 },
+		{ PAGE_SIZE, 0, 0, 0 },
+		{ SZ_4K, -EINVAL, 12, -EOPNOTSUPP },
+		{ SZ_8K, -EINVAL, -EINVAL, -EINVAL },
+		{ SZ_2M, -EINVAL, -EINVAL, -EINVAL },
+	};
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		unsigned long size = cases[i].size;
+
+		KUNIT_EXPECT_EQ(test, arm64_exec_page_size_request(size, false, true, true),
+				cases[i].off);
+		KUNIT_EXPECT_EQ(test, arm64_exec_page_size_request(size, false, false, false),
+				cases[i].off);
+		KUNIT_EXPECT_EQ(test, arm64_exec_page_size_request(size, true, true, true),
+				cases[i].on);
+		KUNIT_EXPECT_EQ(test, arm64_exec_page_size_request(size, true, false, false),
+				cases[i].on_no4k);
+	}
+	/* Larger-than-native process granules are never offered. */
+	if (PAGE_SIZE == SZ_16K) {
+		KUNIT_EXPECT_EQ(test, arm64_exec_page_size_request(SZ_64K, false, true, true),
+				-EINVAL);
+		KUNIT_EXPECT_EQ(test, arm64_exec_page_size_request(SZ_64K, true, true, true),
+				-EINVAL);
+	}
+}
+
+asmlinkage long __arm64_sys_prctl(const struct pt_regs *regs);
+
+static long test_prctl(unsigned long option, unsigned long arg2)
+{
+	struct pt_regs regs = { .regs = { option, arg2 } };
+
+	return __arm64_sys_prctl(&regs);
+}
+
+/* Both SET prctls follow the boot switch; native requests always succeed. */
+static void user4k_boot_switch_prctl_test(struct kunit *test)
+{
+	static const unsigned long options[][2] = {
+		{ PR_AURORA_SET_EXEC_PAGE_SIZE, PR_AURORA_GET_EXEC_PAGE_SIZE },
+		{ PR_AURORA_SET_DEFAULT_PAGE_SIZE, PR_AURORA_GET_DEFAULT_PAGE_SIZE },
+	};
+	unsigned int saved_exec = current->exec_page_shift;
+	unsigned int saved_default = current->default_exec_page_shift;
+	bool has_4k = cpus_have_final_cap(ARM64_HAS_USER4K_GRANULE);
+	long expect = !user4k_enabled() ? -EINVAL : has_4k ? 0 : -EOPNOTSUPP;
+	unsigned int i;
+
+	/* Without user4k=on the CPUs report no 4K user granule either. */
+	if (!user4k_enabled())
+		KUNIT_EXPECT_FALSE(test, has_4k);
+	for (i = 0; i < ARRAY_SIZE(options); i++) {
+		unsigned long set = options[i][0], get = options[i][1];
+
+		current->exec_page_shift = 0;
+		current->default_exec_page_shift = 0;
+		KUNIT_EXPECT_EQ(test, test_prctl(set, SZ_4K), expect);
+		KUNIT_EXPECT_EQ(test, test_prctl(get, 0), expect ? 0L : (long)SZ_4K);
+		if (PAGE_SIZE == SZ_16K) {
+			KUNIT_EXPECT_EQ(test, test_prctl(set, SZ_64K), (long)-EINVAL);
+			KUNIT_EXPECT_EQ(test, test_prctl(get, 0), expect ? 0L : (long)SZ_4K);
+		}
+		KUNIT_EXPECT_EQ(test, test_prctl(set, PAGE_SIZE), 0L);
+		KUNIT_EXPECT_EQ(test, test_prctl(set, 0), 0L);
+		KUNIT_EXPECT_EQ(test, test_prctl(get, 0), 0L);
+	}
+	current->exec_page_shift = saved_exec;
+	current->default_exec_page_shift = saved_default;
+}
+
+/* With the switch off, exec ignores any preference and stays native. */
+static void user4k_boot_switch_exec_test(struct kunit *test)
+{
+	unsigned int saved_exec = current->exec_page_shift;
+	unsigned int saved_default = current->default_exec_page_shift;
+	struct mm_struct *mm;
+	unsigned int compat;
+
+	mm = mm_alloc_exec_page_shift(12);
+	KUNIT_ASSERT_NOT_NULL(test, mm);
+	KUNIT_EXPECT_EQ(test, mm_page_shift(mm), user4k_enabled() ? 12U : PAGE_SHIFT);
+	mmput(mm);
+	/* With user4k=on, user4k_exec_secure_granule_test covers staging. */
+	if (user4k_enabled())
+		return;
+	for (compat = 0; compat < 2; compat++) {
+		struct linux_binprm *bprm = kunit_kzalloc(test, sizeof(*bprm), GFP_KERNEL);
+		int ret;
+
+		KUNIT_ASSERT_NOT_NULL(test, bprm);
+		mm = mm_alloc_exec_page_shift(PAGE_SHIFT);
+		KUNIT_ASSERT_NOT_NULL(test, mm);
+		bprm->mm = mm;
+		current->exec_page_shift = 12;
+		current->default_exec_page_shift = 12;
+		ret = arm64_bprm_prepare_mm(bprm, compat);
+		current->exec_page_shift = saved_exec;
+		current->default_exec_page_shift = saved_default;
+		KUNIT_EXPECT_EQ(test, ret, 0);
+		KUNIT_EXPECT_PTR_EQ(test, bprm->mm, mm);
+		KUNIT_EXPECT_EQ(test, mm_page_shift(bprm->mm), PAGE_SHIFT);
+		/* AArch32 also keeps the native granule. */
+		KUNIT_EXPECT_EQ(test, bprm->secure_page_shift, PAGE_SHIFT);
+		mmput(mm);
+	}
+}
+
+/* Native pages never have a 4K owner; without user4k=on there is no record. */
+static void user4k_boot_switch_page_ext_test(struct kunit *test)
+{
+	struct mm_subpage_mapcounts counts;
+	struct page *page = alloc_page(GFP_KERNEL);
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, page);
+	memset(&counts, 0xff, sizeof(counts));
+	KUNIT_EXPECT_EQ(test, mm_subpage_file_mapcounts(page, &counts), 0U);
+	for (i = 0; i < MM_SUBPAGES_PER_PAGE; i++)
+		KUNIT_EXPECT_EQ(test, counts.slots[i], 0U);
+	KUNIT_EXPECT_NULL(test, mm_subpage_get_from_phys(page_to_phys(page)));
+	if (!user4k_enabled())
+		KUNIT_EXPECT_EQ(test, mm_subpage_shmem_missing(page), 0UL);
+	__free_page(page);
+}
+
 static void user_granule_zero_region_test(struct kunit *test)
 {
 	unsigned long base_pfn = zero_pfn(0);
@@ -14326,6 +14624,9 @@ static struct kunit_case user4k_test_cases[] = {
 	KUNIT_CASE(user4k_mremap_resize_test),
 	KUNIT_CASE(user4k_stack_relocate_test),
 	KUNIT_CASE(user4k_exec_arguments_test),
+	KUNIT_CASE(user4k_exec_privileged_test),
+	KUNIT_CASE(user4k_exec_secure_granule_test),
+	KUNIT_CASE(user4k_hugetlb_refused_test),
 	KUNIT_CASE(user4k_special_mapping_test),
 	KUNIT_CASE(native_callback_mapping_test),
 	KUNIT_CASE(user4k_callback_mapping_test),
@@ -14441,12 +14742,27 @@ static struct kunit_suite user4k_test_suite = {
 	.test_cases = user4k_test_cases,
 };
 
+/* Safe with or without user4k=on; the other suites need user4k=on. */
+static struct kunit_case user4k_policy_cases[] = {
+	KUNIT_CASE(user4k_page_size_request_test),
+	KUNIT_CASE(user4k_boot_switch_prctl_test),
+	KUNIT_CASE(user4k_boot_switch_exec_test),
+	KUNIT_CASE(user4k_boot_switch_page_ext_test),
+	{}
+};
+
+static struct kunit_suite user4k_policy_suite = {
+	.name = "arm64-user4k-policy",
+	.test_cases = user4k_policy_cases,
+};
+
 #if defined(CONFIG_SHMEM) && defined(CONFIG_MM_SUBPAGE) && defined(CONFIG_USERFAULTFD)
-kunit_test_suites(&user4k_test_suite, &user4k_swap_suite, &user4k_shmem_swap_suite,
-		  &user4k_coarse_shmem_suite,
+kunit_test_suites(&user4k_policy_suite, &user4k_test_suite, &user4k_swap_suite,
+		  &user4k_shmem_swap_suite, &user4k_coarse_shmem_suite,
 		  &user4k_nonlinear_swap_suite);
 #else
-kunit_test_suites(&user4k_test_suite, &user4k_swap_suite, &user4k_nonlinear_swap_suite);
+kunit_test_suites(&user4k_policy_suite, &user4k_test_suite, &user4k_swap_suite,
+		  &user4k_nonlinear_swap_suite);
 #endif
 
 MODULE_LICENSE("GPL");

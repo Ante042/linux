@@ -353,6 +353,16 @@ static unsigned long do_mmap_internal(struct file *file, unsigned long addr,
 		return -EINVAL;
 
 	/*
+	 * HugeTLB mappings use native page table geometry and can share PMD
+	 * tables with other processes. An mm with another user granule has
+	 * different tables, so refuse them for every hugetlbfs, MAP_HUGETLB,
+	 * SHM_HUGETLB and MFD_HUGETLB file.
+	 */
+	if (IS_ENABLED(CONFIG_MM_SUBPAGE) && file && is_file_hugepages(file) &&
+	    mm_page_size(mm) != PAGE_SIZE)
+		return -EINVAL;
+
+	/*
 	 * Does the application expect PROT_READ to imply PROT_EXEC?
 	 *
 	 * (the exception is when the underlying filesystem is noexec
@@ -1371,8 +1381,14 @@ void exit_mmap(struct mm_struct *mm)
 destroy:
 	__mt_destroy(&mm->mm_mt);
 	trace_exit_mmap(mm);
+#ifdef CONFIG_MM_SUBPAGE
+	/* The per-mm commitment is updated under the mmap lock. */
 	mm_unacct_memory(mm, nr_accounted);
 	mmap_write_unlock(mm);
+#else
+	mmap_write_unlock(mm);
+	vm_unacct_memory(nr_accounted);
+#endif
 }
 
 /*

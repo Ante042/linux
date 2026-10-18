@@ -34,6 +34,7 @@
 #include <linux/cleanup.h>
 #include <linux/mm_subpage.h>
 #include <linux/shmem_fs.h>
+#include <kunit/visibility.h>
 #include <asm/tlbflush.h>
 #include <asm/tlb.h>
 #include "internal.h"
@@ -2358,7 +2359,7 @@ static void uffd_move_unlock(struct vm_area_struct *dst_vma,
  * in the regions or not, but preventing the risk of having to split
  * the hugepmd during the remap.
  */
-static ssize_t move_pages(struct userfaultfd_ctx *ctx, unsigned long dst_start,
+VISIBLE_IF_KUNIT ssize_t move_pages(struct userfaultfd_ctx *ctx, unsigned long dst_start,
 		   unsigned long src_start, unsigned long len, __u64 mode)
 {
 	struct mm_struct *mm = ctx->mm;
@@ -4397,9 +4398,15 @@ static int userfaultfd_copy(struct userfaultfd_ctx *ctx,
 	/*
 	 * COPY reads the pager's address space, which can have a different
 	 * task size and granule from the registered target. Only the target
-	 * range below requires a page-aligned length.
+	 * range below requires a page-aligned length. Without mixed granules,
+	 * keep validating the source against the registered mm.
 	 */
-	ret = validate_byte_range(current->mm, uffdio_copy.src, uffdio_copy.len);
+	if (IS_ENABLED(CONFIG_MM_SUBPAGE))
+		ret = validate_byte_range(current->mm, uffdio_copy.src,
+					  uffdio_copy.len);
+	else
+		ret = validate_unaligned_range(ctx->mm, uffdio_copy.src,
+					       uffdio_copy.len);
 	if (ret)
 		goto out;
 	ret = validate_range(ctx->mm, uffdio_copy.dst, uffdio_copy.len);
