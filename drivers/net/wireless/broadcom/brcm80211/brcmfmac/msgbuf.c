@@ -11,6 +11,7 @@
 #include <linux/types.h>
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
+#include <linux/ratelimit.h>
 
 #include <brcmu_utils.h>
 #include <brcmu_wifi.h>
@@ -528,8 +529,9 @@ static void brcmf_msgbuf_ioctl_resp_wake(struct brcmf_msgbuf *msgbuf)
 }
 
 
-static int brcmf_msgbuf_query_dcmd(struct brcmf_pub *drvr, int ifidx,
-				   uint cmd, void *buf, uint len, int *fwerr)
+static int brcmf_msgbuf_query_dcmd_len(struct brcmf_pub *drvr, int ifidx,
+				   uint cmd, void *buf, uint len, int *fwerr,
+				    u32 *ret_len)
 {
 	struct brcmf_msgbuf *msgbuf = (struct brcmf_msgbuf *)drvr->proto->pd;
 	struct sk_buff *skb = NULL;
@@ -538,6 +540,8 @@ static int brcmf_msgbuf_query_dcmd(struct brcmf_pub *drvr, int ifidx,
 
 	brcmf_dbg(MSGBUF, "ifidx=%d, cmd=%d, len=%d\n", ifidx, cmd, len);
 	*fwerr = 0;
+	if (ret_len)
+		*ret_len = 0;
 	msgbuf->ctl_completed = false;
 	err = brcmf_msgbuf_tx_ioctl(drvr, ifidx, cmd, buf, len);
 	if (err)
@@ -556,13 +560,27 @@ static int brcmf_msgbuf_query_dcmd(struct brcmf_pub *drvr, int ifidx,
 		if (!skb)
 			return -EBADF;
 
+		if (ret_len && msgbuf->ioctl_resp_ret_len > skb->len) {
+			brcmu_pkt_buf_free_skb(skb);
+			return -EBADMSG;
+		}
 		memcpy(buf, skb->data, (len < msgbuf->ioctl_resp_ret_len) ?
 				       len : msgbuf->ioctl_resp_ret_len);
 	}
 	brcmu_pkt_buf_free_skb(skb);
 
+	if (ret_len)
+		*ret_len = min_t(u32, len, msgbuf->ioctl_resp_ret_len);
 	*fwerr = msgbuf->ioctl_resp_status;
 	return 0;
+}
+
+
+static int brcmf_msgbuf_query_dcmd(struct brcmf_pub *drvr, int ifidx,
+				 uint cmd, void *buf, uint len, int *fwerr)
+{
+	return brcmf_msgbuf_query_dcmd_len(drvr, ifidx, cmd, buf, len,
+					 fwerr, NULL);
 }
 
 
@@ -912,14 +930,26 @@ brcmf_msgbuf_process_ioctl_complete(struct brcmf_msgbuf *msgbuf, void *buf)
 }
 
 
+/* Firmware-reported completion status of AWDL data frames. brcmfmac never
+ * looks at tx_status; it is the WLFC_CTL_PKTFLAG_* fate of the frame
+ * (0 acked, 4 sent-no-ack i.e. multicast on air, 7 dropped by the firmware).
+ * Observed: awdl0 multicast completes ~1:3 sent:dropped, template or not.
+ * Logged for every frame queued on a non-primary flowring. 2000/s so a
+ * 200-frame burst at 1000/s is logged in full and in order -- the sequence
+ * of fates is the measurement.
+ */
+static DEFINE_RATELIMIT_STATE(brcmf_awdl_txs_rs, HZ, 2000);
+
 static void
 brcmf_msgbuf_process_txstatus(struct brcmf_msgbuf *msgbuf, void *buf)
 {
 	struct brcmf_commonring *commonring;
 	struct msgbuf_tx_status *tx_status;
+	struct brcmf_if *ifp;
 	u32 idx;
 	struct sk_buff *skb;
 	u16 flowid;
+	u8 ring_ifidx;
 
 	tx_status = (struct msgbuf_tx_status *)buf;
 	idx = le32_to_cpu(tx_status->msg.request_id) - 1;
@@ -930,12 +960,42 @@ brcmf_msgbuf_process_txstatus(struct brcmf_msgbuf *msgbuf, void *buf)
 	if (!skb)
 		return;
 
+	if (flowid >= msgbuf->max_flowrings) {
+		bphy_err(msgbuf->drvr, "txstatus for flowring %u out of range\n",
+			 flowid);
+		brcmu_pkt_buf_free_skb(skb);
+		return;
+	}
+
 	set_bit(flowid, msgbuf->txstatus_done_map);
 	commonring = msgbuf->flowrings[flowid];
 	atomic_dec(&commonring->outstanding_tx);
 
-	brcmf_txfinalize(brcmf_get_ifp(msgbuf->drvr, tx_status->msg.ifidx),
-			 skb, true);
+	ifp = brcmf_get_ifp(msgbuf->drvr, tx_status->msg.ifidx);
+	/* Key on the flowring's ifidx, which the host assigned when it queued
+	 * the frame, not on what the firmware echoes: repeated runs
+	 * logged nothing for 1227 awdl0 frames each, and a completion
+	 * echoed under ifidx 0 would have been invisible to both filters.
+	 *
+	 * The ring may already be gone: brcmf_msgbuf_delete_flowring() gives up
+	 * on outstanding frames after ~75 ms and the firmware completes them
+	 * (0x0006 EXPIRED) after the ring was freed -- awdl0's VO multicast
+	 * never completes while the ring is open (observed as a NULL deref
+	 * here on `awdl-if destroy`). The skb and its pktid are unaffected.
+	 */
+	ring_ifidx = msgbuf->flow->rings[flowid] ?
+		     brcmf_flowring_ifidx_get(msgbuf->flow, flowid) : 0;
+	if (ring_ifidx && READ_ONCE(brcmf_awdl_trace) &&
+	    __ratelimit(&brcmf_awdl_txs_rs))
+		pr_info("brcmfmac: awdl txstatus ring_ifidx=%u msg_ifidx=%u awdl=%d flow=%u status=%d tx_status=0x%04x meta=%u dst=%pM\n",
+			ring_ifidx, tx_status->msg.ifidx,
+			ifp ? ifp->is_awdl : -1, flowid,
+			(int)(s16)le16_to_cpu(tx_status->compl_hdr.status),
+			le16_to_cpu(tx_status->tx_status),
+			le16_to_cpu(tx_status->metadata_len),
+			skb->len >= ETH_ALEN ? skb->data : (u8 *)"\0\0\0\0\0\0");
+
+	brcmf_txfinalize(ifp, skb, true);
 }
 
 
@@ -1236,7 +1296,7 @@ brcmf_msgbuf_process_rx_complete(struct brcmf_msgbuf *msgbuf, void *buf)
 		return;
 	}
 
-	skb->protocol = eth_type_trans(skb, ifp->ndev);
+	skb->protocol = brcmf_rx_eth_type_trans(ifp, skb);
 	brcmf_netif_rx(ifp, skb);
 }
 
@@ -1584,14 +1644,25 @@ static int brcmf_msgbuf_stats_read(struct seq_file *seq, void *data)
 		if (!msgbuf->flow->rings[i])
 			continue;
 		ring = msgbuf->flow->rings[i];
-		if (ring->status != RING_OPEN)
-			continue;
-		commonring = msgbuf->flowrings[i];
 		hash = &msgbuf->flow->hash[ring->hash_id];
-		seq_printf(seq, "id %3u: rp %4u, wp %4u, qlen %4u, blocked %u\n"
+		if (ring->status != RING_OPEN) {
+			/* A ring the firmware has not acknowledged holds every
+			 * frame queued to it, invisibly, while tx_packets
+			 * advances. Show it rather than skip it.
+			 */
+			seq_printf(seq, "id %3u: status %d (not open), qlen %4u\n"
+					"        ifidx %u, fifo %u, da %pM\n",
+					i, ring->status,
+					skb_queue_len(&ring->skblist),
+					hash->ifidx, hash->fifo, hash->mac);
+			continue;
+		}
+		commonring = msgbuf->flowrings[i];
+		seq_printf(seq, "id %3u: rp %4u, wp %4u, qlen %4u, blocked %u, outstanding_tx %d\n"
 				"        ifidx %u, fifo %u, da %pM\n",
 				i, commonring->r_ptr, commonring->w_ptr,
 				skb_queue_len(&ring->skblist), ring->blocked,
+				atomic_read(&commonring->outstanding_tx),
 				hash->ifidx, hash->fifo, hash->mac);
 	}
 
@@ -1657,6 +1728,7 @@ int brcmf_proto_msgbuf_attach(struct brcmf_pub *drvr)
 
 	drvr->proto->hdrpull = brcmf_msgbuf_hdrpull;
 	drvr->proto->query_dcmd = brcmf_msgbuf_query_dcmd;
+	drvr->proto->query_dcmd_len = brcmf_msgbuf_query_dcmd_len;
 	drvr->proto->set_dcmd = brcmf_msgbuf_set_dcmd;
 	drvr->proto->tx_queue_data = brcmf_msgbuf_tx_queue_data;
 	drvr->proto->configure_addr_mode = brcmf_msgbuf_configure_addr_mode;
