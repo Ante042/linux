@@ -560,6 +560,7 @@ impl Queue::ver {
         ret.q_vtx = Some(SubQueue::ver {
             wq: workqueue::WorkQueue::ver::new(
                 dev.clone(),
+                gpu.get_cfg(),
                 alloc,
                 event_manager.clone(),
                 ret.inner.gpu_context.clone(),
@@ -574,6 +575,7 @@ impl Queue::ver {
         ret.q_frag = Some(SubQueue::ver {
             wq: workqueue::WorkQueue::ver::new(
                 dev.clone(),
+                gpu.get_cfg(),
                 alloc,
                 event_manager.clone(),
                 ret.inner.gpu_context.clone(),
@@ -589,6 +591,7 @@ impl Queue::ver {
         ret.q_comp = Some(SubQueue::ver {
             wq: workqueue::WorkQueue::ver::new(
                 dev.clone(),
+                gpu.get_cfg(),
                 alloc,
                 event_manager,
                 ret.inner.gpu_context.clone(),
