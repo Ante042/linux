@@ -64,7 +64,7 @@ enum tb_tunnel_state {
  * @allocated_down: Allocated downstream bandwidth (only for USB3)
  * @bw_mode: DP bandwidth allocation mode registers can be used to
  *	     determine consumed and allocated bandwidth
- * @dprx_started: DPRX has an outstanding worker reference and callback
+ * @dprx_started: DPRX negotiation was started (tb_dp_dprx_start() was called for it)
  * @dprx_canceled: Was DPRX capabilities read poll canceled
  * @host_dp_generation: Nonzero identity of the announced display handoff
  * @host_dp_notified: The NHI glue was told this DP tunnel is up (Apple hosts)
@@ -72,8 +72,7 @@ enum tb_tunnel_state {
  * @host_pci_activated: The NHI post-activation hook owns PCIe host state
  * @dprx_timeout: If set DPRX capabilities read poll work will timeout after this passes
  * @dprx_work: Worker that is scheduled to poll completion of DPRX capabilities read
- * @callback: Optional callback called when DP tunnel is fully activated
- * @callback_data: Optional data for @callback
+ * @callback: Callback called when DP tunnel is fully activated
  * @paths: All paths required by the tunnel
  */
 struct tb_tunnel {
@@ -114,8 +113,7 @@ struct tb_tunnel {
 	bool host_pci_activated;
 	ktime_t dprx_timeout;
 	struct delayed_work dprx_work;
-	void (*callback)(struct tb_tunnel *tunnel, void *data);
-	void *callback_data;
+	void (*callback)(struct tb_tunnel *tunnel);
 
 	struct tb_path *paths[] __counted_by(npaths);
 };
@@ -129,13 +127,14 @@ int tb_pci_tunnel_deactivate_host(struct tb_tunnel *tunnel);
 bool tb_tunnel_reserved_pci(struct tb_port *port, int *reserved_up,
 			    int *reserved_down);
 struct tb_tunnel *tb_tunnel_discover_dp(struct tb *tb, struct tb_port *in,
-					bool alloc_hopid);
+					bool alloc_hopid,
+					void (*callback)(struct tb_tunnel *));
+void tb_dp_tunnel_cancel_dprx(struct tb_tunnel *tunnel);
 bool tb_apple_nhi_needs_bw_grant(struct tb_nhi *nhi);
 struct tb_tunnel *tb_tunnel_alloc_dp(struct tb *tb, struct tb_port *in,
 				     struct tb_port *out, int link_nr,
 				     int max_up, int max_down,
-				     void (*callback)(struct tb_tunnel *, void *),
-				     void *callback_data);
+				     void (*callback)(struct tb_tunnel *));
 struct tb_tunnel *tb_tunnel_alloc_dma(struct tb *tb, struct tb_port *nhi,
 				      struct tb_port *dst, int transmit_path,
 				      int transmit_ring, int receive_path,

@@ -55,6 +55,24 @@
 #define DCP_V14_CPU_CONTROL	0x44
 #define DCP_V14_CPU_STATUS	0x48
 #define DCP_V14_PMP_TIMEOUT	msecs_to_jiffies(30000)
+
+/*
+ * The PMP report's wait-ready entry point is optional at link time: until a
+ * provider implements it, behave as its !CONFIG_APPLE_PMP_REPORT stub does.
+ */
+static int dcp_v14_pmp_wait_ready(struct device_node *entry,
+				  unsigned long timeout)
+{
+	typeof(&apple_pmp_report_wait_ready) wait;
+	int ret;
+
+	wait = symbol_get(apple_pmp_report_wait_ready);
+	if (!wait)
+		return -ENODEV;
+	ret = wait(entry, timeout);
+	symbol_put(apple_pmp_report_wait_ready);
+	return ret;
+}
 #define DCP_V14_RTKIT_RETRIES	4
 #define DCP_V14_MAX_PROPERTIES	256
 #define DCP_V14_MAX_RAW		32
@@ -1516,7 +1534,7 @@ int iomfb_v14_7_probe(struct apple_dcp *dcp)
 		return dev_err_probe(dev, -ENODEV,
 				     "%s display not started: no apple,pmp-report, the PMP is not described\n",
 				     board->name);
-	ret = apple_pmp_report_wait_ready(entry, DCP_V14_PMP_TIMEOUT);
+	ret = dcp_v14_pmp_wait_ready(entry, DCP_V14_PMP_TIMEOUT);
 	of_node_put(entry);
 	if (ret == -EPROBE_DEFER)
 		return dev_err_probe(dev, ret, "waiting for the PMP report\n");
@@ -1599,6 +1617,28 @@ enum {
 static void dcpext_bringup(struct work_struct *work);
 
 /*
+ * The bounded translator (900-config-tooling) is optional at link time;
+ * without it, refuse a tuple that does not fit before using the unbounded one.
+ */
+static const __be32 *dcpext_translate_region(struct device_node *np,
+					     const __be32 *maps, size_t cells,
+					     phys_addr_t *iova, size_t *length)
+{
+	typeof(&of_translate_dma_region_checked) checked;
+	const __be32 *next;
+
+	checked = symbol_get(of_translate_dma_region_checked);
+	if (checked) {
+		next = checked(np, maps, cells, iova, length);
+		symbol_put(of_translate_dma_region_checked);
+		return next;
+	}
+	if (cells < (size_t)(of_n_addr_cells(np) + of_n_size_cells(np)))
+		return NULL;
+	return of_translate_dma_region(np, maps, iova, length);
+}
+
+/*
  * The IOVA at which @mem's iommu-addresses map @size bytes for the device
  * @np, as the IOMMU core reads them; 0 if they do not.
  */
@@ -1619,7 +1659,7 @@ static u64 dcpext_region_iova(struct device_node *np, struct device_node *mem, u
 
 		if (!owner)
 			return 0;
-		maps = of_translate_dma_region_checked(owner, maps, end - maps, &iova, &length);
+		maps = dcpext_translate_region(owner, maps, end - maps, &iova, &length);
 		of_node_put(owner);
 		if (!maps)
 			return 0;
@@ -1904,7 +1944,7 @@ static int dcpext_check_power(struct apple_dcp *dcp)
 	entry = of_parse_phandle(dev->of_node, "apple,pmp-report", 0);
 	if (!entry)
 		return -ENODEV;
-	ret = apple_pmp_report_wait_ready(entry, DCP_V14_PMP_TIMEOUT);
+	ret = dcp_v14_pmp_wait_ready(entry, DCP_V14_PMP_TIMEOUT);
 	of_node_put(entry);
 	return ret;
 }
@@ -2182,7 +2222,7 @@ void iomfb_v14_7_unbind(struct apple_dcp *dcp)
 	struct apple_dcp_v14 *v14 = dcp->v14;
 
 	dcp->active = false;
-	dcp_mode_set_valid(&dcp->mode_state, false);
+	dcp_mode_invalidate(&dcp->mode_state);
 	if (dcp->external_native && !v14)
 		WRITE_ONCE(dcp->external_detached, true);
 	if (!v14)
@@ -2389,7 +2429,8 @@ int iomfb_v14_7_start(struct apple_dcp *dcp)
 	debugfs_create_file(v14->board->debugfs, 0400, NULL, v14, &dcp_v14_status_fops);
 	dcp->connector->connected = true;
 	dcp_set_dimensions(dcp, dcp_modes_transfer_begin(dcp));
-	dcp_mode_set_valid(&dcp->mode_state, true);
+	scoped_guard(spinlock_irqsave, &dcp->mode_state.lock)
+		dcp->mode_state.valid = true;
 	dcp->active = true;
 	complete(&dcp->start_done);
 
@@ -2637,7 +2678,7 @@ static void dcp_v14_cancel_event(struct apple_dcp *dcp)
 
 /* Only the layout the firmware was qualified with: one full-mode linear plane. */
 int iomfb_v14_7_atomic_check(struct apple_dcp *dcp, struct drm_crtc *crtc,
-			     struct drm_atomic_state *state)
+			     struct drm_atomic_commit *state)
 {
 	struct apple_dcp_v14 *v14 = dcp->v14;
 	struct drm_crtc_state *crtc_state = drm_atomic_get_new_crtc_state(state, crtc);
@@ -2859,7 +2900,8 @@ out:
 		return ret;
 	}
 	atomic_set(&dcp->external_retries, 0);
-	dcp_mode_set_valid(&dcp->mode_state, true);
+	scoped_guard(spinlock_irqsave, &dcp->mode_state.lock)
+		dcp->mode_state.valid = true;
 	return 0;
 }
 
@@ -2870,12 +2912,13 @@ int iomfb_v14_7_modeset(struct apple_dcp *dcp, struct drm_crtc_state *crtc_state
 	/* The firmware keeps the timing it booted with, which is the only mode. */
 	if (!lookup_mode(dcp, &crtc_state->mode, NULL))
 		return -EINVAL;
-	dcp_mode_set_valid(&dcp->mode_state, true);
+	scoped_guard(spinlock_irqsave, &dcp->mode_state.lock)
+		dcp->mode_state.valid = true;
 	return 0;
 }
 
 void iomfb_v14_7_flush(struct apple_dcp *dcp, struct drm_crtc *crtc,
-		       struct drm_atomic_state *state)
+		       struct drm_atomic_commit *state)
 {
 	struct drm_plane_state *p = drm_atomic_get_new_plane_state(state, crtc->primary);
 	struct drm_crtc_state *cs = drm_atomic_get_new_crtc_state(state, crtc);

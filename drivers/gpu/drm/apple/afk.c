@@ -5,12 +5,12 @@
 #include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
-#include <linux/jiffies.h>
 #include <linux/err.h>
+#include <linux/jiffies.h>
 #include <linux/kconfig.h>
 #include <linux/of_platform.h>
-#include <linux/slab.h>
 #include <linux/overflow.h>
+#include <linux/slab.h>
 #include <linux/sizes.h>
 #include <linux/unaligned.h>
 #include <linux/workqueue.h>
@@ -19,8 +19,8 @@
 #include <kunit/visibility.h>
 
 #include "afk.h"
-#include "afk_reply.h"
 #include "afkv2-codec.h"
+#include "afk_reply.h"
 #include "trace.h"
 
 struct afk_receive_message_work {
@@ -93,19 +93,10 @@ static void afk_release_context(void *data)
 struct apple_dcp_afkep *afk_init(struct apple_dcp *dcp, u32 endpoint,
 				 const struct apple_epic_service_ops *ops)
 {
-	bool h17p = dcp->fw_compat == DCP_FIRMWARE_H17P;
 	struct apple_dcp_afkep *afkep;
 	int ret, i;
 
-	/*
-	 * H17P: an endpoint of a retained session outlives the binding, so it
-	 * is freed by its own release action. Other firmware keeps the
-	 * device-managed lifetime it always had.
-	 */
-	if (h17p)
-		afkep = kzalloc_obj(*afkep);
-	else
-		afkep = devm_kzalloc(dcp->dev, sizeof(*afkep), GFP_KERNEL);
+	afkep = kzalloc_obj(*afkep);
 	if (!afkep)
 		return ERR_PTR(-ENOMEM);
 
@@ -125,19 +116,14 @@ struct apple_dcp_afkep *afk_init(struct apple_dcp *dcp, u32 endpoint,
 	spin_lock_init(&afkep->lock);
 	for (i = 0; i < AFK_MAX_CHANNEL; i++)
 		spin_lock_init(&afkep->services[i].lock);
-	if (h17p) {
-		ret = devm_add_action_or_reset(dcp->dev, afk_release_context, afkep);
-		if (ret)
-			return ERR_PTR(ret);
-	}
+	ret = devm_add_action_or_reset(dcp->dev, afk_release_context, afkep);
+	if (ret)
+		return ERR_PTR(ret);
 
 	return afkep;
 
 out_free_afkep:
-	if (h17p)
-		kfree(afkep);
-	else
-		devm_kfree(dcp->dev, afkep);
+	kfree(afkep);
 	return ERR_PTR(ret);
 }
 
@@ -177,10 +163,7 @@ void afk_shutdown(struct apple_dcp_afkep *afkep)
 	spin_lock_irqsave(&afkep->lock, flags);
 	afkep->stopping = true;
 	spin_unlock_irqrestore(&afkep->lock, flags);
-	if (afkep->dcp->fw_compat == DCP_FIRMWARE_H17P)
-		afk_quiesce(afkep);
-	else
-		destroy_workqueue(afkep->wq);
+	afk_quiesce(afkep);
 	if (afkep->rx_scratch) {
 		devm_kfree(afkep->dcp->dev, afkep->rx_scratch);
 		afkep->rx_scratch = NULL;
@@ -239,7 +222,8 @@ int afk_start(struct apple_dcp_afkep *ep)
 	ret = apple_rtkit_start_ep(ep->dcp->rtk, ep->endpoint);
 	if (ret)
 		return ret;
-	if (ep->dcp->fw_compat == DCP_FIRMWARE_V_14_7_TEMPLATE)
+	if (ep->dcp->fw_compat == DCP_FIRMWARE_V_14_7_TEMPLATE &&
+	    ep->dcp->hw.fw_14_7_endpoints)
 		return afk_start_polled(ep);
 	afk_send(ep, FIELD_PREP(RBEP_TYPE, RBEP_INIT));
 
@@ -403,6 +387,17 @@ static struct apple_epic_service *afk_epic_find_service(struct apple_dcp_afkep *
 	return NULL;
 }
 
+static bool afk_epic_channel_retired(struct apple_dcp_afkep *ep, u32 channel)
+{
+	u32 i;
+
+	for (i = 0; i < ep->num_channels; i++)
+		if (afk_service_retired(&ep->services[i], channel))
+			return true;
+
+	return false;
+}
+
 static int afk_send_epic_token(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 			       enum epic_type etype, enum epic_category ecat, u8 stype,
 			       const void *payload, size_t payload_len, u64 token);
@@ -543,7 +538,9 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 	else
 		ops = afk_match_service(ep, service_name);
 
-	if (!ops && ep->ops && !strcmp(ep->ops->name, "dcpav-controller-epic")) {
+	/* T6030 14.7: the DPAV controller endpoint binds whatever it announces. */
+	if (!ops && ep->dcp->fw_compat == DCP_FIRMWARE_V_14_7 && ep->ops &&
+	    !strcmp(ep->ops->name, "dcpav-controller-epic")) {
 		dev_info(ep->dcp->dev,
 			 "AFK[ep:%02x]: binding unmatched DPAV service %s on channel %d\n",
 			 ep->endpoint, service_name, channel);
@@ -645,13 +642,15 @@ static void afk_recv_handle_teardown(struct apple_dcp_afkep *ep, u32 channel)
 
 	service = afk_epic_find_service(ep, channel);
 	if (!service) {
-		dev_warn(ep->dcp->dev, "AFK[ep:%02x]: teardown for disabled channel %u\n",
-			 ep->endpoint, channel);
+		if (afk_epic_channel_retired(ep, channel))
+			dev_dbg(ep->dcp->dev, "AFK[ep:%02x]: teardown for retired channel %u\n",
+				ep->endpoint, channel);
+		else
+			dev_warn(ep->dcp->dev, "AFK[ep:%02x]: teardown for unknown channel %u\n",
+				 ep->endpoint, channel);
 		return;
 	}
 
-	dev_dbg(ep->dcp->dev, "AFK[ep:%02x]: teardown of %s on channel %u\n",
-		ep->endpoint, service->ops->name, channel);
 	afk_remove_service_debugfs(service);
 
 	spin_lock_irqsave(&service->lock, flags);
@@ -810,17 +809,13 @@ static void afk_recv_handle_std_service(struct apple_dcp_afkep *ep, u32 channel,
 		command = le32_to_cpu(call->call.command);
 
 		/*
-		 * H17P firmware: command numbers are per group, so a
-		 * group-less .call handler would take another group's call
-		 * for a group 0 one. Without call_v2 there is no handler for
-		 * it, and AFK cannot guess a reply, so it gets none, as a call
-		 * without any handler. Other firmware hands every group's
-		 * command to .call, as it always has.
+		 * Command numbers are per group: a group-less .call handler
+		 * would take another group's call for a group 0 one. Without
+		 * call_v2 there is no handler for it, and AFK cannot guess a
+		 * reply, so it gets none, as a call without any handler.
 		 */
-		if (!service->ops->call_v2 &&
-		    (!service->ops->call ||
-		     (group && ep->dcp->fw_compat == DCP_FIRMWARE_H17P))) {
-			if (group && ep->dcp->fw_compat == DCP_FIRMWARE_H17P)
+		if (!service->ops->call_v2 && (group || !service->ops->call)) {
+			if (group)
 				dev_warn_ratelimited(ep->dcp->dev,
 						     "AFK[ep:%02x]: %s (chan:%u) apcall %u:%u has no handler, sending NO reply\n",
 						     ep->endpoint, service->ops->name,
@@ -1247,15 +1242,20 @@ static void afk_recv_handle(struct apple_dcp_afkep *ep, u32 channel, u32 type,
 		return afk_recv_handle_teardown(ep, channel);
 
 	/*
-	 * 14.7 returns a command result as a NOTIFY whose category is REPLY
-	 * and whose body is a normal epic_cmd. The tag check inside the
+	 * T6030 14.7 returns a command result as a NOTIFY whose category is
+	 * REPLY and whose body is a normal epic_cmd. The tag check inside the
 	 * reply handler ignores anything that is not one of our commands.
 	 */
-	if ((type == EPIC_TYPE_REPLY ||
-	     (type == EPIC_TYPE_NOTIFY &&
-	      dcp_fw_is_14_7(ep->dcp))) &&
+	if (dcp_fw_is_14_7(ep->dcp) &&
+	    (type == EPIC_TYPE_REPLY || type == EPIC_TYPE_NOTIFY) &&
 	    eshdr->category == EPIC_CAT_REPLY &&
 	    payload_size >= sizeof(struct epic_cmd))
+		return afk_recv_handle_reply(ep, channel,
+					     le16_to_cpu(eshdr->tag), payload,
+					     payload_size);
+
+	if (!dcp_fw_is_14_7(ep->dcp) &&
+	    type == EPIC_TYPE_REPLY && eshdr->category == EPIC_CAT_REPLY)
 		return afk_recv_handle_reply(ep, channel,
 					     le16_to_cpu(eshdr->tag), payload,
 					     payload_size);
@@ -1293,15 +1293,15 @@ static bool afk_recv(struct apple_dcp_afkep *ep)
 	wptr = le32_to_cpu(*ep->rxbfr.wptr);
 	trace_afk_recv_rwptr_pre(ep, rptr, wptr);
 
-	if (rptr == wptr)
-		return false;
-
-	if (rptr > (ep->rxbfr.bufsz - sizeof(*hdr))) {
-		dev_warn(ep->dcp->dev,
-			 "AFK[ep:%02x]: rptr out of bounds: 0x%x > 0x%lx\n",
-			 ep->endpoint, rptr, ep->rxbfr.bufsz - sizeof(*hdr));
+	if (!afk_ring_ptrs_valid(rptr, wptr, ep->rxbfr.bufsz, ep->rxbfr.stride)) {
+		dev_warn_ratelimited(ep->dcp->dev,
+				     "AFK[ep:%02x]: invalid receive ring pointers: rptr 0x%x wptr 0x%x\n",
+				     ep->endpoint, rptr, wptr);
 		return false;
 	}
+
+	if (rptr == wptr)
+		return false;
 
 	dma_rmb();
 
@@ -1321,7 +1321,7 @@ static bool afk_recv(struct apple_dcp_afkep *ep)
 	 * the current dummy queue entry and we have to advance to the next one
 	 * which will contain the real data.
 	*/
-	if (rptr + size + sizeof(*hdr) > ep->rxbfr.bufsz) {
+	if (!afk_ring_payload_fits(rptr, size, ep->rxbfr.bufsz)) {
 		rptr = 0;
 		hdr = ep->rxbfr.buf + rptr;
 		magic = le32_to_cpu(hdr->magic);
@@ -1336,10 +1336,10 @@ static bool afk_recv(struct apple_dcp_afkep *ep)
 		}
 	}
 
-	if (rptr + size + sizeof(*hdr) > ep->rxbfr.bufsz) {
+	if (!afk_ring_payload_fits(rptr, size, ep->rxbfr.bufsz)) {
 		dev_warn(ep->dcp->dev,
-			 "AFK[ep:%02x]: queue entry out of bounds: 0x%lx > 0x%lx\n",
-			 ep->endpoint, rptr + size + sizeof(*hdr), ep->rxbfr.bufsz);
+			 "AFK[ep:%02x]: queue entry of 0x%x bytes at 0x%x out of bounds\n",
+			 ep->endpoint, size, rptr);
 		return false;
 	}
 
@@ -1354,9 +1354,6 @@ static bool afk_recv(struct apple_dcp_afkep *ep)
 
 	rptr = afk_ring_advance(rptr, sizeof(*hdr) + size,
 				ep->rxbfr.bufsz, ep->rxbfr.stride);
-	if (ep->dcp->fw_compat != DCP_FIRMWARE_H17P &&
-	    WARN_ON(rptr > ep->rxbfr.bufsz))
-		rptr = 0;
 
 	dma_mb();
 
@@ -1366,6 +1363,23 @@ static bool afk_recv(struct apple_dcp_afkep *ep)
 	afk_recv_handle(ep, channel, type, ep->rx_scratch, size);
 
 	return true;
+}
+
+static bool afk_recv_entry(void *ep)
+{
+	return afk_recv(ep);
+}
+
+static void afk_recv_drain(struct apple_dcp_afkep *ep)
+{
+	unsigned int budget = afk_ring_drain_budget(ep->rxbfr.bufsz,
+						    ep->rxbfr.stride);
+
+	if (afk_ring_drain(afk_recv_entry, ep, budget) == budget &&
+	    ep->rxbfr.ready && le32_to_cpu(*ep->rxbfr.rptr) != le32_to_cpu(*ep->rxbfr.wptr))
+		dev_warn_ratelimited(ep->dcp->dev,
+				     "AFK[ep:%02x]: receive ring did not drain in one pass\n",
+				     ep->endpoint);
 }
 
 static void afk_receive_message_worker(struct work_struct *work_)
@@ -1382,10 +1396,10 @@ static void afk_receive_message_worker(struct work_struct *work_)
 		break;
 
 	case RBEP_START_ACK:
-		/* 14.7 can queue messages before it acknowledges the start. */
-		if (dcp_fw_is_14_7(work->ep->dcp))
-			while (afk_recv(work->ep))
-				;
+		/* 14.7 may queue messages before it acks the start. */
+		if (dcp_fw_is_14_7(work->ep->dcp) &&
+		    work->ep->rxbfr.ready)
+			afk_recv_drain(work->ep);
 		complete_all(&work->ep->started);
 		break;
 
@@ -1406,8 +1420,7 @@ static void afk_receive_message_worker(struct work_struct *work_)
 		break;
 
 	case RBEP_RECV:
-		while (afk_recv(work->ep))
-			;
+		afk_recv_drain(work->ep);
 		break;
 
 	default:
@@ -1697,6 +1710,15 @@ int afk_send_epic(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 				   payload, payload_len, 0);
 }
 
+int afk_send_command(struct apple_epic_service *service, u8 type,
+		     const void *payload, size_t payload_len, void *output,
+		     size_t output_len, u32 *retcode)
+{
+	return afk_send_command_timeout(service, type, payload, payload_len,
+					output, output_len, retcode,
+					MSEC_PER_SEC);
+}
+
 static u16 afk_command_tag(struct apple_epic_service *service, u8 slot)
 {
 	struct apple_dcp_afkep *ep = service->ep;
@@ -1714,21 +1736,40 @@ static u16 afk_command_tag(struct apple_epic_service *service, u8 slot)
 	return tag;
 }
 
+static int afk_send_command_common(struct apple_epic_service *service, u8 type,
+				   const void *payload, size_t payload_len,
+				   void *output, size_t output_len, u32 *retcode,
+				   unsigned int timeout_ms, size_t *received,
+				   size_t *reply_len);
+
+static int afk_send_command_timeout_len(struct apple_epic_service *service, u8 type,
+					const void *payload, size_t payload_len,
+					void *output, size_t output_len, u32 *retcode,
+					unsigned int timeout_ms, size_t *received)
+{
+	return afk_send_command_common(service, type, payload, payload_len,
+				       output, output_len, retcode, timeout_ms,
+				       received, NULL);
+}
+
+int afk_send_command_timeout(struct apple_epic_service *service, u8 type,
+			     const void *payload, size_t payload_len,
+			     void *output, size_t output_len, u32 *retcode,
+			     unsigned int timeout_ms)
+{
+	return afk_send_command_timeout_len(service, type, payload, payload_len,
+					    output, output_len, retcode, timeout_ms, NULL);
+}
+
 /*
- * Send one EPIC command and wait up to @timeout_ms for its reply. With
- * @reply_len set, only the bytes the firmware reported are copied to @output
- * (the rest is zeroed) and *@reply_len receives that count; without it the
- * whole receive buffer is copied, as the original callers expect.
- *
- * AFKV2 endpoints (@ep->wire_v2, external H17P) carry the reply length in
- * the reply itself: with @reply_len set, only that many bytes are copied,
- * a short successful reply fails with -EMSGSIZE, and nothing is copied for
- * a nonzero status.
+ * @reply_len (legacy EPIC only): return just the bytes the firmware reported
+ * in its reply instead of the whole allocated output.
  */
-static int afk_send_command_full(struct apple_epic_service *service, u8 type,
-				 const void *payload, size_t payload_len,
-				 void *output, size_t output_len, u32 *retcode,
-				 size_t *reply_len, unsigned int timeout_ms)
+static int afk_send_command_common(struct apple_epic_service *service, u8 type,
+				   const void *payload, size_t payload_len,
+				   void *output, size_t output_len, u32 *retcode,
+				   unsigned int timeout_ms, size_t *received,
+				   size_t *reply_len)
 {
 	struct epic_cmd cmd;
 	void *inline_command = NULL;
@@ -1741,15 +1782,22 @@ static int afk_send_command_full(struct apple_epic_service *service, u8 type,
 	struct apple_dcp_afkep *ep;
 	DECLARE_COMPLETION_ONSTACK(completion);
 
-	if (reply_len)
+	if (received)
+		*received = 0;
+	if (reply_len) {
 		*reply_len = 0;
-	if (payload_len > U32_MAX || output_len > U32_MAX)
-		return -EOVERFLOW;
-
+		if (payload_len > U32_MAX || output_len > U32_MAX)
+			return -EOVERFLOW;
+	}
 	service = afk_service_get(service);
 	if (!service)
 		return -ENODEV;
 	ep = service->ep;
+	/* AFKv2 replies report their length through reply_length instead. */
+	if (reply_len && ep->wire_v2) {
+		ret = -EOPNOTSUPP;
+		goto err_put_service;
+	}
 	if (ep->wire_v2 && (!service->channel || service->channel >= AFKV2_INTERFACES ||
 			    !ep->command_tags)) {
 		ret = -ENODEV;
@@ -1815,14 +1863,14 @@ static int afk_send_command_full(struct apple_epic_service *service, u8 type,
 	service->cmds[idx].tag = tag;
 	service->cmds[idx].type = type;
 	service->cmds[idx].reply_length = 0;
+	service->cmds[idx].reply_len = 0;
+	service->cmds[idx].reply_len_valid = false;
 	service->cmds[idx].rxbuf = rxbuf;
 	service->cmds[idx].txbuf = txbuf;
 	service->cmds[idx].rxbuf_dma = rxbuf_dma;
 	service->cmds[idx].txbuf_dma = txbuf_dma;
 	service->cmds[idx].rxlen = output_len;
 	service->cmds[idx].txlen = payload_len;
-	service->cmds[idx].reply_len = 0;
-	service->cmds[idx].reply_len_valid = false;
 	service->cmds[idx].free_on_ack = false;
 	service->cmds[idx].done = false;
 	service->cmds[idx].completion = &completion;
@@ -1866,15 +1914,13 @@ static int afk_send_command_full(struct apple_epic_service *service, u8 type,
 				 ep->endpoint, service->ops->name, service->channel,
 				 type, tag, timeout_ms);
 			if (ep->dcp->external && ep->txbfr.ready && ep->rxbfr.ready) {
-				/*
-				 * Shared ring state, not coprocessor MMIO: unequal
-				 * TX pointers mean the firmware has not drained
-				 * the queue.
+				/* Diagnostic snapshot of shared RAM, not coprocessor MMIO.
+				 * Unequal TX pointers mean firmware has not drained the queue.
 				 */
 				dma_rmb();
 				dev_warn(ep->dcp->dev,
-					 "AFK[ep:%02x]: TX r/w %#x/%#x RX r/w %#x/%#x running %d crashed %d\n",
-					 ep->endpoint,
+					 "AFK timeout channel=%u tag=%#x TX r/w=%#x/%#x RX r/w=%#x/%#x running=%d crashed=%d\n",
+					 service->channel, tag,
 					 le32_to_cpu(READ_ONCE(*ep->txbfr.rptr)),
 					 le32_to_cpu(READ_ONCE(*ep->txbfr.wptr)),
 					 le32_to_cpu(READ_ONCE(*ep->rxbfr.rptr)),
@@ -1891,32 +1937,30 @@ static int afk_send_command_full(struct apple_epic_service *service, u8 type,
 	ret = 0;
 	if (retcode)
 		*retcode = service->cmds[idx].retcode;
-	if (ep->wire_v2) {
-		if (reply_len)
-			copy_len = service->cmds[idx].reply_length;
-		if (!service->cmds[idx].retcode &&
-		    service->cmds[idx].reply_length < copy_len) {
-			ret = -EMSGSIZE;
-		} else if (output && output_len && !service->cmds[idx].retcode) {
-			dma_rmb();
-			memcpy(output, rxbuf, copy_len);
-			if (reply_len)
-				*reply_len = copy_len;
-		}
-	} else if (reply_len) {
+	if (reply_len) {
 		ret = afk_reply_size_valid(service->cmds[idx].reply_len_valid,
-					   service->cmds[idx].reply_len,
-					   output_len, 0);
-		if (ret)
-			goto err_free_cmd;
-		*reply_len = service->cmds[idx].reply_len;
-		dma_rmb();
-		if (output && output_len) {
-			memset(output, 0, output_len);
-			memcpy(output, rxbuf, *reply_len);
+					   service->cmds[idx].reply_len, output_len, 0);
+		if (!ret) {
+			*reply_len = service->cmds[idx].reply_len;
+			dma_rmb();
+			if (output && output_len) {
+				memset(output, 0, output_len);
+				memcpy(output, rxbuf, *reply_len);
+			}
 		}
-	} else if (output && output_len) {
-		memcpy(output, rxbuf, output_len);
+		goto err_free_cmd;
+	}
+	if (ep->wire_v2 && received)
+		copy_len = service->cmds[idx].reply_length;
+	if (ep->wire_v2 && !service->cmds[idx].retcode &&
+	    service->cmds[idx].reply_length < copy_len)
+		ret = -EMSGSIZE;
+	else if (output && output_len && (!ep->wire_v2 || !service->cmds[idx].retcode)) {
+		if (ep->wire_v2)
+			dma_rmb();
+		memcpy(output, rxbuf, copy_len);
+		if (received)
+			*received = copy_len;
 	}
 
 err_free_cmd:
@@ -1935,65 +1979,54 @@ err_put_service:
 	return ret;
 }
 
-int afk_send_command_timeout(struct apple_epic_service *service, u8 type,
-			     const void *payload, size_t payload_len,
-			     void *output, size_t output_len, u32 *retcode,
-			     unsigned int timeout_ms)
+int afk_service_call(struct apple_epic_service *service, u16 group, u32 command,
+		     const void *data, size_t data_len, size_t data_pad,
+		     void *output, size_t output_len, size_t output_pad)
 {
-	return afk_send_command_full(service, type, payload, payload_len,
-				     output, output_len, retcode, NULL,
-				     timeout_ms);
+	return afk_service_call_timeout(service, group, command, data, data_len,
+					data_pad, output, output_len,
+					output_pad, MSEC_PER_SEC);
 }
 
-int afk_send_command(struct apple_epic_service *service, u8 type,
-		     const void *payload, size_t payload_len, void *output,
-		     size_t output_len, u32 *retcode)
+int afk_service_call_len(struct apple_epic_service *service, u16 group,
+			 u32 command, const void *data, size_t data_len,
+			 size_t data_pad, void *output, size_t output_len,
+			 size_t output_pad, size_t *received)
 {
-	return afk_send_command_full(service, type, payload, payload_len,
-				     output, output_len, retcode, NULL,
-				     MSEC_PER_SEC);
+	return afk_service_call_timeout_len(service, group, command, data, data_len,
+					    data_pad, output, output_len, output_pad,
+					    MSEC_PER_SEC, received);
 }
 
-int afk_send_command_with_reply_len(struct apple_epic_service *service, u8 type,
-		const void *payload, size_t payload_len, void *output,
-		size_t output_len, u32 *retcode, size_t *reply_len)
+int afk_service_call_timeout(struct apple_epic_service *service, u16 group,
+			     u32 command, const void *data, size_t data_len,
+			     size_t data_pad, void *output, size_t output_len,
+			     size_t output_pad, unsigned int timeout_ms)
 {
-	if (!reply_len)
-		return -EINVAL;
-	return afk_send_command_full(service, type, payload, payload_len,
-				     output, output_len, retcode, reply_len,
-				     MSEC_PER_SEC);
+	return afk_service_call_timeout_len(service, group, command, data, data_len,
+					    data_pad, output, output_len, output_pad,
+					    timeout_ms, NULL);
 }
 
-/*
- * One EPIC standard-service call. With @reply_len set, the reply body
- * length is validated and returned: against the received bytes on the
- * legacy wire, with afkv2_service_reply_size() on AFKV2 endpoints.
- */
-static int afk_service_call_full(struct apple_epic_service *service, u16 group,
+int afk_service_call_timeout_len(struct apple_epic_service *service, u16 group,
 				 u32 command, const void *data, size_t data_len,
 				 size_t data_pad, void *output, size_t output_len,
-				 size_t output_pad, size_t *reply_len,
-				 unsigned int timeout_ms)
+				 size_t output_pad, unsigned int timeout_ms,
+				 size_t *received)
 {
 	struct epic_service_call *call;
+	size_t wire_received = 0, result_size;
 	void *bfr;
-	size_t bfr_len, input_size, output_size, received = 0, result_size;
-	bool v2;
+	size_t bfr_len = max(data_len + data_pad, output_len + output_pad) +
+			 sizeof(*call);
 	int ret;
 	u32 retcode;
 	u32 retlen;
 
-	if (reply_len)
-		*reply_len = 0;
+	if (received)
+		*received = 0;
 	if (!service)
 		return -ENODEV;
-	v2 = service->ep->wire_v2;
-	if (check_add_overflow(data_len, data_pad, &input_size) ||
-	    check_add_overflow(output_len, output_pad, &output_size) ||
-	    check_add_overflow(max(input_size, output_size), sizeof(*call),
-			       &bfr_len) || bfr_len > U32_MAX)
-		return -EOVERFLOW;
 
 	bfr = kzalloc(bfr_len, GFP_KERNEL);
 	if (!bfr)
@@ -2011,10 +2044,10 @@ static int afk_service_call_full(struct apple_epic_service *service, u16 group,
 	memcpy(bfr + sizeof(*call), data, data_len);
 
 	/* Inline carries only the request; its response capacity is independent. */
-	ret = afk_send_command_full(service, EPIC_SUBTYPE_STD_SERVICE, bfr,
-				    service->ep->inline_v2 ? sizeof(*call) + data_len :
-				    bfr_len, bfr, bfr_len, &retcode,
-				    reply_len ? &received : NULL, timeout_ms);
+	ret = afk_send_command_timeout_len(service, EPIC_SUBTYPE_STD_SERVICE, bfr,
+					   service->ep->inline_v2 ? sizeof(*call) + data_len :
+					   bfr_len, bfr, bfr_len, &retcode, timeout_ms,
+					   received ? &wire_received : NULL);
 	if (ret) {
 		dev_warn(service->ep->dcp->dev,
 			 "AFK[ep:%02x]: %s (chan:%u) service call group %u cmd %u failed to complete: %d\n",
@@ -2031,16 +2064,13 @@ static int afk_service_call_full(struct apple_epic_service *service, u16 group,
 		ret = -EINVAL;
 		goto out;
 	}
-	if (reply_len && v2) {
-		ret = afkv2_service_reply_size(bfr, received, group, command,
-					       output_len, &result_size);
+	if (received) {
+		/* The reply may use the padding reserved after the output. */
+		ret = afkv2_service_reply_size(bfr, wire_received, group, command,
+					       output_len + output_pad, &result_size);
 		if (ret)
 			goto out;
-		*reply_len = result_size;
-	} else if (reply_len) {
-		ret = afk_reply_size_valid(true, received, bfr_len, sizeof(*call));
-		if (ret)
-			goto out;
+		*received = min(result_size, output_len);
 	}
 	if (le32_to_cpu(call->magic) != EPIC_SERVICE_CALL_MAGIC ||
 	    le16_to_cpu(call->group) != group ||
@@ -2060,13 +2090,6 @@ static int afk_service_call_full(struct apple_epic_service *service, u16 group,
 		group, command, le32_to_cpu(call->data_len));
 
 	retlen = le32_to_cpu(call->data_len);
-	if (reply_len && !v2) {
-		ret = afk_service_body_size_valid(received, sizeof(*call),
-						  retlen, output_len);
-		if (ret)
-			goto out;
-		*reply_len = retlen;
-	}
 	if (output_len < retlen)
 		retlen = output_len;
 	if (output && output_len) {
@@ -2079,23 +2102,15 @@ out:
 	return ret;
 }
 
-int afk_service_call_timeout(struct apple_epic_service *service, u16 group,
-			     u32 command, const void *data, size_t data_len,
-			     size_t data_pad, void *output, size_t output_len,
-			     size_t output_pad, unsigned int timeout_ms)
+int afk_send_command_with_reply_len(struct apple_epic_service *service, u8 type,
+		const void *payload, size_t payload_len, void *output,
+		size_t output_len, u32 *retcode, size_t *reply_len)
 {
-	return afk_service_call_full(service, group, command, data, data_len,
-				     data_pad, output, output_len, output_pad,
-				     NULL, timeout_ms);
-}
-
-int afk_service_call(struct apple_epic_service *service, u16 group, u32 command,
-		     const void *data, size_t data_len, size_t data_pad,
-		     void *output, size_t output_len, size_t output_pad)
-{
-	return afk_service_call_full(service, group, command, data, data_len,
-				     data_pad, output, output_len, output_pad,
-				     NULL, MSEC_PER_SEC);
+	if (!reply_len)
+		return -EINVAL;
+	return afk_send_command_common(service, type, payload, payload_len,
+				       output, output_len, retcode, MSEC_PER_SEC,
+				       NULL, reply_len);
 }
 
 int afk_service_call_with_reply_len(struct apple_epic_service *service,
@@ -2103,22 +2118,71 @@ int afk_service_call_with_reply_len(struct apple_epic_service *service,
 		size_t data_pad, void *output, size_t output_len,
 		size_t output_pad, size_t *reply_len)
 {
+	struct epic_service_call *call;
+	void *bfr;
+	size_t bfr_len, input_size, output_size, received = 0;
+	int ret;
+	u32 retcode;
+	u32 retlen;
+
 	if (!reply_len)
 		return -EINVAL;
-	return afk_service_call_full(service, group, command, data, data_len,
-				     data_pad, output, output_len, output_pad,
-				     reply_len, MSEC_PER_SEC);
-}
+	*reply_len = 0;
+	if (!service)
+		return -ENODEV;
+	if (check_add_overflow(data_len, data_pad, &input_size) ||
+	    check_add_overflow(output_len, output_pad, &output_size) ||
+	    check_add_overflow(max(input_size, output_size), sizeof(*call),
+			       &bfr_len) || bfr_len > U32_MAX)
+		return -EOVERFLOW;
 
-/* The AFKV2 (external H17P) name of afk_service_call_with_reply_len(). */
-int afk_service_call_len(struct apple_epic_service *service, u16 group,
-			 u32 command, const void *data, size_t data_len,
-			 size_t data_pad, void *output, size_t output_len,
-			 size_t output_pad, size_t *received)
-{
-	return afk_service_call_with_reply_len(service, group, command, data,
-					       data_len, data_pad, output,
-					       output_len, output_pad, received);
+	bfr = kzalloc(bfr_len, GFP_KERNEL);
+	if (!bfr)
+		return -ENOMEM;
+
+	call = bfr;
+
+	memset(call, 0, sizeof(*call));
+	call->group = cpu_to_le16(group);
+	call->command = cpu_to_le32(command);
+	call->data_len = cpu_to_le32(data_len + data_pad);
+	call->magic = cpu_to_le32(EPIC_SERVICE_CALL_MAGIC);
+
+	memcpy(bfr + sizeof(*call), data, data_len);
+
+	ret = afk_send_command_common(service, EPIC_SUBTYPE_STD_SERVICE, bfr,
+				      bfr_len, bfr, bfr_len, &retcode,
+				      MSEC_PER_SEC, NULL, &received);
+	if (ret)
+		goto out;
+	if (retcode) {
+		ret = -EINVAL;
+		goto out;
+	}
+	ret = afk_reply_size_valid(true, received, bfr_len, sizeof(*call));
+	if (ret)
+		goto out;
+	if (le32_to_cpu(call->magic) != EPIC_SERVICE_CALL_MAGIC ||
+	    le16_to_cpu(call->group) != group ||
+	    le32_to_cpu(call->command) != command) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	retlen = le32_to_cpu(call->data_len);
+	ret = afk_service_body_size_valid(received, sizeof(*call), retlen,
+					  output_len);
+	if (ret)
+		goto out;
+	*reply_len = retlen;
+	if (output && output_len) {
+		memset(output, 0, output_len);
+		memcpy(output, bfr + sizeof(*call), retlen);
+	}
+
+out:
+	kfree(bfr);
+	return ret;
 }
 
 #if IS_ENABLED(CONFIG_DRM_APPLE_DEBUG)
@@ -2263,4 +2327,8 @@ static void afk_remove_service_debugfs(struct apple_epic_service *srv)
 	}
 }
 
+#endif
+
+#if IS_ENABLED(CONFIG_DRM_APPLE_PARSER_KUNIT_TEST)
+#include "afk-parser-test.c"
 #endif

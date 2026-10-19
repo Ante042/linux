@@ -28,14 +28,14 @@ const COMPUTE_REGISTERS_MAX: usize = COMPUTE_REGISTERS + 1;
 
 /// Validated per-command shader-context scratch request.
 ///
-/// The layout word is the packed SCS layout: depth (bits 0:15), levels
+/// The layout word is Apple's packed SCS layout: depth (bits 0:15), levels
 /// (16:23), cliques (24:31), user (32:47) and driver (48:63).  The region the
 /// hardware needs is derived with G17P's Gen1 section model: fixed prefixes
 /// totalling [`Self::FIXED_BYTES`], then per-thread stack, per-thread driver
 /// and per-thread user bytes. Gen1 has no per-clique level payload. The scratch
-/// registers the program writes are computed from that layout, and the
-/// disabled program writes the fixed disabled window and stack words
-/// defined below.
+/// registers the program writes are the native `generateRegisterList`
+/// formulas use `com.apple.AGXG17P`; the
+/// disabled program keeps the native disabled constants.
 #[derive(Clone, Copy)]
 pub(crate) struct ScratchRequest {
     pages: u16,
@@ -46,7 +46,7 @@ pub(crate) struct ScratchRequest {
 }
 
 impl ScratchRequest {
-    /// End of the fixed Gen1 prefix sections.
+    /// Native ScsLayoutGen1::getSectionEnd(4).
     const FIXED_BYTES: u64 = 0x58000;
     const THREADS_PER_CLIQUE: u64 = 32;
     const BYTES_PER_STACK_ENTRY: u64 = 8;
@@ -55,17 +55,17 @@ impl ScratchRequest {
     const PAGES_PER_MIB: u64 = 1 << (20 - Self::PAGE_SHIFT);
     /// Window word when enabled: bit 24 plus the clique count at 16:23.
     const WINDOW_ENABLED: u64 = 1 << 24;
-    /// Disabled window word, [`UNK_10791`].
+    /// Native disabled window word, [`UNK_10791`].
     const WINDOW_DISABLED: u64 = UNK_10791;
-    /// Disabled stack word, [`UNK_1A0E9`].
+    /// Native disabled stack word, [`UNK_1A0E9`].
     const STACK_DISABLED: u64 = UNK_1A0E9;
-    /// Tail reservation when enabled.
+    /// Native tail reservation when enabled.
     const TAIL_ENABLED: u64 = 8;
 
     /// Payload-free layouts request no scratch even if depth/cliques are set.
-    /// Otherwise derive the Gen1 end and round it up with a two-page guard.
-    /// The per-register words are computed from it and range-checked here
-    /// before they reach hardware.
+    /// Otherwise derive the Gen1 end and round it up with the native two-page
+    /// guard; the per-register words are the native formulas, so they are
+    /// checked here against Apple's own values before they reach hardware.
     pub(crate) fn new(layout: u64) -> Result<Self> {
         let depth = layout & u16::MAX as u64;
         let cliques = (layout >> 24) & u8::MAX as u64;
@@ -99,7 +99,7 @@ impl ScratchRequest {
             pages: u16::try_from(pages).map_err(|_| EINVAL)?,
             window: Self::WINDOW_ENABLED | (cliques << 16),
             stack: depth & !7,
-            // G17P's register list does not include the Gen2 level
+            // G17P's native register list does not publish the Gen2 level
             // region register. Preserve the historical zero slot.
             driver: 0,
             tail: Self::TAIL_ENABLED,
@@ -193,7 +193,7 @@ impl IntersectionTables {
         }
         // G17P HAL200 Gen1 publishes a byte-sized table length (25 bits),
         // with a plain aligned address. Unlike G17X HAL300, its address has
-        // no bit 51 and its two pool registers use fixed values.
+        // no bit 51 and its two pool registers use fixed native values.
         // Keep the shared UAPI's 128-byte blocks and 16 KiB allocation units.
         let end = pool.checked_add(pool_bytes).ok_or(EINVAL)?;
         let blocks_end = u64::from(first) + u64::from(count);
@@ -239,8 +239,8 @@ impl IntersectionTables {
 
     pub(crate) fn words(self) -> [u64; 6] {
         if !self.enabled() { return [0; 6]; }
-        // The six intersection-table words of both command encodings;
-        // the firmware passes them to the hardware unchanged.
+        // AGXMetalG17P 26A428 endComputePass, both command encodings;
+        // pinned AGXG17P processComputeSetup copies these six words as-is.
         [self.pool + u64::from(self.first) * 128,
          0xc0000000 | (u64::from(self.count) << 7), 0x6f00000000,
          0x3feff, self.default_program, self.default_control]

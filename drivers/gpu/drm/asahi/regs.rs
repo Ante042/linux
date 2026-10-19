@@ -10,7 +10,7 @@
 //! On G17, the driver also enables the bridge between the GPU and the fabric before the
 //! coprocessors start, and enables dynamic power gating before the firmware is initialized.
 
-use crate::{hw, identity};
+use crate::hw;
 use core::mem::MaybeUninit;
 use kernel::{
     bindings, c_str,
@@ -18,14 +18,17 @@ use kernel::{
     devres::Devres,
     error::{from_err_ptr, to_result},
     io::{
-        mem::IoMem, //
-        poll::read_poll_timeout,
+        mem::IoMem,
         Io,
+        IoBase, //
     },
     platform,
     prelude::*,
-    sync::{aref::ARef, Arc}, //
-    time::Delta,
+    soc::apple::rtkit::ASC_CPU_CONTROL,
+    sync::{
+        aref::ARef,
+        Arc, //
+    }, //
 };
 
 /// Size of the ASC control MMIO region.
@@ -33,9 +36,6 @@ pub(crate) const ASC_CTL_SIZE: usize = 0x4000;
 
 /// Size of the SGX MMIO region.
 pub(crate) const SGX_SIZE: usize = 0x1000000;
-
-const CPU_CONTROL: usize = 0x44;
-const CPU_RUN: u32 = 0x1 << 4; // BIT(4)
 
 const FAULT_INFO: usize = 0x17030;
 
@@ -70,50 +70,6 @@ const G17_PERF_CONTROL: usize = 0xe0141c;
 const G17_PERF_MAP: usize = 0xe01480;
 const G17_CORE_POWER: usize = 0xe01000;
 
-// G15 (t6030) Fender registers. Fender = SGX + 0xd00000 on every AGX checked, so the ID block
-// above is Fender+0x4000 and the G14X core masks are Fender+0x101500. Everything
-// here is inside the 16 MiB `sgx` mapping.
-/// Fender block offset inside the SGX window.
-const FENDER: usize = 0xd00000;
-/// Fender "kick": a command (0x11 at probe, 0x10 at start and teardown) followed by a wait for
-/// bit 4 to clear. The G15 firmware boots and runs jobs without it.
-const FENDER_KICK: usize = FENDER + 0x1000;
-const FENDER_KICK_BUSY: u32 = 1 << 4;
-/// Fender kick command issued at probe. Only used for A/B via asahi.g15_debug bit 41.
-pub(crate) const FENDER_KICK_PROBE: u32 = 0x11;
-/// Fender kick command issued at start and on teardown. Only used for A/B via
-/// asahi.g15_debug bit 41.
-pub(crate) const FENDER_KICK_START: u32 = 0x10;
-/// Dynamic Fender clock gating control: enable = RMW &= !0x6, disable = RMW |= 0x4.
-/// Fender MMU/TTBAT block. Same layout as G14X.
-const FENDER_MMU_ENABLE: usize = FENDER + 0x8000;
-const FENDER_MMU_8004: usize = FENDER + 0x8004;
-const FENDER_MMU_8008: usize = FENDER + 0x8008;
-const FENDER_MMU_800C: usize = FENDER + 0x800c;
-const FENDER_MMU_8010: usize = FENDER + 0x8010;
-const FENDER_MMU_8014: usize = FENDER + 0x8014;
-const FENDER_MMU_8018: usize = FENDER + 0x8018;
-const FENDER_MMU_801C: usize = FENDER + 0x801c;
-const FENDER_MMU_8020: usize = FENDER + 0x8020;
-const FENDER_MMU_8024: usize = FENDER + 0x8024;
-const FENDER_MMU_8028: usize = FENDER + 0x8028;
-/// TTBAT base, PA >> 14 in a 28-bit field (G13X had it at +0x8024).
-const FENDER_MMU_TTBAT_BASE: usize = FENDER + 0x802c;
-const FENDER_MMU_TTBAT_BASE_MASK: u32 = (1 << 28) - 1;
-/// GPC performance state ([3:0]); host-owned on G15, firmware-owned on G14S.
-const GPC_PERF_STATE: usize = FENDER + 0x101000;
-/// GPC -> host interrupt enable: bit 0/1/2 for type 0/1/2.
-/// GPC -> host interrupt status, write-1-to-clear.
-
-/// G15 read-only self-test snapshot: GPC perf state, per-event status c020, busy mask c120,
-/// kick control c050, fault address/info d8c8/d8c0 and the done mask c128. The kick registers
-/// c040/c048/c058/c238 are write-only and are not read.
-const SGX_EVENT_STATUS: usize = 0xc020;
-const SGX_KICK_CTL: usize = 0xc050;
-const SGX_BUSY_MASK: usize = 0xc120;
-const SGX_DONE_MASK: usize = 0xc128;
-
-const FAULT_ADDR_MASK_G15: u64 = (1 << 42) - 1;
 /// Enum representing the unit that caused an MMU fault.
 #[allow(non_camel_case_types)]
 #[allow(clippy::upper_case_acronyms)]
@@ -191,13 +147,6 @@ pub(crate) enum FaultUnit {
     gIPP_CS,
     gKSM_RCE,
 
-    /// G15: Graphics L2 cache metadata, in the x4/xF slots of clusters 1, 2, 6, 7
-    GL2CC_META_G15GX(u8),
-    /// G15: UMA (Dynamic Caching) core
-    UMA_CORE,
-    /// G15: UMA parameter management?
-    gUPM,
-
     Unknown(u8),
 }
 
@@ -265,7 +214,7 @@ unsafe impl Sync for CpuControl {}
 
 impl CpuControl {
     /// Resolve the mailbox phandle and validate its firmware role before use.
-    pub(crate) fn new(pdev: &platform::Device<Core>, index: usize) -> Result<Self> {
+    pub(crate) fn new(pdev: &platform::Device<Core<'_>>, index: usize) -> Result<Self> {
         let expected = match index {
             0 => bindings::apple_mbox_ascwrap_v6_role_APPLE_MBOX_ASCWRAP_V6_ROLE_GFX,
             1 => bindings::apple_mbox_ascwrap_v6_role_APPLE_MBOX_ASCWRAP_V6_ROLE_GFX1,
@@ -309,203 +258,18 @@ impl CpuControl {
 }
 
 /// Device resources for this GPU instance.
-#[derive(Clone)]
-pub(crate) struct Resources {
+pub(crate) struct Resources<'drm> {
     dev: ARef<platform::Device>,
-    sgx: Arc<Devres<IoMem<SGX_SIZE>>>,
+    sgx: Arc<IoMem<'drm, SGX_SIZE>>,
 }
 
-impl Resources {
-    fn sgx_write32<const OFF: usize>(&self, val: u32) {
-        if let Some(sgx) = self.sgx.try_access() {
-            sgx.relaxed().write32(val, OFF);
-        }
-    }
-
-    pub(crate) fn init_mmio_g15(&self, ttbat_base: u64) -> Result {
-        self.g15_setup_mmu_config(ttbat_base)
-    }
-
-    fn g15_setup_mmu_config(&self, ttbat_base: u64) -> Result {
-        if ttbat_base & ((1 << 14) - 1) != 0
-            || (ttbat_base >> 14) > FENDER_MMU_TTBAT_BASE_MASK as u64
-        {
-            dev_err!(
-                self.dev.as_ref(),
-                "Fender MMU: TTBAT base {:#x} not representable\n",
-                ttbat_base
-            );
-            return Err(EINVAL);
-        }
-
-        if self.sgx_read32::<FENDER_MMU_ENABLE>() != 0 {
-            let cur = ((self.sgx_read32::<FENDER_MMU_TTBAT_BASE>() & FENDER_MMU_TTBAT_BASE_MASK)
-                as u64)
-                << 14;
-            if cur != ttbat_base {
-                dev_err!(
-                    self.dev.as_ref(),
-                    "Fender MMU: preconfigured TTBAT {:#x} != ttbs region {:#x}\n",
-                    cur,
-                    ttbat_base
-                );
-                return Err(EINVAL);
-            }
-            dev_info!(
-                self.dev.as_ref(),
-                "Fender MMU: preconfigured by the bootloader (TTBAT {:#x})\n",
-                cur
-            );
-            return Ok(());
-        }
-
-        dev_info!(
-            self.dev.as_ref(),
-            "Fender MMU: programming TTBAT {:#x}\n",
-            ttbat_base
-        );
-        // G15 MMU configuration sequence. The meaning of the 0x80d8 / 1 / 0x3ff
-        // words is unknown.
-        // TODO: confirm this register sequence on hardware.
-        self.sgx_write32::<FENDER_MMU_TTBAT_BASE>(
-            (ttbat_base >> 14) as u32 & FENDER_MMU_TTBAT_BASE_MASK,
-        );
-        self.sgx_write32::<FENDER_MMU_8014>(0x80d8);
-        self.sgx_write32::<FENDER_MMU_8018>(0x80d8);
-        self.sgx_write32::<FENDER_MMU_800C>(0);
-        self.sgx_write32::<FENDER_MMU_8010>(0);
-        self.sgx_write32::<FENDER_MMU_801C>(0);
-        self.sgx_write32::<FENDER_MMU_8020>(0);
-        self.sgx_write32::<FENDER_MMU_8024>(0);
-        self.sgx_write32::<FENDER_MMU_8028>(0);
-        self.sgx_write32::<FENDER_MMU_8008>(1);
-        self.sgx_write32::<FENDER_MMU_8004>(0x3ff);
-        // Enable, written last.
-        self.sgx_write32::<FENDER_MMU_ENABLE>(1);
-
-        Ok(())
-    }
-
-    pub(crate) fn g15_fender_kick(&self, cmd: u32) -> Result {
-        self.sgx_write32::<FENDER_KICK>(cmd);
-        read_poll_timeout(
-            || Ok(self.sgx_read32::<FENDER_KICK>()),
-            |val| val & FENDER_KICK_BUSY == 0,
-            Delta::from_micros(10),
-            Delta::from_millis(100),
-        )
-        .inspect_err(|_| {
-            dev_err!(self.dev.as_ref(), "Fender kick {:#x} timed out\n", cmd);
-        })?;
-        Ok(())
-    }
-
-    pub(crate) fn g15_selftest_snapshot(&self, tag: &str, with_done: bool) {
-        let gpc = self.sgx_read32::<GPC_PERF_STATE>();
-        let status = self.sgx_read64::<SGX_EVENT_STATUS>();
-        let kick_ctl = self.sgx_read64::<SGX_KICK_CTL>();
-        let busy = self.sgx_read64::<SGX_BUSY_MASK>();
-        let fault_addr = self.sgx_read64::<FAULT_ADDR_G14X>();
-        let fault_info = self.sgx_read64::<FAULT_INFO_G14X>();
-        let done = if with_done {
-            Some(self.sgx_read64::<SGX_DONE_MASK>())
-        } else {
-            None
-        };
-        dev_info!(
-            self.dev.as_ref(),
-            "G15 self-test mmio [{}]: GPC perf {:#x} (pstate {}), c020 {:#x}, c050 {:#x}, c120 busy {:#x}, d8c8 {:#x}, d8c0 {:#x}, c128 done {:?}\n",
-            tag,
-            gpc,
-            gpc & 0xf,
-            status,
-            kick_ctl,
-            busy,
-            fault_addr,
-            fault_info,
-            done
-        );
-    }
-
-    fn fault_unit_g15(unit_code: u8) -> FaultUnit {
-        let hi = unit_code >> 4;
-        // x4 -> GL2CC_META_G15GX_{0,2,4,6}, xF -> GL2CC_META_G15GX_{1,3,5,7}
-        let gl2cc_meta = |odd: u8| match hi {
-            1 => FaultUnit::GL2CC_META_G15GX(odd),
-            2 => FaultUnit::GL2CC_META_G15GX(2 + odd),
-            6 => FaultUnit::GL2CC_META_G15GX(4 + odd),
-            7 => FaultUnit::GL2CC_META_G15GX(6 + odd),
-            _ => FaultUnit::Unknown(unit_code),
-        };
-
-        match unit_code {
-            0x00..=0x9f => match unit_code & 0xf {
-                0x0 => FaultUnit::DCMP(hi),
-                0x1 => FaultUnit::UL1C(hi),
-                0x2 => FaultUnit::CMP(hi),
-                0x3 => FaultUnit::GSL1(hi),
-                0x4 => gl2cc_meta(0),
-                0x5 => FaultUnit::VCE(hi),
-                0x6 => FaultUnit::TE(hi),
-                0x7 => FaultUnit::RAS(hi),
-                0x8 => FaultUnit::VDM(hi),
-                0x9 => FaultUnit::PPP(hi),
-                0xa => FaultUnit::IPF(hi),
-                0xb => FaultUnit::IPF_CPF(hi),
-                0xc => FaultUnit::VF(hi),
-                0xd => FaultUnit::VF_CPF(hi),
-                0xe => FaultUnit::ZLS(hi),
-                _ => gl2cc_meta(1),
-            },
-            0xa0 => FaultUnit::UMA_CORE,
-            0xa1 => FaultUnit::dPM,
-            0xa2 => FaultUnit::dCDM_KS(0),
-            0xa3 => FaultUnit::dCDM_KS(1),
-            0xa4 => FaultUnit::dCDM_KS(2),
-            0xa5 => FaultUnit::dIPP,
-            0xa6 => FaultUnit::dIPP_CS,
-            0xa7 => FaultUnit::dVDM_CSD,
-            0xa8 => FaultUnit::dVDM_SSD,
-            0xa9 => FaultUnit::dVDM_ILF,
-            0xaa => FaultUnit::dVDM_ILD,
-            0xab => FaultUnit::dRDE(0),
-            0xac => FaultUnit::dRDE(1),
-            0xad => FaultUnit::FC,
-            0xae => FaultUnit::GSL2,
-            0xb8 => FaultUnit::GL2CC_MB,
-            0xd0 => FaultUnit::gCDM_CS,
-            0xd1 => FaultUnit::gCDM_ID,
-            0xd2 => FaultUnit::gCDM_CSR,
-            0xd3 => FaultUnit::gCDM_CSW,
-            0xd4 => FaultUnit::gCDM_CTXR,
-            0xd5 => FaultUnit::gCDM_CTXW,
-            0xd6 => FaultUnit::gIPP,
-            0xd7 => FaultUnit::gIPP_CS,
-            0xd8 => FaultUnit::gKSM_RCE,
-            0xd9 => FaultUnit::gUPM,
-            0xe0..=0xff => {
-                // Group n: bit 4 selects 0/1, bit 3 adds 2 (0xe0 -> 0, 0xf0 -> 1, 0xe8 -> 2,
-                // 0xf8 -> 3). RDE exists only in groups 0 and 1.
-                let n = ((unit_code >> 4) & 1) | ((unit_code >> 2) & 2);
-                match (unit_code & 0x7, unit_code & 0x8 != 0) {
-                    (0x0, _) => FaultUnit::gPM_SP(n),
-                    (0x1, _) => FaultUnit::gVDM_CSD_SP(n),
-                    (0x2, _) => FaultUnit::gVDM_SSD_SP(n),
-                    (0x3, _) => FaultUnit::gVDM_ILF_SP(n),
-                    (0x4, _) => FaultUnit::gVDM_TFP_SP(n),
-                    (0x5, _) => FaultUnit::gVDM_MMB_SP(n),
-                    (0x6, false) => FaultUnit::gRDE0_SP(n),
-                    _ => FaultUnit::Unknown(unit_code),
-                }
-            }
-            _ => FaultUnit::Unknown(unit_code),
-        }
-    }
-
+impl Resources<'_> {
     /// Map the required resources given our platform device.
-    pub(crate) fn new(pdev: &platform::Device<Core>) -> Result<Resources> {
-        let sgx_req = pdev.io_request_by_name(c_str!("sgx")).ok_or(EINVAL)?;
-        let sgx_iomem = Arc::pin_init(sgx_req.iomap_sized::<SGX_SIZE>(), GFP_KERNEL)?;
+    pub(crate) fn new<'bound>(
+        pdev: &'bound platform::Device<Core<'_>>,
+    ) -> Result<Resources<'bound>> {
+        let sgx_req = pdev.io_request_by_name(c"sgx").ok_or(EINVAL)?;
+        let sgx_iomem = Arc::new(sgx_req.iomap_sized::<SGX_SIZE>()?, GFP_KERNEL)?;
 
         Ok(Resources {
             // SAFETY: This device does DMA via the UAT IOMMU.
@@ -514,54 +278,18 @@ impl Resources {
         })
     }
 
-    /// Installs both render queues while the caller holds the device mutex.
-    /// No other port publisher may interleave between this power witness and
-    /// the final validity strobe. False means no write was attempted.
-    pub(crate) fn install_render_pair(
-        &self,
-        registration: &crate::g17::fw::kick::RenderRegistration,
-    ) -> Result<bool> {
-        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
-        if sgx.relaxed().read32(G17_HOST_IRQ_SUMMARY) & G17_HOST_POWERED == 0 {
-            return Ok(false);
-        }
-        for &(offset, value) in registration.writes() {
-            sgx.try_write64(value, offset)?;
-        }
-        Ok(true)
-    }
-
     fn sgx_read32<const OFF: usize>(&self) -> u32 {
-        if let Some(sgx) = self.sgx.try_access() {
-            sgx.relaxed().read32(OFF)
-        } else {
-            0
-        }
+        self.sgx.as_view().relaxed().read32(OFF)
     }
-
-    /* Not yet used
-    fn sgx_write32<OFF: usize>(&self, val: u32) {
-        if let Some(sgx) = self.sgx.try_access() {
-            sgx.write32_relaxed(val, OFF)
-        }
-    }
-    */
 
     fn sgx_read64<const OFF: usize>(&self) -> u64 {
-        if let Some(sgx) = self.sgx.try_access() {
-            sgx.relaxed().read64(OFF)
-        } else {
-            0
-        }
+        // TODO: use infallible `read64()`
+        self.sgx
+            .as_view()
+            .relaxed()
+            .try_read64(OFF)
+            .expect("64-bit read failed!")
     }
-
-    /* Not yet used
-    fn sgx_write64<OFF: usize>(&self, val: u64) {
-        if let Some(sgx) = self.sgx.try_access() {
-            sgx.write64_relaxed(val, OFF)
-        }
-    }
-    */
 
     /// Initialize the MMIO registers for the GPU.
     pub(crate) fn init_mmio(&self) -> Result {
@@ -571,13 +299,11 @@ impl Resources {
     }
 
     /// Start the ASC coprocessor CPU.
-    pub(crate) fn start_cpu(pdev: &platform::Device<Core>) -> Result {
+    pub(crate) fn start_cpu(pdev: &platform::Device<Core<'_>>) -> Result {
         let asc_req = pdev.io_request_by_name(c_str!("asc")).ok_or(EINVAL)?;
-        let asc_iomem = KBox::pin_init(asc_req.iomap_sized::<ASC_CTL_SIZE>(), GFP_KERNEL)?;
-        let res = asc_iomem.access(pdev.as_ref())?.relaxed();
-
-        let val = res.read32(CPU_CONTROL);
-        res.write32(val | CPU_RUN, CPU_CONTROL);
+        let asc_mmio = asc_req.iomap_sized::<ASC_CTL_SIZE>()?;
+        let asc_mmio = asc_mmio.as_view().relaxed();
+        asc_mmio.update(ASC_CPU_CONTROL, |r| r.with_const_cpu_run::<1>());
         Ok(())
     }
 
@@ -603,19 +329,19 @@ impl Resources {
             id_clusters
         );
 
-        let family = ((id_version >> 24) & 0xff) as u8;
-        let variant = ((id_version >> 16) & 0xff) as u8;
-        let num_dies = (id_counts_1 >> 16) & 0xf;
+        let gpu_gen = (id_version >> 24) & 0xff;
+
         let mut core_mask_regs = KVec::new();
 
-        let num_clusters = match family {
+        let num_clusters = match gpu_gen {
             4 | 5 => {
                 // G13 | G14G
                 core_mask_regs.push(self.sgx_read32::<CORE_MASK_0>(), GFP_KERNEL)?;
                 core_mask_regs.push(self.sgx_read32::<CORE_MASK_1>(), GFP_KERNEL)?;
                 (id_clusters >> 12) & 0xff
             }
-            6 | 0x7 => {
+            6 => {
+                // G14X
                 core_mask_regs.push(self.sgx_read32::<CORE_MASKS_G14X>(), GFP_KERNEL)?;
                 core_mask_regs.push(self.sgx_read32::<{ CORE_MASKS_G14X + 4 }>(), GFP_KERNEL)?;
                 core_mask_regs.push(self.sgx_read32::<{ CORE_MASKS_G14X + 8 }>(), GFP_KERNEL)?;
@@ -623,7 +349,7 @@ impl Resources {
                 ((id_counts_1 >> 8) & 0xff) * ((id_counts_1 >> 16) & 0xf)
             }
             a => {
-                dev_err!(self.dev.as_ref(), "Unsupported GPU family {:#x}\n", a);
+                dev_err!(self.dev.as_ref(), "Unknown GPU generation {}\n", a);
                 return Err(ENODEV);
             }
         };
@@ -633,13 +359,7 @@ impl Resources {
 
         dev_info!(self.dev.as_ref(), "Core masks: {:#x?}\n", core_masks_packed);
 
-        let num_cores = match (family, variant) {
-            // G15S (variant 3) and G15C (variant 4) have 10 cores per MGPU; ID_COUNTS_1[7:0]
-            // does not report that on these variants.
-            // TODO: read the real ID_COUNTS_1[7:0] on the M3 Pro to see why.
-            (7, 3 | 4) => 10,
-            _ => id_counts_1 & 0xff,
-        };
+        let num_cores = id_counts_1 & 0xff;
 
         if num_cores > 32 {
             dev_err!(
@@ -661,80 +381,38 @@ impl Resources {
             return Err(ENODEV);
         }
 
-        let mut core_masks = KVec::new();
-        let mut total_active_cores: u32 = 0;
+        let (core_masks, total_active_cores) =
+            split_core_masks(&self.dev, &mut core_mask_regs, num_clusters, num_cores)?;
+        let (gpu_rev, gpu_rev_id) = gpu_revision(&self.dev, id_version)?;
 
-        let max_core_mask = ((1u64 << num_cores) - 1) as u32;
-        for _ in 0..num_clusters {
-            let mask = core_mask_regs[0] & max_core_mask;
-            core_masks.push(mask, GFP_KERNEL)?;
-            for i in 0..core_mask_regs.len() {
-                core_mask_regs[i] >>= num_cores;
-                if i < (core_mask_regs.len() - 1) {
-                    core_mask_regs[i] |= core_mask_regs[i + 1] << (32 - num_cores);
-                }
-            }
-            total_active_cores += mask.count_ones();
-        }
-
-        if core_mask_regs.iter().any(|a| *a != 0) {
-            dev_err!(
-                self.dev.as_ref(),
-                "Leftover core mask: {:#x?}\n",
-                core_mask_regs
-            );
-            return Err(EIO);
-        }
-
-        let (gpu_rev, gpu_rev_id) = match (id_version >> 8) & 0xff {
-            0x00 => (hw::GpuRevision::A0, hw::GpuRevisionID::A0),
-            0x01 => (hw::GpuRevision::A1, hw::GpuRevisionID::A1),
-            0x10 => (hw::GpuRevision::B0, hw::GpuRevisionID::B0),
-            0x11 => (hw::GpuRevision::B1, hw::GpuRevisionID::B1),
-            0x20 => (hw::GpuRevision::C0, hw::GpuRevisionID::C0),
-            0x21 => (hw::GpuRevision::C1, hw::GpuRevisionID::C1),
-            a => {
-                dev_err!(self.dev.as_ref(), "Unknown GPU revision {}\n", a);
-                return Err(ENODEV);
-            }
-        };
-
-        // Preserve the public G13/G14 identity independently of the firmware
-        // core identity: the legacy ABI distinguishes Max and Ultra by clusters.
-        let (gpu_gen, gpu_variant, usc_generation, gpu_hal_generation) = if family <= 6 {
-            let gpu_gen = match family {
+        Ok(hw::GpuIdConfig {
+            gpu_gen: match (id_version >> 24) & 0xff {
                 4 => hw::GpuGen::G13,
-                5 | 6 => hw::GpuGen::G14,
+                5 => hw::GpuGen::G14,
+                6 => hw::GpuGen::G14, // G14X has a separate ID
                 a => {
                     dev_err!(self.dev.as_ref(), "Unknown GPU generation {}\n", a);
                     return Err(ENODEV);
                 }
-            };
-            let gpu_variant = match variant {
-                1 => hw::GpuVariant::P,
+            },
+            gpu_variant: match (id_version >> 16) & 0xff {
+                1 => hw::GpuVariant::P, // Guess
                 2 => hw::GpuVariant::G,
                 3 => hw::GpuVariant::S,
-                4 if num_clusters > 4 => hw::GpuVariant::D,
-                4 => hw::GpuVariant::C,
+                4 => {
+                    if num_clusters > 4 {
+                        hw::GpuVariant::D
+                    } else {
+                        hw::GpuVariant::C
+                    }
+                }
                 a => {
                     dev_err!(self.dev.as_ref(), "Unknown GPU variant {}\n", a);
                     return Err(ENODEV);
                 }
-            };
-            (gpu_gen, gpu_variant, 2, identity::GpuHalGeneration::Legacy)
-        } else {
-            let id = identity::decode_gpu_identity(family, variant, num_dies as u8).ok_or(ENODEV)?;
-            (id.gpu_gen, id.gpu_variant, id.usc_generation, id.gpu_hal_generation)
-        };
-
-        Ok(hw::GpuIdConfig {
-            gpu_gen,
-            gpu_variant,
-            usc_generation,
-            gpu_hal_generation,
+            },
             gpu_rev,
             gpu_rev_id,
-            num_dies,
             num_clusters,
             num_cores,
             num_frags: num_cores, // Used to be id_counts_1[15:8] but does not work for G14X
@@ -745,180 +423,9 @@ impl Resources {
         })
     }
 
-    /// Get the identification of a G17 GPU from its registers.
-    pub(crate) fn get_g17_id(&self) -> Result<G17Id> {
-        let id_version = self.sgx_read32::<ID_VERSION>();
-        let id_unk08 = self.sgx_read32::<ID_UNK08>();
-        let id_counts_1 = self.sgx_read32::<ID_COUNTS_1>();
-        let id_counts_2 = self.sgx_read32::<ID_COUNTS_2>();
-        let id_unk18 = self.sgx_read32::<ID_UNK18>();
-        let id_clusters = self.sgx_read32::<ID_CLUSTERS>();
-
-        dev_info!(
-            self.dev.as_ref(),
-            "GPU ID registers: {:#x} {:#x} {:#x} {:#x} {:#x} {:#x}\n",
-            id_version,
-            id_unk08,
-            id_counts_1,
-            id_counts_2,
-            id_unk18,
-            id_clusters
-        );
-
-        // Later reads can fault while the firmware has gated the cores. Submission uses only
-        // these saved values and never re-reads the registers.
-        let perf_control = self.sgx_read32::<G17_PERF_CONTROL>() & 1;
-        let perf_map = self.sgx_read32::<G17_PERF_MAP>();
-        let mut core_mask_regs = [
-            self.sgx_read32::<CORE_MASKS_G14X>(),
-            self.sgx_read32::<{ CORE_MASKS_G14X + 4 }>(),
-            self.sgx_read32::<{ CORE_MASKS_G14X + 8 }>(),
-        ];
-        dev_info!(self.dev.as_ref(), "Core masks: {:#x?}\n", core_mask_regs);
-
-        let num_dies = (id_counts_1 >> 16) & 0xf;
-        let num_clusters = ((id_counts_1 >> 8) & 0xff) * num_dies;
-        let num_cores = id_counts_1 & 0xff;
-        if num_cores == 0 || num_cores > 32 || num_cores * num_clusters > 3 * 32 {
-            dev_err!(
-                self.dev.as_ref(),
-                "Invalid core counts ({} x {})\n",
-                num_clusters,
-                num_cores
-            );
-            return Err(ENODEV);
-        }
-        let (core_masks, _) =
-            self.split_core_masks(&mut core_mask_regs, num_clusters, num_cores)?;
-        let (gpu_rev, _) = self.gpu_revision(id_version)?;
-
-        Ok(G17Id {
-            family: ((id_version >> 24) & 0xff) as u8,
-            variant: ((id_version >> 16) & 0xff) as u8,
-            gpu_rev,
-            num_dies,
-            num_clusters,
-            num_cores,
-            core_masks,
-            perf_control,
-            perf_map: [perf_map & 0xf, (perf_map >> 16) & 0xf],
-        })
-    }
-
-    /// Enable the G17 GPU-to-fabric bridge and check that it took effect.
-    ///
-    /// The GPU power domain must be on. The coprocessors cannot reach memory until this is done.
-    pub(crate) fn enable_g17_bridge(&self) -> Result {
-        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
-        for offset in G17_BRIDGE_CONTROL {
-            let val = sgx.try_read32(offset)?;
-            sgx.try_write32(val | G17_BRIDGE_ENABLE, offset)?;
-            if sgx.try_read32(offset)? & G17_BRIDGE_ENABLE == 0 {
-                dev_err!(
-                    self.dev.as_ref(),
-                    "GPU bridge {:#x} did not enable\n",
-                    offset
-                );
-                return Err(EIO);
-            }
-        }
-        Ok(())
-    }
-
-    /// Disable the G17 GPU-to-fabric bridge. Both coprocessors must be stopped.
-    pub(crate) fn disable_g17_bridge(&self) {
-        if let Some(sgx) = self.sgx.try_access() {
-            for offset in G17_BRIDGE_CONTROL {
-                if let Ok(val) = sgx.try_read32(offset) {
-                    // Cannot fail: the offset was read just before.
-                    let _ = sgx.try_write32(val & !G17_BRIDGE_ENABLE, offset);
-                }
-            }
-        }
-    }
-
-    /// Power witness for the queue-configuration port, accessible while the cores are gated.
-    pub(crate) fn g17_configuration_powered(&self) -> bool {
-        self.sgx_read32::<G17_CORE_POWER>() & 0xf != 0
-    }
-
-    /// Enable dynamic power gating of idle G17 GPU cores. The firmware expects this before it is
-    /// initialized.
-    pub(crate) fn enable_g17_gating(&self) -> Result {
-        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
-        let val = sgx.try_read32(G17_GATING_CONTROL)?;
-        sgx.try_write32(val & !G17_GATING_DISABLE, G17_GATING_CONTROL)
-    }
-
-    /// Split the packed per-cluster core masks into one mask per cluster.
-    ///
-    /// Returns the masks and the total number of enabled cores.
-    fn split_core_masks(
-        &self,
-        core_mask_regs: &mut [u32],
-        num_clusters: u32,
-        num_cores: u32,
-    ) -> Result<(KVec<u32>, u32)> {
-        let mut core_masks = KVec::new();
-        let mut total_active_cores: u32 = 0;
-
-        let max_core_mask = ((1u64 << num_cores) - 1) as u32;
-        for _ in 0..num_clusters {
-            let mask = core_mask_regs[0] & max_core_mask;
-            core_masks.push(mask, GFP_KERNEL)?;
-            for i in 0..core_mask_regs.len() {
-                core_mask_regs[i] = core_mask_regs[i].checked_shr(num_cores).unwrap_or(0);
-                if i < (core_mask_regs.len() - 1) {
-                    core_mask_regs[i] |= core_mask_regs[i + 1]
-                        .checked_shl(32 - num_cores)
-                        .unwrap_or(0);
-                }
-            }
-            total_active_cores += mask.count_ones();
-        }
-
-        if core_mask_regs.iter().any(|a| *a != 0) {
-            dev_err!(
-                self.dev.as_ref(),
-                "Leftover core mask: {:#x?}\n",
-                core_mask_regs
-            );
-            return Err(EIO);
-        }
-
-        Ok((core_masks, total_active_cores))
-    }
-
-    /// Decode the silicon revision from the ID version register.
-    fn gpu_revision(&self, id_version: u32) -> Result<(hw::GpuRevision, hw::GpuRevisionID)> {
-        Ok(match (id_version >> 8) & 0xff {
-            0x00 => (hw::GpuRevision::A0, hw::GpuRevisionID::A0),
-            0x01 => (hw::GpuRevision::A1, hw::GpuRevisionID::A1),
-            0x10 => (hw::GpuRevision::B0, hw::GpuRevisionID::B0),
-            0x11 => (hw::GpuRevision::B1, hw::GpuRevisionID::B1),
-            0x20 => (hw::GpuRevision::C0, hw::GpuRevisionID::C0),
-            0x21 => (hw::GpuRevision::C1, hw::GpuRevisionID::C1),
-            a => {
-                dev_err!(self.dev.as_ref(), "Unknown GPU revision {}\n", a);
-                return Err(ENODEV);
-            }
-        })
-    }
-
     /// Get the fault information from the MMU status register, if one occurred.
     pub(crate) fn get_fault_info(&self, cfg: &'static hw::HwConfig) -> Option<FaultInfo> {
-        let g14x = cfg
-            .gpu_core
-            .map(|core| core as u32 >= hw::GpuCore::G14S as u32)
-            .unwrap_or(false)
-            || cfg.gpu_gen as u32 >= hw::GpuGen::G15 as u32;
-        let g15 = cfg.gpu_gen == hw::GpuGen::G15;
-
-        // SGX+0xd800 is a fault-instance selector, value ((s >> 2) & 0xf) | ((s & 3) << 18).
-        // Writing it is optional and drm/asahi never writes it on G14X; a host write could race
-        // with the firmware's own MMU fault handling and select the wrong instance, so G15 reads
-        // the registers the same way.
-        // TODO: which instance `s` to select, if any.
+        let g14x = cfg.gpu_core as u32 >= hw::GpuCore::G14S as u32;
 
         let fault_info = if g14x {
             self.sgx_read64::<FAULT_INFO_G14X>()
@@ -930,9 +437,7 @@ impl Resources {
             return None;
         }
 
-        let fault_addr = if g15 {
-            self.sgx_read64::<FAULT_ADDR_G14X>() & FAULT_ADDR_MASK_G15
-        } else if g14x {
+        let fault_addr = if g14x {
             self.sgx_read64::<FAULT_ADDR_G14X>()
         } else {
             fault_info >> 30
@@ -940,7 +445,6 @@ impl Resources {
 
         let unit_code = ((fault_info >> 9) & 0xff) as u8;
         let unit = match unit_code {
-            _ if g15 => Self::fault_unit_g15(unit_code),
             0x00..=0x9f => match unit_code & 0xf {
                 0x0 => FaultUnit::DCMP(unit_code >> 4),
                 0x1 => FaultUnit::UL1C(unit_code >> 4),
@@ -1040,4 +544,217 @@ impl Resources {
             reason,
         })
     }
+}
+
+/// Device resources of a G17 GPU.
+///
+/// The G17 GPU object outlives the probe call, so its register mapping is device-managed and
+/// revoked when the device is unbound.
+#[derive(Clone)]
+pub(crate) struct G17Resources {
+    dev: ARef<platform::Device>,
+    sgx: Arc<Devres<IoMem<'static, SGX_SIZE>>>,
+}
+
+impl G17Resources {
+    /// Map the required resources given our platform device.
+    pub(crate) fn new(pdev: &platform::Device<Core<'_>>) -> Result<G17Resources> {
+        let sgx_req = pdev.io_request_by_name(c"sgx").ok_or(EINVAL)?;
+        let sgx = Arc::new(sgx_req.iomap_sized::<SGX_SIZE>()?.into_devres()?, GFP_KERNEL)?;
+
+        Ok(G17Resources {
+            dev: pdev.into(),
+            sgx,
+        })
+    }
+
+    /// Installs both render queues while the caller holds the device mutex.
+    /// No other port publisher may interleave between this power witness and
+    /// the final validity strobe. False means no write was attempted.
+    pub(crate) fn install_render_pair(
+        &self,
+        registration: &crate::g17::fw::kick::RenderRegistration,
+    ) -> Result<bool> {
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        let sgx = (&*sgx).as_view();
+        if sgx.relaxed().read32(G17_HOST_IRQ_SUMMARY) & G17_HOST_POWERED == 0 {
+            return Ok(false);
+        }
+        for &(offset, value) in registration.writes() {
+            sgx.try_write64(value, offset)?;
+        }
+        Ok(true)
+    }
+
+    fn sgx_read32<const OFF: usize>(&self) -> u32 {
+        if let Some(sgx) = self.sgx.try_access() {
+            (&*sgx).as_view().relaxed().read32(OFF)
+        } else {
+            0
+        }
+    }
+
+    /// Get the identification of a G17 GPU from its registers.
+    pub(crate) fn get_g17_id(&self) -> Result<G17Id> {
+        let id_version = self.sgx_read32::<ID_VERSION>();
+        let id_unk08 = self.sgx_read32::<ID_UNK08>();
+        let id_counts_1 = self.sgx_read32::<ID_COUNTS_1>();
+        let id_counts_2 = self.sgx_read32::<ID_COUNTS_2>();
+        let id_unk18 = self.sgx_read32::<ID_UNK18>();
+        let id_clusters = self.sgx_read32::<ID_CLUSTERS>();
+
+        dev_info!(
+            self.dev.as_ref(),
+            "GPU ID registers: {:#x} {:#x} {:#x} {:#x} {:#x} {:#x}\n",
+            id_version,
+            id_unk08,
+            id_counts_1,
+            id_counts_2,
+            id_unk18,
+            id_clusters
+        );
+
+        // Later reads can fault while the firmware has gated the cores. Submission uses only
+        // these saved values and never re-reads the registers.
+        let perf_control = self.sgx_read32::<G17_PERF_CONTROL>() & 1;
+        let perf_map = self.sgx_read32::<G17_PERF_MAP>();
+        let mut core_mask_regs = [
+            self.sgx_read32::<CORE_MASKS_G14X>(),
+            self.sgx_read32::<{ CORE_MASKS_G14X + 4 }>(),
+            self.sgx_read32::<{ CORE_MASKS_G14X + 8 }>(),
+        ];
+        dev_info!(self.dev.as_ref(), "Core masks: {:#x?}\n", core_mask_regs);
+
+        let num_dies = (id_counts_1 >> 16) & 0xf;
+        let num_clusters = ((id_counts_1 >> 8) & 0xff) * num_dies;
+        let num_cores = id_counts_1 & 0xff;
+        if num_cores == 0 || num_cores > 32 || num_cores * num_clusters > 3 * 32 {
+            dev_err!(
+                self.dev.as_ref(),
+                "Invalid core counts ({} x {})\n",
+                num_clusters,
+                num_cores
+            );
+            return Err(ENODEV);
+        }
+        let (core_masks, _) =
+            split_core_masks(&self.dev, &mut core_mask_regs, num_clusters, num_cores)?;
+        let (gpu_rev, _) = gpu_revision(&self.dev, id_version)?;
+
+        Ok(G17Id {
+            family: ((id_version >> 24) & 0xff) as u8,
+            variant: ((id_version >> 16) & 0xff) as u8,
+            gpu_rev,
+            num_dies,
+            num_clusters,
+            num_cores,
+            core_masks,
+            perf_control,
+            perf_map: [perf_map & 0xf, (perf_map >> 16) & 0xf],
+        })
+    }
+
+    /// Enable the G17 GPU-to-fabric bridge and check that it took effect.
+    ///
+    /// The GPU power domain must be on. The coprocessors cannot reach memory until this is done.
+    pub(crate) fn enable_g17_bridge(&self) -> Result {
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        let sgx = (&*sgx).as_view();
+        for offset in G17_BRIDGE_CONTROL {
+            let val = sgx.try_read32(offset)?;
+            sgx.try_write32(val | G17_BRIDGE_ENABLE, offset)?;
+            if sgx.try_read32(offset)? & G17_BRIDGE_ENABLE == 0 {
+                dev_err!(
+                    self.dev.as_ref(),
+                    "GPU bridge {:#x} did not enable\n",
+                    offset
+                );
+                return Err(EIO);
+            }
+        }
+        Ok(())
+    }
+
+    /// Disable the G17 GPU-to-fabric bridge. Both coprocessors must be stopped.
+    pub(crate) fn disable_g17_bridge(&self) {
+        if let Some(sgx) = self.sgx.try_access() {
+            let sgx = (&*sgx).as_view();
+            for offset in G17_BRIDGE_CONTROL {
+                if let Ok(val) = sgx.try_read32(offset) {
+                    // Cannot fail: the offset was read just before.
+                    let _ = sgx.try_write32(val & !G17_BRIDGE_ENABLE, offset);
+                }
+            }
+        }
+    }
+
+    /// Power witness for the queue-configuration port, accessible while the cores are gated.
+    pub(crate) fn g17_configuration_powered(&self) -> bool {
+        self.sgx_read32::<G17_CORE_POWER>() & 0xf != 0
+    }
+
+    /// Enable dynamic power gating of idle G17 GPU cores. The firmware expects this before it is
+    /// initialized.
+    pub(crate) fn enable_g17_gating(&self) -> Result {
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        let sgx = (&*sgx).as_view();
+        let val = sgx.try_read32(G17_GATING_CONTROL)?;
+        sgx.try_write32(val & !G17_GATING_DISABLE, G17_GATING_CONTROL)
+    }
+
+}
+
+/// Split the packed per-cluster core masks into one mask per cluster.
+///
+/// Returns the masks and the total number of enabled cores.
+fn split_core_masks(
+    dev: &platform::Device,
+    core_mask_regs: &mut [u32],
+    num_clusters: u32,
+    num_cores: u32,
+) -> Result<(KVec<u32>, u32)> {
+    let mut core_masks = KVec::new();
+    let mut total_active_cores: u32 = 0;
+
+    let max_core_mask = ((1u64 << num_cores) - 1) as u32;
+    for _ in 0..num_clusters {
+        let mask = core_mask_regs[0] & max_core_mask;
+        core_masks.push(mask, GFP_KERNEL)?;
+        for i in 0..core_mask_regs.len() {
+            core_mask_regs[i] = core_mask_regs[i].checked_shr(num_cores).unwrap_or(0);
+            if i < (core_mask_regs.len() - 1) {
+                core_mask_regs[i] |= core_mask_regs[i + 1]
+                    .checked_shl(32 - num_cores)
+                    .unwrap_or(0);
+            }
+        }
+        total_active_cores += mask.count_ones();
+    }
+
+    if core_mask_regs.iter().any(|a| *a != 0) {
+        dev_err!(
+            dev.as_ref(),
+            "Leftover core mask: {:#x?}\n",
+            core_mask_regs
+        );
+        return Err(EIO);
+    }
+
+    Ok((core_masks, total_active_cores))
+}
+
+/// Decode the silicon revision from the ID version register.
+fn gpu_revision(dev: &platform::Device, id_version: u32) -> Result<(hw::GpuRevision, hw::GpuRevisionID)> {
+    Ok(match (id_version >> 8) & 0xff {
+        0x00 => (hw::GpuRevision::A0, hw::GpuRevisionID::A0),
+        0x01 => (hw::GpuRevision::A1, hw::GpuRevisionID::A1),
+        0x10 => (hw::GpuRevision::B0, hw::GpuRevisionID::B0),
+        0x11 => (hw::GpuRevision::B1, hw::GpuRevisionID::B1),
+        0x20 => (hw::GpuRevision::C0, hw::GpuRevisionID::C0),
+        0x21 => (hw::GpuRevision::C1, hw::GpuRevisionID::C1),
+        a => {
+            dev_err!(dev.as_ref(), "Unknown GPU revision {}\n", a);
+            return Err(ENODEV);
+        }
+    })
 }

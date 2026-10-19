@@ -8,6 +8,7 @@
 use core::{
     arch::asm,
     cmp,
+    marker::Unpin,
     mem,
     ptr::{self, NonNull},
     slice, //
@@ -30,11 +31,13 @@ use kernel::{
     firmware::Firmware,
     fmt,
     io::{
-        mem::IoMem,
+        io_project,
         Io,
-        RelaxedMmio, //
+        IoBase,
+        IoSysMap,
+        Mmio,
+        Region, //
     },
-    iosys_map::IoSysMapRef,
     module_platform_driver,
     new_condvar,
     new_mutex,
@@ -50,7 +53,10 @@ use kernel::{
         AOP, //
     },
     soc::apple::mailbox,
-    soc::apple::rtkit,
+    soc::apple::rtkit::{
+        self,
+        ASC_CPU_CONTROL, //
+    },
     str::CString,
     sync::{
         aref::ARef,
@@ -85,8 +91,6 @@ const AOP_MMIO_SIZE: usize = 0x1e0000;
 const ASC_MMIO_SIZE: usize = 0x4000;
 const BOOTARGS_OFFSET: usize = 0x22c;
 const BOOTARGS_SIZE: usize = 0x230;
-const CPU_CONTROL: usize = 0x44;
-const CPU_RUN: u32 = 0x1 << 4;
 const AFK_ENDPOINT_START: u8 = 0x20;
 const AFK_ENDPOINT_COUNT: u8 = 0xf;
 const AFK_OPC_GET_BUF: u64 = 0x89;
@@ -180,9 +184,7 @@ const ALS_CALIBRATION_LEN: usize = 80;
 const ALS_CALIBRATION_OPERATION: u64 = 0x0746_b8d6_6515_2e31;
 const ALS_CALIBRATION_BODY_LEN: u64 = 56;
 
-fn align_up(v: usize, a: usize) -> usize {
-    (v + a - 1) & !(a - 1)
-}
+mod aop_ring;
 
 /// Index into the AFK endpoint tables for RTKit endpoint `ep`, if it is one
 /// of the endpoints this driver drives.
@@ -209,6 +211,7 @@ fn le_u64(b: &[u8], off: usize) -> u64 {
 
 #[inline(always)]
 fn mem_sync() {
+    // SAFETY: a full-system barrier touches no memory or registers of ours.
     unsafe {
         asm!("dsb sy");
     }
@@ -221,6 +224,29 @@ struct QEHeader {
     size: u32,
     channel: u32,
     ty: u32,
+}
+
+/// The size of a ring entry header.
+const QEH_SIZE: usize = mem::size_of::<QEHeader>();
+
+impl QEHeader {
+    fn from_bytes(b: &[u8; QEH_SIZE]) -> QEHeader {
+        QEHeader {
+            magic: le_u32(b, 0),
+            size: le_u32(b, 4),
+            channel: le_u32(b, 8),
+            ty: le_u32(b, 12),
+        }
+    }
+
+    fn to_bytes(self) -> [u8; QEH_SIZE] {
+        let mut b = [0; QEH_SIZE];
+        b[0..4].copy_from_slice(&{ self.magic }.to_le_bytes());
+        b[4..8].copy_from_slice(&{ self.size }.to_le_bytes());
+        b[8..12].copy_from_slice(&{ self.channel }.to_le_bytes());
+        b[12..16].copy_from_slice(&{ self.ty }.to_le_bytes());
+        b
+    }
 }
 
 #[repr(C, packed)]
@@ -311,7 +337,7 @@ struct FutureValue<T> {
     completion: CondVar,
 }
 
-impl<T> FutureValue<T> {
+impl<T: Unpin> FutureValue<T> {
     fn pin_init() -> impl PinInit<FutureValue<T>> {
         pin_init!(
             FutureValue {
@@ -593,44 +619,62 @@ impl AFKEndpoint {
             }
         };
         let mut rptr = self.iomem_read32(buf_offset + block_size)? as usize;
-        let mut wptr = self.iomem_read32(buf_offset + block_size * 2)?;
+        let mut wptr = self.iomem_read32(buf_offset + block_size * 2)? as usize;
         mem_sync();
         let base = buf_offset + block_size * 3;
         let mut msg_buf = KVec::new();
-        const QEH_SIZE: usize = mem::size_of::<QEHeader>();
-        while wptr as usize != rptr {
-            let mut qeh_bytes = [0; QEH_SIZE];
-            self.memcpy_from_iomem(base + rptr, &mut qeh_bytes)?;
-            let mut qeh = unsafe { &*(qeh_bytes.as_ptr() as *const QEHeader) };
-            if qeh.magic != QE_MAGIC1 && qeh.magic != QE_MAGIC2 {
-                let magic = qeh.magic;
+        let ring = match aop_ring::Ring::new(buf_size, block_size) {
+            Ok(ring) => ring,
+            Err(e) => {
                 dev_err!(
                     client.dev,
-                    "Invalid magic on ep {}, got {:x}",
+                    "Invalid ring on ep {}: size {:#x} block {:#x}",
                     self.index,
-                    magic
+                    buf_size,
+                    block_size
+                );
+                return Err(e);
+            }
+        };
+        // Entries the producer adds while this pass runs beyond one ring's
+        // worth are left for the doorbell that announces them.
+        let mut budget = ring.capacity();
+        loop {
+            if ring.check_ptr(rptr).is_err() || ring.check_ptr(wptr).is_err() {
+                dev_err!(
+                    client.dev,
+                    "Ring pointers out of range on ep {}: rptr {:#x} wptr {:#x}",
+                    self.index,
+                    rptr,
+                    wptr
                 );
                 return Err(EIO);
             }
-            let room = buf_size.checked_sub(rptr + QEH_SIZE).ok_or(EIO)?;
-            if qeh.size as usize > room {
-                rptr = 0;
-                self.memcpy_from_iomem(base + rptr, &mut qeh_bytes)?;
-                qeh = unsafe { &*(qeh_bytes.as_ptr() as *const QEHeader) };
-
-                if qeh.magic != QE_MAGIC1 && qeh.magic != QE_MAGIC2 {
-                    let magic = qeh.magic;
-                    dev_err!(
-                        client.dev,
-                        "Invalid magic on ep {}, got {:x}",
-                        self.index,
-                        magic
-                    );
-                    return Err(EIO);
-                }
+            if wptr == rptr || budget == 0 {
+                break;
             }
+            budget -= 1;
+            let mut last = QEHeader::default();
+            let read = ring.read_entry(rptr, |ptr| {
+                let mut qeh_bytes = [0; QEH_SIZE];
+                self.memcpy_from_iomem(base + ptr, &mut qeh_bytes)?;
+                last = QEHeader::from_bytes(&qeh_bytes);
+                Ok(last)
+            });
+            let Ok((qeh, entry, next)) = read else {
+                let (magic, size) = (last.magic, last.size);
+                dev_err!(
+                    client.dev,
+                    "Invalid entry on ep {} at {:#x}: magic {:x} size {:#x}",
+                    self.index,
+                    rptr,
+                    magic,
+                    size
+                );
+                return Err(EIO);
+            };
             msg_buf.resize(qeh.size as usize, 0, GFP_KERNEL)?;
-            self.memcpy_from_iomem(base + rptr + QEH_SIZE, &mut msg_buf)?;
+            self.memcpy_from_iomem(base + entry + QEH_SIZE, &mut msg_buf)?;
             // A message the endpoint cannot handle is skipped. The ring
             // position is still good, and not advancing past the entry would
             // read it again on every doorbell and stall the endpoint for good.
@@ -639,7 +683,7 @@ impl AFKEndpoint {
                     self.drop_message(&client.dev, fmt!("short message ({} bytes)", msg_buf.len()))
                 }
                 Some((header, msg)) => {
-                    if let Err(e) = self.handle_ipc(client, qeh, &header, msg) {
+                    if let Err(e) = self.handle_ipc(client, &qeh, &header, msg) {
                         let channel = qeh.channel;
                         self.drop_message(
                             &client.dev,
@@ -655,10 +699,10 @@ impl AFKEndpoint {
                     }
                 }
             }
-            rptr = align_up(rptr + QEH_SIZE + qeh.size as usize, block_size) % buf_size;
+            rptr = next;
             mem_sync();
             self.iomem_write32(buf_offset + block_size, rptr as u32)?;
-            wptr = self.iomem_read32(buf_offset + block_size * 2)?;
+            wptr = self.iomem_read32(buf_offset + block_size * 2)? as usize;
             mem_sync();
         }
         Ok(())
@@ -784,35 +828,39 @@ impl AFKEndpoint {
         let base = buf_offset + block_size * 3;
         mem_sync();
         let rptr = self.iomem_read32(buf_offset + block_size)? as usize;
-        let mut wptr = self.iomem_read32(buf_offset + block_size * 2)? as usize;
-        const QEH_SIZE: usize = mem::size_of::<QEHeader>();
-        if wptr < rptr && wptr + QEH_SIZE >= rptr {
-            dev_err!(client.dev, "Tx buffer full at endpoint {}", self.index);
+        let wptr = self.iomem_read32(buf_offset + block_size * 2)? as usize;
+        let ring = aop_ring::Ring::new(buf_size, block_size)?;
+        if ring.check_ptr(rptr).is_err() || ring.check_ptr(wptr).is_err() {
+            dev_err!(
+                client.dev,
+                "Tx ring pointers out of range at endpoint {}: rptr {:#x} wptr {:#x}",
+                self.index,
+                rptr,
+                wptr
+            );
             return Err(EIO);
         }
-        let payload_len = header.len() + data.len();
+        let payload_len = header.len().checked_add(data.len()).ok_or(EIO)?;
+        let Ok((entry, next)) = ring.write_entry(rptr, wptr, payload_len) else {
+            dev_err!(client.dev, "Tx buffer full at endpoint {}", self.index);
+            return Err(EIO);
+        };
         let qeh = QEHeader {
             magic: QE_MAGIC1,
-            size: payload_len as u32,
+            size: u32::try_from(payload_len).map_err(|_| EIO)?,
             channel,
             ty,
         };
-        let qeh_bytes = unsafe {
-            slice::from_raw_parts(
-                &qeh as *const QEHeader as *const u8,
-                mem::size_of::<QEHeader>(),
-            )
-        };
-        self.memcpy_to_iomem(base + wptr, qeh_bytes)?;
-        if payload_len > buf_size.checked_sub(wptr + QEH_SIZE).ok_or(EIO)? {
-            wptr = 0;
-            self.memcpy_to_iomem(base + wptr, qeh_bytes)?;
+        let qeh_bytes = qeh.to_bytes();
+        if entry != wptr {
+            self.memcpy_to_iomem(base + wptr, &qeh_bytes)?;
         }
-        self.memcpy_to_iomem(base + wptr + QEH_SIZE, header)?;
-        self.memcpy_to_iomem(base + wptr + QEH_SIZE + header.len(), data)?;
-        wptr = align_up(wptr + QEH_SIZE + payload_len, block_size) % buf_size;
-        self.iomem_write32(buf_offset + block_size * 2, wptr as u32)?;
-        Ok(wptr as u64 | (AFK_OPC_SEND << 48))
+        self.memcpy_to_iomem(base + entry, &qeh_bytes)?;
+        self.memcpy_to_iomem(base + entry + QEH_SIZE, header)?;
+        self.memcpy_to_iomem(base + entry + QEH_SIZE + header.len(), data)?;
+        mem_sync();
+        self.iomem_write32(buf_offset + block_size * 2, next as u32)?;
+        Ok(next as u64 | (AFK_OPC_SEND << 48))
     }
     fn epic_notify(
         &mut self,
@@ -1231,11 +1279,11 @@ impl WorkItem for AopServiceRegisterWork {
             .and_then(|x| x.get_child_by_name(this.name));
         let info = bindings::platform_device_info {
             parent: this.data.dev.as_raw(),
-            name: this.name.as_ptr() as *const _,
+            name: this.name.as_char_ptr(),
             id: bindings::PLATFORM_DEVID_AUTO,
             res: ptr::null_mut(),
             num_res: 0,
-            data: &this.service as *const EPICService as *const _,
+            data: ptr::from_ref(&this.service).cast(),
             size_data: mem::size_of::<EPICService>(),
             dma_mask: 0,
             fwnode: fwnode
@@ -1284,7 +1332,7 @@ impl WorkItem for AopServiceRegisterWork {
 }
 
 impl AopData {
-    fn new(dev: &platform::Device<Core>, cfg: &AopHwConfig) -> Result<Arc<AopData>> {
+    fn new(dev: &platform::Device<Core<'_>>, cfg: &AopHwConfig) -> Result<Arc<AopData>> {
         let registration_queue = OwnedQueue::new_ordered(c_str!("apple-aop"))?;
         let setup_queue = if cfg.setup_port {
             Some(OwnedQueue::new_ordered(c_str!("apple-aop-setup"))?)
@@ -1462,14 +1510,15 @@ impl AopData {
 
     fn patch_bootargs(
         &self,
-        aop_mmio: &IoMem<AOP_MMIO_SIZE>,
+        aop_mmio: &Mmio<'_, Region<AOP_MMIO_SIZE>>,
         patches: &[(u32, u64)],
     ) -> Result<()> {
-        let aop_mmio = aop_mmio.relaxed();
         let offset = aop_mmio.read32(BOOTARGS_OFFSET) as usize;
         let size = aop_mmio.read32(BOOTARGS_SIZE) as usize;
         let mut arg_bytes = KVec::<u8>::from_elem(0, size, GFP_KERNEL)?;
-        aop_mmio.try_memcpy_fromio(&mut arg_bytes, offset)?;
+        let aop_io_array: Mmio<'_, [u8; AOP_MMIO_SIZE]> = aop_mmio.try_cast()?;
+        let bootargs = io_project!(aop_io_array, [try: offset .. offset+size]);
+        bootargs.copy_to_slice(&mut arg_bytes);
         let mut idx = 0;
         while idx < size {
             let key = u32::from_le_bytes(arg_bytes[idx..idx + 4].try_into().unwrap());
@@ -1479,18 +1528,12 @@ impl AopData {
                 if *k != key {
                     continue;
                 }
-                arg_bytes[idx..idx + size].copy_from_slice(&(*v as u64).to_le_bytes()[..size]);
+                arg_bytes[idx..idx + size].copy_from_slice(&v.to_le_bytes()[..size]);
                 break;
             }
             idx += size;
         }
-        aop_mmio.try_memcpy_toio(offset, &arg_bytes)
-    }
-
-    fn start_cpu(&self, asc_mmio: &RelaxedMmio<ASC_MMIO_SIZE>) -> Result<()> {
-        let val = asc_mmio.read32(CPU_CONTROL);
-        asc_mmio.write32(val | CPU_RUN, CPU_CONTROL);
-        self.cpu_started.store(true, Release);
+        bootargs.copy_from_slice(&arg_bytes);
         Ok(())
     }
 
@@ -2151,7 +2194,7 @@ impl rtkit::Buffer for NoBuffer {
     fn iova(&self) -> Result<usize> {
         unreachable!()
     }
-    fn buf(&mut self) -> Result<IoSysMapRef<'_, u8>> {
+    fn buf(&mut self) -> Result<IoSysMap<'_, Region>> {
         unreachable!()
     }
 }
@@ -2281,13 +2324,14 @@ kernel::of_device_table!(
 
 impl platform::Driver for AopDriver {
     type IdInfo = &'static AopHwConfig;
+    type Data<'bound> = AopDriver;
 
     const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
 
-    fn probe(
-        pdev: &platform::Device<Core>,
-        info: Option<&Self::IdInfo>,
-    ) -> impl PinInit<Self, Error> {
+    fn probe<'bound>(
+        pdev: &'bound platform::Device<Core<'_>>,
+        info: Option<&'bound Self::IdInfo>,
+    ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
         let cfg = info.ok_or(ENODEV)?;
         if RETIRED.load(Acquire) {
             dev_err!(
@@ -2296,19 +2340,21 @@ impl platform::Driver for AopDriver {
             );
             return Err(ENODEV);
         }
+        // SAFETY: nothing of this device has DMA in flight before probe.
         unsafe { pdev.dma_set_mask_and_coherent(DmaMask::new::<42>())? };
         let aop_req = pdev.io_request_by_index(0).ok_or(EINVAL)?;
-        let aop_mmio = KBox::pin_init(aop_req.iomap_sized::<AOP_MMIO_SIZE>(), GFP_KERNEL)?;
+        let aop_mmio = aop_req.iomap_sized::<AOP_MMIO_SIZE>()?;
         let asc_req = pdev.io_request_by_index(1).ok_or(EINVAL)?;
-        let asc_mmio = KBox::pin_init(asc_req.iomap_sized::<ASC_MMIO_SIZE>(), GFP_KERNEL)?;
+        let asc_mmio = asc_req.iomap_sized::<ASC_MMIO_SIZE>()?;
+        let asc_mmio = asc_mmio.as_view().relaxed();
         let data = AopData::new(pdev, cfg)?;
         // Whatever fails below leaves the AOP running and its children
         // registering; the same teardown as unbind's cleans that up.
         let probe_guard = ScopeGuard::new_with_data(data.clone(), |data| data.remove());
-        let aop_mmio = aop_mmio.access(pdev.as_ref())?;
+        let aop_mmio = aop_mmio.as_view();
         if cfg.patch_bootargs {
             data.patch_bootargs(
-                aop_mmio,
+                &aop_mmio,
                 &[
                     (from_fourcc(b"EC0p"), cfg.ec0p),
                     (from_fourcc(b"nCal"), 0x0),
@@ -2318,12 +2364,12 @@ impl platform::Driver for AopDriver {
             )?;
         }
         let rtkit = rtkit::RtKit::<AopData>::new(pdev.as_ref(), None, 0, data.clone())?;
-        *data.rtkit.lock() = Some(rtkit);
+        data.rtkit.lock().as_mut().set(Some(rtkit));
         if cfg.setup_port {
             AopData::setup_open(&data, pdev.as_ref())?;
         }
-        let asc_mmio = asc_mmio.access(pdev.as_ref())?.relaxed();
-        data.start_cpu(asc_mmio)?;
+        asc_mmio.update(ASC_CPU_CONTROL, |r| r.with_const_cpu_run::<1>());
+        data.cpu_started.store(true, Release);
         if cfg.setup_port {
             // The RTKit handshake up to AP power on comes first, then the
             // setup port's own power state and endpoint buffers, and only
@@ -2344,7 +2390,7 @@ impl platform::Driver for AopDriver {
         Ok(Self(data))
     }
 
-    fn unbind(_dev: &platform::Device<Core>, this: Pin<&Self>) {
+    fn unbind(_dev: &platform::Device<Core<'_>>, this: Pin<&Self>) {
         // The device is still bound here, which the DMA allocations the
         // teardown frees require. Drop only repeats it as a no-op.
         this.0.remove();
@@ -2357,6 +2403,8 @@ impl Drop for AopDriver {
     }
 }
 
+// SAFETY: the wrapped `Arc<dyn AOP>` is `Send + Sync` (the trait requires
+// both), so the handle may move to the thread that unbinds the device.
 unsafe impl Send for AopDriver {}
 
 module_platform_driver! {

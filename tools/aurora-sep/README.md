@@ -13,6 +13,10 @@ curl -fsSL https://github.com/omacom/linux-aurora/releases/latest/download/insta
 The installer in this source tree is an assembly template. Use the release
 asset above, whose package checksums and GPU profiles are pinned together.
 
+Each release installer downloads its own exact package versions and verifies
+their checksums. Experimental hardware profiles require their explicit opt-ins.
+Normal stable delivery uses Omacom's package channels and installer images.
+
 For experimental acceleration on the 13-inch or 15-inch M3 MacBook Air, see
 the [M3 GPU quick start](M3-GPU.md) for the matched activation command and
 desktop GPU check.
@@ -76,41 +80,24 @@ window shifted 90 APFS blocks beyond the actual `.gl` extent. This proves the
 locator can misidentify the extent; it does not identify the historical cause
 of any particular damaged container.
 
-For fingerprint support, apply
-`patches/libfprint-1.94.100-apple-sep.patch` to libfprint 1.94.100, build and
-install libfprint, then install the fprintd device policy:
+For fingerprint support, install libfprint with the aurora driver, then the
+fprintd device policy below. The userspace driver is maintained in
+https://github.com/aurora-silicon/aurora-sep-userspace (libfprint with the
+aurora driver, as source and as distribution packages); this tree carries only
+the kernel driver, its loader and its service. The driver behaviour fprintd
+sees:
 
-```sh
-git clone --depth 1 --branch v1.94.100 \
-    https://gitlab.freedesktop.org/libfprint/libfprint.git libfprint-aurora
-cd libfprint-aurora
-git apply ../linux/tools/aurora-sep/patches/libfprint-1.94.100-apple-sep.patch
-meson setup build -Dprefix=/usr -Ddrivers=default -Dintrospection=false \
-    -Dgtk-examples=false -Ddoc=false -Dinstalled-tests=false
-ninja -C build
-meson test -C build --print-errorlogs
-```
-
-The aurora driver for libfprint is also maintained in
-https://github.com/aurora-silicon/aurora-sep-userspace, as source and as
-distribution packages.
-
-Adjust the patch path for your checkout. The patch includes a fix for an
-upstream Meson test loop when introspection is disabled. In the Aurora
-`linux-build` guest, the additional packages needed for this build are
-`libgudev libgusb pixman cairo glib2-devel`; `meson` and `ninja` are already
-in the release image. The default driver set retains all normal libfprint
-drivers and adds Aurora. This build was checked on aarch64: the shared library
-and all default drivers compiled, with 0 test failures (most device tests
-skip without their optional mocks/hardware). That does **not** prove Touch ID
-works on m2. The patched library is installed privately under
-`/opt/aurora-sep` there, with fprintd loading it via a service drop-in while
-the distro libfprint remains untouched. fprintd discovers one Apple SEP sensor.
 The Aurora driver now reports stage progress only when the kernel's stage
 number increases; guidance and stage-zero events are not captured samples.
 fprintd 1.94.5 itself emits an initial `enroll-stage-passed` after its
 duplicate check, **before** starting enrollment. That first line does not
 prove a finger was captured.
+A capture the enclave cannot use is reported as a retry, both while enrolling
+and while matching: fprintd shows `enroll-retry-scan` or `verify-retry-scan`,
+and starts a match again by itself. When the kernel ends an enrolment because
+too many captures in a row were unusable (`SEP_BIO_STATUS_REJECTED`), the
+enrolment fails with that reason in fprintd's log, and fprintd reports
+`enroll-unknown-error`. Kernels from before these statuses never send them.
 The device-specific `apple/mesa_calibration.bin` on m2 was recovered using
 the bundled [`extract-mesa-calibration.py`](extract-mesa-calibration.py), copied
 from [Gist revision `eb079a8007985d04e75182f20994f1a1c496f12e`](https://gist.github.com/DjDeveloperr/867a1961b861c570442724f48f770158/eb079a8007985d04e75182f20994f1a1c496f12e),
@@ -161,6 +148,16 @@ systemctl daemon-reload
 systemctl restart fprintd.service
 ```
 
+Where SELinux is enforcing, as on Fedora, fprintd may not open `/dev/sep-bio`
+until it is labelled. Build and load the policy module (Fedora's
+`selinux-policy-devel` provides the Makefile), then label the device:
+
+```sh
+make -f /usr/share/selinux/devel/Makefile aurora_sep.pp
+semodule -i aurora_sep.pp
+restorecon /dev/sep-bio
+```
+
 On Omarchy, run `omarchy-apply-lock` once after enrollment. The Quickshell
 lock screen then selects `omarchy-lock-fingerprint` automatically and accepts
 Touch ID through fprintd. Hyprlock's separate fingerprint switch is not used
@@ -181,8 +178,30 @@ mkdir rpms
 podman run --rm -v "$PWD":/src:ro,z -v "$PWD/rpms":/out:z \
     registry.fedoraproject.org/fedora:45 \
     /src/tools/aurora-sep/packaging/fedora/build.sh /out
-sudo dnf install rpms/aurora-sep-1-*.noarch.rpm
+sudo dnf install rpms/aurora-sep-1-*.noarch.rpm rpms/aurora-sep-selinux-1-*.noarch.rpm
 ```
+
+`aurora-sep-selinux` holds the policy module above. `aurora-sep` requires it
+wherever the targeted policy is installed. Where SELinux is disabled, the
+module is installed but not loaded, and nothing is relabelled.
+
+**On Fedora, turn on fingerprint authentication yourself.** PAM decides what
+asks for a fingerprint, and the packages leave it alone. Fedora's authselect
+profiles keep fingerprints off until their `with-fingerprint` feature is
+selected. Until then sudo, polkit and the lock screen never ask, and GNOME
+Settings shows no Fingerprint Login row, even with a finger enrolled. Once a
+finger is enrolled:
+
+```sh
+sudo authselect enable-feature with-fingerprint
+```
+
+This adds `pam_fprintd` to the system and fingerprint PAM stacks. It also sets
+`org.gnome.login-screen enable-fingerprint-authentication`, which authselect
+otherwise locks to false. `sudo authselect disable-feature with-fingerprint`
+undoes both. While the feature is off, `aurora-sep-ready` logs this command
+once per boot. On Omarchy, `aurora-touchid-setup` makes the PAM changes after
+an enrolment.
 
 On Arch Linux and Arch Linux ARM, build `aurora-sep`:
 
@@ -216,8 +235,25 @@ enrolled fingerprints from the enclave before the open returns, which takes
 a few seconds. `aurora-sep-ready.service`, which `aurora-sep.service` pulls
 in, makes that open at boot, before fprintd starts. The lock screen, sudo
 and polkit then find the reader and the fingerprints ready, and the first
-fingerprint request does not wait for the restore. A failed open is only
-logged. The packages install it; by hand:
+fingerprint request does not wait for the restore.
+
+An open that succeeds is not enough: the sensor can still fall short of
+attaching. The script reports Touch ID ready only once the driver's `diag`
+attributes show the sensor attached and the fingerprints restored (or none
+enrolled), the state in which the kernel logs `Touch ID: restored N`. The
+driver tries an attach that fell short once more about 10 s later, so the
+script waits for that, up to 50 s from its start. Otherwise it logs
+`Touch ID is NOT ready` with the reason and the unit fails; anything that
+merely wants it still starts.
+
+Restored is not the same as able to match: a match rewrites xART session
+records, which the xART guard can refuse. The script reads the driver's
+`matching` attribute: `usable` is ready, `blocked` is NOT ready with the
+reason and the `xart_guard=0` opt-out, and `unverified` (or a kernel that
+does not say) logs `Touch ID is restored, matching UNVERIFIED` and does not
+fail the unit. See `XART-SAFETY.md`.
+
+The packages install it; by hand:
 
 ```sh
 install -Dm755 aurora-sep-ready /usr/local/sbin/aurora-sep-ready
@@ -252,8 +288,9 @@ install -Dm644 logind-aurora-sep.conf /etc/systemd/logind.conf.d/aurora-sep.conf
 
 GNOME Shell 51 offers fingerprint only on the lock screen, never on the
 login screen, and `org.gnome.login-screen enable-fingerprint-authentication`
-(true by default) cannot change that: the greeter connects its fingerprint
-reader only when it re-authenticates a running session. That is GNOME's
+(true in GNOME's defaults, false under authselect until `with-fingerprint` is
+on) cannot change that: the greeter connects its fingerprint reader only
+when it re-authenticates a running session. That is GNOME's
 choice, because a fingerprint cannot unlock the login keyring: after a
 fingerprint login, the first application that wants a stored secret asks
 for the password. `aurora-sep-greeter-fingerprint.service` lifts the

@@ -107,14 +107,26 @@ static int iommu_map(struct iommu_domain*d,u64 i,u64 p,size_t sz,int prot,int g)
 /* CORE */
 static u64 leaf(u64 phys){return GENMASK_ULL(51,40)|((phys>>4)&GENMASK_ULL(37,10))|1;}
 int main(int argc,char**argv){
- assert(argc==2);const char*c=argv[1];struct apple_dart_hw hw={APPLE_DART2,1,1};struct apple_dart d={.pgsize=SZ_16K,.oas=42,.fw_mirror=1,.fw_handoff=1,.ias=42,.locked=1,.num_streams=1,.hw=&hw};
+ assert(argc==2);const char*c=argv[1];struct apple_dart_hw hw={APPLE_DART2,1,1};struct apple_dart d={.pgsize=SZ_16K,.oas=42,.fw_mirror=0,.fw_handoff=1,.ias=42,.locked=1,.num_streams=1,.hw=&hw};
  u64 live[2]={0x1401,0},owned[2]={0,0},ours[2]={0x401,0};u64 entries[2]={0x1401,0},accepted[2]={0,0};u64*leaves[2]={firmware_leaf,NULL};struct apple_dart_fw_root fw={entries,accepted,leaves};
  firmware_leaf[0]=leaf(0x8000);ours_leaf[0]=leaf(0x8000);phys_addr_t phys;
  struct apple_dart_domain domain={0};domain.stream_maps[0].dart=&d;domain.fw_sidmap[0][0]=1;
  struct apple_dart_master_cfg cfg={0};cfg.stream_maps[0].dart=&d;cfg.stream_maps[0].sidmap[0]=1;
  struct iommu_device io={0};struct device_node node={1,1,true};struct device dev={&node,&cfg,&io};d.dev=&dev;struct list_head head={0};
  d.locked_ttbr[0][0]=root;static u64 shadow[2048];d.locked_owned[0][0]=shadow;d.locked_fw[0][0]=&fw;
- if(!strncmp(c,"handoff-",8)){
+ if(!strncmp(c,"legacy-",7)){
+  d.fw_handoff=0;d.fw_mirror=1;root[0]=0x1401;
+  if(!strcmp(c,"legacy-map-match"))
+   assert(!apple_dart_check_fw_map(&domain,0,0x8000,SZ_16K,IOMMU_READ|IOMMU_WRITE|IOMMU_CACHE));
+  else if(!strcmp(c,"legacy-map-mismatch"))
+   assert(apple_dart_check_fw_map(&domain,0,0xc000,SZ_16K,IOMMU_READ|IOMMU_WRITE|IOMMU_CACHE)==-EBUSY);
+  else if(!strcmp(c,"legacy-lookup"))assert(apple_dart_inherited_phys(&domain,0)==0x8000);
+  else if(!strcmp(c,"legacy-snapshot")){
+   reserved=0;struct apple_dart_fw_root*f=apple_dart_snapshot_fw_root(&d,0,root);
+   assert(f&&!IS_ERR(f)&&f->entry[0]==0x1401);apple_dart_free_fw_root(&d,f);
+  }else abort();
+ }
+ else if(!strncmp(c,"handoff-",8)){
   if(!strcmp(c,"handoff-missing"))node.count=-EINVAL;
   if(!strcmp(c,"handoff-duplicate"))node.count=2;
   if(!strcmp(c,"handoff-zero"))node.value=0;

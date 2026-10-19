@@ -5,7 +5,6 @@
 
 #include "plane.h"
 
-#include "dcp.h"
 #include "dcp-internal.h"
 #include "iomfb_internal.h"
 
@@ -22,19 +21,19 @@
 #define FRAC_16_16(mult, div)    (((mult) << 16) / (div))
 
 static int apple_plane_atomic_check(struct drm_plane *plane,
-				    struct drm_atomic_state *state)
+				    struct drm_atomic_commit *commit)
 {
 	struct drm_plane_state *new_plane_state;
 	struct drm_crtc_state *crtc_state;
 	struct drm_rect *dst;
 	int ret;
 
-	new_plane_state = drm_atomic_get_new_plane_state(state, plane);
+	new_plane_state = drm_atomic_get_new_plane_state(commit, plane);
 
 	if (!new_plane_state->crtc)
 		return 0;
 
-	crtc_state = drm_atomic_get_crtc_state(state, new_plane_state->crtc);
+	crtc_state = drm_atomic_get_crtc_state(commit, new_plane_state->crtc);
 	if (IS_ERR(crtc_state))
 		return PTR_ERR(crtc_state);
 
@@ -70,7 +69,7 @@ static int apple_plane_atomic_check(struct drm_plane *plane,
 	 */
 	dst = &new_plane_state->dst;
 	if (drm_rect_width(dst) < 32 || drm_rect_height(dst) < 32) {
-		dev_err_once(state->dev->dev,
+		dev_err_once(commit->dev->dev,
 			"Plane operation would have crashed DCP! Rejected!\n\
 			DCP requires 32x32 of every plane to be within screen space.\n\
 			Your compositor asked to overlay [%dx%d, %dx%d] on %dx%d.\n\
@@ -209,9 +208,9 @@ static enum dcp_colorspace get_colorspace(bool is_yuv,
 }
 
 static void apple_plane_atomic_update(struct drm_plane *plane,
-				      struct drm_atomic_state *state)
+				      struct drm_atomic_commit *commit)
 {
-	struct drm_plane_state *base = drm_atomic_get_new_plane_state(state, plane);
+	struct drm_plane_state *base = drm_atomic_get_new_plane_state(commit, plane);
 	struct apple_plane_state *new_state;
 	struct drm_gem_dma_object *obj;
 	bool is_premultiplied = false;
@@ -252,7 +251,7 @@ static void apple_plane_atomic_update(struct drm_plane *plane,
 		.width = fb->width,
 		.height = fb->height,
 		.buf_size = fb->height * fb->pitches[0],
-		// .surface_id = req->swap.surf_ids[l],
+		.surface_id = plane->base.id,
 
 		/* Only used for compressed or multiplanar surfaces */
 		.pix_size = 1,
@@ -309,26 +308,6 @@ static void apple_plane_cleanup_fb(struct drm_plane *plane,
 	kfree(entry);
 }
 
-/* Does @plane scan out on an H17-generation pipeline (T8140, T8142)? */
-static bool apple_plane_h17p(struct drm_plane *plane)
-{
-	struct drm_crtc *crtc;
-
-	drm_for_each_crtc(crtc, plane->dev) {
-		struct apple_dcp *dcp;
-
-		if (!(plane->possible_crtcs & drm_crtc_mask(crtc)))
-			continue;
-		dcp = platform_get_drvdata(to_apple_crtc(crtc)->dcp);
-		return dcp && dcp->fw_compat == DCP_FIRMWARE_H17P;
-	}
-	return false;
-}
-
-/*
- * H17P: a displaced framebuffer stays referenced until the swap that
- * replaces it completes (dcp_release_retained_framebuffers()).
- */
 static int apple_plane_prepare_fb(struct drm_plane *plane,
 				  struct drm_plane_state *state)
 {
@@ -342,8 +321,6 @@ static int apple_plane_prepare_fb(struct drm_plane *plane,
 
 	old = drm_atomic_get_old_plane_state(state->state, plane);
 	if (!old || !old->crtc || !old->fb || old->fb == state->fb)
-		return 0;
-	if (!apple_plane_h17p(plane))
 		return 0;
 
 	entry = kzalloc_obj(*entry);
@@ -403,12 +380,9 @@ apple_plane_duplicate_state(struct drm_plane *plane)
         __drm_atomic_helper_plane_duplicate_state(plane, &apple_plane_state->base);
 
 	apple_plane_state->surf = old_apple_plane_state->surf;
-	/* H17P presents re-use the cached scanout geometry. */
-	if (apple_plane_h17p(plane)) {
-		apple_plane_state->src_rect = old_apple_plane_state->src_rect;
-		apple_plane_state->dst_rect = old_apple_plane_state->dst_rect;
-		apple_plane_state->iova = old_apple_plane_state->iova;
-	}
+	apple_plane_state->src_rect = old_apple_plane_state->src_rect;
+	apple_plane_state->dst_rect = old_apple_plane_state->dst_rect;
+	apple_plane_state->iova = old_apple_plane_state->iova;
 
 	return &apple_plane_state->base;
 }

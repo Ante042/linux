@@ -2,14 +2,25 @@
 /*
  * Engine-busy CPU cluster boost.
  *
- * Bandwidth-bound programs depend on CPU cluster frequency. On our
- * T8103 hardware, holding the highest cluster frequency reduced slow
- * submissions and keeping the boost until completion reduced latency.
+ * Bandwidth-bound programs run at a speed set by the CPU cluster
+ * p-states. On T8103, with a mostly-sleeping submitter at normal
+ * priority, some submits run about twice as long as normal, while the
+ * submitter's CPU time and run delay stay unchanged; with both clusters
+ * pinned at their top p-state (performance governor, or SCHED_FIFO for
+ * the submitter, which schedutil boosts the same way) the slow submits
+ * disappear. A single long program slows down as well if the QoS
+ * lapses before it completes, so the hold must last from submit start
+ * to completion, and the idle delay counts from completion. The likely
+ * mechanism is the second p-state field apple-soc-cpufreq writes with
+ * the cluster p-state on T8103 only (DVFS_CMD PS2, has_ps2); the
+ * memory-controller tuning its author named as unimplemented is still
+ * absent from the tree. Whatever the field drives, the cure is the
+ * cluster p-state, which cpufreq lets a driver request.
  *
- * Hold a minimum-frequency QoS at the top of every cpufreq policy
- * while a submission runs, then release it boost_idle_ms after the last
- * completion. Use cpufreq constraints so the request composes with the
- * governor without direct DVFS register access.
+ * So hold a min-frequency QoS at the top of every cpufreq policy while a
+ * submit runs, and drop it boost_idle_ms after the last one completes.
+ * The QoS goes through cpufreq's own constraint object, so it composes
+ * with any governor and never touches the DVFS registers.
  */
 #include <linux/cpufreq.h>
 #include <linux/jiffies.h>
@@ -99,7 +110,7 @@ void ane_boost_end(struct ane_device *ane)
 	b->busy = false;
 	b->last_end = jiffies;
 	if (b->on)
-		mod_delayed_work(system_wq, &b->off,
+		mod_delayed_work(system_dfl_wq, &b->off,
 				 msecs_to_jiffies(boost_idle_ms));
 	mutex_unlock(&b->lock);
 }

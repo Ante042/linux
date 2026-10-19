@@ -410,9 +410,8 @@ static bool apple_nvme_in_inherited_rtkit_range(struct apple_nvme *anv,
 
 	/*
 	 * A range property or a partial System RAM intersection does not prove
-	 * ownership. Every page must be reserved and present in the linear map.
-	 * Native m1n1 reserves the predecessor's inherited allocation prefix.
-	 * RAM excluded by a resident EL2 stage needs a separate cache contract.
+	 * ownership. Every page must be reserved and present in the linear map,
+	 * as the bootloader leaves the buffers it hands over.
 	 */
 	if (region_intersects(bfr->iova, bfr->size, IORESOURCE_SYSTEM_RAM,
 			      IORES_DESC_NONE) != REGION_INTERSECTS)
@@ -1140,7 +1139,7 @@ static int apple_nvme_init_hctx(struct blk_mq_hw_ctx *hctx, void *data,
 
 static int apple_nvme_init_request(struct blk_mq_tag_set *set,
 				   struct request *req, unsigned int hctx_idx,
-				   unsigned int numa_node)
+				   int numa_node)
 {
 	struct apple_nvme_queue *q = set->driver_data;
 	struct apple_nvme *anv = queue_to_apple_nvme(q);
@@ -1179,7 +1178,7 @@ static void apple_nvme_disable_legacy(struct apple_nvme *anv, bool shutdown)
 	 * doing a safe shutdown.
 	 */
 	if (!dead && shutdown && freeze)
-		nvme_wait_freeze_timeout(&anv->ctrl, NVME_IO_TIMEOUT);
+		nvme_wait_freeze_timeout(&anv->ctrl);
 
 	nvme_quiesce_io_queues(&anv->ctrl);
 
@@ -1276,7 +1275,7 @@ static int apple_nvme_disable_locked(struct apple_nvme *anv, bool shutdown)
 		nvme_start_freeze(&anv->ctrl);
 	if (shutdown && test_bit(NVME_CTRL_FROZEN, &anv->ctrl.flags) &&
 	    !apple_rtkit_is_crashed(anv->rtk))
-		nvme_wait_freeze_timeout(&anv->ctrl, NVME_IO_TIMEOUT);
+		nvme_wait_freeze_timeout(&anv->ctrl);
 
 	/* Quiescing dispatch does not stop already submitted DMA. */
 	nvme_quiesce_io_queues(&anv->ctrl);
@@ -1425,7 +1424,7 @@ static enum blk_eh_timer_return apple_nvme_timeout(struct request *req)
 				}
 				WRITE_ONCE(anv->abort_reset, true);
 			}
-			queue_work(system_unbound_wq, &anv->recovery_work);
+			queue_work(system_dfl_wq, &anv->recovery_work);
 		}
 		return BLK_EH_RESET_TIMER;
 	}
@@ -1530,7 +1529,7 @@ static void apple_nvme_init_queue(struct apple_nvme_queue *q)
  */
 static void apple_nvme_wait_freeze(struct apple_nvme *anv)
 {
-	while (!nvme_wait_freeze_timeout(&anv->ctrl, NVME_IO_TIMEOUT)) {
+	while (!nvme_wait_freeze_timeout(&anv->ctrl)) {
 		if (READ_ONCE(anv->abort_reset) || READ_ONCE(anv->quarantined))
 			return;
 	}
@@ -1640,8 +1639,8 @@ static void apple_nvme_reset_work(struct work_struct *work)
 			 * Post-M4 ANS cannot be reset through PMGR: the reset
 			 * assert raises an SError. A previous boot stage that
 			 * stopped the coprocessor cleanly leaves its firmware
-			 * resident, so mirror the qualified U-Boot handoff:
-			 * set RUN and run a fresh RTKit boot handshake.
+			 * resident, so set RUN and run a fresh RTKit boot
+			 * handshake.
 			 */
 			dev_dbg(anv->dev,
 				"post-M4 firmware handoff: restarting stopped ANS without reset\n");

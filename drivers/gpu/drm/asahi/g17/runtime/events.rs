@@ -13,7 +13,7 @@ use crate::g17::{
 };
 use kernel::{prelude::*, sync::Arc};
 
-/// Wake interval while a tiler heap may still shrink: the shrink check period.
+/// Wake interval while a tiler heap may still shrink: the native check period.
 const SHRINK_WAKE_NS: u64 = 1_000_000_000;
 
 struct Service<'a> {

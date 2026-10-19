@@ -38,6 +38,7 @@
 #define __rust_helper __always_inline
 #endif
 
+#include "acpi.c"
 #include "arm_arch_timer.c"
 #include "atomic.c"
 #include "atomic_ext.c"
@@ -59,8 +60,10 @@
 #include "device.c"
 #include "dma.c"
 #include "dma-fence.c"
-#include "dma-mapping.c"
+#ifdef CONFIG_DMA_SHARED_BUFFER
 #include "dma-resv.c"
+#include "dma-mapping.c"
+#endif
 #include "drm.c"
 #include "drm_gpuvm.c"
 #include "drm_syncobj.c"
@@ -69,7 +72,6 @@
 #include "fs.c"
 #include "gpu.c"
 #include "io.c"
-#include "iosys_map.c"
 #include "jump_label.c"
 #include "kunit.c"
 #include "list.c"
@@ -95,6 +97,7 @@
 #include "signal.c"
 #include "slab.c"
 #include "spinlock.c"
+#include "string.c"
 #include "sync.c"
 #include "task.c"
 #include "time.c"

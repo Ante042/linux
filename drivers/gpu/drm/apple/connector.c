@@ -18,77 +18,35 @@
 
 void apple_connector_edid_init(struct apple_connector *connector)
 {
-	mutex_init(&connector->edid_lock);
-	connector->edid_generation = 1;
+	connector->edid_live = false;
+	connector->edid_invalidation_pending = false;
 }
 
-static void apple_connector_edid_clear_locked(struct apple_connector *connector)
-{
-	lockdep_assert_held(&connector->edid_lock);
-	drm_edid_free(connector->drm_edid);
-	connector->drm_edid = NULL;
-	connector->edid_generation++;
-}
-
+/*
+ * The EDID cache is generation fenced and owned under mode_config.mutex:
+ * mark it stale here, and the hotplug work or the next get_modes() clears it.
+ */
 void apple_connector_invalidate_edid(struct apple_connector *connector)
 {
-	if (!connector)
-		return;
-	guard(mutex)(&connector->edid_lock);
-	apple_connector_edid_clear_locked(connector);
+	if (connector)
+		WRITE_ONCE(connector->edid_invalidation_pending, true);
 }
 
 void apple_connector_edid_set_live(struct apple_connector *connector, bool live)
 {
 	if (!connector)
 		return;
-	guard(mutex)(&connector->edid_lock);
-	if (!live || connector->edid_live != live)
-		apple_connector_edid_clear_locked(connector);
-	connector->edid_live = live;
+	if (!live || READ_ONCE(connector->edid_live) != live)
+		apple_connector_invalidate_edid(connector);
+	WRITE_ONCE(connector->edid_live, live);
 }
 
 void apple_connector_set_pipeline(struct apple_connector *connector,
 				  struct platform_device *pdev)
 {
-	guard(mutex)(&connector->edid_lock);
-	apple_connector_edid_clear_locked(connector);
-	connector->edid_live = !!pdev;
+	apple_connector_invalidate_edid(connector);
+	WRITE_ONCE(connector->edid_live, !!pdev);
 	WRITE_ONCE(connector->dcp, pdev);
-}
-
-bool apple_connector_edid_begin(struct apple_connector *connector,
-				struct platform_device *pdev, u64 *generation)
-{
-	guard(mutex)(&connector->edid_lock);
-	if (!pdev || !connector->edid_live || connector->dcp != pdev || connector->drm_edid)
-		return false;
-	*generation = connector->edid_generation;
-	return true;
-}
-
-/* Consume the fetched EDID even if its route or sink changed during the RPC. */
-bool apple_connector_edid_install(struct apple_connector *connector,
-				  struct platform_device *pdev, u64 generation,
-				  const struct drm_edid *edid)
-{
-	guard(mutex)(&connector->edid_lock);
-	if (!edid || !pdev || !connector->edid_live || connector->dcp != pdev ||
-	    connector->edid_generation != generation || connector->drm_edid) {
-		drm_edid_free(edid);
-		return false;
-	}
-	connector->drm_edid = edid;
-	return true;
-}
-
-const struct drm_edid *apple_connector_edid_dup(struct apple_connector *connector,
-						struct platform_device *pdev)
-{
-	guard(mutex)(&connector->edid_lock);
-	if (!pdev || !connector->edid_live || connector->dcp != pdev || !connector->drm_edid)
-		return NULL;
-	return drm_edid_dup(connector->drm_edid);
 }
 
 enum dcp_chunk_type {
@@ -223,6 +181,8 @@ void dcp_connector_update_dict(struct apple_connector *connector, const char *ke
 		dcp_connector_set_dict(connector, &connector->display_attributes, chunks);
 	else if (!strcmp(key, "Transport"))
 		dcp_connector_set_dict(connector, &connector->transport, chunks);
+	else
+		kfree(chunks->data);
 
 	chunks->data = NULL;
 	chunks->length = 0;

@@ -37,8 +37,8 @@
  * separate 16 KiB page at 0x350780000, so the register is 0x350780008. The
  * device tree describes that page as its own syscon. t8122 is unresolved.
  *
- * On t8142, selector 0x62 is a separate MMIO region at 0x380780000, using a
- * per-port layout. The t8132 layout has not been decoded.
+ * On t8142, RegMap 0x62 is a separate MMIO region at 0x380780000.
+ * The t8132 layout has not been decoded.
  *
  * Reference firmware polls the busy bits, stores the request, then polls
  * again, with a 192 ms budget. It discards the first poll's result. The
@@ -84,7 +84,7 @@ struct apple_cio_reset {
 	struct device *dev;
 	struct regmap *regmap;
 	u32 offset;
-	struct mutex lock;
+	struct mutex lock; /* serializes access to the shared t600x register */
 };
 
 static int t8103_cio_deassert(struct apple_cio_reset *priv, unsigned long id)
@@ -94,6 +94,11 @@ static int t8103_cio_deassert(struct apple_cio_reset *priv, unsigned long id)
 	int ret;
 
 	/*
+	 * After writing BIT(0) the reset is deasserted and the CIO block comes up.
+	 * Once the sequence is done BIT(0) is cleared automatically and then BIT(2)
+	 * is set. There's no way to assert the reset again other than cutting the power
+	 * to the entire CIO block. Writing the bit again has no effect.
+	 *
 	 * Wait for a reconfiguration already in flight, as Apple does, and like Apple
 	 * carry on regardless of the result. See the t6000 variant for why this is only
 	 * a warning.
@@ -125,6 +130,16 @@ static int t6000_cio_deassert(struct apple_cio_reset *priv, unsigned long id)
 	u32 val;
 	int ret;
 
+	/*
+	 * Note that even the mutex is likely paranoid and not actually required
+	 * here: The way this controller works is that setting bit N immediately
+	 * results in bit 16+n being set. Once the reset is fully released both
+	 * bits are cleared again but macOS specifically waits for the upper one
+	 * to clear before continuing.
+	 * Manually clearing bits is ignored and has no effect, the only way to
+	 * put the block into reset again is shut down its power domains.
+	 * Thus, there's no need to either RMW here or wait before polling.
+	 */
 	guard(mutex)(&priv->lock);
 
 	/*
@@ -222,6 +237,8 @@ static int apple_cio_reset_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	priv->variant = of_device_get_match_data(dev);
+	if (!priv->variant)
+		return -ENODEV;
 	priv->dev = dev;
 
 	ret = devm_mutex_init(dev, &priv->lock);
@@ -232,11 +249,11 @@ static int apple_cio_reset_probe(struct platform_device *pdev)
 		priv->regmap = syscon_node_to_regmap(dev->of_node->parent);
 		if (IS_ERR(priv->regmap))
 			return dev_err_probe(dev, PTR_ERR(priv->regmap),
-					     "Failed to get parent regmap");
+					     "Failed to get parent regmap\n");
 
 		ret = of_property_read_u32(dev->of_node, "reg", &priv->offset);
 		if (ret)
-			return dev_err_probe(dev, ret, "Failed to read reg offset");
+			return dev_err_probe(dev, ret, "Failed to read reg offset\n");
 	} else {
 		void __iomem *base;
 
@@ -248,7 +265,7 @@ static int apple_cio_reset_probe(struct platform_device *pdev)
 						     &apple_cio_reset_regmap_config);
 		if (IS_ERR(priv->regmap))
 			return dev_err_probe(dev, PTR_ERR(priv->regmap),
-					     "Failed to init MMIO regmap");
+					     "Failed to init MMIO regmap\n");
 	}
 
 	priv->rcdev.owner = THIS_MODULE;

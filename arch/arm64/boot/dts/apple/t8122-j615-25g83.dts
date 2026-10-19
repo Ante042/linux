@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
- * Experimental J615 board with the exact 25G83 DCP, PMP and GPU profile.
+ * Experimental J615 board with the exact 25G83 DCP and PMP profile.
  * Board-specific speakers, Wi-Fi, power limits, storage and trackpad remain
- * in t8122-j615.dts. m1n1 hands the J615 display or GPU over only with
+ * in t8122-j615.dts. m1n1 hands the J615 display over only with
  * chosen.asahi,j615-25g83-experimental=1, and Linux checks it again.
  */
 #include "t8122-j615.dts"

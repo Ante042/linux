@@ -10,7 +10,7 @@
 
 struct apple_connector;
 struct apple_crtc;
-struct drm_atomic_state;
+struct drm_atomic_commit;
 struct drm_crtc;
 struct drm_display_mode;
 struct device_node;
@@ -46,10 +46,7 @@ struct apple_dcp_typec_route {
 	bool tunnel;
 	/* tunnel: crossbar brought up (at DidChangeLinkConfiguration) */
 	bool xbar_up;
-	/*
-	 * H17P: the lower mux release is consumed even when idle programming
-	 * fails, and that error retains the route's owner.
-	 */
+	/* Lower mux release is consumed even when idle programming fails. */
 	bool deactivate_xbar_done;
 	int deactivate_error;
 };
@@ -76,12 +73,12 @@ void dcp_typec_port_set_connector(unsigned int idx, bool secondary,
 bool dcp_typec_dual_stream(void);
 void dcp_typec_reorder(void);
 bool dcp_typec_follows_crtc(struct apple_dcp *dcp);
-bool dcp_typec_follow_holder_off(struct drm_atomic_state *state, struct drm_crtc *crtc,
+bool dcp_typec_follow_holder_off(struct drm_atomic_commit *state, struct drm_crtc *crtc,
 				 struct apple_connector *connector, struct apple_dcp *back);
 int dcp_typec_follow_check(struct apple_dcp *dcp, struct drm_crtc *crtc,
-			   struct drm_atomic_state *state,
+			   struct drm_atomic_commit *state,
 			   const struct drm_display_mode *mode);
-int dcp_typec_follow_crtc(struct drm_crtc *crtc, struct drm_atomic_state *state,
+int dcp_typec_follow_crtc(struct drm_crtc *crtc, struct drm_atomic_commit *state,
 			  bool *locked);
 void dcp_typec_follow_done(bool locked);
 bool dcp_is_typec_only(struct platform_device *pdev);
@@ -93,6 +90,13 @@ void dcp_unlink(struct drm_device *drm);
 int dcp_tunnel_crossbar_up(struct apple_dcp *dcp, u32 unit);
 int dcp_tunnel_crossbar_down(struct apple_dcp *dcp, u32 unit);
 int dcp_direct_crossbar_link(struct apple_dcp *dcp, bool up);
+/*
+ * T6030 ATC PHY: keep the source owning the pixel clock across rate changes
+ * and stop (linux/soc/apple/dp-tunnel.h, 170-usb). Declared here until that
+ * header has it; called through symbol_get() only.
+ */
+int apple_atc_dp_tunnel_rate_source(struct phy *phy, unsigned int source,
+				    unsigned int dpin, u8 rate);
 int dcp_tunnel_set_rate(struct apple_dcp *dcp, struct phy *phy, u32 unit,
 			u32 link_rate);
 int dcp_tunnel_dpin_activate(struct apple_dcp *dcp, u32 unit, bool active);
@@ -100,6 +104,7 @@ int dcp_tunnel_dpin_activate(struct apple_dcp *dcp, u32 unit, bool active);
 /* DCP probe, resume and endpoint teardown hooks. */
 int dcp_register_typec_routes(struct apple_dcp *dcp);
 void dcp_typec_routes_disable(struct apple_dcp *dcp);
+void dcp_typec_retrain_work(struct work_struct *work);
 void dcp_fabric_init(struct apple_dcp *dcp);
 void dcp_fabric_hdmi_resume(struct apple_dcp *dcp);
 void dcp_fabric_hdmi_reinit(struct apple_dcp *dcp, const char *why);
@@ -111,5 +116,6 @@ void dcp_fabric_shutdown_dptx(struct apple_dcp *dcp);
 /* DPTX operations supplied by the DCP firmware layer. */
 int dcp_dptx_connect(struct apple_dcp *dcp, u32 port);
 int dcp_dptx_disconnect(struct apple_dcp *dcp, u32 port);
+bool dcp_is_external_h17p(struct apple_dcp *dcp);
 
 #endif /* __APPLE_DCP_FABRIC_H__ */

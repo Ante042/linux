@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 static bool timeout_during_resume;
 static int hci_resume_sync(struct hci_dev *h) { if(timeout_during_resume)hci_cmd_timeout(&h->cmd_timer.work);return resume_error; }
 static int hci_dev_close_sync(struct hci_dev *h) {assert(req_locked);h->flags&=~HCI_UP;return bcm4377_hci_close(h);}
@@ -19,7 +20,10 @@ int main(int argc,char **argv) {
  case 3: resume_cycle(&dev);reset_error=-EIO;recover(&b);recover(&b);assert(reset_count==1&&!(h.flags&HCI_UP)&&b.needs_reset);break;
  case 4: resume_cycle(&dev);cal_failures=1;recover(&b);recover(&b);assert(reset_count==1&&cal_count==1&&b.cal_needed&&!(h.flags&HCI_UP));break;
  case 5: resume_cycle(&dev);addr_error=-EIO;recover(&b);assert(reset_count==1&&b.cal_loaded&&b.cal_needed&&!(h.flags&HCI_UP));break;
- case 6: recover(&b);assert(!reset_count&&!request.fn);break;
+	case 6:
+		recover(&b);
+		assert(!reset_count && !request.fn && rebind_count == 1);
+		break;
  case 7: h.flags=HCI_RUNNING;resume_cycle(&dev);recover(&b);assert(!reset_count);break;
  case 8: h.flags|=HCI_AUTO_OFF;resume_cycle(&dev);recover(&b);assert(!reset_count);break;
  case 9: h.flags|=HCI_SETUP;resume_cycle(&dev);recover(&b);assert(!reset_count);break;
@@ -27,9 +31,24 @@ int main(int argc,char **argv) {
  case 11: h.flags|=HCI_RFKILLED;resume_cycle(&dev);recover(&b);assert(!reset_count);break;
  case 12: h.flags|=HCI_POWERING_DOWN;resume_cycle(&dev);recover(&b);assert(!reset_count);break;
  case 13: board_j493=false;resume_cycle(&dev);recover(&b);assert(!reset_count);break;
- case 14: hw=bcm4377_hw_variants[BCM4377];resume_cycle(&dev);recover(&b);assert(!reset_count);break;
- case 15: hw=bcm4377_hw_variants[BCM4387];resume_cycle(&dev);recover(&b);assert(!reset_count);break;
- case 16: hw=bcm4377_hw_variants[BCM4388];resume_cycle(&dev);recover(&b);assert(!reset_count);break;
+	case 14:
+		hw = bcm4377_hw_variants[BCM4377];
+		resume_cycle(&dev);
+		recover(&b);
+		assert(!reset_count);
+		break;
+	case 15:
+		hw = bcm4377_hw_variants[BCM4387];
+		resume_cycle(&dev);
+		recover(&b);
+		assert(!reset_count);
+		break;
+	case 16:
+		hw = bcm4377_hw_variants[BCM4388];
+		resume_cycle(&dev);
+		recover(&b);
+		assert(!reset_count);
+		break;
  case 17: resume_cycle(&dev);bcm4377_hci_timeout(&h);deliver_work(&b);assert(request.fn);bcm4377_hci_close(&h);run_request(&h);assert(!reset_count);break;
  case 18: resume_cycle(&dev);bcm4377_hci_timeout(&h);deliver_work(&b);h.flags&=~HCI_UP;bcm4377_hci_close(&h);h.flags|=HCI_UP;run_request(&h);assert(!reset_count);break;
  case 19: resume_cycle(&dev);bcm4377_hci_timeout(&h);deliver_work(&b);h.flags|=HCI_RFKILLED;run_request(&h);assert(!reset_count);break;
@@ -55,7 +74,45 @@ int main(int argc,char **argv) {
  case 39: resume_cycle(&dev);assert(!reset_count&&!request.fn&&!cal_count&&!ptb_count);break;
  case 40: resume_cycle(&dev);bcm4377_hci_timeout(&h);deliver_work(&b);active_callback_pause=active_running=true;pthread_barrier_init(&active_started,NULL,2);pthread_barrier_init(&active_release,NULL,2);pthread_create(&active_thread,NULL,active_callback,&h);pthread_barrier_wait(&active_started);assert(!request.fn);assert(!bcm4377_suspend(&dev));assert(reset_count==1&&quiesces==2&&!active_running&&!req_locked);break;
  case 41: resume_cycle(&dev);bcm4377_hci_timeout(&h);deliver_work(&b);active_callback_pause=active_running=true;pthread_barrier_init(&active_started,NULL,2);pthread_barrier_init(&active_release,NULL,2);pthread_create(&active_thread,NULL,active_callback,&h);pthread_barrier_wait(&active_started);bcm4377_hci_unregister_dev(&h);assert(reset_count==1&&unregistered==1&&!active_running&&!req_locked);break;
+	case 42:
+		fixture_wakeup = true;
+		resume_cycle(&dev);
+		assert(!quiesces && !b.wake_armed && !b.quiesced);
+		recover(&b);
+		assert(reset_count == 1);
+		break;
+	case 43:
+		resume_cycle(&dev);
+		assert(quiesces == 1 && !b.quiesced && !b.wake_armed);
+		break;
+	case 44:
+		resume_cycle(&dev);
+		recover(&b);
+		recover(&b);
+		assert(reset_count == 1 && !rebind_count && b.resume_guarded);
+		h.flags &= ~HCI_UP;
+		bcm4377_hci_close(&h);
+		h.flags |= HCI_UP;
+		recover(&b);
+		assert(reset_count == 1 && rebind_count == 1);
+		break;
+	case 45:
+		resume_cycle(&dev);
+		bcm4377_hci_timeout(&h);
+		deliver_work(&b);
+		h.flags &= ~HCI_UP;
+		bcm4377_hci_close(&h);
+		h.flags |= HCI_UP;
+		run_request(&h);
+		assert(!reset_count && !b.resume_guarded);
+		recover(&b);
+		assert(rebind_count == 1);
+		break;
  default:abort();
  }
+	if (atoi(argv[1]) == 6 || atoi(argv[1]) == 44 || atoi(argv[1]) == 45)
+		assert(rebind_count == 1);
+	else
+		assert(!rebind_count);
  assert(!request.fn);printf("case %s passed\n",argv[1]);return 0;
 }

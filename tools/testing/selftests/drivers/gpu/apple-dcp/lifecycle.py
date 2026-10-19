@@ -3,7 +3,7 @@
 """Actual disconnect authority, DWC3 teardown and firmware resource admission."""
 from pathlib import Path
 import re
-from common import block, source_defines
+from common import block, apple_function, internal_inline, atc_mux_without_pm, source_defines, ATC_POST_TUNABLE, tipd_pm_header
 
 def disconnect(root):
     # Copyright 2026 Ryan Murray
@@ -21,11 +21,31 @@ def disconnect(root):
             pos += 1
         return s[m.start():pos]
 
-    pm = (r / 'drivers/usb/typec/tipd/cd321x-pm.h').read_text()
-    pm = pm.replace('#include <linux/types.h>', '')
+    pm = tipd_pm_header(r)
     core = 'drivers/usb/typec/tipd/core.c'
     dcp = 'drivers/gpu/drm/apple/dcp.c'
-    funcs = '\n'.join(function(f, n) for f, n in (
+    # The retry of a change that a mux with transient timeouts held up
+    held = [n for n in ('cd321x_mux_held', 'cd321x_mux_set', 'cd321x_mux_still_held',
+                        'cd321x_retry_held_mux', 'cd321x_update_done')
+            if re.search(r'^static \w+ ' + n + r'\(', (r / core).read_text(), re.M)]
+    # The DisplayPort hotplug decisions live in cd321x-dp.h when present.
+    dp_header = r / 'drivers/usb/typec/tipd/cd321x-dp.h'
+    dp = ''
+    if dp_header.exists():
+        dp = '\n'.join(l for l in dp_header.read_text().splitlines()
+                       if not l.startswith('#include'))
+        dp = r'''
+#ifndef BIT
+#define BIT(n) (1U << (n))
+#endif
+#define CD321X_DATA_STATUS_HPD_IRQ (1U << 9)
+#ifndef DP_STATUS_IRQ_HPD
+#define DP_STATUS_IRQ_HPD BIT(8)
+#endif
+#define trace_cd321x_dp_hotplug(...) ((void)0)
+''' + dp + '\n'
+    notify = (('drivers/usb/typec/tipd/core.c', 'cd321x_dp_notify'),) if dp else ()
+    funcs = '\n'.join(function(f, n) for f, n in notify + (
         ('drivers/gpu/drm/apple/iomfb.c', 'iomfb_pause_presentation'),
         (dcp, 'dcp_external_report_disconnected'),
         (dcp, 'dcp_external_publish_generation'),
@@ -36,6 +56,9 @@ def disconnect(root):
         (dcp, 'dcp_external_link_locked'),
         (dcp, 'dcp_dptx_connect_oob'),
         (core, 'cd321x_retry_revalidation'),
+        *((core, n) for n in held),
+        *((core, n) for n in ('cd321x_uses_dp_sid', 'cd321x_dp_hpd',
+                              'cd321x_dp_sid_replay', 'cd321x_dp_release_first')),
         (core, 'cd321x_update_work')))
     prefix = r'''
 #include <assert.h>
@@ -84,7 +107,9 @@ typedef uint32_t u32; typedef uint64_t u64;
 #define DCP_HOTPLUG_NOTIFY 1
 struct work_struct { bool pending; };
 struct delayed_work { struct work_struct work; };
-static int system_freezable_wq;
+static int system_freezable_wq, system_dfl_wq;
+#define DCP_SWAP_WATCHDOG_MS 1000
+#define DCP_EXTERNAL_STOP_RETRIES 3
 static int schedule_work(struct work_struct *w) { w->pending = true; return 1; }
 static void cancel_work_sync(struct work_struct *w) { w->pending = false; }
 static void cancel_delayed_work_sync(struct delayed_work *w) { w->work.pending = false; }
@@ -92,14 +117,18 @@ static void cancel_delayed_work_sync(struct delayed_work *w) { w->work.pending =
 static void mod_delayed_work(int q, struct delayed_work *w, int t)
 { (void)q; (void)t; w->work.pending = true; }
 struct apple_connector { bool connected, edid_invalidation_pending; };
+struct dcp_announce { int ends; };
 struct apple_dcp {
  int external_lock, hpd_mutex;
+ int relink_lock, relink;
  struct { int lock; bool presentation_paused; } iomfb;
  struct { bool connected; void *service; } dptxport[1];
  struct apple_connector *connector;
  struct delayed_work typec_reconnect_wq, placeholder_edid_wq;
  struct work_struct external_stop_work;
  bool external_running, external_stopped, external_power_attempted;
+ bool external_stop_deferred; unsigned int external_stop_retries;
+ struct delayed_work external_stop_retry_wq;
  bool external_cable, typec_cable_connected, typec_crtc_off, pipe_enabled_h17p;
  bool external_physically_absent, external_prepared, placeholder_retried;
  int typec_reconnect_tries;
@@ -107,7 +136,11 @@ struct apple_dcp {
  u64 external_generation, external_rx_generation, external_crtc_generation;
  u64 external_stop_generation, typec_generation;
  int external_error, mode_state; void *avep;
+ struct dcp_announce announce;
+ /* T6030 external processors only; an H17P display is never one. */
+ bool external_native; int external_retries; struct delayed_work external_retry_wq;
 };
+#define atomic_set(p, v) (*(p) = (v))
 struct platform_device { struct apple_dcp *data; };
 static struct apple_dcp *platform_get_drvdata(struct platform_device *p) { return p->data; }
 static int raw_error, raw_links;
@@ -116,7 +149,7 @@ static int dcp_dptx_connect_raw(struct apple_dcp *d, u32 port, bool *waiting)
  if (!raw_error) d->dptxport[0].connected = true;
  return raw_error; }
 static bool dcp_is_typec_output(struct apple_dcp *d) { (void)d; return true; }
-static int dcp_dptx_connect(struct apple_dcp *d, u32 port) { (void)d; (void)port; return 0; }
+static int __attribute__((unused)) dcp_dptx_connect(struct apple_dcp *d, u32 port) { (void)d; (void)port; return 0; }
 #define DPTX_RECONNECT_DELAY 500
 static int settle_error, power_error, hpd_error, release_error;
 static int settles, powers, releases, detaches, notices;
@@ -139,12 +172,14 @@ static void dpavservep_detach(struct apple_dcp *d) { (void)d; detaches++; }
 static void dcp_firmware_metadata_hotplug(struct apple_dcp *d, bool c) { (void)d; (void)c; }
 static void dcp_firmware_metadata_connection(struct apple_dcp *d, u64 g, bool c)
 { (void)d; (void)g; (void)c; }
+static void dcp_firmware_metadata_announced(struct apple_dcp *d) { (void)d; }
+static void dcp_announce_end(struct dcp_announce *a) { a->ends++; }
 static int dcp_external_disconnect(struct apple_dcp *, bool);
 static struct apple_dcp display;
 static void drm_connector_oob_hotplug_event(void *node, int status)
 { assert(node); if (!status) dcp_external_disconnect(&display, true); }
-#define connector_status_disconnected 0
-#define connector_status_connected 1
+enum drm_connector_status { connector_status_disconnected, connector_status_connected,
+ connector_status_unknown };
 '''
     shim = r'''
 enum usb_role { USB_ROLE_NONE, USB_ROLE_HOST, USB_ROLE_DEVICE };
@@ -155,12 +190,29 @@ struct typec_mux_state { void *alt, *data; int mode; };
 struct typec_thunderbolt_switch_data { int state; };
 struct typec_partner_desc { bool usb_pd; int accessory; struct usb_pd_identity *identity; };
 struct cd321x_status { u32 status, data_status, status_changed, data_status_changed, pwr_status;
- struct usb_pd_identity partner_identity; };
+ struct usb_pd_identity partner_identity;
+ bool dp_sid_event,dp_sid_hpd_low,dp_sid_irq;
+ struct { u32 status_rx,configure; } dp_sid_status; };
 struct tps6598x { void *partner, *dev, *port, *psy; int lock; u32 data_status; enum usb_role *role_sw; };
 struct cd321x { struct tps6598x tps; struct cd321x_status update_status;
  struct cd321x_pm_state pm; struct delayed_work update_work, resume_work;
  struct typec_mux_state state; bool state_valid, display_route_active, cur_partner_is_pd;
- struct usb_pd_identity cur_partner_identity; void *connector_fwnode, *tbt_switch; };
+ bool dp_irq_hpd, dp_sink_reported,dp_sid_valid;
+ u32 dp_status,dp_conf; void *port_altmode_dp;
+ struct usb_pd_identity cur_partner_identity; void *connector_fwnode, *tbt_switch, *mux; };
+/* The disconnect/transaction fixtures use the native H17 machine. */
+#define device_is_compatible(dev, name) (!strcmp((name), "apple,sn201202x"))
+#define of_machine_is_compatible(name) (!strcmp((name), "apple,t8140"))
+#define le32_to_cpu(v) (v)
+#define cpu_to_le32(v) (v)
+#ifndef DP_STATUS_HPD_STATE
+#define DP_STATUS_HPD_STATE (1U << 7)
+#endif
+struct typec_displayport_data { u32 status,conf; };
+/* No mux here declares its timeouts transient: every failure is budgeted. */
+static bool typec_mux_timeout_transient(void *m) { (void)m; return false; }
+#define dev_dbg(...) ((void)0)
+#define dev_info(...) ((void)0)
 static int tbt_error, role_error, safe_error, mode_error;
 static int tbts, roles, safes;
 static enum usb_role usb_role_switch_get_role(enum usb_role *r) { return *r; }
@@ -172,6 +224,14 @@ static int typec_set_mode(void *p, int s)
 { (void)p; assert(s == TYPEC_STATE_SAFE); safes++; return safe_error; }
 static int cd321x_typec_update_mode(struct tps6598x *t, struct cd321x_status *s, bool *busy)
 { (void)t; (void)s; *busy = mode_error == -EBUSY; return mode_error; }
+/* SAFE through the driver's own mux handle is the same SAFE request. */
+static int __attribute__((unused)) typec_mux_set(void *m, struct typec_mux_state *s)
+{ (void)m; return typec_set_mode(NULL, s->mode); }
+static int typec_mux_begin(void *m, struct typec_mux_state *s) { (void)m;(void)s;return 0; }
+static bool typec_mux_safe_after_role(void *m) { (void)m;return false; }
+static int typec_mux_apply(void *m) { struct typec_mux_state s={.mode=TYPEC_STATE_SAFE};return typec_mux_set(m,&s); }
+static void typec_mux_abort(void *m) { (void)m; }
+static int typec_mux_end(void *m) { (void)m;return 0; }
 static void typec_unregister_partner(void *p) { (void)p; }
 static void *typec_register_partner(void *p, struct typec_partner_desc *d)
 { (void)p; (void)d; return (void *)1; }
@@ -363,8 +423,547 @@ int main(void)
  printf("%d assertions, %d failures\n", checks, failures); return !!failures;
 }
 '''
-    source = prefix + pm + shim + funcs + tests
+    # The mode update also tells whether a mux held it up.
+    if re.search(r'bool \*display_busy,\s*bool \*held\)', (r / core).read_text()):
+        old = ('static int cd321x_typec_update_mode(struct tps6598x *t, struct cd321x_status *s, bool *busy)\n'
+               '{ (void)t; (void)s; *busy = mode_error == -EBUSY; return mode_error; }')
+        assert shim.count(old) == 1
+        shim = shim.replace(old, 'static int cd321x_typec_update_mode(struct tps6598x *t, struct cd321x_status *s, bool *busy,\n'
+                            ' bool *held)\n'
+                            '{ (void)t; (void)s; *busy = mode_error == -EBUSY; *held = false; return mode_error; }')
+    # Reconnect sessions (TB binding cookies/generations): the raw connect
+    # checks a session, and the Type-C retry goes through
+    # dcp_queue_typec_reconnect().  An H17P external link is sessionless.
+    if SESSION_RAW.search((r / dcp).read_text()):
+        old = ('static int dcp_dptx_connect_raw(struct apple_dcp *d, u32 port, bool *waiting)\n'
+               '{ assert(port == 0); *waiting = false; raw_links++;')
+        assert prefix.count(old) == 1
+        session = (r / 'drivers/gpu/drm/apple/dcp-fabric-session.h').read_text()
+        prefix = prefix.replace(old, block(session, 'struct dcp_fabric_session {') + ';\n'
+            'static int dcp_dptx_connect_raw(struct apple_dcp *d, u32 port, bool *waiting,\n'
+            ' const struct dcp_fabric_session *session, bool cable, bool recovery)\n'
+            '{ assert(port == 0); assert(!session && !cable && !recovery); *waiting = false; raw_links++;')
+        prefix += ('/* Only a Type-C (non-H17P) output queues the session reconnect. */\n'
+                   'static void __attribute__((unused)) dcp_queue_typec_reconnect(struct apple_dcp *d, unsigned long delay)\n'
+                   '{ (void)d; (void)delay; assert(!"Type-C session reconnect for H17P"); }\n')
+    # Shared out-of-band connect also contains the legacy relink branch.
+    # These scenarios are native H17P: reaching that branch is a test failure.
+    if 'dcp_typec_attach_locked(dcp)' in funcs:
+        prefix += r"""
+static void dcp_typec_attach_locked(struct apple_dcp *d)
+{ (void)d; assert(!"legacy Type-C attachment in an H17P scenario"); }
+static int dcp_dptx_connect_attached(struct apple_dcp *d, u32 port)
+{ (void)d; (void)port; assert(!"legacy Type-C connect in an H17P scenario"); return -EINVAL; }
+static void dcp_relink_attach(int *s, u64 generation)
+{ (void)s; (void)generation; assert(!"legacy relink in an H17P scenario"); }
+static void __attribute__((unused)) dcp_relink_link_up(int *s, u64 generation, unsigned long now)
+{ (void)s; (void)generation; (void)now; assert(!"legacy relink timestamp in an H17P scenario"); }
+"""
+    # How long a held mux has been retried is measured on the driver's clock.
+    if 'jiffies_to_msecs(jiffies)' in funcs:
+        shim += ('\nstatic unsigned long jiffies;\n'
+                 'static unsigned jiffies_to_msecs(unsigned long t) { return t; }\n')
+    source = prefix + pm + shim + dp + funcs + tests
     return source
+
+
+SESSION_RAW = re.compile(r'dcp_dptx_connect_raw\([^)]*const struct dcp_fabric_session \*')
+
+def bounce(root):
+    """Fast dock replug: the sink vanishes while the DPTX link trains.
+
+    The physical-disconnect fixture with the actual dcp_dptx_connect_raw()
+    and a firmware model whose link configuration may never arrive and
+    whose requests may fail, be refused or go unanswered.
+    """
+    unit = disconnect(root)
+    dcp = (root / 'drivers/gpu/drm/apple/dcp.c').read_text()
+    m = re.search(r'^static int dcp_dptx_connect_raw\(', dcp, re.M)
+    assert m, 'dcp_dptx_connect_raw'
+    raw = block(dcp, m.start())
+
+    def swap(old, new):
+        nonlocal unit
+        assert unit.count(old) == 1, old
+        unit = unit.replace(old, new)
+
+    swap(' struct { bool connected; void *service; } dptxport[1];',
+         ' struct { bool connected, closed, tile_hint; void *service, *atcphy; int linkcfg_completion; } dptxport[1];\n'
+         ' void *phy, *dev, *active_typec_route;\n'
+         ' int dptx_die, dptx_phy, dptx_dfp_port, connector_type;\n'
+         ' bool external, external_link_ready, crashed;\n'
+         ' bool typec_work_enabled; int fw_compat; struct { bool fw_14_7_endpoints; } hw;\n'
+         ' struct { bool active; } split;')
+    old_raw = unit[unit.index('static int dcp_dptx_connect_raw('):]
+    old_raw = old_raw[:old_raw.index('return raw_error; }') + len('return raw_error; }')]
+    sessions = bool(SESSION_RAW.search(dcp))
+    swap(old_raw, 'static int dcp_dptx_connect_raw(struct apple_dcp *, u32, bool *' +
+         (', const struct dcp_fabric_session *, bool, bool' if sessions else '') + ');')
+    swap('static int dptxport_set_hpd(void *p, bool on)\n{ (void)p; assert(!on); return hpd_error; }',
+         'static bool fw_hpd, fw_display, link_trains;\n'
+         'static int hpd_drops, connects, release_error_once, assert_error;\n'
+         '/* A request that times out may still be carried out; a refused one is not. */\n'
+         'static int dptxport_set_hpd(void *p, bool on)\n'
+         '{ (void)p; if (on) { fw_hpd |= assert_error != -EINVAL; return assert_error; }\n'
+         ' hpd_drops++; if (hpd_error) return hpd_error; fw_hpd = false; return 0; }')
+    swap('static int dptxport_release_display(void *p)\n{ (void)p; releases++; return release_error; }',
+         'static int dptxport_release_display(void *p)\n'
+         '{ (void)p; releases++; if (release_error) return release_error;\n'
+         ' if (release_error_once) { int r = release_error_once; release_error_once = 0; return r; }\n'
+         ' fw_display = false; return 0; }')
+    swap('int main(void)\n{', 'static int __attribute__((unused)) prior_main(void)\n{')
+    firmware = r'''
+typedef uint8_t u8;
+#define dev_dbg(...) ((void)0)
+#define dev_info(...) ((void)0)
+#define DRM_MODE_CONNECTOR_DisplayPort 10
+#define DCP_FIRMWARE_H17P 17
+#define DPTX_CONNECT_TIMEOUT 2000
+#define DPTX_TUNNEL_CONNECT_TIMEOUT 8000
+static void mutex_lock(int *m) { (void)m; }
+static void mutex_unlock(int *m) { (void)m; }
+static bool dcp_is_usb4_output(struct apple_dcp *d) { (void)d; return false; }
+static bool apple_dp_tunnel_t602x(void) { return false; }
+static void reinit_completion(int *c) { *c = 0; }
+/* The firmware configures the link only while a sink answers it. */
+static unsigned long wait_for_completion_timeout(int *c, unsigned long t)
+{ if (link_trains) *c = 1; return *c ? t : 0; }
+static unsigned jiffies_to_msecs(unsigned long t) { return t; }
+static void usleep_range(int a, int b) { (void)a; (void)b; }
+static void av_service_connect(struct apple_dcp *d) { (void)d; }
+static int validate_error, connect_error, request_error;
+static int dptxport_validate_connection(void *s, int core, int atc, int die)
+{ (void)s; (void)core; (void)atc; (void)die; return validate_error; }
+static int dptxport_connect(void *s, int core, int atc, int die, bool typec)
+{ (void)s; (void)core; (void)atc; (void)die; (void)typec; connects++; return connect_error; }
+static int dptxport_request_display(void *s)
+{ (void)s; fw_display |= request_error != -EINVAL; return request_error; }
+static int dptxport_set_hpd_timeout(void *s, bool on, int t) { (void)t; return dptxport_set_hpd(s, on); }
+/* The pre-split condition: neither a USB4 output nor a T602X tunnel machine here. */
+static bool dcp_uses_t6020_tunnel_flow(struct apple_dcp *d) { return dcp_is_usb4_output(d) && apple_dp_tunnel_t602x(); }
+/* An H17P display is not a T6030 dcpext (dcp->external): no scanout to fault or restore. */
+#define smp_store_release(p, v) (*(p) = (v))
+static bool dcpext_scanout_terminal(struct apple_dcp *d) { (void)d; return false; }
+static void dcpext_scanout_link_restored(struct apple_dcp *d) { (void)d; assert(!"T6030 dcpext path in an H17P scenario"); }
+static bool iomfb_v14_7_external_ready(struct apple_dcp *d) { (void)d; assert(!"T6030 external processor in an H17P scenario"); return false; }
+static int iomfb_v14_7_external_open(struct apple_dcp *d) { (void)d; assert(!"T6030 external processor in an H17P scenario"); return -ENODEV; }
+'''
+    tests = r'''
+static struct platform_device device = { .data = &display };
+/* The session the dock leaves behind after its plug-time route bounce. */
+static void bounced(void)
+{
+ init(); display.phy = (void *)1; fw_hpd = fw_display = true;
+ release_error_once = 0; link_trains = true;
+ CHECK(dcp_external_disconnect(&display, true) == 0);
+ CHECK(display.external_stopped && !display.dptxport[0].connected && !display.external_error);
+ connects = hpd_drops = 0;
+ validate_error = connect_error = request_error = assert_error = 0;
+}
+/* The failure stays latched across the unplug, and the next plug is refused. */
+static void stays_latched(int error)
+{
+ int before;
+
+ validate_error = connect_error = request_error = assert_error = 0;
+ hpd_error = release_error = 0;
+ CHECK(display.external_error == error);
+ CHECK(dcp_external_disconnect(&display, true) == error);
+ CHECK(display.external_error == error);
+ before = connects; link_trains = true;
+ CHECK(dcp_dptx_connect_oob(&device, 0) == error && connects == before);
+}
+int main(void)
+{
+ /* The route comes back while the sink no longer answers: withdrawn, not latched. */
+ bounced(); link_trains = false;
+ CHECK(dcp_dptx_connect_oob(&device, 0) == -ETIMEDOUT);
+ CHECK(!display.external_error && !display.dptxport[0].connected);
+ CHECK(!fw_hpd && !fw_display && hpd_drops == 1);
+ /* tipd's own OOB connect after the mux tries again rather than refusing. */
+ CHECK(dcp_dptx_connect_oob(&device, 0) == -ETIMEDOUT && connects == 2);
+ /* The unplug's teardown (OOB disconnect, then SAFE) succeeds. */
+ CHECK(dcp_external_disconnect(&display, true) == 0 && !display.external_error);
+ /* The next plug connects: the display recovers without a reboot. */
+ link_trains = true;
+ CHECK(dcp_dptx_connect_oob(&device, 0) == 0);
+ CHECK(display.dptxport[0].connected && fw_hpd && fw_display && connects == 3);
+ printf("case withdrawn-link complete\n");
+
+ /*
+  * The firmware does not acknowledge the withdrawal: HPD low or the release
+  * times out, or HPD low gets an incomplete reply.  The session stays held.
+  */
+ for (int which = 0; which < 3; which++) {
+  bounced(); link_trains = false;
+  if (which == 0) hpd_error = -ETIMEDOUT;
+  if (which == 1) release_error_once = -ETIMEDOUT;
+  if (which == 2) hpd_error = -EPROTO;
+  CHECK(dcp_dptx_connect_oob(&device, 0) == -ETIMEDOUT);
+  CHECK(display.external_error == -ETIMEDOUT && display.dptxport[0].connected);
+  stays_latched(-ETIMEDOUT);
+ }
+ printf("case unacknowledged-withdrawal complete\n");
+
+ /*
+  * A request goes unanswered, so the firmware may still carry it out, with
+  * its cleanup failing as well or not, on a session that never powered its
+  * pipe or that stopped it before.  A port no longer marked connected is no
+  * proof that the firmware let go of it: the failure stays latched.
+  */
+ for (int fault = 0; fault < 4; fault++)
+  for (int cleanup = 0; cleanup < 2; cleanup++)
+   for (int stopped = 0; stopped < 2; stopped++) {
+    bounced();
+    if (!stopped)
+     display.external_power_attempted = display.external_stopped = false;
+    if (fault == 0) validate_error = -ETIMEDOUT;
+    if (fault == 1) connect_error = -ETIMEDOUT;
+    if (fault == 2) request_error = -ETIMEDOUT;
+    if (fault == 3) assert_error = -ETIMEDOUT;
+    if (cleanup) release_error = -ETIMEDOUT;
+    CHECK(dcp_dptx_connect_oob(&device, 0) == -ETIMEDOUT);
+    stays_latched(-ETIMEDOUT);
+   }
+ printf("case unanswered-request complete\n");
+
+ /* A request the firmware refuses is latched as before, released display or not. */
+ for (int fault = 0; fault < 2; fault++) {
+  bounced();
+  if (fault == 0) request_error = -EINVAL;
+  if (fault == 1) assert_error = -EINVAL;
+  CHECK(dcp_dptx_connect_oob(&device, 0) == -EINVAL);
+  CHECK(!display.dptxport[0].connected);
+  stays_latched(-EINVAL);
+ }
+ printf("case refused-request complete\n");
+
+ /* A live failure (powered pipe never acknowledged off) still holds everything. */
+ init(); display.phy = (void *)1; power_error = -ETIMEDOUT; connects = 0;
+ CHECK(dcp_external_disconnect(&display, true) == -ETIMEDOUT);
+ power_error = 0;
+ CHECK(dcp_external_disconnect(&display, true) == -ETIMEDOUT);
+ CHECK(display.external_error == -ETIMEDOUT && display.pipe_enabled_h17p);
+ CHECK(dcp_dptx_connect_oob(&device, 0) == -ETIMEDOUT && connects == 0);
+ printf("case live-failure complete\n");
+
+ printf("%d assertions, %d failures\n", checks, failures); return !!failures;
+}
+'''
+    if sessions:
+        # Not a T8122 dcpext (fw_compat UNKNOWN); the session checks are real.
+        firmware += ('#define DCP_FIRMWARE_V_14_7_TEMPLATE 4\n' + internal_inline(root, 'dcp_ext_dptx_607') +
+                     'struct dcp_fabric_session;\n'
+                     'static bool dcp_session_valid_locked(struct apple_dcp *d, struct dcp_fabric_session s, bool cable);\n'
+                     'static bool __attribute__((unused)) dcp_hdmi_port_attached(struct apple_dcp *d)\n'
+                     '{ (void)d; assert(!"T6030 external HDMI port in an H17P scenario"); return false; }\n' +
+                     apple_function(root, 'dcp_connect_session_valid_locked') +
+                     apple_function(root, 'dcp_connect_session_valid') +
+                     '/* Never reached: the H17P external link passes no session. */\n'
+                     'static bool dcp_session_valid_locked(struct apple_dcp *d, struct dcp_fabric_session s, bool cable)\n'
+                     '{ (void)d; (void)s; (void)cable; assert(!"session check for a sessionless link"); return false; }\n')
+    if 'static unsigned long jiffies;' not in unit:
+        firmware += '\nstatic unsigned long jiffies;\n'
+    # unless the update work already needed the clock
+    clock = 'static unsigned jiffies_to_msecs(unsigned long t) { return t; }\n'
+    if clock in unit:
+        firmware = firmware.replace(clock, '')
+    return unit + firmware + raw + '\n' + tests
+
+
+def poweroff_replug(root):
+    """An old disconnect's CRTC-off must not release a replacement link."""
+    poweroff = apple_function(root, 'dcp_poweroff')
+    assert poweroff, 'dcp_poweroff'
+    iomfb = (root / 'drivers/gpu/drm/apple/iomfb.c').read_text()
+    modeset = block(iomfb, iomfb.index('int dcp_crtc_atomic_modeset('))
+    assert 'dcp->crtc_unplugs = dcp->typec_unplugs;' in modeset
+
+    return r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <errno.h>
+typedef uint32_t u32; typedef uint64_t u64;
+#define READ_ONCE(x) (x)
+#define WRITE_ONCE(x, v) ((x) = (v))
+#define guard(x) fake_guard
+#define fake_guard(x) ((void)(x))
+#define scoped_guard(x, y) for (int once = ((void)(y), 1); once; once = 0)
+#define dev_dbg(...) ((void)0)
+#define dev_warn(...) ((void)0)
+#define dev_err(...) ((void)0)
+struct delayed_work { bool pending; };
+struct completion { int done; };
+struct apple_connector { bool connected; };
+struct dptx_port { bool enabled, connected, available; void *service; };
+struct apple_dcp {
+ void *dev, *avep, *hdmi_hpd;
+ int external_lock, hpd_mutex;
+ struct delayed_work typec_reconnect_wq, placeholder_edid_wq, swap_watchdog_wq;
+ struct completion typec_iomfb_hpd_ready;
+ struct dptx_port dptxport[2];
+ struct apple_connector *connector;
+ struct { bool active; } split;
+ bool external_h17p, external_stop_deferred, soft_dpms, typec_output;
+ bool typec_cable_connected, typec_crtc_off, external_native;
+ u64 external_crtc_generation, typec_unplugs, crtc_unplugs;
+};
+struct platform_device { struct apple_dcp *data; };
+static struct apple_dcp *platform_get_drvdata(struct platform_device *p) { return p->data; }
+static int poweroffs, hpd_drops, disconnects, retries, av_disconnects;
+static void cancel_delayed_work_sync(struct delayed_work *w) { w->pending = false; }
+static void cancel_delayed_work(struct delayed_work *w) { w->pending = false; }
+static bool dcp_is_external_h17p(struct apple_dcp *d) { return d->external_h17p; }
+static int dcp_external_stop_locked(struct apple_dcp *d, u64 generation)
+{ (void)d; (void)generation; return 0; }
+static void dcp_external_crtc_released(struct apple_dcp *d) { (void)d; }
+static bool dcp_uses_soft_dpms(struct apple_dcp *d) { return d->soft_dpms; }
+static int dcp_backlight_dpms(struct apple_dcp *d, bool on)
+{ (void)d; (void)on; return 0; }
+static void av_service_disconnect(struct apple_dcp *d)
+{ (void)d; av_disconnects++; }
+static bool dcp_is_typec_output(struct apple_dcp *d) { return d->typec_output; }
+static void _dcp_poweroff(struct apple_dcp *d) { (void)d; poweroffs++; }
+static void reinit_completion(struct completion *c) { c->done = 0; }
+static bool dptx_service_available(struct dptx_port *p) { return p->available; }
+static int dptxport_set_hpd(void *service, bool on)
+{ (void)service; assert(!on); hpd_drops++; return 0; }
+static int dcp_dptx_disconnect(struct apple_dcp *d, u32 port)
+{ disconnects++; d->dptxport[port].connected = false; return 0; }
+static void dcp_external_retry(struct apple_dcp *d, const char *why, int error, int delay)
+{ (void)d; (void)why; (void)error; (void)delay; retries++; }
+static bool gpiod_get_value_cansleep(void *gpio) { (void)gpio; return false; }
+static void disconnected_hpd_event(struct apple_connector *connector) { (void)connector; }
+''' + poweroff + r'''
+static struct apple_dcp dcp;
+static struct apple_connector connector;
+static struct platform_device pdev = { .data = &dcp };
+static void init(u64 released, u64 claimed)
+{
+ dcp = (struct apple_dcp){
+  .typec_output = true, .typec_cable_connected = true,
+  .typec_unplugs = released, .crtc_unplugs = claimed,
+  .connector = &connector,
+ };
+ dcp.dptxport[0].available = dcp.dptxport[0].connected = true;
+ dcp.typec_reconnect_wq.pending = true;
+ connector.connected = true;
+ poweroffs = hpd_drops = disconnects = retries = av_disconnects = 0;
+}
+int main(void)
+{
+ /* M1/M2: the old sink left and a replacement link is already starting. */
+ init(4, 3); dcp_poweroff(&pdev);
+ assert(poweroffs == 1 && av_disconnects == 0);
+ assert(hpd_drops == 0 && disconnects == 0 && retries == 0);
+ assert(dcp.dptxport[0].connected && dcp.typec_reconnect_wq.pending);
+ assert(!dcp.typec_crtc_off);
+
+ /* Ordinary DPMS of the session the CRTC owns still releases that link. */
+ init(4, 4); dcp_poweroff(&pdev);
+ assert(poweroffs == 1 && hpd_drops == 1 && disconnects == 1);
+ assert(!dcp.dptxport[0].connected && !dcp.typec_reconnect_wq.pending);
+ assert(dcp.typec_crtc_off);
+
+ /* A successful replacement modeset refreshes the token before later DPMS. */
+ init(5, 4); dcp.crtc_unplugs = dcp.typec_unplugs; dcp_poweroff(&pdev);
+ assert(poweroffs == 1 && hpd_drops == 1 && disconnects == 1);
+ puts("stale CRTC power-off ownership passed");
+ return 0;
+}
+'''
+
+def dropped(root):
+    """A dock leaves during the first mode set, and the next swap is dropped.
+
+    The physical-disconnect fixture with tipd's actual update and retry work
+    and the actual external stop, against an IOMFB queue that a dropped
+    present keeps busy until the swap watchdog retires it, or until the
+    transaction timeout declares the coprocessor crashed.  Time is the
+    queue's own clock, advanced by the waits of the stop and of tipd.
+    """
+    unit = disconnect(root)
+    dcp = (root / 'drivers/gpu/drm/apple/dcp.c').read_text()
+    extra = block(dcp, dcp.index('static int dcp_external_start_locked('))
+    # Without a retry of its own, a deferred stop of a CRTC that is off waits.
+    retry = 'static void dcp_external_stop_retry('
+    extra += '\n' + (block(dcp, dcp.index(retry)) if retry in dcp else
+                      retry + 'struct work_struct *work) { (void)work; }')
+
+    def swap(old, new):
+        nonlocal unit
+        assert unit.count(old) == 1, old
+        unit = unit.replace(old, new)
+
+    swap('static int iomfb_queue_settle(struct apple_dcp *d, int t)\n'
+         '{ (void)d; (void)t; settles++; return settle_error; }',
+         '/* Milliseconds since the firmware accepted the dropped present. */\n'
+         'static int now, retire_at, crash_at, after_power_error;\n'
+         'static bool pending, crashed, powered;\n'
+         'static int iomfb_queue_settle(struct apple_dcp *d, int t)\n'
+         '{ (void)d; settles++; if (settle_error) return settle_error;\n'
+         ' if (powered) { powered = false; if (after_power_error) return after_power_error; }\n'
+         ' if (pending && retire_at >= 0 && now + t >= retire_at) {\n'
+         '  if (now < retire_at) now = retire_at; pending = false; }\n'
+         ' if (pending && now + t >= crash_at) { if (now < crash_at) now = crash_at; crashed = true; }\n'
+         ' if (crashed) return -EIO;\n'
+         ' if (pending) { now += t; return -ETIMEDOUT; }\n'
+         ' return 0; }')
+    swap('static int iomfb_external_power_h17p(struct apple_dcp *d, bool on)\n'
+         '{ (void)d; assert(!on); powers++; return power_error; }',
+         'static int iomfb_external_power_h17p(struct apple_dcp *d, bool on)\n'
+         '{ (void)d; if (on) { power_ons++; return 0; }\n'
+         ' assert(!pending); powers++; powered = !power_error; return power_error; }')
+    swap('static int settle_error,', 'static int power_ons, settle_error,')
+    # The H17P branch of dcp_typec_route_prepare(), which quiesce-before-safe
+    # runs for real inside typec_mux_set().
+    swap('static int typec_set_mode(void *p, int s)\n'
+         '{ (void)p; assert(s == TYPEC_STATE_SAFE); safes++; return safe_error; }',
+         'static int phy_safes;\n'
+         'static int typec_set_mode(void *p, int s)\n'
+         '{ int r; (void)p; assert(s == TYPEC_STATE_SAFE); safes++;\n'
+         ' if (display.external_error) return display.external_error;\n'
+         ' if (display.external_cable || !display.external_stopped || display.dptxport[0].connected) {\n'
+         '  r = dcp_external_disconnect(&display, true); if (r) return r; }\n'
+         ' phy_safes++; return 0; }')
+    swap('int main(void)\n{', 'static int __attribute__((unused)) prior_main(void)\n{')
+    tests = r'''
+static struct platform_device device = { .data = &display };
+/* The dock has left; the firmware accepted a present it will not complete. */
+static void left(int retire)
+{
+ init(); now = 0; retire_at = retire; crash_at = 10000; after_power_error = 0;
+ pending = true; crashed = powered = false; phy_safes = power_ons = 0;
+}
+/* tipd's revalidation of the cable after its debounce, as resume_work. */
+static bool revalidate(void)
+{
+ now += CD321X_DEBOUNCE_DELAY_MS;
+ if (!cd321x_pm_begin_read(&port.pm)) return false;
+ cd321x_pm_snapshot_ready(&port.pm); cd321x_update_work(&port.update_work.work);
+ return true;
+}
+/* Nothing of the session has been released, and nothing was sent. */
+static void owned(void)
+{
+ CHECK(!display.external_stopped && display.dptxport[0].connected);
+ CHECK(display.pipe_enabled_h17p && !display.typec_crtc_off);
+ CHECK(display.iomfb.presentation_paused && !display.external_running);
+ CHECK(powers == 0 && releases == 0 && phy_safes == 0);
+}
+int main(void)
+{
+ /*
+  * The capture: tipd's out-of-band disconnect and then its SAFE stop the
+  * session while the dropped present is in flight.  Each settle times out
+  * after 500 ms, before the power-off is sent: not latched.  The watchdog
+  * retires the present, and tipd's next revalidation stops the session and
+  * reaches the PHY.
+  */
+ left(1500);
+ cd321x_update_work(&port.update_work.work);
+ CHECK(safes == 1 && settles == 2 && now == 1000);
+ CHECK(!display.external_error && !display.external_cable && !sink.connected);
+ owned();
+ CHECK(port.pm.phase == CD321X_PM_REVALIDATE && !port.state_valid);
+ CHECK(revalidate());
+ CHECK(safes == 2 && phy_safes == 1 && powers == 1 && releases == 1);
+ CHECK(!display.external_error && display.external_stopped);
+ CHECK(!display.dptxport[0].connected && !display.pipe_enabled_h17p && display.typec_crtc_off);
+ CHECK(port.state_valid && port.pm.phase == CD321X_PM_RUNNING);
+ /* The next plug connects. */
+ CHECK(dcp_dptx_connect_oob(&device, 0) == 0);
+ CHECK(display.dptxport[0].connected && display.external_cable && !display.external_error);
+ printf("case captured complete\n");
+
+ /* The watchdog retires the present during the retry's settle. */
+ left(1900);
+ cd321x_update_work(&port.update_work.work);
+ CHECK(!display.external_error); owned();
+ CHECK(revalidate() && phy_safes == 1 && display.external_stopped && now == 1900);
+ printf("case retired-during-retry complete\n");
+
+ /*
+  * Nothing retires the present.  The stop is retried within tipd's budget
+  * and the session stays owned throughout; once the transaction timeout
+  * declares the coprocessor crashed, the stop latches and the next plug is
+  * refused: the protected case.
+  */
+ left(-1);
+ cd321x_update_work(&port.update_work.work);
+ while (revalidate())
+  ;
+ CHECK(safes == 1 + CD321X_RESUME_ATTEMPTS && port.pm.phase == CD321X_PM_STALE);
+ CHECK(!display.external_error); owned();
+ now = 12000;
+ CHECK(cd321x_pm_event(&port.pm) && revalidate());
+ CHECK(display.external_error == -EIO); owned();
+ CHECK(dcp_dptx_connect_oob(&device, 0) == -EIO && raw_links == 0);
+ printf("case never-retired complete\n");
+
+ /* A settle after the power-off was sent still latches and holds. */
+ left(0); pending = false; after_power_error = -ETIMEDOUT;
+ cd321x_update_work(&port.update_work.work);
+ CHECK(powers == 1 && display.external_error == -ETIMEDOUT);
+ CHECK(display.dptxport[0].connected && display.pipe_enabled_h17p && !display.external_stopped);
+ CHECK(revalidate() && phy_safes == 0 && powers == 1 && releases == 0);
+ printf("case after-power-off complete\n");
+
+ /* A crashed or stopped queue is no proof that DMA stopped: latched. */
+ left(1000); settle_error = -EIO;
+ cd321x_update_work(&port.update_work.work);
+ CHECK(display.external_error == -EIO); settle_error = 0;
+ CHECK(revalidate() && phy_safes == 0 && powers == 0);
+ printf("case crashed-queue complete\n");
+
+ /* The same deferral for a CRTC switched off on the same cable. */
+ left(1000);
+ CHECK(dcp_external_disconnect(&display, false) == -ETIMEDOUT);
+ CHECK(!display.external_error && display.external_cable); owned();
+ now = 1000;
+ CHECK(dcp_external_disconnect(&display, false) == 0 && display.external_stopped && powers == 1);
+ printf("case crtc-off complete\n");
+
+ /* Nothing else retries a CRTC that is off: the stop retries itself, bounded. */
+ left(1000);
+ CHECK(dcp_external_disconnect(&display, false) == -ETIMEDOUT);
+ CHECK(display.external_stop_deferred && display.external_stop_retry_wq.work.pending);
+ now = 1000; display.external_stop_retry_wq.work.pending = false;
+ dcp_external_stop_retry(&display.external_stop_retry_wq.work);
+ CHECK(display.external_stopped && !display.external_stop_deferred && powers == 1);
+ CHECK(!display.external_stop_retry_wq.work.pending && !display.external_stop_retries);
+ left(-1); crash_at = 1 << 30;
+ for (int i = 0; i <= DCP_EXTERNAL_STOP_RETRIES; i++) {
+  display.external_stop_retry_wq.work.pending = false;
+  dcp_external_stop_retry(&display.external_stop_retry_wq.work);
+  if (!i) CHECK(dcp_external_disconnect(&display, false) == -ETIMEDOUT);
+ }
+ CHECK(!display.external_stop_retry_wq.work.pending && !display.external_error); owned();
+ printf("case stop-retry complete\n");
+
+ /*
+  * The CRTC is enabled again on the same cable before any stop went
+  * through: the pipe was never powered off, so it is resumed, not powered
+  * on a second time.
+  */
+ left(1000);
+ CHECK(dcp_external_disconnect(&display, false) == -ETIMEDOUT); owned();
+ CHECK(dcp_external_start_locked(&display) == 0);
+ CHECK(power_ons == 0 && powers == 0 && display.external_running);
+ CHECK(!display.iomfb.presentation_paused && !display.external_stop_deferred);
+ CHECK(display.pipe_enabled_h17p && display.dptxport[0].connected);
+ /* Once the cable is gone, the deferred session is not resumed. */
+ left(1000);
+ CHECK(dcp_external_disconnect(&display, true) == -ETIMEDOUT);
+ CHECK(dcp_external_start_locked(&display) == -ENODEV && power_ons == 0); owned();
+ printf("case enable-after-deferral complete\n");
+
+ printf("%d assertions, %d failures\n", checks, failures); return !!failures;
+}
+'''
+    return unit + extra + '\n' + tests
 
 def teardown(root):
 
@@ -382,11 +981,11 @@ def teardown(root):
         s = files[n]
         normalized = n == 'atc' and name == 'atcphy_mux_set' and 'static int atcphy_mux_set_locked(' in s
         if normalized:
-            name = 'atcphy_mux_set_locked'
-        m = re.search(r'^(?:static [^\n]*\b|(?:int|void) )' + name + r'\(', s, re.M)
+            return atc_mux_without_pm(s)
+        m = re.search(r'^(?:static [^\n]*\b|(?:int|void) )' + name + r'\([^;{}]*\)\s*\{', s, re.M)
         assert m, (n, name)
         result = block(s, m.start())
-        return result.replace('atcphy_mux_set_locked(', 'atcphy_mux_set(', 1) if normalized else result
+        return result
 
     decls = []
     for name in ('atcphy_generation', 'atcphy_lane_mode', 'atcphy_pipehandler_state', 'atcphy_mode', 'atcphy_dp_link_rate'):
@@ -408,12 +1007,13 @@ def teardown(root):
                 'atcphy_configure_pipehandler_usb3_host_t8103',
                 'atcphy_configure_pipehandler_usb3_host_t8122',
                 'atcphy_configure_pipehandler_usb3', 'atcphy_configure_pipehandler_usb4',
-                'atcphy_enable_dummy_phy', 'atcphy_configure_pipehandler_dummy',
+                'atcphy_enable_dummy_phy', 'atcphy_pipe_live', 'atcphy_needs_dummy_phy', 'atcphy_configure_pipehandler_dummy',
                 'atcphy_configure_pipehandler', 'atcphy_park_pipehandler',
                 'atcphy_get_mode_config', 'atcphy_dp_configure',
                 'j700_field_update', 'j700_aux_disable', 'atcphy_disable_dp_aux',
-                'atcphy_power_off', 'atcphy_power_on', 'atcphy_configure', 'atcphy_usb2_init', 'atcphy_usb3_power_off',
-                'atcphy_usb3_set_mode', 'atcphy_usb2_power_off',
+                'atcphy_power_off', 'atcphy_power_on', *ATC_POST_TUNABLE, 'atcphy_configure', 'atcphy_restore_after_pd_off',
+                'atcphy_usb2_init', 'atcphy_usb3_power_off',
+                'atcphy_usb3_route', 'atcphy_usb3_set_mode', 'atcphy_usb2_power_off',
                 '_atcphy_dwc3_reset_assert', 'atcphy_dwc3_reset_assert', 'atcphy_mux_set'),
         'phy': ('phy_init', 'phy_exit', 'phy_power_on', 'phy_power_off'),
         'core': ('dwc3_phy_power_on', 'dwc3_phy_power_off', 'dwc3_phy_exit', 'dwc3_core_exit'),
@@ -472,6 +1072,8 @@ def profile(root):
     headers = "\n".join(line for name in ("dcp-external-bw.h", "dcp-link.h")
                         for line in (base / name).read_text().splitlines()
                         if not line.startswith("#include"))
+    # Header inline helpers this unit does not call are unused, as in a header.
+    headers = headers.replace("static inline ", "static inline __attribute__((unused)) ")
     prefix = r'''
 #include <assert.h>
 #include <stdbool.h>
@@ -481,6 +1083,16 @@ def profile(root):
 #include <errno.h>
 typedef uint32_t u32; typedef uint64_t u64;
 typedef uint32_t __le32; typedef uint64_t __le64;
+/* dcp-link.h also carries the T6030 14.7 DCPLink transport encoders. */
+typedef uint8_t u8; typedef uint16_t u16;
+#define le64_to_cpu(v) (v)
+#define BIT_ULL(n) (1ULL << (n))
+#define GENMASK_ULL(h, l) ((~0ULL >> (63 - (h))) & (~0ULL << (l)))
+#define FIELD_GET(m, v) ((__typeof__(m))(((v) & (m)) >> __builtin_ctzll(m)))
+#define FIELD_PREP(m, v) (((__typeof__(m))(v) << __builtin_ctzll(m)) & (m))
+#define check_add_overflow(a, b, d) __builtin_add_overflow(a, b, d)
+#define is_power_of_2(n) ((n) != 0 && (((n) & ((n) - 1)) == 0))
+#define U16_MAX UINT16_MAX
 #define __packed __attribute__((packed))
 #undef static_assert
 #define static_assert(condition, ...) _Static_assert(condition, "wire layout")
@@ -607,6 +1219,7 @@ typedef uint32_t __le32;
 #define trace_iomfb_callback(d, t, n) ((void)(d), (void)(t))
 #define dev_err(...) ((void)0)
 #define dev_warn_once(...) ((void)0)
+#define dev_info_once(...) ((void)0)
 struct device_node { bool internal, external, present; int length; };
 struct device { struct device_node *of_node; };
 struct apple_dcp { struct { int iomfb_method_profile; } hw; struct device *dev; bool crashed; };
@@ -703,16 +1316,29 @@ def readiness(root):
 
     # This slice is the production probe's publication boundary, including its
     # failure exits and prepared-before-component_add ordering, not a copied model.
-    probe = function(dcp, 'static int dcp_platform_probe(')
+    # The T8122 dcpext wrapper moved the pipe's probe into dcp_platform_probe_pipe().
+    probe = function(dcp, 'static int dcp_platform_probe_pipe(' if 'static int dcp_platform_probe_pipe(' in dcp
+                     else 'static int dcp_platform_probe(')
     publish = probe[probe.rindex('\tif (dcp->hw.iomfb_method_profile ==\n\t    DCP_IOMFB_METHODS_H17P_EXTERNAL) {'):]
+    # Which processor must come up before the boot framebuffer is taken over.
+    header = root / 'drivers/gpu/drm/apple/apple_boot_display.h'
+    boot_display = ''
+    if header.exists():
+        text = header.read_text()
+        boot_display = text[text.index('enum apple_boot_display_class {'):text.rindex('#endif')]
     production = '\n'.join((
         function(dcp, 'bool dcp_h17p_external_supported('),
         function(dcp, 'bool dcp_h17p_external_ready('),
+        # A failed T8122 dcpext stays bound without a pipeline; none fails here.
+        apple_function(root, 'dcp_ext_unusable'),
         function(drm, 'static bool apple_dcp_usable('),
         function(drm, 'static int add_dcp_components('),
+        boot_display,
         function(drm, 'static int apple_drm_init_dcp('),
         'static int publish_provider(struct platform_device *pdev, struct apple_dcp *dcp)\n'
-        '{\n\tstruct device *dev = &pdev->dev;\n\tint ret;\n' + publish,
+        '{\n\tstruct device *dev = &pdev->dev;\n\tint ret;\n'
+        # Type-C route registration, earlier in probe, succeeded here.
+        + ('\tbool routes_failed = false;\n' if 'routes_failed' in publish else '') + publish,
     ))
     prefix = r'''
 #include <assert.h>
@@ -730,6 +1356,12 @@ typedef uint64_t u64;
 #define DL_FLAG_AUTOREMOVE_SUPPLIER 0
 #define DCP_IOMFB_METHODS_H17P_EXTERNAL 2
 #define dev_warn(...) ((void)0)
+#define dev_err(...) ((void)0)
+#define max(a, b) ((a) > (b) ? (a) : (b))
+#define DRM_MODE_CONNECTOR_DisplayPort 10
+#define DRM_MODE_CONNECTOR_HDMIA 11
+#define DRM_MODE_CONNECTOR_eDP 14
+#define DRM_MODE_CONNECTOR_USB 20
 #define msleep(x) ((void)(x))
 #define component_compare_of 0
 #define apple_dcp_id_tbl 0
@@ -737,10 +1369,26 @@ static int dcp_comp_ops;
 struct device_node { bool available, external, phys; unsigned int index; u32 firmware[3], compat[3]; int firmware_cells, compat_cells; };
 struct device { struct device_node *of_node; void *data; };
 struct platform_device { struct device dev; bool bound, registered; };
+/* The native T6030 14.7 backend is never selected in these scenarios. */
+enum dcp_firmware_version { DCP_FIRMWARE_UNKNOWN, DCP_FIRMWARE_V_14_7, DCP_FIRMWARE_V_14_7_TEMPLATE, DCP_FIRMWARE_V_26_6 };
 struct apple_dcp {
-    bool external_prepared, quiescing, crashed;
+    bool external_prepared, quiescing, crashed, external_native, ext_dead;
+    enum dcp_firmware_version fw_compat;
     struct { int iomfb_method_profile; } hw;
 };
+static void __attribute__((unused)) iomfb_v14_7_remove(struct apple_dcp *d)
+{ (void)d; assert(!"14.7 backend on a non-14.7 DCP"); }
+/* Nor the J613 26.6 backend. */
+static void __attribute__((unused)) iomfb_v26_6_unbind(struct apple_dcp *d)
+{ (void)d; assert(!"26.6 backend on a non-26.6 DCP"); }
+/* No node here is a T6030 dcpext, so no native external processor. */
+struct device_node;
+static bool __attribute__((unused)) dcp_t6030_ext_native(const struct device_node *n)
+{ (void)n; assert(!"T6030 dcpext in a J700 scenario"); return false; }
+static int __attribute__((unused)) iomfb_v14_7_external_prepare(struct apple_dcp *d)
+{ (void)d; assert(!"T6030 external processor in a J700 scenario"); return -ENODEV; }
+static void __attribute__((unused)) iomfb_v14_7_external_refuse(struct apple_dcp *d, const char *why)
+{ (void)d; (void)why; assert(!"T6030 external processor in a J700 scenario"); }
 struct drm_device { int unused; };
 struct drm_encoder { int unused; };
 struct apple_drm_private { struct drm_device drm; };
@@ -809,9 +1457,14 @@ static int apple_probe_per_dcp(struct device *d, struct drm_device *drm,
 static int apple_probe_typec_ports(struct drm_device *d, struct platform_device **p,
                                   u32 *masks, int count)
 { (void)d; (void)p; (void)masks; (void)count; return 0; }
-static int dcp_start(struct platform_device *p) { (void)p; return 0; }
+/* The internal processor drives the panel; the J700 dcpext is Type-C. */
+static int start_error[2], ready_error[2], starts[2], waits[2];
+static int dcp_get_connector_type(struct platform_device *p)
+{ return p->dev.of_node->external ? DRM_MODE_CONNECTOR_USB : DRM_MODE_CONNECTOR_eDP; }
+static int dcp_start(struct platform_device *p)
+{ starts[p->dev.of_node->index]++; return start_error[p->dev.of_node->index]; }
 static int dcp_wait_ready(struct platform_device *p, u64 timeout)
-{ (void)p; (void)timeout; return 0; }
+{ (void)timeout; waits[p->dev.of_node->index]++; return ready_error[p->dev.of_node->index]; }
 static u64 get_jiffies_64(void) { return 0; }
 static u64 msecs_to_jiffies(unsigned int ms) { return ms; }
 static bool time_after_eq64(u64 a, u64 b) { return a >= b; }
@@ -845,6 +1498,10 @@ static void initial(bool supported_firmware)
     memset(dcps, 0, sizeof(dcps));
     memset(&matches, 0, sizeof(matches));
     memset(probes, 0, sizeof(probes));
+    memset(start_error, 0, sizeof(start_error));
+    memset(ready_error, 0, sizeof(ready_error));
+    memset(starts, 0, sizeof(starts));
+    memset(waits, 0, sizeof(waits));
     for (unsigned int i = 0; i < 2; i++) {
         nodes[i] = (struct device_node){ .available = true, .external = i == 1, .index = i };
         devices[i].dev = (struct device){ .of_node = &nodes[i], .data = &dcps[i] };
@@ -941,7 +1598,26 @@ int main(void)
     external_probe_error = -EIO;
     assert(apple_drm_init_dcp(&master) == -EIO);
     assert(probes[1] == 1 && node_puts == 1);
-    puts("PASS: automatic hardware/firmware matching, delayed/preflight-failed providers, synchronous publication, readiness rejection");
+
+    /* The panel's processor must come up before the boot framebuffer goes. */
+    for (unsigned int failure = 0; failure < 2; failure++) {
+        initial(true);
+        dcps[1].external_prepared = true;
+        if (failure) start_error[0] = -EIO; else ready_error[0] = -ETIMEDOUT;
+        assert(apple_drm_init_dcp(&master) == -ENODEV);
+        /* A processor that did not start is not waited for. */
+        assert(starts[0] == 1 && waits[0] == (int)!failure && waits[1] == 1);
+    }
+    /* A failed external processor alone leaves the panel's take-over alone. */
+    initial(true);
+    dcps[1].external_prepared = true;
+    ready_error[1] = -ETIMEDOUT;
+    assert(apple_drm_init_dcp(&master) == 0);
+    initial(true);
+    dcps[1].external_prepared = true;
+    start_error[1] = -EIO;
+    assert(apple_drm_init_dcp(&master) == 0 && waits[1] == 0);
+    puts("PASS: automatic hardware/firmware matching, delayed/preflight-failed providers, synchronous publication, readiness rejection, boot framebuffer kept without the panel processor");
     return 0;
 }
 '''
@@ -969,8 +1645,13 @@ def vrr(root):
 #define READ_ONCE(x) (x)
 #define dev_dbg(...) ((void)0)
 struct apple_connector { bool connected; };
+/* The native T6030 14.7 backend is never selected in these scenarios. */
+enum dcp_firmware_version { DCP_FIRMWARE_UNKNOWN, DCP_FIRMWARE_V_12_3, DCP_FIRMWARE_V_13_5,
+    DCP_FIRMWARE_V_14_7, DCP_FIRMWARE_V_14_7_TEMPLATE, DCP_FIRMWARE_V_26_6 };
 struct apple_dcp {
-    bool crashed;
+    bool crashed, external, external_native;
+    unsigned int nr_typec_routes;
+    enum dcp_firmware_version fw_compat;
     struct { int iomfb_method_profile; } hw;
     struct { bool valid; } mode_state;
     struct apple_connector *connector;
@@ -978,16 +1659,29 @@ struct apple_dcp {
 };
 struct platform_device { struct apple_dcp *data; };
 struct drm_crtc { struct platform_device *dcp; };
-struct drm_crtc_state { bool vrr_enabled, modeset; };
-struct drm_atomic_state { struct drm_crtc_state crtc; };
+struct drm_display_mode { int unused; };
+struct drm_crtc_state { bool enable, vrr_enabled, modeset; struct drm_display_mode mode; };
+/* mainline 7.2 renamed struct drm_atomic_state to struct drm_atomic_commit */
+struct drm_atomic_commit { struct drm_crtc_state crtc; };
 #define to_apple_crtc(x) (x)
 #define platform_get_drvdata(x) ((x)->data)
 static struct drm_crtc_state *drm_atomic_get_new_crtc_state(
-    struct drm_atomic_state *s, struct drm_crtc *c)
+    struct drm_atomic_commit *s, struct drm_crtc *c)
 { (void)c; return &s->crtc; }
 static bool drm_atomic_crtc_needs_modeset(struct drm_crtc_state *s)
 { return s->modeset; }
-"""
+static int __attribute__((unused)) iomfb_v14_7_atomic_check(struct apple_dcp *d,
+    struct drm_crtc *c, struct drm_atomic_commit *s)
+{ (void)d; (void)c; (void)s; assert(!"14.7 backend on a non-14.7 DCP"); return -EINVAL; }
+static int __attribute__((unused)) iomfb_v26_6_atomic_check(struct apple_dcp *d,
+    struct drm_crtc *c, struct drm_atomic_commit *s)
+{ (void)d; (void)c; (void)s; assert(!"26.6 backend on a non-26.6 DCP"); return -EINVAL; }
+/* Route-follow is for Type-C displays; this DCP has no Type-C routes. */
+static bool __attribute__((unused)) typec_follow_crtc = true;
+static int __attribute__((unused)) dcp_typec_follow_check(struct apple_dcp *d, struct drm_crtc *c,
+    struct drm_atomic_commit *s, const struct drm_display_mode *m)
+{ (void)d; (void)c; (void)s; (void)m; assert(!"route-follow without Type-C routes"); return -EINVAL; }
+""" + apple_function(root, 'dcp_typec_follows_crtc')
     suffix = r"""
 int main(void)
 {
@@ -995,7 +1689,7 @@ int main(void)
     struct apple_dcp dcp = { .connector = &connector };
     struct platform_device pdev = { .data = &dcp };
     struct drm_crtc crtc = { .dcp = &pdev };
-    struct drm_atomic_state state = {0};
+    struct drm_atomic_commit state = {0};
     unsigned int cases = 0;
     /* Check initial modesets, plane-only commits and link recovery states. */
     for (unsigned int profile = 0; profile < 3; profile++)
@@ -1006,6 +1700,7 @@ int main(void)
         dcp.hw.iomfb_method_profile = profile;
         dcp.mode_state.valid = valid;
         state.crtc.modeset = modeset;
+        state.crtc.enable = true;
         state.crtc.vrr_enabled = vrr;
         dcp.connector = link == 2 ? NULL : &connector;
         connector.connected = link == 1;

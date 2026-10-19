@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  * Apple Silicon USB4 and Thunderbolt driver
+ * Copyright (c) Sven Peter <sven@kernel.org>
  *
  * This driver implements the Host Router / ACIO coprocessor as well as the
  * Native Host Interface (NHI) as shown in the diagram below.
@@ -48,7 +49,32 @@
  *                                     SSRX/TX | Port    |
  *                                             +---------+
  *
- * Copyright (c) Sven Peter <sven@kernel.org>
+ * ACIO and ATCPHY have strict ordering requirements. When a USB4/Thunderbolt
+ * connection is requested after a device has been connected the Type-C PD
+ * driver performs the following sequence:
+ *
+ * 1) Configure the PHY for the negotiated mode and orientation through
+ *    typec_mux_set()
+ * 2) Pass the cable details to this driver through typec_thunderbolt_switch_set()
+ * 3) Power up ACIO, boot its RTKit co-processor and apply the tunables
+ * 4) Probe the DART and NHI children now that their MMIO is accessible from
+ *    the main SoC bus
+ * 5) Register the USB4 domain and write the cable details to the host router
+ *    which brings up the link and starts discovery
+ *
+ * The reverse order is required when the cable is disconnected then:
+ *
+ * 1) typec_thunderbolt_switch_set() removes the USB4 domain and the ACIO
+ *    children, shuts down the co-processor and powers everything off.
+ * 2) typec_mux_set() puts the PHY into safe mode and powers it off.
+ *
+ * ACIO must not be started before the PHY is configured and the PHY must
+ * remain active until ACIO has been powered down again. The child devices
+ * cannot  remain populated while ACIO is powered off because they are part
+ * of the ACIO block and only exposed to the main SoC bus and will SError
+ * once ACIO is off.
+ * Violating this ordering can panic the kernel with an async SError at best
+ * and trigger some internal watchdog that will reset the entire SoC at worst.
  */
 
 #include <linux/bitfield.h>
@@ -125,10 +151,7 @@ static const struct apple_cio_hw apple_cio_t6030_hw = {
 	.dp = &apple_dpin_m3,
 };
 
-/*
- * T8142 (M5) Type 7 ACIO: ready is checked by acio->type7. Thunderbolt DP
- * tunnels are not driven on this SoC yet.
- */
+/* Type 7 uses its existing ready-state check and has no qualified DP route. */
 static const struct apple_cio_hw apple_cio_t8142_hw = {
 	.dp = &apple_dpin_disabled,
 };
@@ -183,6 +206,12 @@ MODULE_PARM_DESC(s2idle_teardown,
 #define APPLE_CIO_PCIEC_INTR2AXI_CTRL 0x80
 #define APPLE_CIO_PCIEC_INTR2AXI_ENABLE BIT(0)
 
+/*
+ * The Apple vendor-specific extended capability contains a cable-information
+ * word which has to be programmed from the USB4/Thunderbolt details reported
+ * out-of-band by the Type-C PD controller. It must be programmed into the
+ * host router before link discovery starts.
+ */
 #define TB_VSE_CAP_APPLE 0x00
 #define TB_VSE_CAP_APPLE_CABLE_INFO 0x01
 #define TB_VSE_CAP_APPLE_CABLE_INFO_PRESENT BIT(0)
@@ -200,6 +229,25 @@ MODULE_PARM_DESC(dpin_mode_value,
 
 struct apple_dpin_binding;
 
+/**
+ * struct apple_cio - Apple Converged I/O host router complex
+ * @dev: ACIO device
+ * @np: ACIO device tree node
+ * @rtk: RTKit instance for the ACIO co-processor
+ * @rc_base: ACIO root controller registers
+ * @rc_res: ACIO root controller MMIO resource
+ * @rc_tunable: Tunable sequence for the ACIO root controller
+ * @sram_res: ACIO co-processor SRAM resource
+ * @sram_base: ACIO co-processor SRAM
+ * @reset: ACIO reset controller
+ * @pd_list: Power domains used by the ACIO complex
+ * @lock: Serializes cable transitions and ACIO power changes
+ * @current_cable_info: Cable information currently programmed into ACIO
+ * @target_cable_info: Cable information requested by the Type-C PD driver
+ * @nhi_boot_completion: Signals completion of the NHI bringup
+ * @nhi_boot_status: Status returned by the NHI bringup
+ * @tbt_switch: USB4/Thunderbolt switch triggered by the Type-C PD driver
+ */
 struct apple_cio {
 	struct device *dev;
 	bool type7;
@@ -313,7 +361,7 @@ struct apple_dpin_binding {
 
 static bool dp_display = true;
 module_param(dp_display, bool, 0444);
-MODULE_PARM_DESC(dp_display, "Drive displays behind Thunderbolt DP tunnels on t8103, t8112, t600x and t6030 (default: true)");
+MODULE_PARM_DESC(dp_display, "Drive displays behind qualified Thunderbolt DP tunnels (default: true)");
 
 /*
  * The M1 Pro/Max ATC is the t8103 generation: same DP IN adapter registers,
@@ -685,7 +733,7 @@ static void apple_dpin_retry_fn(struct work_struct *work)
 
 /*
  * Only where both the display allocator and the connection manager can hold
- * a tunnel for a pipeline (capacity-retry hosts, see
+ * a tunnel for a pipeline (M1-family hosts, see
  * apple_nhi_dp_tunnel_awaits_display()) does a refused tunnel wait for one.
  */
 static void apple_dpin_work_fn(struct work_struct *work)
@@ -808,7 +856,8 @@ apple_cio_pcie_tunnel_is_preinitialized(struct device_node *parent)
 					  &status) && status == 1)
 			return true;
 		/* t8103 brings the port up itself. */
-		if (of_property_read_bool(child, "apple,pciec-kernel-init"))
+		if (of_device_is_compatible(child, "apple,t8103-pciec") &&
+		    of_property_read_bool(child, "apple,pciec-kernel-init"))
 			return true;
 		/* T600x/T602x without a handoff, when opted in. */
 		return apple_pcie_tunnel_needs_cold_init(child);
@@ -903,6 +952,22 @@ static int apple_cio_map_pcie_intr2axi(struct apple_cio *acio)
 	return -ENODEV;
 }
 
+/**
+ * struct apple_nhi - Apple Native Host Interface
+ * @dev: NHI device
+ * @pdev: NHI platform device
+ * @np: NHI device tree node
+ * @acio: Parent ACIO complex
+ * @tb: USB4 domain and software connection manager
+ * @nhi: NHI struct
+ * @nhi_base: NHI registers
+ * @pdf_base: PDF (Protocol Defined Field) configuration registers
+ * @tx_irqs: Transmit ring interrupts indexed by HopID
+ * @rx_irqs: Receive ring interrupts indexed by HopID
+ * @tx_irq_names: Names of the transmit ring interrupts
+ * @rx_irq_names: Names of the receive ring interrupts
+ * @n_rings: Number of rings in each direction
+ */
 struct apple_nhi {
 	struct device *dev;
 	struct platform_device *pdev;
@@ -934,6 +999,16 @@ struct apple_nhi {
 
 #define nhi_to_anhi(nhi_) container_of((nhi_), struct apple_nhi, nhi)
 
+/**
+ * apple_cio_rtkit_shmem_setup - Map an RTKit shared memory buffer
+ * @cookie: ACIO instance passed to RTKit
+ * @bfr: RTKit shared memory buffer descriptor
+ *
+ * Translate the firmware-provided IOVA into the ACIO SRAM mapping and reject
+ * buffers that fall outside the reserved SRAM resource.
+ *
+ * Return: 0 on success or a negative error code on failure.
+ */
 static int apple_cio_rtkit_shmem_setup(void *cookie, struct apple_rtkit_shmem *bfr)
 {
 	struct apple_cio *acio = cookie;
@@ -1060,9 +1135,11 @@ static void apple_nhi_ring_interrupt_active(struct tb_ring *ring, bool active)
 	lockdep_assert_held(&ring->nhi->lock);
 
 	if (active && ring->interval_nsec) {
-		interval = DIV_ROUND_UP(ring->interval_nsec,
+		interval = min_t(u32, ring->interval_nsec,
+				 FIELD_MAX(APPLE_CIO_NHI_IRQ_THROTTLE_INTERVAL_MASK) *
+				 APPLE_CIO_NHI_IRQ_THROTTLE_GRANULARITY_NSEC);
+		interval = DIV_ROUND_UP(interval,
 					APPLE_CIO_NHI_IRQ_THROTTLE_GRANULARITY_NSEC);
-		interval &= APPLE_CIO_NHI_IRQ_THROTTLE_INTERVAL_MASK;
 		writel(interval, anhi->nhi_base + APPLE_CIO_NHI_IRQ_THROTTLE +
 				 4 * idx);
 	}
@@ -1093,7 +1170,7 @@ static irqreturn_t apple_cio_ring_irq(int irq, void *data)
 
 	writel(BIT(idx), anhi->nhi_base + APPLE_CIO_NHI_IRQ_STATUS);
 	if (!ring->running)
-		return IRQ_NONE;
+		return IRQ_HANDLED;
 
 	if (ring->start_poll) {
 		apple_nhi_ring_interrupt_mask(ring, true);
@@ -1698,7 +1775,7 @@ static void apple_dp_aux_work(struct work_struct *work)
 	 * after the fact, once polling ends.
 	 */
 	if (!dprx && anhi->dp_aux_polls < APPLE_DP_AUX_POLL_MAX) {
-		mod_delayed_work(system_wq, &anhi->dp_aux_work,
+		mod_delayed_work(system_dfl_wq, &anhi->dp_aux_work,
 				 msecs_to_jiffies(APPLE_DP_AUX_POLL_MS));
 	} else if (anhi->acio) {
 		apple_dp_dump_analog(anhi->acio,
@@ -1805,7 +1882,7 @@ static int apple_nhi_dp_tunnel_post_activate(struct tb_nhi *nhi,
 				 in->cap_adap + i, 1))
 			anhi->dp_in_cs[i] = 0xffffffff;
 	}
-	mod_delayed_work(system_wq, &anhi->dp_aux_work,
+	mod_delayed_work(system_dfl_wq, &anhi->dp_aux_work,
 			 msecs_to_jiffies(APPLE_DP_AUX_POLL_MS));
 	return 0;
 }
@@ -1929,8 +2006,6 @@ static int apple_nhi_probe(struct platform_device *pdev)
 		goto err;
 	}
 
-	dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(42));
-
 	anhi->pdev = pdev;
 	anhi->dev = &pdev->dev;
 	anhi->np = pdev->dev.of_node;
@@ -1938,6 +2013,9 @@ static int apple_nhi_probe(struct platform_device *pdev)
 	INIT_DELAYED_WORK(&anhi->dp_aux_work, apple_dp_aux_work);
 	platform_set_drvdata(pdev, anhi);
 
+	ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(42));
+	if (ret)
+		goto err;
 	if (acio->type7 &&
 	    of_property_count_u32_elems(anhi->np, "apple,tunable-nhi") <= 0) {
 		ret = dev_err_probe(anhi->dev, -EINVAL,
@@ -2047,9 +2125,8 @@ static int apple_nhi_probe(struct platform_device *pdev)
 
 	if (!anhi->tb->root_switch->drom) {
 		dev_err(anhi->dev, "No valid host DROM in the device tree\n");
-		mutex_unlock(&anhi->tb->lock);
 		ret = -EINVAL;
-		goto err_remove_tb_domain;
+		goto err_unlock_tb_domain;
 	}
 
 	cap_apple = tb_switch_find_vse_cap(anhi->tb->root_switch, TB_VSE_CAP_APPLE);
@@ -2057,9 +2134,8 @@ static int apple_nhi_probe(struct platform_device *pdev)
 	if (cap_apple < 0) {
 		dev_err(anhi->dev, "Unable to find VSE Apple capability: %d\n",
 			cap_apple);
-		mutex_unlock(&anhi->tb->lock);
 		ret = cap_apple;
-		goto err_remove_tb_domain;
+		goto err_unlock_tb_domain;
 	}
 
 	/*
@@ -2080,8 +2156,7 @@ static int apple_nhi_probe(struct platform_device *pdev)
 			  cap_apple + TB_VSE_CAP_APPLE_CABLE_INFO, 1);
 	if (ret) {
 		dev_warn(anhi->dev, "Setting VSE Apple cable info failed: %d\n", ret);
-		mutex_unlock(&anhi->tb->lock);
-		goto err_remove_tb_domain;
+		goto err_unlock_tb_domain;
 	}
 
 	mutex_unlock(&anhi->tb->lock);
@@ -2091,7 +2166,8 @@ static int apple_nhi_probe(struct platform_device *pdev)
 	complete(&acio->nhi_boot_completion);
 	return 0;
 
-err_remove_tb_domain:
+err_unlock_tb_domain:
+	mutex_unlock(&anhi->tb->lock);
 	disable_delayed_work_sync(&anhi->dp_aux_work);
 	apple_cio_stop_pcie_tunnel(acio);
 	tb_domain_remove(anhi->tb);
@@ -2142,8 +2218,8 @@ static void apple_nhi_remove(struct platform_device *pdev)
  * seconds.  Not while devices suspend and resume: stop asking before any of
  * them suspends, let an attempt in flight finish (a wait for appledrm to
  * load gives way, see apple_dpin_connect()), and ask again once all of them
- * have resumed. The tunnel keeps waiting meanwhile. Suspend-gated handoffs
- * are deferred until complete, including after an aborted suspend. Established
+ * have resumed. The tunnel keeps waiting meanwhile. New M1-family handoffs are
+ * deferred until complete, including after an aborted suspend. Established
  * handed callbacks and synchronous tunnel teardown remain permitted.
  */
 static void apple_dpin_pause_retries(struct apple_cio *acio)
@@ -2389,6 +2465,14 @@ static void apple_cio_remove_children(struct apple_cio *acio)
 	}
 }
 
+/**
+ * apple_cio_stop - Stop and power down the ACIO complex
+ * @acio: ACIO complex to stop
+ *
+ * Remove the NHI and DART children before shutting down the co-processor and
+ * dropping the power-domain links. The Type-C PHY must remain configured
+ * until this function returns. The caller must hold @acio->lock.
+ */
 static void apple_cio_stop(struct apple_cio *acio)
 {
 	int ret, i;
@@ -2447,6 +2531,17 @@ static bool apple_cio_recovering(struct apple_cio *acio)
 	return acio->resume_recovery_active;
 }
 
+/**
+ * apple_cio_start - Power up and start the ACIO complex
+ * @acio: ACIO complex to start
+ *
+ * The Type-C PHY must already be configured for USB4 or Thunderbolt. Power up
+ * ACIO, boot its RTKit co-processor, populate its child devices and wait for
+ * the NHI to register the USB4 domain. All completed steps are unwound on
+ * failure. The caller must hold @acio->lock.
+ *
+ * Return: 0 on success or a negative error code on failure.
+ */
 static int apple_cio_start(struct apple_cio *acio)
 {
 	struct device_link *link;
@@ -2559,15 +2654,11 @@ static int apple_cio_start(struct apple_cio *acio)
 					 FIELD_GET(APPLE_CIO_M3_STAT_STATE, state) ==
 					 APPLE_CIO_M3_STAT_STATE_READY,
 					 100, 500000);
-	else if (acio->type7)
-		/* Type 7 reports ready as state 1; other nonzero states are not ready. */
-		ret = readl_poll_timeout(acio->rc_base + APPLE_CIO_M3_STAT, state,
-					 FIELD_GET(APPLE_CIO_M3_STAT_STATE, state) ==
-					 APPLE_CIO_M3_STAT_STATE_READY,
-					 100, 500000);
 	else
 		ret = readl_poll_timeout(acio->rc_base + APPLE_CIO_M3_STAT, state,
-					 state & APPLE_CIO_M3_STAT_STATE, 100, 500000);
+					 acio->type7 ?
+				 (state & APPLE_CIO_M3_STAT_STATE) == BIT(24) :
+				 (state & APPLE_CIO_M3_STAT_STATE), 100, 500000);
 	if (!ret && acio->hw->strict_fw_ready && (state & APPLE_CIO_M3_STAT_CODE_VALID)) {
 		dev_err(acio->dev, "M3 firmware assert, code 0x%06lx (state 0x%08x)\n",
 			FIELD_GET(APPLE_CIO_M3_STAT_CODE, state), state);
@@ -2781,6 +2872,18 @@ static const struct dev_pm_ops apple_cio_pm_ops = {
 	.complete = apple_cio_complete,
 };
 
+/**
+ * apple_cio_tbt_switch_set - Handle a USB4/Thunderbolt cable transition
+ * @sw: USB4/Thunderbolt switch
+ * @data: New cable state and negotiated cable details
+ *
+ * Translate the cable details into the Apple host-router representation and
+ * synchronously power ACIO up or down. The Type-C PD driver must configure
+ * the PHY before an active transition and must request the inactive state
+ * before shutting the PHY down.
+ *
+ * Return: 0 on success or a negative error code on failure.
+ */
 static int apple_cio_tbt_switch_set(struct typec_thunderbolt_switch_dev *sw,
 				    const struct typec_thunderbolt_switch_data *data)
 {
@@ -2983,7 +3086,7 @@ static int apple_cio_pm_notify(struct notifier_block *nb, unsigned long event,
 		}
 		/* Start from a worker: probing children inside this chain can deadlock. */
 		if (owed)
-			queue_delayed_work(system_unbound_wq, &acio->sleep_restart_work,
+			queue_delayed_work(system_dfl_wq, &acio->sleep_restart_work,
 					   early ? 0 :
 					   msecs_to_jiffies(APPLE_CIO_SLEEP_RESTART_FALLBACK_MS));
 		break;
@@ -3027,6 +3130,11 @@ static int apple_cio_probe(struct platform_device *pdev)
 	init_completion(&acio->nhi_boot_completion);
 	acio->dev = &pdev->dev;
 	acio->np = dev->of_node;
+	acio->type7 = of_device_is_compatible(acio->np, "apple,t8142-usb4-acio");
+	if (acio->type7 &&
+	    of_property_count_u32_elems(acio->np, "apple,tunable-rc") <= 0)
+		return dev_err_probe(dev, -EINVAL, "Missing bootloader RC tuning\n");
+
 	acio->hw = of_device_get_match_data(dev);
 	if (!acio->hw)
 		return -EINVAL;
@@ -3043,11 +3151,6 @@ static int apple_cio_probe(struct platform_device *pdev)
 			return dev_err_probe(dev, PTR_ERR(acio->cpu_base),
 					     "Unable to map MxWrap cpu regs\n");
 	}
-	acio->type7 = of_device_is_compatible(acio->np, "apple,t8142-usb4-acio");
-	if (acio->type7 &&
-	    of_property_count_u32_elems(acio->np, "apple,tunable-rc") <= 0)
-		return dev_err_probe(dev, -EINVAL, "Missing bootloader RC tuning\n");
-
 	acio->pcie_tunnel_np =
 		of_parse_phandle(dev->of_node, "apple,pcie-tunnel", 0);
 	if (acio->pcie_tunnel_np) {
@@ -3220,6 +3323,9 @@ static void apple_cio_remove(struct platform_device *pdev)
 		apple_cio_stop(acio);
 }
 
+
+
+
 static const struct of_device_id apple_acio_match[] = {
 	{
 		.compatible = "apple,t8142-usb4-acio",
@@ -3245,7 +3351,7 @@ static struct platform_driver apple_cio_driver = {
 	.driver = {
 		.name = "thunderbolt-apple-acio",
 		.of_match_table = apple_acio_match,
-		.pm = &apple_cio_pm_ops,
+		.pm = pm_sleep_ptr(&apple_cio_pm_ops),
 	},
 	.probe = apple_cio_probe,
 	.remove = apple_cio_remove,
@@ -3271,7 +3377,6 @@ static void __exit apple_cio_exit(void)
 module_init(apple_cio_init);
 module_exit(apple_cio_exit);
 
-MODULE_IMPORT_NS("USB4");
 MODULE_AUTHOR("Sven Peter <sven@kernel.org>");
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Apple Silicon USB4/Thunderbolt driver");

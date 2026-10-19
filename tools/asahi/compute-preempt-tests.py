@@ -104,6 +104,9 @@ fn main() {
     println!("{cases} policy and priority cases PASS");
 }
 '''
+    g15_available = bool(re.search(r'"G15"\s*,\s*"V14_8_3"', macro))
+    if not g15_available:
+        suffix = suffix.replace('    cases+=check(PolicyG15V14_8_3::select,false);\n', '')
     selected = policy(queue)
     sources = {'positive': selected}
     if args.old_ref:
@@ -127,7 +130,7 @@ fn main() {
         (args.out/f'{name}.log').write_text(run.stdout+run.stderr)
         assert (run.returncode==0)==(name=='positive'), (name,run.returncode)
         results[name]={'returncode':run.returncode,'policy_sha256':sha(body),'compiled_source_sha256':sha(source.read_text())}
-    receipt={'results':results,'policy_sha256':sha(selected),'priority_table_sha256':sha(table),'versions_sha256':sha(macro),'scope':'Actual priority policy, priority table and version macro; controlled parameter/debug inputs. No GPU allocation, firmware scheduling, cancellation or hardware execution.'}
+    receipt={'g15_backend_available':g15_available,'results':results,'policy_sha256':sha(selected),'priority_table_sha256':sha(table),'versions_sha256':sha(macro),'scope':'Actual priority policy, priority table and version macro; controlled parameter/debug inputs. No GPU allocation, firmware scheduling, cancellation or hardware execution.'}
     (args.out/'results.json').write_text(json.dumps(receipt,indent=2)+'\n')
     print(json.dumps(receipt,indent=2))
 

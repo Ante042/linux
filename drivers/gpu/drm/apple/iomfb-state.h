@@ -32,7 +32,7 @@ static inline void dcp_mode_begin(struct dcp_mode_state *state)
 	spin_unlock_irqrestore(&state->lock, flags);
 }
 
-/* For firmware that keeps a single mode and has no modeset in flight. */
+/* For a pipe whose firmware keeps its own mode state (T6030 14.7). */
 static inline void dcp_mode_set_valid(struct dcp_mode_state *state, bool valid)
 {
 	unsigned long flags;
@@ -42,14 +42,21 @@ static inline void dcp_mode_set_valid(struct dcp_mode_state *state, bool valid)
 	spin_unlock_irqrestore(&state->lock, flags);
 }
 
-static inline void dcp_mode_invalidate(struct dcp_mode_state *state)
+/*
+ * The mode is gone, also for a mode set in flight, which then does not
+ * complete it.  Returns whether a set mode was valid until now.
+ */
+static inline bool dcp_mode_invalidate(struct dcp_mode_state *state)
 {
 	unsigned long flags;
+	bool valid;
 
 	spin_lock_irqsave(&state->lock, flags);
+	valid = state->valid;
 	state->valid = false;
 	state->invalidated = true;
 	spin_unlock_irqrestore(&state->lock, flags);
+	return valid;
 }
 
 /*

@@ -2,7 +2,7 @@
 #ifndef __LINUX_USB_H
 #define __LINUX_USB_H
 
-#include <linux/mod_devicetable.h>
+#include <linux/device-id/usb.h>
 #include <linux/usb/ch9.h>
 
 #define USB_MAJOR			180
@@ -708,6 +708,7 @@ struct usb_device {
 	unsigned usb2_hw_lpm_allowed:1;
 	unsigned usb3_lpm_u1_enabled:1;
 	unsigned usb3_lpm_u2_enabled:1;
+	unsigned awake_in_sleep:1;
 	int string_langid;
 
 	/* static strings from the device */
@@ -954,6 +955,10 @@ int usb_hub_claim_port(struct usb_device *hdev, unsigned port1,
 int usb_hub_release_port(struct usb_device *hdev, unsigned port1,
 		struct usb_dev_state *owner);
 
+/* port power switching for a driver that moves the lanes behind a port */
+int usb_hub_port_power_off(struct usb_device *hdev, int port1);
+int usb_hub_port_power_on(struct usb_device *hdev, int port1);
+
 /**
  * usb_make_path - returns stable device path in the usb tree
  * @dev: the device whose path is being constructed
@@ -1185,7 +1190,8 @@ extern ssize_t usb_show_dynids(struct usb_dynids *dynids, char *buf);
  *	interface.  It may also use usb_set_interface() to specify the
  *	appropriate altsetting.  If unwilling to manage the interface,
  *	return -ENODEV, if genuine IO errors occurred, an appropriate
- *	negative errno value.
+ *	negative errno value.  The usb_device_id parameter is only valid during
+ *	probe.
  * @disconnect: Called when the interface is no longer accessible, usually
  *	because its device has been (or is being) disconnected or the
  *	driver module is being unloaded.

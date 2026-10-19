@@ -8,8 +8,11 @@
  * that cannot take the display over from iBoot keep scanning out through the
  * simple framebuffer, and all of them share one device tree. The boot loader
  * sets apple,t8122-handoff = <1> on the DCP and the display subsystem after
- * it has checked and locked the inherited DART mappings; the display enable
- * gate (drivers/soc/apple/t6030-display-gate.c) then enables these nodes.
+ * it has checked and locked the inherited DART mappings. A kernel display
+ * gate that checks this handoff, and can start the PMP that the DCP firmware
+ * needs, then enables these nodes. A kernel without such a gate leaves them
+ * disabled. The 25G83 profile (t8122-j613-dcp-25g83.dtsi) has its own
+ * handoff, which the display driver checks before it enables these nodes.
  *
  * Register, interrupt and DART addresses are SoC addresses from the J613
  * boot device tree: the DCP block and its iop-vbar come from /arm-io/dcp,
@@ -45,6 +48,13 @@
 		#clock-cells = <0>;
 		clock-frequency = <0>;
 		clock-output-names = "clk_dispext0";
+	};
+
+	/* Component master without MMIO, outside the simple-bus. */
+	display: display-subsystem {
+		compatible = "apple,t8122-display-subsystem";
+		iommus = <&disp0_dart 0>;
+		status = "disabled";
 	};
 };
 
@@ -101,8 +111,11 @@
 		      <0x2 0x8e850000 0x0 0x4000>;
 		power-domains = <&ps_disp_cpu>;
 		clocks = <&clk_disp0>;
+		/* The 14.x firmware runs once the PMP acknowledges this request. */
+		apple,pmp-report = <&pmp_report_disp>;
 		#address-cells = <2>;
 		#size-cells = <2>;
+		ranges;
 		status = "disabled";
 
 		disp0_piodma: piodma {
@@ -110,11 +123,6 @@
 		};
 	};
 
-	display: display-subsystem {
-		compatible = "apple,t8122-display-subsystem";
-		iommus = <&disp0_dart 0>;
-		status = "disabled";
-	};
 
 	/*
 	 * The PMGR bandwidth page (ADT disp0/dispext0 reg 5). The internal
@@ -204,6 +212,8 @@
 		power-domains = <&ps_dispext_cpu>;
 		resets = <&ps_dispext_cpu>;
 		clocks = <&clk_dispext0>;
+		/* Its first mode set completes only with this PMP request. */
+		apple,pmp-report = <&pmp_report_dispext>;
 		apple,dcp-index = <1>;
 		status = "disabled";
 

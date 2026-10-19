@@ -1229,9 +1229,9 @@ impl super::Shared {
 const COMPUTE_WARM_CAP: usize = 4;
 /// A retained pool idle this long gives its backing back regardless of the
 /// cap: a burst of short-lived clients still finds warm pools, but the pools
-/// of clients that are gone do not stay resident. Ten seconds matches the
-/// idle period of the tiler-heap shrink, so idle compute pools and idle
-/// tiler heaps are given back on the same schedule.
+/// of clients that are gone do not stay resident. The macOS driver frees a
+/// client's USC pools with the client and has an idle shrink; ten seconds
+/// matches its idle parameter-buffer shrink.
 const COMPUTE_WARM_EXPIRY_NS: u64 = 10_000_000_000;
 
 impl super::Firmware {

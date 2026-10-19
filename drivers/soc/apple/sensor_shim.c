@@ -23,13 +23,13 @@
 
 #include "shim.h"
 
-/* Use the board's device-tree mode (J313: 1, J414s: 2). */
+/* The board selects the SPI mode; an override is diagnostic only. */
 #define SEP_SENSOR_HZ		8000000
 #define SEP_SENSOR_BITS		8
 static unsigned int sep_sensor_mode = ~0U;
 module_param_named(sensor_spi_mode, sep_sensor_mode, uint, 0444);
 MODULE_PARM_DESC(sensor_spi_mode,
-		 "Optional diagnostic SPI mode override (0-3); default uses the device tree");
+		 "Diagnostic SPI mode override (0-3); default retains the board mode");
 
 /* Chip-select setup and hold, in ns. */
 #define SEP_SENSOR_CS_NS		20
@@ -413,7 +413,6 @@ static int sep_sensor_probe_locked(struct spi_device *spi)
 	if (rc)
 		return dev_err_probe(&spi->dev, rc, "sep sensor: power unavailable\n");
 	sep_spi = spi;
-	sep_diag_set_sensor_bound(true);
 	/* Read the mode back: a mode that did not take must not be logged as
 	 * the one requested. */
 	dev_info(&spi->dev,
@@ -441,6 +440,7 @@ static int sep_sensor_probe(struct spi_device *spi)
 		if (!error) {
 			spi_set_drvdata(spi, sensor);
 			sep_active_sensor = sensor;
+			sep_diag_set_sensor_bound(true);
 		}
 	}
 	mutex_unlock(&sep_sensor_registry_lock);

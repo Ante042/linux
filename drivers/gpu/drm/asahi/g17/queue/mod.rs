@@ -15,7 +15,7 @@ use super::{
     validation::Proof,
 };
 use crate::{
-    driver::{AsahiDevRef, AsahiDevice},
+    driver::{AsahiDevRef, AsahiDrmDevice},
     file, mmu,
 };
 use core::ops::Range;
@@ -96,7 +96,7 @@ pub(crate) struct Queue<B: Backend> {
 
 impl<B: Backend> Queue<B> {
     pub(crate) fn new(
-        dev: &AsahiDevice,
+        dev: &AsahiDrmDevice,
         context: Arc<Context>,
         backend: Arc<B>,
         frontend: Frontend,
@@ -367,6 +367,7 @@ impl<B: Backend> crate::queue::Queue for Queue<B> {
 
     fn submit(
         &mut self,
+        _reg_data: &crate::driver::AsahiRegData<'_>,
         id: u64,
         syncs: KVec<file::SyncItem>,
         input_count: usize,

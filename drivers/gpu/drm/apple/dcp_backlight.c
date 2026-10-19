@@ -211,7 +211,7 @@ static void dcp_backlight_fade_work(struct work_struct *work)
 	if (kick)
 		dcp_backlight_kick(dcp);
 	if (running)
-		queue_delayed_work(system_wq, &dcp->backlight.fade_work,
+		queue_delayed_work(system_dfl_wq, &dcp->backlight.fade_work,
 				   msecs_to_jiffies(DCP_BL_FADE_STEP_MS));
 }
 
@@ -387,99 +387,49 @@ static u32 calculate_dac(struct apple_dcp *dcp, int val)
 
 static int drm_crtc_set_brightness(struct apple_dcp *dcp)
 {
-	struct drm_atomic_state *state;
+	struct drm_atomic_commit *commit;
 	struct drm_crtc_state *crtc_state;
 	struct drm_modeset_acquire_ctx ctx;
 	struct drm_crtc *crtc = &dcp->crtc->base;
-	int ret = 0;
+	int ret;
 
-	drm_modeset_acquire_init(&ctx, DRM_MODESET_ACQUIRE_INTERRUPTIBLE);
-	ret = drm_modeset_lock(&crtc->mutex, &ctx);
-	if (ret == -EDEADLK) {
-		drm_modeset_backoff(&ctx);
-		drm_modeset_acquire_fini(&ctx);
-		return -EDEADLK;
-	} else if (ret == -ERESTARTSYS) {
-		drm_modeset_acquire_fini(&ctx);
-		return -ERESTARTSYS;
-	}
-
-	if (!dcp->brightness.update)
-		goto done;
-
-	state = drm_atomic_state_alloc(crtc->dev);
-	if (!state) {
-		ret = -ENOMEM;
-		goto done;
-	}
-
-	state->acquire_ctx = &ctx;
-	crtc_state = drm_atomic_get_crtc_state(state, crtc);
-	if (IS_ERR(crtc_state)) {
-		ret = PTR_ERR(crtc_state);
-		goto fail;
-	}
-
-	crtc_state->color_mgmt_changed |= true;
-
-	ret = drm_atomic_commit(state);
-
-fail:
-	drm_atomic_state_put(state);
-done:
-	drm_modeset_drop_locks(&ctx);
-	drm_modeset_acquire_fini(&ctx);
-
-	return ret;
-}
-
-/*
- * H17P (T8142 H17G): brightness-only commits re-present the scanout and back
- * off within the call.
- */
-static int drm_crtc_set_brightness_h17p(struct apple_dcp *dcp)
-{
-	struct drm_atomic_state *state;
-	struct drm_crtc_state *crtc_state;
-	struct drm_modeset_acquire_ctx ctx;
-	struct drm_crtc *crtc = &dcp->crtc->base;
-	int ret = 0;
-
-	state = drm_atomic_state_alloc(crtc->dev);
-	if (!state)
+	commit = drm_atomic_commit_alloc(crtc->dev);
+	if (!commit)
 		return -ENOMEM;
 
 	drm_modeset_acquire_init(&ctx, DRM_MODESET_ACQUIRE_INTERRUPTIBLE);
-	state->acquire_ctx = &ctx;
-
+	commit->acquire_ctx = &ctx;
 retry:
-	crtc_state = drm_atomic_get_crtc_state(state, crtc);
+	ret = drm_modeset_lock(&crtc->mutex, &ctx);
+	if (ret)
+		goto out;
+
+	if (!dcp->brightness.update)
+		goto out;
+
+	crtc_state = drm_atomic_get_crtc_state(commit, crtc);
 	if (IS_ERR(crtc_state)) {
 		ret = PTR_ERR(crtc_state);
 		goto out;
 	}
 
-	if (!dcp->brightness.update)
-		goto out;
-
 	/* Re-present the current scanout when brightness is the only change. */
-	ret = drm_atomic_add_affected_planes(state, crtc);
+	ret = drm_atomic_add_affected_planes(commit, crtc);
 	if (ret)
 		goto out;
 
 	crtc_state->color_mgmt_changed |= true;
 
-	ret = drm_atomic_commit(state);
-
+	ret = drm_atomic_commit(commit);
 out:
 	if (ret == -EDEADLK) {
-		drm_atomic_state_clear(state);
+		drm_atomic_commit_clear(commit);
 		ret = drm_modeset_backoff(&ctx);
 		if (!ret)
 			goto retry;
 	}
 
-	drm_atomic_state_put(state);
+	drm_atomic_commit_put(commit);
 	drm_modeset_drop_locks(&ctx);
 	drm_modeset_acquire_fini(&ctx);
 
@@ -511,12 +461,10 @@ int dcp_backlight_update(struct apple_dcp *dcp)
 	 * the brightness */
 	msleep((1001 + 23) / 24); // 42ms for 23.976 fps
 
-	if (dcp->fw_compat == DCP_FIRMWARE_H17P)
-		return drm_crtc_set_brightness_h17p(dcp);
 	return drm_crtc_set_brightness(dcp);
 }
 
-static int dcp_set_brightness_h17p(struct backlight_device *bd)
+static int dcp_set_brightness(struct backlight_device *bd)
 {
 	int ret = 0;
 	struct apple_dcp *dcp = bl_get_data(bd);
@@ -543,7 +491,7 @@ static int dcp_set_brightness_h17p(struct backlight_device *bd)
 			dcp->backlight.fade_start = jiffies;
 		spin_unlock_irqrestore(&dcp->backlight.lock, flags);
 		if (fade)
-			queue_delayed_work(system_wq, &dcp->backlight.fade_work,
+			queue_delayed_work(system_dfl_wq, &dcp->backlight.fade_work,
 					   msecs_to_jiffies(DCP_BL_FADE_STEP_MS));
 		else if (!ret)
 			dcp_backlight_kick(dcp);
@@ -562,36 +510,6 @@ static int dcp_set_brightness_h17p(struct backlight_device *bd)
 	return dcp_backlight_update(dcp);
 }
 
-static int dcp_set_brightness(struct backlight_device *bd)
-{
-	int ret = 0;
-	struct apple_dcp *dcp = bl_get_data(bd);
-	struct drm_modeset_acquire_ctx ctx;
-	int brightness = backlight_get_brightness(bd);
-
-	if (dcp->fw_compat == DCP_FIRMWARE_H17P)
-		return dcp_set_brightness_h17p(bd);
-
-	drm_modeset_acquire_init(&ctx, DRM_MODESET_ACQUIRE_INTERRUPTIBLE);
-	ret = drm_modeset_lock(&dcp->crtc->base.mutex, &ctx);
-	if (ret == -EDEADLK) {
-		drm_modeset_backoff(&ctx);
-		drm_modeset_acquire_fini(&ctx);
-		return -EDEADLK;
-	} else if (ret == -ERESTARTSYS) {
-		drm_modeset_acquire_fini(&ctx);
-		return -ERESTARTSYS;
-	}
-
-	dcp->brightness.dac = calculate_dac(dcp, brightness);
-	dcp->brightness.update = true;
-
-	drm_modeset_drop_locks(&ctx);
-	drm_modeset_acquire_fini(&ctx);
-
-	return dcp_backlight_update(dcp);
-}
-
 static bool dcp_backlight_controls_device(struct backlight_device *bd,
 					  struct device *display_dev)
 {
@@ -602,13 +520,6 @@ static bool dcp_backlight_controls_device(struct backlight_device *bd,
 }
 
 static const struct backlight_ops dcp_backlight_ops = {
-	.options = BL_CORE_SUSPENDRESUME,
-	.get_brightness = dcp_get_brightness,
-	.update_status = dcp_set_brightness,
-};
-
-/* H17P: fbdev blanking follows only this display. */
-static const struct backlight_ops dcp_backlight_ops_h17p = {
 	.options = BL_CORE_SUSPENDRESUME,
 	.get_brightness = dcp_get_brightness,
 	.update_status = dcp_set_brightness,
@@ -644,8 +555,6 @@ int dcp_backlight_register(struct apple_dcp *dcp)
 	}
 
 	bl_dev = devm_backlight_device_register(dev, "apple-panel-bl", dev, dcp,
-						dcp->fw_compat == DCP_FIRMWARE_H17P ?
-						&dcp_backlight_ops_h17p :
 						&dcp_backlight_ops, &props);
 	if (IS_ERR(bl_dev))
 		return PTR_ERR(bl_dev);
@@ -677,6 +586,9 @@ s32 dcp_ext_backlight_value(struct apple_dcp *dcp)
 	int level;
 
 	if (!connector || !READ_ONCE(dcp->ext_backlight))
+		return -1;
+	/* H17P external swap brightness fields are unverified; leave them. */
+	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL)
 		return -1;
 
 	level = READ_ONCE(connector->bl_level);

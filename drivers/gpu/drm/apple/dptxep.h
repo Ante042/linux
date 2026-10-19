@@ -64,13 +64,6 @@ struct dptx_port {
 	u32 drive_settings[2];
 	u32 trained_voltage[4], trained_pre[4];
 	/*
-	 * Per-boot invocation counters for the validate/connect/request/
-	 * release AFK calls, used together with the caller return address
-	 * logged alongside them to correlate call ordering when diagnosing
-	 * link-training sequencing issues.
-	 */
-	u32 validate_calls, connect_calls, request_calls, release_calls;
-	/*
 	 * The sink's tile topology as DCP reports it in SetTiledDisplayHints:
 	 * tiles across and down, and this stream's tile. Valid once
 	 * tile_hint is set; cleared whenever the port (re)connects.
@@ -89,7 +82,6 @@ int dptxport_set_hpd(struct apple_epic_service *service, bool hpd);
 int dptxport_set_hpd_timeout(struct apple_epic_service *service, bool hpd,
 			     unsigned int timeout_ms);
 int dptxport_sink_irq(struct apple_epic_service *service);
-
 
 struct apple_dcp;
 int dpav_ctrl_init(struct apple_dcp *dcp);

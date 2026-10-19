@@ -57,8 +57,12 @@ use kernel::{
     c_str,
     device::{self, Core},
     drm::gem::shmem,
+    io::{
+        IoBase,
+        IoSysMap,
+        Region, //
+    },
     impl_has_delayed_work, impl_has_work,
-    iosys_map::IoSysMapRef,
     new_condvar, new_delayed_work, new_mutex, new_work, platform,
     prelude::*,
     soc::apple::rtkit,
@@ -85,7 +89,7 @@ use kernel::{
 
 use crate::driver::{
     AsahiDevRef,
-    AsahiDevice, //
+    AsahiDrmDevice, //
 };
 use crate::gem::AsahiObject;
 use crate::{
@@ -201,7 +205,7 @@ const CRASH_BUFFER_FILL: [u8; 2] = [0xa5, 0x5a];
 /// A crash log buffer handed to RTKit.
 pub(crate) struct CrashLog {
     iova: usize,
-    map: shmem::VMap<AsahiObject, u8>,
+    map: shmem::VMapOwned<AsahiObject>,
 }
 
 impl rtkit::Buffer for CrashLog {
@@ -209,8 +213,8 @@ impl rtkit::Buffer for CrashLog {
         Ok(self.iova)
     }
 
-    fn buf(&mut self) -> Result<IoSysMapRef<'_, u8>> {
-        Ok(self.map.get())
+    fn buf(&mut self) -> Result<IoSysMap<'_, Region>> {
+        Ok(IoSysMap::from((&self.map).as_view()))
     }
 }
 
@@ -220,7 +224,7 @@ struct RoleState {
     role: Role,
     shared: Arc<Shared>,
     crash_log: FixedBuffer,
-    crash_map: shmem::VMap<AsahiObject, u8>,
+    crash_map: shmem::VMapOwned<AsahiObject>,
     crashed: AtomicBool,
     #[pin]
     ack: Opaque<kernel::bindings::completion>,
@@ -305,7 +309,7 @@ impl rtkit::Operations for RoleOps {
         }
         Ok(CrashLog {
             iova,
-            map: data.crash_map.clone(),
+            map: data.crash_map.owner().owned_vmap()?,
         })
     }
 }
@@ -324,8 +328,8 @@ struct Coprocessor {
 impl Coprocessor {
     /// Sets up a coprocessor's RTKit and crash log buffer, without starting it.
     fn new(
-        pdev: &platform::Device<Core>,
-        dev: &AsahiDevice,
+        pdev: &platform::Device<Core<'_>>,
+        dev: &AsahiDrmDevice,
         cfg: &Config,
         uat: &mmu::Uat,
         shared: &Arc<Shared>,
@@ -373,12 +377,12 @@ impl Coprocessor {
     }
 
     fn receiver(
-        dev: &AsahiDevice,
+        dev: &AsahiDrmDevice,
         index: usize,
         state: &Arc<RoleState>,
     ) -> Result<rtkit::RtKit<RoleOps>> {
         for attempt in 0..RECEIVER_ATTEMPTS {
-            match rtkit::RtKit::<RoleOps>::new(dev.as_ref(), None, index, state.clone()) {
+            match rtkit::RtKit::<RoleOps>::new(dev.as_ref().as_ref(), None, index, state.clone()) {
                 Ok(receiver) => return Ok(receiver),
                 Err(error) if error == EINVAL || error == ETIMEDOUT => {
                     if attempt + 1 < RECEIVER_ATTEMPTS {
@@ -432,12 +436,12 @@ impl Drop for Coprocessor {
 
 /// The GPU-to-fabric bridge, enabled for as long as this exists.
 struct Bridge {
-    regs: regs::Resources,
+    regs: regs::G17Resources,
     enabled: bool,
 }
 
 impl Bridge {
-    fn enable(regs: regs::Resources) -> Result<Bridge> {
+    fn enable(regs: regs::G17Resources) -> Result<Bridge> {
         let bridge = Bridge {
             regs,
             enabled: true,
@@ -728,11 +732,11 @@ impl Shared {
     }
 
     fn queue_grow(self: &Arc<Self>) {
-        let _ = workqueue::system_unbound().enqueue::<Arc<Self>, GROW_WORK>(self.clone());
+        let _ = workqueue::system_dfl().enqueue::<Arc<Self>, GROW_WORK>(self.clone());
     }
 
     fn queue_reclaims(self: &Arc<Self>) {
-        let _ = workqueue::system_unbound().enqueue::<Arc<Self>, RECLAIM_WORK>(self.clone());
+        let _ = workqueue::system_dfl().enqueue::<Arc<Self>, RECLAIM_WORK>(self.clone());
     }
 
     fn drain_reclaims(self: &Arc<Self>) {
@@ -806,39 +810,11 @@ impl Shared {
             role
         );
 
-        #[cfg(CONFIG_DEV_COREDUMP)]
-        if let Some(crashlog) = crashlog {
-            if let Err(e) = self.publish_crashlog(crashlog) {
-                dev_err!(self.dev.as_ref(), "Could not generate crashdump: {:?}\n", e);
-            }
-        }
-        #[cfg(not(CONFIG_DEV_COREDUMP))]
+        // The GPU dev coredump support this used is gone; the crash log is not published.
         let _ = crashlog;
         self.queue_events();
     }
-
-    #[cfg(CONFIG_DEV_COREDUMP)]
-    fn publish_crashlog(&self, crashlog: &[u8]) -> Result {
-        use kernel::{devcoredump, time::msecs_to_jiffies};
-
-        // The dump does not include firmware memory: its kernel mappings are private to it.
-        let mut crashdump = crate::crashdump::CrashDumpBuilder::new(KVVec::new())?;
-        crashdump.add_crashlog(crashlog)?;
-        let crashdump = KBox::new(crashdump.finalize()?, GFP_KERNEL)?;
-        devcoredump::dev_coredump(
-            self.dev.as_ref(),
-            &crate::THIS_MODULE,
-            crashdump,
-            GFP_KERNEL,
-            msecs_to_jiffies(CRASHDUMP_TIMEOUT_MS),
-        );
-        Ok(())
-    }
 }
-
-/// How long a crash dump stays available.
-#[cfg(CONFIG_DEV_COREDUMP)]
-const CRASHDUMP_TIMEOUT_MS: u32 = 60 * 60 * 1000;
 
 /// A G17 GPU.
 pub(crate) struct Gpu {
@@ -853,10 +829,10 @@ pub(crate) struct Gpu {
 impl Gpu {
     /// Boots the firmware of a G17 GPU.
     pub(crate) fn new(
-        pdev: &platform::Device<Core>,
-        dev: &AsahiDevice,
+        pdev: &platform::Device<Core<'_>>,
+        dev: &AsahiDrmDevice,
         cfg: &'static Config,
-        regs: regs::Resources,
+        regs: regs::G17Resources,
     ) -> Result<Arc<Gpu>> {
         let id = regs.get_g17_id()?;
         if id.family != cfg.identity.family
@@ -885,7 +861,7 @@ impl Gpu {
         let shared = Arc::pin_init(
             pin_init!(Shared {
                 drm <- new_mutex!(Some(dev.into()), "g17::Shared::drm"),
-                dev: dev.as_ref().into(),
+                dev: dev.as_ref().as_ref().into(),
                 clusters: id.num_clusters,
                 active_cores,
                 descriptor_flags: [id.perf_control, id.perf_map[0]],
@@ -924,8 +900,8 @@ impl Gpu {
     }
 
     /// Returns the highest advertised operating-point frequency without changing table order.
-    fn max_frequency_khz(dev: &AsahiDevice) -> Result<u32> {
-        let node = dev.as_ref().of_node().ok_or(EIO)?;
+    fn max_frequency_khz(dev: &AsahiDrmDevice) -> Result<u32> {
+        let node = dev.as_ref().as_ref().of_node().ok_or(EIO)?;
         let opps = node
             .parse_phandle(c_str!("operating-points-v2"), 0)
             .ok_or(EIO)?;
@@ -939,16 +915,16 @@ impl Gpu {
 
     /// Starts both coprocessors and initializes their firmware.
     fn boot(
-        pdev: &platform::Device<Core>,
-        dev: &AsahiDevice,
+        pdev: &platform::Device<Core<'_>>,
+        dev: &AsahiDrmDevice,
         cfg: &'static Config,
-        regs: regs::Resources,
+        regs: regs::G17Resources,
         geometry: mmu::UatGeometry,
         shared: &Arc<Shared>,
     ) -> Result<KBox<Firmware>> {
         let uat = Arc::new(
             mmu::Uat::new(
-                dev,
+                dev.into(),
                 geometry,
                 true,
                 mmu::UatFirmware::PublishedRoots {
@@ -1026,7 +1002,7 @@ impl Gpu {
 
     /// Waits for both coprocessors to retire their opening device-control records.
     fn wait_for_opening(
-        dev: &AsahiDevice,
+        dev: &AsahiDrmDevice,
         init: &initdata::InitData,
         primary: &Coprocessor,
         secondary: &Coprocessor,
@@ -1079,6 +1055,10 @@ impl gpu::Gpu for Gpu {
 
     fn arc_as_any(self: Arc<Self>) -> Arc<dyn Any + Sync + Send> {
         self as Arc<dyn Any + Sync + Send>
+    }
+
+    fn stats_snapshot(&self) -> Option<Arc<crate::stats::StatsSnapshot>> {
+        None
     }
 
     fn manager(&self) -> Option<&dyn gpu::GpuManager> {

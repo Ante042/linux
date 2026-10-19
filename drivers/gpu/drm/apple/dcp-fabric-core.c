@@ -29,7 +29,7 @@ EXPORT_SYMBOL_GPL(dcp_fabric_t6020_flow);
 u8 dcp_fabric_tunnel_clock_blocked(bool t6030, unsigned int source)
 {
 	return t6030 ? BIT(1) |
-		(apple_dp_tunnel_t6030_pclk(source, 0) < 0 ? BIT(0) : 0) : 0;
+		(dcp_fabric_t6030_pclk(source, 0) < 0 ? BIT(0) : 0) : 0;
 }
 EXPORT_SYMBOL_GPL(dcp_fabric_tunnel_clock_blocked);
 

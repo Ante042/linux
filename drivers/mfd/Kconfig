@@ -343,6 +343,16 @@ config MFD_MACSMC
 	  various features. The MFD core device handles this protocol and
 	  exposes it to the sub-devices.
 
+config MFD_MACSMC_KUNIT_TEST
+	bool "KUnit tests for Apple SMC key readers" if !KUNIT_ALL_TESTS
+	depends on MFD_MACSMC && KUNIT=y
+	default KUNIT_ALL_TESTS
+	help
+	  Build tests for SMC key/value readers, request limits and metadata
+	  decoding. Static stubs replace mailbox commands and SRAM access,
+	  allowing malformed replies and output buffer limits to be checked
+	  without a running SMC.
+
 config MFD_MADERA
 	tristate "Cirrus Logic Madera codecs"
 	select MFD_CORE
@@ -1198,13 +1208,6 @@ config MFD_OCELOT
 	  called ocelot-soc.
 
 	  If unsure, say N.
-
-config EZX_PCAP
-	bool "Motorola EZXPCAP Support"
-	depends on SPI_MASTER
-	help
-	  This enables the PCAP ASIC present on EZX Phones. This is
-	  needed for MMC, TouchScreen, Sound, USB, etc..
 
 config MFD_CPCAP
 	tristate "Support for Motorola CPCAP"
@@ -2388,7 +2391,7 @@ config MFD_ACER_A500_EC
 	  customized for the specific needs of the Acer A500 hardware.
 
 config MFD_QCOM_PM8008
-	tristate "QCOM PM8008 Power Management IC"
+	tristate "Qualcomm PM8008 Power Management IC"
 	depends on I2C && OF
 	select MFD_CORE
 	select REGMAP_I2C

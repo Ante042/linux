@@ -144,7 +144,9 @@ static int apple_rtkit_management_send(struct apple_rtkit *rtk, u8 type,
 	ret = apple_rtkit_send_message(rtk, APPLE_RTKIT_EP_MGMT, msg, NULL, false);
 
 	if (ret)
-		dev_err(rtk->dev, "RTKit: Failed to send management message: %d\n", ret);
+		dev_err(rtk->dev,
+			"RTKit: Failed to send management message type 0x%02x: %d\n",
+			type, ret);
 
 	return ret;
 }
@@ -208,8 +210,14 @@ static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 	 * endpoint is started before the map is acknowledged.
 	 */
 	if (apple_rtkit_coproc_places_buffers(rtk) && base == 0 &&
-	    test_bit(APPLE_RTKIT_EP_CRASHLOG, &bitmap))
-		apple_rtkit_start_ep(rtk, APPLE_RTKIT_EP_CRASHLOG);
+	    test_bit(APPLE_RTKIT_EP_CRASHLOG, &bitmap)) {
+		ret = apple_rtkit_start_ep(rtk, APPLE_RTKIT_EP_CRASHLOG);
+		if (ret) {
+			rtk->boot_result = ret;
+			complete_all(&rtk->epmap_completion);
+			return;
+		}
+	}
 
 	reply = FIELD_PREP(APPLE_RTKIT_MGMT_EPMAP_BASE, base);
 	if (msg & APPLE_RTKIT_MGMT_EPMAP_LAST)
@@ -552,27 +560,18 @@ static void apple_rtkit_crashlog_rx(struct apple_rtkit *rtk, u64 msg)
 		return;
 	}
 
-	if (rtk->crashlog_inherited && !rtk->crashlog_buffer.size) {
-		/*
-		 * The previous owner negotiated the crashlog buffer, so this
-		 * session never learned its geometry. A CRASH message on an
-		 * inherited session is therefore a crash notification, not a
-		 * buffer request, and must not be answered as one.
-		 */
-		dev_err(rtk->dev,
-			"RTKit: adopted co-processor has crashed (crashlog at %#llx, %#llx bytes, not mapped)\n",
-			(u64)FIELD_GET(APPLE_RTKIT_BUFFER_REQUEST_IOVA, msg),
-			(u64)FIELD_GET(APPLE_RTKIT_BUFFER_REQUEST_SIZE, msg) << 12);
-		rtk->crashed = true;
-		if (rtk->ops->crashed)
-			rtk->ops->crashed(rtk->cookie, NULL, 0);
-		return;
-	}
-
 	if (!rtk->crashlog_buffer.size) {
 		if (apple_rtkit_common_rx_get_buffer(rtk, &rtk->crashlog_buffer,
 						     APPLE_RTKIT_EP_CRASHLOG, msg))
 			goto unmapped;
+		/*
+		 * In a session that went through the handshake, the first
+		 * message on this endpoint is the buffer request. Firmware may
+		 * place that buffer in memory which still holds the log of an
+		 * earlier crash, so only look for one in an inherited session.
+		 */
+		if (!rtk->crashlog_inherited)
+			return;
 		if (rtk->crashlog_buffer.size < sizeof(header))
 			goto unmapped;
 
@@ -682,7 +681,7 @@ static void apple_rtkit_syslog_rx_log(struct apple_rtkit *rtk, u64 msg)
 	if (rtk->syslog_inherited)
 		goto done;
 
-	if (!rtk->syslog_msg_buffer || !rtk->syslog_msg_size) {
+	if (!rtk->syslog_msg_buffer) {
 		dev_warn_ratelimited(
 			rtk->dev,
 			"RTKit: received syslog message but no syslog_msg_buffer\n");
@@ -754,12 +753,9 @@ static void apple_rtkit_oslog_rx(struct apple_rtkit *rtk, u64 msg)
 	u8 type = FIELD_GET(APPLE_RTKIT_OSLOG_TYPE, msg);
 	int err;
 
-	/*
-	 * T8140 and T8142 co-processors send notifications 2 to 5 during
-	 * normal operation; they expect no reply and keep running without one.
-	 */
-	if (type >= APPLE_RTKIT_OSLOG_LOG && type <= 5 &&
-	    (of_machine_is_compatible("apple,t8140") ||
+	/* Preserve the tested Neo/M5 and synchronous-log no-ACK policy. */
+	if (type == APPLE_RTKIT_OSLOG_LOG &&
+	    (rtk->sync_syslog_ack || of_machine_is_compatible("apple,t8140") ||
 	     of_machine_is_compatible("apple,t8142"))) {
 		dev_dbg(rtk->dev, "RTKit: oslog notification: %016llx\n", msg);
 		return;
@@ -771,17 +767,6 @@ static void apple_rtkit_oslog_rx(struct apple_rtkit *rtk, u64 msg)
 						 APPLE_RTKIT_EP_OSLOG, msg);
 		break;
 	case APPLE_RTKIT_OSLOG_LOG:
-		/*
-		 * apple,sync-syslog-ack co-processors (the T8122 dcpext) are
-		 * not acknowledged, as in AsahiLinux/linux#607, which drives
-		 * that firmware: it then sends one notification and keeps its
-		 * log to itself.
-		 */
-		if (rtk->sync_syslog_ack) {
-			dev_dbg(rtk->dev, "RTKit: oslog notification %llx not acknowledged\n",
-				msg);
-			break;
-		}
 		/* Channel zero reports a cumulative 32-bit write counter. Even
 		 * though we discard these logs, acknowledge that exact counter:
 		 * AppleDCP waits for its log transport to drain before AP sleep.
@@ -798,6 +783,14 @@ static void apple_rtkit_oslog_rx(struct apple_rtkit *rtk, u64 msg)
 					       msg, NULL, false);
 		if (err)
 			dev_err(rtk->dev, "RTKit: oslog acknowledgment failed: %d\n", err);
+		break;
+	case 3 ... 5:
+		/*
+		 * Undocumented notifications sent during normal operation. They
+		 * expect no reply, and the co-processor keeps running without
+		 * one.
+		 */
+		dev_dbg(rtk->dev, "RTKit: oslog notification: %016llx\n", msg);
 		break;
 	default:
 		dev_warn(rtk->dev, "RTKit: Unknown oslog message: %llx\n",
@@ -987,16 +980,11 @@ int apple_rtkit_poll(struct apple_rtkit *rtk)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_poll);
 
-void apple_rtkit_flush_rx(struct apple_rtkit *rtk)
-{
-	flush_workqueue(rtk->wq);
-	flush_work(&rtk->sync_ack_work);
-}
-EXPORT_SYMBOL_GPL(apple_rtkit_flush_rx);
-
 void apple_rtkit_hold_rx(struct apple_rtkit *rtk)
 {
 	apple_mbox_hold_rx(rtk->mbox);
+	if (rtk->sync_syslog_ack)
+		flush_work(&rtk->sync_ack_work);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_hold_rx);
 
@@ -1005,6 +993,12 @@ void apple_rtkit_resume_rx(struct apple_rtkit *rtk)
 	apple_mbox_release_rx(rtk->mbox);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_resume_rx);
+
+void apple_rtkit_flush_rx(struct apple_rtkit *rtk)
+{
+	flush_workqueue(rtk->wq);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_flush_rx);
 
 bool apple_rtkit_has_endpoint(struct apple_rtkit *rtk, u8 ep)
 {
@@ -1362,22 +1356,28 @@ static int apple_rtkit_boot_common(struct apple_rtkit *rtk, bool early_ap_power)
 
 	dev_dbg(rtk->dev, "RTKit: waiting for boot to finish\n");
 	ret = apple_rtkit_wait(rtk, &rtk->epmap_completion);
-	if (ret)
+	if (ret) {
+		dev_err(rtk->dev, "RTKit: endpoint discovery failed: %d\n", ret);
 		return ret;
+	}
 	if (rtk->boot_result)
 		return rtk->boot_result;
 
 	/* Some helpers need AP readiness before acknowledging IOP power. */
 	if (early_ap_power) {
 		ret = apple_rtkit_set_ap_power_state(rtk, APPLE_RTKIT_PWR_STATE_ON);
-		if (ret)
+		if (ret) {
+			dev_err(rtk->dev, "RTKit: early AP readiness failed: %d\n", ret);
 			return ret;
+		}
 	}
 
 	dev_dbg(rtk->dev, "RTKit: waiting for IOP power state ACK\n");
 	ret = apple_rtkit_wait(rtk, &rtk->iop_pwr_ack_completion);
-	if (ret)
+	if (ret) {
+		dev_err(rtk->dev, "RTKit: IOP power acknowledgment failed: %d\n", ret);
 		return ret;
+	}
 
 	return early_ap_power ? 0 :
 		apple_rtkit_set_ap_power_state(rtk, APPLE_RTKIT_PWR_STATE_ON);
@@ -1535,14 +1535,15 @@ void apple_rtkit_free_retaining_buffers(struct apple_rtkit *rtk)
 	apple_rtkit_stop_rx(rtk);
 
 	/*
-	 * A failed shutdown provides no guarantee that firmware stopped DMA.
-	 * Retain shared buffers, including custom allocation contexts, rather
-	 * than returning their storage to an allocator while it may be live.
+	 * The firmware may still be using the shared buffers, so keep them,
+	 * including custom allocation contexts, rather than returning their
+	 * storage to an allocator. Callers use this on purpose for firmware
+	 * that cannot be stopped, and report a failed shutdown themselves.
 	 */
-	dev_warn(rtk->dev,
-		 "RTKit: retaining the shared buffers of an unstopped co-processor (ioreport %zu, crashlog %zu, oslog %zu, syslog %zu bytes)\n",
-		 rtk->ioreport_buffer.size, rtk->crashlog_buffer.size,
-		 rtk->oslog_buffer.size, rtk->syslog_buffer.size);
+	dev_dbg(rtk->dev,
+		"RTKit: retaining the shared buffers of a running co-processor (ioreport %zu, crashlog %zu, oslog %zu, syslog %zu bytes)\n",
+		rtk->ioreport_buffer.size, rtk->crashlog_buffer.size,
+		rtk->oslog_buffer.size, rtk->syslog_buffer.size);
 	kfree(rtk->syslog_msg_buffer);
 	apple_rtkit_release_rx(rtk);
 	kfree(rtk);

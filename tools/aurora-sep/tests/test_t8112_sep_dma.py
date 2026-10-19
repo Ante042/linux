@@ -72,7 +72,7 @@ struct apple_dart_hw { u32 tcr, tcr_4level; };
 struct apple_dart {
     u32 ias, pgsize, num_streams;
     u64 dma_min, dma_max, dma_offset;
-    bool locked, fw_mirror, fw_handoff;
+    bool locked, fw_handoff, fw_mirror;
     struct apple_dart_hw *hw;
     int lock;
     const u64 *locked_ttbr[1][DART_MAX_TTBR];
@@ -188,7 +188,7 @@ int main(int argc, char **argv)
     assert(!apple_dart_dma_window_aligned(0x4001, 0xffff3fff, 0x4000));
     assert(!apple_dart_dma_window_aligned(0x4000, 0xffff4000, 0x4000));
     domain.dma_offset = dart.dma_offset;
-    assert(!dart.locked && !dart.fw_handoff);
+    assert(!dart.locked && !dart.fw_handoff && !dart.fw_mirror);
     assert(apple_dart_iova_to_phys(&domain.domain, 0x8000) == 0);
     u64 iovas[] = { 0x4000, 0xffff0000 };
     u64 physical[] = { 0x803ffc000, (1ULL << 42) - 0x4000 };

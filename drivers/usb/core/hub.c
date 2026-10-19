@@ -10,6 +10,7 @@
  * Released under the GPLv2 only.
  */
 
+#include <kunit/visibility.h>
 #include <linux/kernel.h>
 #include <linux/errno.h>
 #include <linux/module.h>
@@ -48,6 +49,8 @@
 #define USB_PRODUCT_USB5534B			0x5534
 #define USB_VENDOR_CYPRESS			0x04b4
 #define USB_PRODUCT_CY7C65632			0x6570
+#define USB_VENDOR_VIA_LABS			0x2109
+#define USB_PRODUCT_VL122			0x2122
 #define USB_VENDOR_TEXAS_INSTRUMENTS		0x0451
 #define USB_PRODUCT_TUSB8041_USB3		0x8140
 #define USB_PRODUCT_TUSB8041_USB2		0x8142
@@ -55,9 +58,6 @@
 #define USB_PRODUCT_USB4913			0x4913
 #define USB_PRODUCT_USB4914			0x4914
 #define USB_PRODUCT_USB4915			0x4915
-#define HUB_QUIRK_CHECK_PORT_AUTOSUSPEND	BIT(0)
-#define HUB_QUIRK_DISABLE_AUTOSUSPEND		BIT(1)
-#define HUB_QUIRK_REDUCE_FRAME_INTR_BINTERVAL	BIT(2)
 
 #define USB_TP_TRANSMISSION_DELAY	40	/* ns */
 #define USB_TP_TRANSMISSION_DELAY_MAX	65535	/* ns */
@@ -73,8 +73,11 @@
 /*
  * Give SS hubs 200ms time after wake to train downstream links before
  * assuming no port activity and allowing hub to runtime suspend back.
+ * Root hubs have no upstream hub whose wake propagation needs to be
+ * accounted for, so they need less time, use 120ms for them.
  */
 #define USB_SS_PORT_U0_WAKE_TIME	200  /* ms */
+#define USB_SS_RH_PORT_U0_WAKE_TIME     120 /* ms */
 
 /* Protect struct usb_device->state and ->children members
  * Note: Both are also protected by ->dev.sem, except that ->state can
@@ -753,10 +756,12 @@ void usb_wakeup_notification(struct usb_device *hdev,
 {
 	struct usb_hub *hub;
 	struct usb_port *port_dev;
+	unsigned long flags;
 
 	if (!hdev)
 		return;
 
+	spin_lock_irqsave(&device_state_lock, flags);
 	hub = usb_hub_to_struct_hub(hdev);
 	if (hub) {
 		port_dev = hub->ports[portnum - 1];
@@ -766,6 +771,7 @@ void usb_wakeup_notification(struct usb_device *hdev,
 		set_bit(portnum, hub->wakeup_bits);
 		kick_hub_wq(hub);
 	}
+	spin_unlock_irqrestore(&device_state_lock, flags);
 }
 EXPORT_SYMBOL_GPL(usb_wakeup_notification);
 
@@ -991,10 +997,12 @@ static int hub_hub_status(struct usb_hub *hub,
 
 	mutex_lock(&hub->status_mutex);
 	ret = get_hub_status(hub->hdev, &hub->status->hub);
-	if (ret < 0) {
+	if (ret < (int)sizeof(hub->status->hub)) {
 		if (ret != -ENODEV)
 			dev_err(hub->intfdev,
 				"%s failed (err = %d)\n", __func__, ret);
+		if (ret >= 0)
+			ret = -EIO;
 	} else {
 		*status = le16_to_cpu(hub->status->hub.wHubStatus);
 		*change = le16_to_cpu(hub->status->hub.wHubChange);
@@ -1353,7 +1361,9 @@ static void hub_activate(struct usb_hub *hub, enum hub_activation_type type)
 
 		queue_delayed_work(system_power_efficient_wq,
 				   &hub->post_resume_work,
-				   msecs_to_jiffies(USB_SS_PORT_U0_WAKE_TIME));
+				   msecs_to_jiffies(hdev->parent ?
+				USB_SS_PORT_U0_WAKE_TIME :
+				USB_SS_RH_PORT_U0_WAKE_TIME));
 		return;
 	}
 
@@ -2120,6 +2130,169 @@ bool usb_device_is_owned(struct usb_device *udev)
 	return !!hub->ports[udev->portnum - 1]->port_owner;
 }
 
+/**
+ * usb_hub_port_power_off - disconnect a hub port and hold its power off
+ * @hdev: USB device belonging to the usb hub
+ * @port1: port number
+ *
+ * For a driver that has to move the data lanes behind a port while the hub
+ * keeps running, such as a Type-C PHY that switches the PIPE interface of a
+ * SuperSpeed root port to another backend. The device on the port is
+ * disconnected and the port is powered off, which takes its link down, as
+ * the port's "disable" attribute does. Connect changes still queued for the
+ * port are dropped. Only hubs that switch the power of each port on its own
+ * are supported.
+ *
+ * The port is then held off until usb_hub_port_power_on(): the hub driver
+ * leaves it off, and the port is kept runtime-active, so that neither its
+ * own runtime resume nor that of its USB2 peer switches it on in between.
+ * Writing 0 to its "disable" attribute fails with -EBUSY; writing 1 takes the
+ * port over, after which usb_hub_port_power_on() leaves it off.
+ *
+ * An administratively disabled port is powered off again, in case it was
+ * repowered before the handover. It stays under administrative ownership:
+ * runtime resume leaves it off, and the caller's hub lock prevents a write
+ * to "disable" from enabling it during the lane change. The return value
+ * distinguishes this from a port held for the caller. Other ports, including
+ * those switched off by runtime PM, are resumed and held off for the caller.
+ *
+ * Context: process context; the caller holds @hdev's device lock.
+ *
+ * Return: 0 if the port is held off for the caller, also if it was already,
+ * 1 if it is administratively disabled, -EOPNOTSUPP if the hub cannot switch the
+ * power of a single port, or another negative error code.
+ */
+int usb_hub_port_power_off(struct usb_device *hdev, int port1)
+{
+	struct usb_hub *hub = usb_hub_to_struct_hub(hdev);
+	struct usb_interface *intf;
+	struct usb_port *port_dev;
+	bool disabled;
+	int ret;
+
+	device_lock_assert(&hdev->dev);
+	if (!hub || hub->disconnected)
+		return -ENODEV;
+	if (port1 < 1 || port1 > hdev->maxchild)
+		return -EINVAL;
+	if ((le16_to_cpu(hub->descriptor->wHubCharacteristics) & HUB_CHAR_LPSM) !=
+	    HUB_CHAR_INDV_PORT_LPSM)
+		return -EOPNOTSUPP;
+
+	port_dev = hub->ports[port1 - 1];
+	if (port_dev->held_off)
+		return 0;
+	disabled = port_dev->disabled;
+
+	intf = to_usb_interface(hub->intfdev);
+	ret = usb_autopm_get_interface(intf);
+	if (ret < 0)
+		return ret;
+
+	/*
+	 * Administrative disable excludes the runtime-resume power writer under
+	 * power_lock. For other ports, wait for any port PM and keep it out
+	 * until power-on. Neither path takes the hub lock in the PM callback.
+	 */
+	if (!disabled) {
+		ret = pm_runtime_resume_and_get(&port_dev->dev);
+		if (ret < 0) {
+			/* After a runtime PM error, nothing resumes the port any more. */
+			if (!pm_runtime_active(&port_dev->dev))
+				goto out;
+			pm_runtime_get_noresume(&port_dev->dev);
+		}
+	}
+
+	if (port_dev->child)
+		usb_disconnect(&port_dev->child);
+
+	ret = usb_hub_set_port_power(hdev, hub, port1, false);
+	if (ret) {
+		/* The link may still be up: have hub_wq look for its device. */
+		set_bit(port1, hub->change_bits);
+		kick_hub_wq(hub);
+		goto put_port;
+	}
+
+	/* The runtime PM reference is dropped once the hold ends. */
+	port_dev->held_off = !disabled;
+	/* Nothing hub_wq still has queued for the port applies to it off. */
+	clear_bit(port1, hub->change_bits);
+	clear_bit(port1, hub->warm_reset_bits);
+	msleep(2 * hub_power_on_good_delay(hub));
+	/* Losing the connection with the power is not an event. */
+	usb_clear_port_feature(hdev, port1, USB_PORT_FEAT_C_CONNECTION);
+	if (!port_dev->is_superspeed)
+		usb_clear_port_feature(hdev, port1, USB_PORT_FEAT_C_ENABLE);
+	ret = disabled;
+	goto out;
+
+put_port:
+	if (!disabled)
+		pm_runtime_put(&port_dev->dev);
+out:
+	usb_autopm_put_interface(intf);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(usb_hub_port_power_off);
+
+/**
+ * usb_hub_port_power_on - switch on a port held off by usb_hub_port_power_off()
+ * @hdev: USB device belonging to the usb hub
+ * @port1: port number
+ *
+ * hub_wq then checks the port for a connection. It warm resets a SuperSpeed
+ * port first: toggling the port power can leave the two ends of the link
+ * out of sync (see usb_port_runtime_resume()), and the warm reset starts
+ * both from a reset. The port is under its usual runtime PM policy again.
+ *
+ * A port that is not held off, because its "disable" attribute took it over
+ * for example, is left alone.
+ *
+ * Context: process context; the caller holds @hdev's device lock.
+ *
+ * Return: 0 if the port was switched on, 1 if it was not held off, or a
+ * negative error code, in which case the port stays held off.
+ */
+int usb_hub_port_power_on(struct usb_device *hdev, int port1)
+{
+	struct usb_hub *hub = usb_hub_to_struct_hub(hdev);
+	struct usb_interface *intf;
+	struct usb_port *port_dev;
+	int ret;
+
+	device_lock_assert(&hdev->dev);
+	if (!hub || hub->disconnected)
+		return -ENODEV;
+	if (port1 < 1 || port1 > hdev->maxchild)
+		return -EINVAL;
+
+	port_dev = hub->ports[port1 - 1];
+	if (!port_dev->held_off)
+		return 1;
+
+	intf = to_usb_interface(hub->intfdev);
+	ret = usb_autopm_get_interface(intf);
+	if (ret < 0)
+		return ret;
+
+	ret = usb_hub_set_port_power(hdev, hub, port1, true);
+	if (!ret) {
+		msleep(hub_power_on_good_delay(hub));
+		if (hub_is_superspeed(hdev))
+			set_bit(port1, hub->warm_reset_bits);
+		set_bit(port1, hub->change_bits);
+		kick_hub_wq(hub);
+		port_dev->held_off = false;
+		pm_runtime_put(&port_dev->dev);
+	}
+
+	usb_autopm_put_interface(intf);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(usb_hub_port_power_on);
+
 static void update_port_device_state(struct usb_device *udev)
 {
 	struct usb_hub *hub;
@@ -2401,7 +2574,7 @@ static void show_string(struct usb_device *udev, char *id, char *string)
 	dev_info(&udev->dev, "%s: %s\n", id, string);
 }
 
-static void announce_device(struct usb_device *udev)
+static void announce_device_ids(struct usb_device *udev)
 {
 	u16 bcdDevice = le16_to_cpu(udev->descriptor.bcdDevice);
 
@@ -2410,6 +2583,10 @@ static void announce_device(struct usb_device *udev)
 		le16_to_cpu(udev->descriptor.idVendor),
 		le16_to_cpu(udev->descriptor.idProduct),
 		bcdDevice >> 8, bcdDevice & 0xff);
+}
+
+static void announce_device_strings(struct usb_device *udev)
+{
 	dev_info(&udev->dev,
 		"New USB device strings: Mfr=%d, Product=%d, SerialNumber=%d\n",
 		udev->descriptor.iManufacturer,
@@ -2420,7 +2597,8 @@ static void announce_device(struct usb_device *udev)
 	show_string(udev, "SerialNumber", udev->serial);
 }
 #else
-static inline void announce_device(struct usb_device *udev) { }
+static inline void announce_device_ids(struct usb_device *udev) { }
+static inline void announce_device_strings(struct usb_device *udev) { }
 #endif
 
 
@@ -2651,6 +2829,9 @@ int usb_new_device(struct usb_device *udev)
 		device_init_wakeup(&udev->dev, 0);
 	}
 
+	/* Announce the device identity */
+	announce_device_ids(udev);
+
 	/* Tell the runtime-PM framework the device is active */
 	pm_runtime_set_active(&udev->dev);
 	pm_runtime_get_noresume(&udev->dev);
@@ -2672,8 +2853,8 @@ int usb_new_device(struct usb_device *udev)
 	udev->dev.devt = MKDEV(USB_DEVICE_MAJOR,
 			(((udev->bus->busnum-1) * 128) + (udev->devnum-1)));
 
-	/* Tell the world! */
-	announce_device(udev);
+	/* Announce the device's product, manufacturer and serial number */
+	announce_device_strings(udev);
 
 	if (udev->serial)
 		add_device_randomness(udev->serial, strlen(udev->serial));
@@ -3148,7 +3329,7 @@ static int hub_port_reset(struct usb_hub *hub, int port1,
 		delay = HUB_LONG_RESET_TIME;
 	}
 
-	dev_err(&port_dev->dev, "Cannot enable. Maybe the USB cable is bad?\n");
+	dev_err_ratelimited(&port_dev->dev, "Cannot enable. Maybe the USB cable is bad?\n");
 
 done:
 	if (status == 0) {
@@ -3449,6 +3630,44 @@ unsigned usb_wakeup_enabled_descendants(struct usb_device *udev)
 			(hub ? hub->wakeup_enabled_descendants : 0);
 }
 EXPORT_SYMBOL_GPL(usb_wakeup_enabled_descendants);
+
+/**
+ * usb_wakeup_reaches - Whether a remote wakeup from below reaches a hub
+ * @hdev: The hub, with the devices below it suspended for system sleep
+ *
+ * A device signals a remote wakeup only if the USB core enabled that when it
+ * suspended it: resume signalling, or for a hub, a connect, disconnect or
+ * over-current change on one of its ports. A hub passes on the remote wakeup
+ * of a device below it whatever its own wakeup setting (USB 2.0, section
+ * 7.1.7.7). While it is suspended, a hub with USB_QUIRK_HUB_NO_SUSPENDED_WAKEUP
+ * does not, and one with USB_QUIRK_HUB_NO_SUSPENDED_PORT_WAKEUP does not signal
+ * its own; a hub kept awake does both.
+ *
+ * Context: System sleep, once the devices below @hdev are suspended, so that
+ * neither they nor their wakeup settings change. Takes no locks.
+ *
+ * Return: true if a device below @hdev can wake it up.
+ */
+bool usb_wakeup_reaches(struct usb_device *hdev)
+{
+	struct usb_device *child;
+	int port1;
+
+	usb_hub_for_each_child(hdev, port1, child) {
+		/* A hub kept awake reports any change on its status endpoint */
+		u32 quirks = child->awake_in_sleep ? 0 : child->quirks;
+
+		if (child->do_remote_wakeup &&
+		    !(quirks & USB_QUIRK_HUB_NO_SUSPENDED_PORT_WAKEUP))
+			return true;
+		if (!(quirks & USB_QUIRK_HUB_NO_SUSPENDED_WAKEUP) &&
+		    usb_wakeup_reaches(child))
+			return true;
+	}
+
+	return false;
+}
+EXPORT_SYMBOL_GPL(usb_wakeup_reaches);
 
 /*
  * usb_port_suspend - suspend a usb device's upstream port
@@ -5437,11 +5656,13 @@ static void hub_port_connect(struct usb_hub *hub, int port1, u16 portstatus,
 
 		/*
 		 * maybe switch power back on (e.g. root hub was reset)
-		 * but only if the port isn't owned by someone else.
+		 * but only if the port isn't owned by someone else, and
+		 * was not switched off on purpose, see hub_power_on().
 		 */
-		if (hub_is_port_power_switchable(hub)
-				&& !usb_port_is_power_on(hub, portstatus)
-				&& !port_dev->port_owner)
+		if (hub_is_port_power_switchable(hub) &&
+		    !usb_port_is_power_on(hub, portstatus) &&
+		    !port_dev->port_owner &&
+		    test_bit(port1, hub->power_bits))
 			set_port_feature(hdev, port1, USB_PORT_FEAT_POWER);
 
 		if (portstatus & USB_PORT_STAT_ENABLE)
@@ -6026,6 +6247,11 @@ static const struct usb_device_id hub_id_table[] = {
       .idVendor = USB_VENDOR_TEXAS_INSTRUMENTS,
       .idProduct = USB_PRODUCT_TUSB8041_USB3,
       .driver_info = HUB_QUIRK_DISABLE_AUTOSUSPEND},
+    { .match_flags = USB_DEVICE_ID_MATCH_VENDOR
+			| USB_DEVICE_ID_MATCH_PRODUCT,
+      .idVendor = USB_VENDOR_VIA_LABS,
+      .idProduct = USB_PRODUCT_VL122,
+      .driver_info = HUB_QUIRK_DISABLE_AUTOSUSPEND},
 	{ .match_flags = USB_DEVICE_ID_MATCH_VENDOR
 			| USB_DEVICE_ID_MATCH_PRODUCT,
 	  .idVendor = USB_VENDOR_MICROCHIP,
@@ -6047,6 +6273,17 @@ static const struct usb_device_id hub_id_table[] = {
       .bInterfaceClass = USB_CLASS_HUB},
     { }						/* Terminating entry */
 };
+
+#if IS_ENABLED(CONFIG_KUNIT)
+/* The HUB_QUIRK_* flags that hub_id_table gives a hub interface */
+unsigned long usb_hub_id_quirks(struct usb_interface *intf)
+{
+	const struct usb_device_id *id = usb_match_id(intf, hub_id_table);
+
+	return id ? id->driver_info : 0;
+}
+EXPORT_SYMBOL_IF_KUNIT(usb_hub_id_quirks);
+#endif
 
 MODULE_DEVICE_TABLE(usb, hub_id_table);
 

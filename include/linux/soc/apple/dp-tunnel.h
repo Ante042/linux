@@ -9,8 +9,8 @@
 #define _LINUX_SOC_APPLE_DP_TUNNEL_H_
 
 #include <linux/kernel.h>
-#include <linux/of.h>
 #include <linux/of_graph.h>
+#include <linux/of.h>
 #include <linux/types.h>
 
 struct device_node;
@@ -44,16 +44,6 @@ int apple_dcp_tb_dp_tunnel(struct device_node *connector_np, unsigned int dpin,
  */
 int apple_atc_dp_tunnel_rate(struct phy *phy, unsigned int dpin, u8 rate);
 
-/* T6030's even external sources feed DP IN0 through DPTX PCLK1. */
-static inline int apple_dp_tunnel_t6030_pclk(unsigned int source, unsigned int dpin)
-{
-	return !dpin && (source == 0 || source == 2) ? 0 : -EOPNOTSUPP;
-}
-
-/* T6030: keep the source owning the pixel clock across rate changes and stop. */
-int apple_atc_dp_tunnel_rate_source(struct phy *phy, unsigned int source,
-				    unsigned int dpin, u8 rate);
-
 /*
  * ATC PHY: wake the DP clock path of a PHY in Thunderbolt/USB4 mode ahead of
  * apple_atc_dp_tunnel_rate(), before DCP is told about the display.
@@ -66,12 +56,19 @@ int apple_atc_dp_tunnel_open(struct phy *phy);
  * bring it back up (clock gates and enables) around a link reconfiguration.
  * The mux selection is left alone; link_down() also leaves the ATC output
  * enable set and link_up() re-asserts it. The caller keeps the output
- * selected (holds the mux) around both. Supports t8103 and T602X crossbars,
- * T6030 DP IN outputs included.
+ * selected (holds the mux) around both. Supports t8103 and T602X crossbars.
  */
 int apple_dpxbar_link_down(struct mux_control *mux);
 int apple_dpxbar_link_up(struct mux_control *mux);
 int apple_dpxbar_tunnel_select_source(struct mux_control *mux, int state);
+
+/*
+ * Display crossbar: point a DP IN output that is not selected yet at source
+ * @state without bringing the connection up, or back at its idle source
+ * (MUX_IDLE_DISCONNECT). The later mux selection does the rest.
+ * -EOPNOTSUPP on T602X crossbars.
+ */
+int apple_dpxbar_preselect(struct mux_control *mux, int state);
 
 /* Shared with the pure fabric classifier; a partial named pair is invalid. */
 static inline bool apple_dp_tunnel_wiring_dual(unsigned int endpoints,
@@ -159,12 +156,5 @@ static inline bool apple_dp_tunnel_dual_stream(struct device_node *connector_np)
 	return false;
 }
 
-/*
- * Display crossbar: point a DP IN output that is not selected yet at source
- * @state without bringing the connection up, or back at its idle source
- * (MUX_IDLE_DISCONNECT). The later mux selection does the rest.
- * -EOPNOTSUPP on T602X crossbars.
- */
-int apple_dpxbar_preselect(struct mux_control *mux, int state);
 
 #endif

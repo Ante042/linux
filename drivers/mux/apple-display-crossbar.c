@@ -203,12 +203,7 @@ static void t602x_dump(struct apple_dpxbar *xbar, const char *tag)
 		readl(xbar->regs + T602X_REG_81C_STAT));
 }
 
-/*
- * T6030 DP IN outputs. T6030 has the T6020 crossbar, but it brings a DP IN
- * output up and down with its own sequence: the mux selection only routes, and
- * DCP's DidChangeLinkConfiguration enables the clocks. The M2 Pro and M2 Max
- * keep apple_dpxbar_t602x_link_up() and apple_dpxbar_t602x_link_down().
- */
+/* T602X compact register map; the older dpphy-only names above are retained. */
 #define T602X_RD_PCLK1 0x00c
 #define T602X_RD_PCLK2 0x010
 #define T602X_RD_GATE 0x014
@@ -648,6 +643,7 @@ static int apple_dpxbar_set(struct mux_control *mux, int state)
 }
 
 static const struct mux_control_ops apple_dpxbar_ops;
+static const struct mux_control_ops apple_dpxbar_t602x_ops;
 
 static const u32 apple_dpxbar_atc_bits[MUX_MAX] = { ATC_DPPHY, ATC_DPIN0, ATC_DPIN1 };
 
@@ -825,15 +821,13 @@ int apple_dpxbar_tunnel_select_source(struct mux_control *mux, int state)
 
 	if (!mux || mux->chip->ops != &apple_dpxbar_t602x_ops)
 		return -EOPNOTSUPP;
-	xbar = mux_chip_priv(mux->chip);
-	if (xbar->t6030_dpin)
-		return -EOPNOTSUPP;
 	index = mux_control_get_index(mux);
 	if (index != MUX_DPIN0 && index != MUX_DPIN1)
 		return -EINVAL;
 	if (state < -1 || state >= 9)
 		return -EINVAL;
 
+	xbar = mux_chip_priv(mux->chip);
 	spin_lock_irqsave(&xbar->lock, flags);
 	if (xbar->selected_dispext[index] >= 0 &&
 	    xbar->selected_dispext[index] != state) {
@@ -1009,8 +1003,7 @@ static int apple_dpxbar_probe(struct platform_device *pdev)
 	spin_lock_init(&dpxbar->lock);
 
 	dpxbar->dev = dev;
-	dpxbar->t6030_dpin = of_device_is_compatible(dev->of_node, "apple,t6020-display-crossbar") &&
-			     of_machine_is_compatible("apple,t6030");
+	dpxbar->t6030_dpin = of_machine_is_compatible("apple,t6030");
 	dpxbar->regs = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(dpxbar->regs))
 		return PTR_ERR(dpxbar->regs);

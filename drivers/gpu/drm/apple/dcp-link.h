@@ -5,12 +5,32 @@
 #define __APPLE_DCP_LINK_H__
 
 #include <linux/bitfield.h>
+#include <linux/build_bug.h>
 #include <linux/bits.h>
 #include <linux/byteorder/generic.h>
 #include <linux/errno.h>
 #include <linux/log2.h>
 #include <linux/overflow.h>
 #include <linux/types.h>
+
+#include <asm/byteorder.h>
+
+/*
+ * Two users share this header:
+ *
+ * - The DCPLink transport (APPLE_DCP_LINK_*) of the 14.7 firmware session
+ *   that the boot loader hands over on T6030 (iomfb_v14_7_link.c).
+ *
+ * - H17-generation DCP firmware, which uses the ordinary IOMFB transport once
+ *   the INIT/SetShmem handshake is done: the same six fixed channels (CMD
+ *   0x00000, OOBCMD 0x08000, ASYNC 0x40000, OOBASYNC 0x48000, CB 0x60000,
+ *   OOBCB 0x68000), selected by the context field of the message.  Records
+ *   are allocated on each channel's stack at
+ *     off_next = off_cur + align_up(12 + in_len + out_len, 0x40)
+ *   which is the rule dcp_packet_start() and DCP_PACKET_ALIGNMENT implement
+ *   in iomfb.c.  For H17P this header only describes the callback payloads
+ *   whose layout differs from older firmware (apple_dcp_h17p_*).
+ */
 
 #define APPLE_DCP_LINK_PROTOCOL_VERSION		4
 #define APPLE_DCP_LINK_ENDPOINT			0x37

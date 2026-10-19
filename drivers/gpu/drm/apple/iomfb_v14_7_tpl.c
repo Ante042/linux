@@ -2,9 +2,9 @@
 /* Copyright The Asahi Linux Contributors */
 
 /*
- * 14.7 firmware through the classic IOMFB template: the method and
- * callback tables of asahi-wip-7.2 (AsahiLinux/linux#607), used for the
- * T8122 dcpext (DCP_FIRMWARE_V_14_7_TEMPLATE).
+ * 14.7 firmware through the classic IOMFB template, for the generic M1/M2
+ * 14.7.0 firmware (DCP_FIRMWARE_V_14_7_TEMPLATE). Not to be confused with
+ * iomfb_v14_7.c, the native DCPLink backend for T6030 panels.
  */
 
 /* Include all per-version headers before defining DCP_FW ourself. */
@@ -31,9 +31,9 @@ static const struct dcp_method_entry dcp_methods[dcpep_num_methods] = {
 	IOMFB_METHOD("A425", iomfbep_get_color_remap_mode),
 	IOMFB_METHOD("A440", dcpep_set_parameter_dcp),
 	IOMFB_METHOD("A444", dcpep_create_default_fb),
-	IOMFB_METHOD("A443", dcpep_enable_disable_video_power_savings),
+	IOMFB_METHOD("A448", dcpep_enable_disable_video_power_savings),
 	IOMFB_METHOD("A455", dcpep_first_client_open),
-	IOMFB_METHOD("A457", iomfbep_last_client_close),
+	IOMFB_METHOD("A456", iomfbep_last_client_close),
 	IOMFB_METHOD("A463", dcpep_set_display_refresh_properties),
 	IOMFB_METHOD("A466", dcpep_flush_supports_power),
 	IOMFB_METHOD("A467", iomfbep_abort_swaps_dcp),
@@ -65,8 +65,8 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[111] = trampoline_true, /* create_iomfb_service */
 	[112] = trampoline_create_backlight_service,
 	[113] = trampoline_true, /* create_nvram_service? */
-	[115] = trampoline_get_tiling_state,
-	[116] = trampoline_false, /* set_tiling_state */
+	//[114] = trampoline_get_tiling_state,
+	//[115] = trampoline_false, /* set_tiling_state */
 	[121] = dcpep_cb_boot_1, /* is_dark_boot */
 	[122] = trampoline_false, /* is_dark_boot / is_waking_from_hibernate*/
 	[123] = trampoline_false,
@@ -114,7 +114,6 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[597] = trampoline_false, /* IOMobileFramebufferAP::preserveContents */
 	[598] = trampoline_nop, /* find_swap_function_gated */
 };
-
 void DCP_FW_NAME(iomfb_start)(struct apple_dcp *dcp)
 {
 	dcp->cb_handlers = cb_handlers;

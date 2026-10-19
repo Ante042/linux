@@ -52,6 +52,7 @@
  *   endpoint rings; it generates events on the event ring for these.
  */
 
+#include <kunit/visibility.h>
 #include <linux/jiffies.h>
 #include <linux/scatterlist.h>
 #include <linux/slab.h>
@@ -340,7 +341,7 @@ static bool trb_in_td(struct xhci_td *td, dma_addr_t suspect_dma)
  * Only for transfer and command rings where driver is the producer, not for
  * event rings.
  */
-static unsigned int xhci_num_trbs_free(struct xhci_ring *ring)
+unsigned int xhci_num_trbs_free(struct xhci_ring *ring)
 {
 	struct xhci_segment *enq_seg = ring->enq_seg;
 	union xhci_trb *enq = ring->enqueue;
@@ -609,7 +610,7 @@ static struct xhci_virt_ep *xhci_get_virt_ep(struct xhci_hcd *xhci,
 					     unsigned int slot_id,
 					     unsigned int ep_index)
 {
-	if (slot_id == 0 || slot_id >= MAX_HC_SLOTS) {
+	if (slot_id == 0 || slot_id > xhci->max_slots) {
 		xhci_warn(xhci, "Invalid slot_id %u\n", slot_id);
 		return NULL;
 	}
@@ -842,21 +843,18 @@ static void xhci_giveback_urb_in_irq(struct xhci_hcd *xhci,
 	usb_hcd_giveback_urb(hcd, urb, status);
 }
 
-static void xhci_unmap_td_bounce_buffer(struct xhci_hcd *xhci,
-		struct xhci_ring *ring, struct xhci_td *td)
+static void xhci_unmap_one_bounce_buffer(struct xhci_hcd *xhci,
+		struct xhci_ring *ring, struct xhci_td *td,
+		struct xhci_segment *seg)
 {
 	struct device *dev = xhci_to_hcd(xhci)->self.sysdev;
-	struct xhci_segment *seg = td->bounce_seg;
 	struct urb *urb = td->urb;
 	size_t len;
-
-	if (!ring || !seg || !urb)
-		return;
 
 	if (usb_urb_dir_out(urb)) {
 		dma_unmap_single(dev, seg->bounce_dma, ring->bounce_buf_len,
 				 DMA_TO_DEVICE);
-		return;
+		goto done;
 	}
 
 	dma_unmap_single(dev, seg->bounce_dma, ring->bounce_buf_len,
@@ -872,8 +870,27 @@ static void xhci_unmap_td_bounce_buffer(struct xhci_hcd *xhci,
 		memcpy(urb->transfer_buffer + seg->bounce_offs, seg->bounce_buf,
 		       seg->bounce_len);
 	}
+done:
 	seg->bounce_len = 0;
 	seg->bounce_offs = 0;
+}
+
+static void xhci_unmap_td_bounce_buffer(struct xhci_hcd *xhci,
+		struct xhci_ring *ring, struct xhci_td *td)
+{
+	struct xhci_segment *seg;
+	int i = 0;
+
+	if (!td->bounce_seg || !ring || !td->urb)
+		return;
+
+	/* td->bounce_seg is the last one bounced, unmap them all */
+	for (seg = td->start_seg; i++ < ring->num_segs; seg = seg->next) {
+		if (seg->bounce_len)
+			xhci_unmap_one_bounce_buffer(xhci, ring, td, seg);
+		if (seg == td->bounce_seg)
+			break;
+	}
 }
 
 static void xhci_td_cleanup(struct xhci_hcd *xhci, struct xhci_td *td,
@@ -1405,6 +1422,7 @@ void xhci_hc_died(struct xhci_hcd *xhci)
 	if (notify)
 		usb_hc_died(xhci_to_hcd(xhci));
 }
+EXPORT_SYMBOL_GPL(xhci_hc_died);
 
 /*
  * When we get a completion for a Set Transfer Ring Dequeue Pointer command,
@@ -1613,7 +1631,7 @@ static void xhci_handle_cmd_disable_slot(struct xhci_hcd *xhci, int slot_id,
 		/* Delete default control endpoint resources */
 		xhci_free_device_endpoint_resources(xhci, virt_dev, true);
 	if (cmd_comp_code == COMP_SUCCESS) {
-		xhci->dcbaa->dev_context_ptrs[slot_id] = 0;
+		xhci->dcbaa.ctx_array[slot_id] = 0;
 		xhci->devs[slot_id] = NULL;
 	}
 }
@@ -1804,7 +1822,7 @@ static void handle_cmd_completion(struct xhci_hcd *xhci,
 	struct xhci_command *cmd;
 	u32 cmd_type;
 
-	if (slot_id >= MAX_HC_SLOTS) {
+	if (slot_id > xhci->max_slots) {
 		xhci_warn(xhci, "Invalid slot_id %u\n", slot_id);
 		return;
 	}
@@ -1940,6 +1958,113 @@ static void handle_vendor_event(struct xhci_hcd *xhci,
 		handle_cmd_completion(xhci, &event->event_cmd);
 }
 
+/*
+ * A controller kept running in suspend-to-idle interrupts for every event, see
+ * xhci_run_in_s2idle_begin(). The event handling decides which of them wake
+ * the system, as the platform has no other wake logic that would.
+ */
+void xhci_s2idle_wakeup(struct xhci_hcd *xhci)
+{
+	pm_wakeup_hard_event(xhci_to_hcd(xhci)->self.controller);
+}
+
+/*
+ * Whether a port change is one that a halted controller would wake the system
+ * on: resume signalling, which a device only sends once the USB core enabled
+ * its remote wakeup, or a connect, disconnect or over-current change that
+ * xhci_bus_suspend() armed the port for, which it does only when the root hub
+ * may wake the system. Any other change, such as a SuperSpeed link going to
+ * SS.Inactive, does not wake it.
+ */
+VISIBLE_IF_KUNIT bool xhci_s2idle_port_wakeup(u32 portsc)
+{
+	if ((portsc & PORT_PLC) && (portsc & PORT_PLS_MASK) == XDEV_RESUME)
+		return true;
+
+	if ((portsc & PORT_CSC) && (portsc & (PORT_WKCONN_E | PORT_WKDISC_E)))
+		return true;
+
+	return (portsc & PORT_OCC) && (portsc & PORT_WKOC_E);
+}
+EXPORT_SYMBOL_IF_KUNIT(xhci_s2idle_port_wakeup);
+
+/**
+ * xhci_s2idle_port_change - Decide on a port change in suspend-to-idle
+ * @xhci: The controller, running in suspend-to-idle, with its lock held
+ * @port: The port
+ * @portsc: PORTSC as the event handling read it, updated as it is read again
+ *
+ * A port posts a Port Status Change Event only for a change made while none of
+ * its change bits is set, see xHCI 1.2 section 4.19.2. Left set in PORTSC until
+ * the hub driver clears it after resume, a change that does not wake the system
+ * would keep the port from posting one for a later change that does, such as a
+ * connect. Clear the change bits and hold them in software instead, where
+ * xhci_get_port_status() and xhci_hub_status_data() report them as before.
+ *
+ * Clearing them is part of the decision. A change that the port latched in the
+ * meantime, while other change bits were still set, posted no event, so PORTSC
+ * is read and judged again after each write. And a remote wakeup that started
+ * while PLC was set sets no new PLC, so clearing PLC removes its only change
+ * bit: if the link is then in Resume, PLC is put back into @portsc for the
+ * event handling, as if it had stayed set.
+ *
+ * Return: true if a change of the port wakes the system, or if the port keeps
+ * changing. The event handling then carries on with @portsc.
+ */
+static bool xhci_s2idle_port_change(struct xhci_hcd *xhci, struct xhci_port *port,
+				    u32 *portsc)
+{
+	u32 reported = PORT_CHANGE_MASK;
+	int retries = 4;
+
+	/* The hub driver sees no USB 2 link state change, the event handling deals with it */
+	if (port->rhub == &xhci->usb2_rhub)
+		reported &= ~PORT_PLC;
+
+	while (!xhci_s2idle_port_wakeup(*portsc)) {
+		u32 changes = *portsc & PORT_CHANGE_MASK;
+
+		if (!changes)
+			return false;
+		if (retries-- == 0)
+			return true;
+
+		xhci_dbg(xhci, "port %d-%d: no s2idle wakeup, change left for resume\n",
+			 port->rhub->hcd->self.busnum, port->hcd_portnum + 1);
+		port->held_changes |= changes & reported;
+		xhci_portsc_writel(port, xhci_port_state_to_neutral(*portsc) | changes);
+		*portsc = xhci_portsc_readl(port);
+
+		if ((changes & PORT_PLC) && (*portsc & PORT_PLS_MASK) == XDEV_RESUME)
+			*portsc |= PORT_PLC;
+	}
+
+	return true;
+}
+
+/*
+ * Only hubs that the USB core kept awake for a remote wakeup have transfers in
+ * flight, see usb_suspend_both(): a completed one reports a change on one of
+ * their ports.
+ */
+VISIBLE_IF_KUNIT bool xhci_s2idle_transfer_wakeup(const struct usb_device *udev)
+{
+	return udev && udev->awake_in_sleep;
+}
+EXPORT_SYMBOL_IF_KUNIT(xhci_s2idle_transfer_wakeup);
+
+static void xhci_s2idle_transfer_event(struct xhci_hcd *xhci,
+				       struct xhci_transfer_event *event)
+{
+	unsigned int slot_id = TRB_TO_SLOT_ID(le32_to_cpu(event->flags));
+	struct xhci_virt_device *vdev = xhci->devs[slot_id];
+
+	if (vdev && xhci_s2idle_transfer_wakeup(vdev->udev)) {
+		xhci_dbg(xhci, "slot %u transfer: s2idle wakeup\n", slot_id);
+		xhci_s2idle_wakeup(xhci);
+	}
+}
+
 static void handle_device_notification(struct xhci_hcd *xhci,
 		union xhci_trb *event)
 {
@@ -1955,6 +2080,8 @@ static void handle_device_notification(struct xhci_hcd *xhci,
 
 	xhci_dbg(xhci, "Device Wake Notification event for slot ID %u\n",
 			slot_id);
+	if (xhci->running_in_s2idle)
+		xhci_s2idle_wakeup(xhci);
 	udev = xhci->devs[slot_id]->udev;
 	if (udev && udev->parent)
 		usb_wakeup_notification(udev->parent, udev->portnum);
@@ -2025,7 +2152,7 @@ static void handle_port_status(struct xhci_hcd *xhci, union xhci_trb *event)
 		vdev = xhci->devs[port->slot_id];
 
 	/* We might get interrupts after shared_hcd is removed */
-	if (port->rhub == &xhci->usb3_rhub && xhci->shared_hcd == NULL) {
+	if (port->rhub == &xhci->usb3_rhub && xhci_get_usb3_hcd(xhci) == NULL) {
 		xhci_dbg(xhci, "ignore port event for removed USB3 hcd\n");
 		bogus_port_status = true;
 		goto cleanup;
@@ -2041,16 +2168,31 @@ static void handle_port_status(struct xhci_hcd *xhci, union xhci_trb *event)
 
 	trace_xhci_handle_port_status(port, portsc);
 
-	if (hcd->state == HC_STATE_SUSPENDED) {
-		xhci_dbg(xhci, "resume root hub\n");
-		usb_hcd_resume_root_hub(hcd);
-	}
-
 	if (vdev && (portsc & PORT_PLS_MASK) == XDEV_INACTIVE) {
 		if (!(portsc & PORT_RESET))
 			vdev->flags |= VDEV_PORT_ERROR;
 	} else if (vdev && portsc & PORT_RC) {
 		vdev->flags &= ~VDEV_PORT_ERROR;
+	}
+
+	/*
+	 * Running in suspend-to-idle, wake the system only as a halted
+	 * controller would. Hold any other change for the USB core until
+	 * resume, and do not resume or poll the root hub for it now. Nothing
+	 * below may clear a change bit before this decision, see
+	 * xhci_s2idle_port_change().
+	 */
+	if (xhci->running_in_s2idle) {
+		if (!xhci_s2idle_port_change(xhci, port, &portsc))
+			return;
+		xhci_dbg(xhci, "port %d-%d: s2idle wakeup\n",
+			 hcd->self.busnum, hcd_portnum + 1);
+		xhci_s2idle_wakeup(xhci);
+	}
+
+	if (hcd->state == HC_STATE_SUSPENDED) {
+		xhci_dbg(xhci, "resume root hub\n");
+		usb_hcd_resume_root_hub(hcd);
 	}
 
 	if ((portsc & PORT_PLC) && (portsc & PORT_PLS_MASK) == XDEV_RESUME) {
@@ -2161,6 +2303,33 @@ cleanup:
 	/* Pass this up to the core */
 	usb_hcd_poll_rh_status(hcd);
 	spin_lock(&xhci->lock);
+}
+
+/**
+ * xhci_s2idle_latched_changes - Decide on the changes latched before suspend-to-idle
+ * @xhci: The controller, just set running in suspend-to-idle, with its lock held
+ *
+ * A port whose change bits are still set, such as one whose changes the hub
+ * driver had no chance to clear before it froze, posts no event for its next
+ * change. Handle each such port as if it had just posted an event, so that its
+ * changes are held, or wake the system, as for any other event.
+ */
+void xhci_s2idle_latched_changes(struct xhci_hcd *xhci)
+{
+	union xhci_trb event = {};
+	unsigned int i;
+
+	event.generic.field[2] = cpu_to_le32(COMP_SUCCESS << 24);
+	for (i = 0; i < xhci->max_ports; i++) {
+		struct xhci_port *port = &xhci->hw_ports[i];
+
+		if (!port->rhub || !port->rhub->hcd ||
+		    port->hcd_portnum == DUPLICATE_ENTRY ||
+		    !(xhci_portsc_readl(port) & PORT_CHANGE_MASK))
+			continue;
+		event.generic.field[0] = cpu_to_le32((i + 1) << 24);
+		handle_port_status(xhci, &event);
+	}
 }
 
 static void xhci_clear_hub_tt_buffer(struct xhci_hcd *xhci, struct xhci_td *td,
@@ -2395,7 +2564,6 @@ static void process_isoc_td(struct xhci_hcd *xhci, struct xhci_virt_ep *ep,
 	u32 trb_comp_code;
 	bool sum_trbs_for_length = false;
 	u32 remaining, requested, ep_trb_len;
-	int short_framestatus;
 
 	trb_comp_code = GET_COMP_CODE(le32_to_cpu(event->transfer_len));
 	urb_priv = td->urb->hcpriv;
@@ -2404,8 +2572,6 @@ static void process_isoc_td(struct xhci_hcd *xhci, struct xhci_virt_ep *ep,
 	requested = frame->length;
 	remaining = EVENT_TRB_LEN(le32_to_cpu(event->transfer_len));
 	ep_trb_len = TRB_LEN(le32_to_cpu(ep_trb->generic.field[2]));
-	short_framestatus = td->urb->transfer_flags & URB_SHORT_NOT_OK ?
-		-EREMOTEIO : 0;
 
 	/* handle completion code */
 	switch (trb_comp_code) {
@@ -2413,15 +2579,12 @@ static void process_isoc_td(struct xhci_hcd *xhci, struct xhci_virt_ep *ep,
 		/* Don't overwrite status if TD had an error, see xHCI 4.9.1 */
 		if (td->error_mid_td)
 			break;
-		if (remaining) {
-			frame->status = short_framestatus;
+		if (remaining)
 			sum_trbs_for_length = true;
-			break;
-		}
 		frame->status = 0;
 		break;
 	case COMP_SHORT_PACKET:
-		frame->status = short_framestatus;
+		frame->status = 0;
 		sum_trbs_for_length = true;
 		break;
 	case COMP_BANDWIDTH_OVERRUN_ERROR:
@@ -2456,7 +2619,7 @@ static void process_isoc_td(struct xhci_hcd *xhci, struct xhci_virt_ep *ep,
 		break;
 	case COMP_STOPPED_SHORT_PACKET:
 		/* field normally containing residue now contains transferred */
-		frame->status = short_framestatus;
+		frame->status = 0;
 		requested = remaining;
 		break;
 	case COMP_STOPPED_LENGTH_INVALID:
@@ -2492,26 +2655,6 @@ finish_td:
 	finish_td(xhci, ep, ep_ring, td, trb_comp_code);
 }
 
-static void skip_isoc_td(struct xhci_hcd *xhci, struct xhci_td *td,
-			 struct xhci_virt_ep *ep, int status)
-{
-	struct urb_priv *urb_priv;
-	struct usb_iso_packet_descriptor *frame;
-	int idx;
-
-	urb_priv = td->urb->hcpriv;
-	idx = urb_priv->num_tds_done;
-	frame = &td->urb->iso_frame_desc[idx];
-
-	/* The transfer is partly done. */
-	frame->status = -EXDEV;
-
-	/* calc actual length */
-	frame->actual_length = 0;
-
-	xhci_dequeue_td(xhci, td, ep->ring, status);
-}
-
 /*
  * Process bulk and interrupt tds, update urb status and actual_length.
  */
@@ -2542,6 +2685,7 @@ static void process_bulk_intr_td(struct xhci_hcd *xhci, struct xhci_virt_ep *ep,
 		td->status = 0;
 		break;
 	case COMP_SHORT_PACKET:
+		ep->err_count = 0;
 		td->status = 0;
 		break;
 	case COMP_STOPPED_SHORT_PACKET:
@@ -2623,6 +2767,17 @@ static bool xhci_spurious_success_tx_event(struct xhci_hcd *xhci,
 	default:
 		return false;
 	}
+}
+
+static struct xhci_td *find_td_by_dma(struct xhci_ring *ep_ring, dma_addr_t dma)
+{
+	struct xhci_td *td;
+
+	if (dma)
+		list_for_each_entry(td, &ep_ring->td_list, td_list)
+			if (trb_in_td(td, dma))
+				return td;
+	return NULL;
 }
 
 /*
@@ -2819,8 +2974,11 @@ static int handle_tx_event(struct xhci_hcd *xhci,
 		xhci_dequeue_td(xhci, td, ep_ring, td->status);
 	}
 
-	/* If the TRB pointer is NULL, missed TDs will be skipped on the next event */
-	if (trb_comp_code == COMP_MISSED_SERVICE_ERROR && !ep_trb_dma)
+	/*
+	 * We don't know how many TDs were missed when ep_trb_dma is zero (as permitted by
+	 * xHCI 1.0) or bogus. Bail out leaving ep->skip set, next event will sort it out.
+	 */
+	if (trb_comp_code == COMP_MISSED_SERVICE_ERROR && !find_td_by_dma(ep_ring, ep_trb_dma))
 		return 0;
 
 	if (list_empty(&ep_ring->td_list)) {
@@ -2854,7 +3012,11 @@ static int handle_tx_event(struct xhci_hcd *xhci,
 				if (trb_comp_code == COMP_STOPPED_LENGTH_INVALID)
 					return 0;
 
-				skip_isoc_td(xhci, td, ep, status);
+				/*
+				 * TD was missed, skip it. Core already initialized frame->status
+				 * to -EXDEV and frame->actual_length to 0, nothing more to do.
+				 */
+				xhci_dequeue_td(xhci, td, ep_ring, 0);
 
 				if (!list_empty(&ep_ring->td_list)) {
 					if (ring_xrun_event) {
@@ -3008,6 +3170,8 @@ static int xhci_handle_event_trb(struct xhci_hcd *xhci, struct xhci_interrupter 
 		handle_port_status(xhci, event);
 		break;
 	case TRB_TRANSFER:
+		if (xhci->running_in_s2idle)
+			xhci_s2idle_transfer_event(xhci, &event->trans_event);
 		handle_tx_event(xhci, ir, &event->trans_event);
 		break;
 	case TRB_DEV_NOTE:
@@ -3215,6 +3379,15 @@ irqreturn_t xhci_irq(struct usb_hcd *hcd)
 	/* This is the handler of the primary interrupter */
 	xhci_handle_events(xhci, xhci->interrupters[0], false);
 out:
+	/*
+	 * A controller that stopped or failed in suspend-to-idle is dealt with
+	 * on resume. A Host Controller or Host System Error wakes the system
+	 * even if xhci_halt() timed out: a failing controller may never halt.
+	 */
+	if (xhci->running_in_s2idle &&
+	    ((status & (STS_HCE | STS_FATAL)) ||
+	     (xhci->xhc_state & (XHCI_STATE_DYING | XHCI_STATE_HALTED))))
+		xhci_s2idle_wakeup(xhci);
 	spin_unlock(&xhci->lock);
 
 	return ret;
@@ -3695,7 +3868,7 @@ int xhci_queue_bulk_tx(struct xhci_hcd *xhci, gfp_t mem_flags,
 						  &trb_buff_len,
 						  ring->enq_seg)) {
 					send_addr = ring->enq_seg->bounce_dma;
-					/* assuming TD won't span 2 segs */
+					/* TD bounced at least, and last on this seg */
 					td->bounce_seg = ring->enq_seg;
 				}
 			}
@@ -4353,12 +4526,18 @@ static int queue_command(struct xhci_hcd *xhci, struct xhci_command *cmd,
 			 u32 field3, u32 field4, bool command_must_succeed)
 {
 	int reserved_trbs = xhci->cmd_ring_reserved_trbs;
+	struct usb_hcd *hcd = xhci_to_hcd(xhci);
 	int ret;
 
 	if ((xhci->xhc_state & XHCI_STATE_DYING) ||
 		(xhci->xhc_state & XHCI_STATE_HALTED)) {
 		xhci_dbg(xhci, "xHCI dying or halted, can't queue_command. state: 0x%x\n",
 			 xhci->xhc_state);
+		return -ESHUTDOWN;
+	}
+
+	if (!HCD_HW_ACCESSIBLE(hcd)) {
+		xhci_warn(xhci, "Can't queue command, xHC not accessible\n");
 		return -ESHUTDOWN;
 	}
 

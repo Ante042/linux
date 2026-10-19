@@ -15,10 +15,10 @@
 #include <linux/usb/typec.h>
 #include <linux/usb/typec_mux.h>
 
+#include "cd321x-pm.h"
+
 #ifndef __TPS6598X_H__
 #define __TPS6598X_H__
-
-#include "cd321x-pm.h"
 
 /* Also read by the SPMI glue to tell when the controller has woken up */
 #define TPS_REG_MODE			0x03
@@ -297,13 +297,22 @@
 #define TPS_TASK_TIMEOUT		1
 #define TPS_TASK_REJECTED		3
 
+enum tipd_hw_variant {
+	TIPD_VARIANT_INVALID = 0,
+	TIPD_VARIANT_CD321X,
+	TIPD_VARIANT_TPS6598X,
+	TIPD_VARIANT_TPS25750,
+	TIPD_VARIANT_SN201202X,
+	TIPD_VARIANT_MAX,
+};
+
 struct tps6598x;
 
 struct tipd_data {
 	irq_handler_t irq_handler;
 	u64 irq_mask1;
 	size_t tps_struct_size;
-	void (*remove)(struct tps6598x *tps);
+	int (*remove)(struct tps6598x *tps);
 	int (*register_port)(struct tps6598x *tps, struct fwnode_handle *node);
 	void (*unregister_port)(struct tps6598x *tps);
 	void (*ready)(struct tps6598x *tps);
@@ -316,24 +325,19 @@ struct tipd_data {
 	bool (*read_data_status)(struct tps6598x *tps);
 	int (*reset)(struct tps6598x *tps);
 	int (*connect)(struct tps6598x *tps, u32 status);
-	void (*suspend_prepare)(struct tps6598x *tps);
-	void (*resume_reverify)(struct tps6598x *tps);
+	void (*prepare)(struct tps6598x *tps);
+	void (*complete)(struct tps6598x *tps);
 };
 
 struct tps6598x {
+	/* Native H17 routes retain ENOSPC admission and their own HPD path. */
+	u8 h17_display:1;
 	struct device *dev;
 	struct regmap *regmap;
 	struct mutex lock; /* device lock */
 	int irq;
 	u8 i2c_protocol:1;
 	u8 dbma_at_probe:1; /* Apple "DBMa" debug mode was active at probe */
-	/*
-	 * T8140 (H17P) and T8142 (H17G) Type-C display handling: the display
-	 * mux reports a display taken by another port as -ENOSPC (-EBUSY is a
-	 * transient PHY state and is retried), and the SN201202x DP status
-	 * event and its HPD rules stay off.
-	 */
-	u8 h17_display:1;
 
 	struct gpio_desc *reset;
 	struct typec_port *port;
@@ -341,6 +345,12 @@ struct tps6598x {
 	struct usb_pd_identity partner_identity;
 	struct usb_role_switch *role_sw;
 	struct typec_capability typec_cap;
+	struct typec_mux *mux;
+	/*
+	 * Set by ->remove() while its SAFE transaction is still open, so that
+	 * tps6598x_disconnect() ends it after shutting down the USB role.
+	 */
+	bool remove_safe_prepared;
 
 	struct power_supply *psy;
 	struct power_supply_desc psy_desc;
@@ -421,6 +431,8 @@ struct cd321x {
 	atomic_t ready_event;
 	atomic_t restore_event;
 	bool display_route_active;
+	bool dp_sink_reported;
+	bool dp_irq_hpd;
 
 	struct cd321x_status update_status;
 	struct delayed_work update_work;
@@ -441,10 +453,7 @@ struct sn201202x {
 	struct spmi_device *sdev;
 };
 
-extern const struct tipd_data tipd_cd321x_data;
-extern const struct tipd_data tipd_tps6598x_data;
-extern const struct tipd_data tipd_tps25750_data;
-extern const struct tipd_data tipd_sn201202x_data;
+extern const struct tipd_data *tipd_hw_variants[];
 extern const struct regmap_config tps6598x_regmap_config;
 
 int tipd_init(struct tps6598x *tps);
@@ -469,6 +478,15 @@ void tipd_debugfs_exit(void);
 static inline void tipd_debugfs_register(struct tps6598x *tps) { }
 static inline void tipd_debugfs_unregister(struct tps6598x *tps) { }
 static inline void tipd_debugfs_exit(void) { }
+#endif
+
+#if IS_ENABLED(CONFIG_KUNIT)
+void cd321x_init_work(struct cd321x *cd321x);
+bool cd321x_tbt_switch_keep_waiting(struct device *dev);
+struct typec_thunderbolt_switch *
+cd321x_tbt_switch_get(struct device *dev, struct fwnode_handle *fwnode);
+int sn201202x_suspend(struct device *dev);
+int sn201202x_resume(struct device *dev);
 #endif
 
 #endif /* __TPS6598X_H__ */

@@ -80,7 +80,6 @@ static void hotplug_cleanup(void *data)
 	cancel_work_sync(&fixture->connector.bl_sync_wq);
 	cancel_work_sync(&fixture->connector.bl_commit_wq);
 	apple_connector_invalidate_edid(&fixture->connector);
-	mutex_destroy(&fixture->connector.edid_lock);
 	mutex_destroy(&fixture->connector.bl_lock);
 }
 

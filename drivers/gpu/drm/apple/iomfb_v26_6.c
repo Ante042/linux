@@ -33,7 +33,6 @@
 
 #include <linux/backlight.h>
 #include <linux/delay.h>
-#include <linux/soc/apple/pmp.h>
 #include <linux/debugfs.h>
 #include <linux/device.h>
 #include <linux/dma-mapping.h>
@@ -67,7 +66,7 @@
 #include "dcp-lifecycle.h"
 #include "iomfb_internal.h"
 #include "iomfb_v26_6.h"
-#include <linux/soc/apple/j613-display.h>
+#include "j613-25g83.h"
 #include "iomfb_v26_6_link.h"
 #include "iomfb_v26_6_swap.h"
 #include "parser.h"
@@ -947,6 +946,36 @@ const char *iomfb_v26_6_board_name(const struct dcp_v26_board *board)
 	return board->name;
 }
 
+/*
+ * The PMP device-power entry points are optional at link time: until a
+ * provider is built, behave as their !CONFIG_APPLE_PMP stubs do.
+ */
+static int dcp_v26_pmp_link_device(struct device *dev)
+{
+	typeof(&apple_pmp_link_device) link;
+	int ret;
+
+	link = symbol_get(apple_pmp_link_device);
+	if (!link)
+		return -ENODEV;
+	ret = link(dev);
+	symbol_put(apple_pmp_link_device);
+	return ret;
+}
+
+static int dcp_v26_pmp_set_device_power(u8 command, u16 device_id, u32 enabled)
+{
+	typeof(&apple_pmp_set_device_power) set;
+	int ret;
+
+	set = symbol_get(apple_pmp_set_device_power);
+	if (!set)
+		return -ENODEV;
+	ret = set(command, device_id, enabled);
+	symbol_put(apple_pmp_set_device_power);
+	return ret;
+}
+
 static int keep_display_power(struct device *dev)
 {
 	struct device_node *node;
@@ -955,7 +984,7 @@ static int keep_display_power(struct device *dev)
 
 	/* The power API is exported before the firmware supplier has probed.
 	 * Link to the DT supplier first so coldplug defers and removal is ordered. */
-	ret = apple_pmp_link_device(dev);
+	ret = dcp_v26_pmp_link_device(dev);
 	if (ret)
 		return ret;
 	node = of_parse_phandle(dev->of_node, "apple,pmp", 0);
@@ -966,7 +995,7 @@ static int keep_display_power(struct device *dev)
 	if (table && length == 20 * 0x7c &&
 	    get_unaligned_le32(table + 11 * 0x7c) == 8 &&
 	    !memcmp(table + 11 * 0x7c + 0x74, "DISP\0\0\0\0", 8))
-		ret = apple_pmp_set_device_power(0x0f, 8, 1);
+		ret = dcp_v26_pmp_set_device_power(0x0f, 8, 1);
 	of_node_put(node);
 	if (ret)
 		return ret;
@@ -1002,7 +1031,12 @@ int iomfb_v26_6_probe(struct apple_dcp *dcp)
 		return dev_err_probe(dev, -ENODEV,
 				     "%s display not started: DCP firmware %s is not supported\n",
 				     board->name, uuid ?: "(unknown)");
-	display = of_find_node_by_path("/soc/display-subsystem");
+	/* The display subsystem sits at the root, outside the simple-bus. */
+	display = of_find_node_by_path("disp0");
+	if (display && !of_device_is_compatible(display, "apple,t8122-display-subsystem")) {
+		of_node_put(display);
+		display = NULL;
+	}
 	piodma = of_get_child_by_name(np, "piodma");
 	ret = of_property_count_u32_elems(np, board->handoff) == 1 &&
 		!of_property_read_u32(np, board->handoff, &markers[0]) &&
@@ -1670,7 +1704,7 @@ static void dcp_v26_cancel_event(struct apple_dcp *dcp)
 
 /* Only the layout the firmware was qualified with: one full-mode linear plane. */
 int iomfb_v26_6_atomic_check(struct apple_dcp *dcp, struct drm_crtc *crtc,
-			     struct drm_atomic_state *state)
+			     struct drm_atomic_commit *state)
 {
 	struct apple_dcp_v26 *v26 = dcp->v26;
 	struct drm_crtc_state *crtc_state = drm_atomic_get_new_crtc_state(state, crtc);
@@ -1725,7 +1759,7 @@ int iomfb_v26_6_modeset(struct apple_dcp *dcp, struct drm_crtc_state *crtc_state
 }
 
 void iomfb_v26_6_flush(struct apple_dcp *dcp, struct drm_crtc *crtc,
-		       struct drm_atomic_state *state)
+		       struct drm_atomic_commit *state)
 {
 	struct drm_plane_state *p = drm_atomic_get_new_plane_state(state, crtc->primary);
 	struct drm_framebuffer *fb;
@@ -1766,14 +1800,14 @@ static int dcp_v26_brightness_commit(struct apple_dcp_v26 *v26)
 	struct apple_dcp *dcp = READ_ONCE(v26->dcp);
 	struct drm_modeset_acquire_ctx ctx;
 	struct drm_crtc_state *crtc_state;
-	struct drm_atomic_state *state;
+	struct drm_atomic_commit *state;
 	struct drm_crtc *crtc;
 	int ret;
 
 	if (!dcp || !dcp->crtc)
 		return 0;
 	crtc = &dcp->crtc->base;
-	state = drm_atomic_state_alloc(crtc->dev);
+	state = drm_atomic_commit_alloc(crtc->dev);
 	if (!state)
 		return -ENOMEM;
 	drm_modeset_acquire_init(&ctx, DRM_MODESET_ACQUIRE_INTERRUPTIBLE);
@@ -1792,12 +1826,12 @@ retry:
 	ret = drm_atomic_commit(state);
 out:
 	if (ret == -EDEADLK) {
-		drm_atomic_state_clear(state);
+		drm_atomic_commit_clear(state);
 		ret = drm_modeset_backoff(&ctx);
 		if (!ret)
 			goto retry;
 	}
-	drm_atomic_state_put(state);
+	drm_atomic_commit_put(state);
 	drm_modeset_drop_locks(&ctx);
 	drm_modeset_acquire_fini(&ctx);
 	return ret;

@@ -78,8 +78,8 @@ struct dcp_packet_header {
 #define DCP_PACKET_ALIGNMENT (0x40)
 
 enum iomfb_property_id {
-    IOMFB_PROPERTY_NITS = 15, // divide by Brightness_Scale
-    IOMFB_PROPERTY_NITS_V14_7 = 19, // the same, on 14.7 firmware
+    IOMFB_PROPERTY_NITS_V13_3 = 15, // divide by Brightness_Scale
+    IOMFB_PROPERTY_NITS_V14_7 = 19,
 };
 
 #define IOMFB_BRIGHTNESS_MIN 0x10000000
@@ -230,13 +230,6 @@ struct dcp_map_buf_req {
 	u8 dva_null;
 } __packed;
 
-/* 12.3, 13.5 and 14.7; H17P's is in iomfb_template.h. */
-struct dcp_map_buf_resp {
-	u64 vaddr;
-	u64 dva;
-	u32 ret;
-} __packed;
-
 struct dcp_unmap_buf_resp {
 	u64 buffer;
 	u64 vaddr;
@@ -277,21 +270,6 @@ struct dcp_map_physical_resp {
 	u32 mem_desc_id;
 } __packed;
 
-/* 12.3, 13.5 and 14.7; H17P's are in iomfb_template.h. */
-struct dcp_swap_start_req {
-	u32 swap_id;
-	struct dcp_iouserclient client;
-	u8 swap_id_null;
-	u8 client_null;
-	u8 padding[2];
-} __packed;
-
-struct dcp_swap_start_resp {
-	u32 swap_id;
-	struct dcp_iouserclient client;
-	u32 ret;
-} __packed;
-
 struct dcp_get_uint_prop_req {
 	char obj[4];
 	char key[0x40];
@@ -318,14 +296,6 @@ struct iomfb_set_fx_prop_req {
 	char obj[4];
 	char key[0x40];
 	u32 value;
-} __packed;
-
-/* 12.3, 13.5 and 14.7; H17P's is in iomfb_template.h. */
-struct dcp_set_power_state_req {
-	u64 unklong;
-	u8 unkbool;
-	u8 unkint_null;
-	u8 padding[2];
 } __packed;
 
 struct dcp_set_power_state_resp {

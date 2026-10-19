@@ -9,9 +9,18 @@ struct apple_dcp;
 struct apple_dcp_v14;
 struct dcp_v14_board;
 struct device;
-struct drm_atomic_state;
+struct drm_atomic_commit;
 struct drm_crtc;
 struct drm_crtc_state;
+struct device_node;
+
+/*
+ * Bounded DMA-region translation from drivers/of/address.c (42d7be2c9500,
+ * bucket 900-config-tooling, which owns include/linux/of_address.h).
+ */
+const __be32 *of_translate_dma_region_checked(struct device_node *dev,
+					      const __be32 *addr, size_t cells,
+					      phys_addr_t *start, size_t *length);
 
 /*
  * The board of an internal 14.x DCP node (by compatible and machine): NULL if
@@ -57,10 +66,10 @@ void iomfb_v14_7_remove(struct apple_dcp *dcp);
 int iomfb_v14_7_start(struct apple_dcp *dcp);
 
 int iomfb_v14_7_atomic_check(struct apple_dcp *dcp, struct drm_crtc *crtc,
-			     struct drm_atomic_state *state);
+			     struct drm_atomic_commit *state);
 int iomfb_v14_7_modeset(struct apple_dcp *dcp, struct drm_crtc_state *crtc_state);
 void iomfb_v14_7_flush(struct apple_dcp *dcp, struct drm_crtc *crtc,
-		       struct drm_atomic_state *state);
+		       struct drm_atomic_commit *state);
 void iomfb_v14_7_poweron(struct apple_dcp *dcp);
 void iomfb_v14_7_poweroff(struct apple_dcp *dcp);
 

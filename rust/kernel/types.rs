@@ -12,6 +12,10 @@ use core::{
 };
 use pin_init::{PinInit, Wrapper, Zeroable};
 
+#[doc(hidden)]
+pub mod for_lt;
+pub use for_lt::ForLt;
+
 /// Used to transfer ownership to and from foreign (non-Rust) languages.
 ///
 /// Ownership is transferred from Rust to a foreign language by calling [`Self::into_foreign`] and
@@ -28,10 +32,14 @@ pub unsafe trait ForeignOwnable: Sized {
     const FOREIGN_ALIGN: usize;
 
     /// Type used to immutably borrow a value that is currently foreign-owned.
-    type Borrowed<'a>;
+    type Borrowed<'a>
+    where
+        Self: 'a;
 
     /// Type used to mutably borrow a value that is currently foreign-owned.
-    type BorrowedMut<'a>;
+    type BorrowedMut<'a>
+    where
+        Self: 'a;
 
     /// Converts a Rust-owned object to a foreign-owned one.
     ///
@@ -448,7 +456,7 @@ pub unsafe trait Ownable {
 ///
 /// When this type is implemented for an Ownable type, it allows Owned<T> to be dereferenced
 /// into a &mut T.
-
+///
 /// # Safety
 ///
 /// Implementers must ensure that the kernel never mutates the underlying type while
@@ -549,86 +557,3 @@ pub type NotThreadSafe = PhantomData<*mut ()>;
 /// [`NotThreadSafe`]: type@NotThreadSafe
 #[allow(non_upper_case_globals)]
 pub const NotThreadSafe: NotThreadSafe = PhantomData;
-
-/// Helper macro to declare a bitfield style type. The type will automatically
-/// gain boolean operator implementations, as well as the `as_raw()` and `contains()`
-/// methods, Debug, Copy, Clone, and PartialEq implementations.
-///
-/// Optionally, a default value can be specified with `= value` syntax, which
-/// will add a Default trait implementation.
-///
-/// # Examples
-///
-/// ```
-/// declare_flags_type! {
-///     /// Flags to be used for foo.
-///     pub struct FooFlags(u32);
-/// }
-///
-/// declare_flags_type! {
-///     /// Flags to be used for bar.
-///     pub struct BarFlags(u32) = 0;
-/// }
-/// ```
-macro_rules! declare_flags_type (
-    (
-        $(#[$outer:meta])*
-        $v:vis struct $t:ident ( $base:ty );
-        $($rest:tt)*
-    ) => {
-        $(#[$outer])*
-        #[derive(Debug, Clone, Copy, PartialEq)]
-        $v struct $t($base);
-
-        impl $t {
-            /// Get the raw representation of this flag.
-            pub(crate) fn as_raw(self) -> $base {
-                self.0
-            }
-
-            /// Check whether `flags` is contained in `self`.
-            pub fn contains(self, flags: Self) -> bool {
-                (self & flags) == flags
-            }
-        }
-
-        impl core::ops::BitOr for $t {
-            type Output = Self;
-            fn bitor(self, rhs: Self) -> Self::Output {
-                Self(self.0 | rhs.0)
-            }
-        }
-
-        impl core::ops::BitAnd for $t {
-            type Output = Self;
-            fn bitand(self, rhs: Self) -> Self::Output {
-                Self(self.0 & rhs.0)
-            }
-        }
-
-        impl core::ops::Not for $t {
-            type Output = Self;
-            fn not(self) -> Self::Output {
-                Self(!self.0)
-            }
-        }
-    };
-    (
-        $(#[$outer:meta])*
-        $v:vis struct $t:ident ( $base:ty ) = $default:expr;
-        $($rest:tt)*
-    ) => {
-        declare_flags_type! {
-            $(#[$outer])*
-            $v struct $t ($base);
-            $($rest)*
-        }
-        impl Default for $t {
-            fn default() -> Self {
-                Self($default)
-            }
-        }
-    };
-);
-
-pub(crate) use declare_flags_type;

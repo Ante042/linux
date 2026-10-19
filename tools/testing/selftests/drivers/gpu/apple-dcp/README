@@ -29,7 +29,13 @@ The modules contain public synthetic host boundaries and retained assertions:
   faulted ACK/BIST cleanup, dirty-route retry, OFF/new-calibration epochs,
   warm reset and legacy T8103/T8122/T8140/T8142 route controls.
 * lifecycle: actual physical-disconnect authority and ownership despite failed
-  teardown; DWC3/core/PHY PM and reset-reference recovery; exact firmware
+  teardown; a fast dock replug whose DPTX link never configures (withdrawn,
+  unacknowledged, unanswered, refused and live failures); an old disconnect's
+  delayed CRTC power-off racing a replacement M1/M2 Type-C session; a dock
+  that leaves during the first mode set, whose dropped present keeps the IOMFB
+  queue busy (deferred and retried stop, never-retired, post-power-off and
+  crashed-queue latches); DWC3/core/PHY PM
+  and reset-reference recovery; exact firmware
   tuple/resource admission, unsupported VRR rejection and power reply bounds;
   15,552 D134 dispatcher scope/length/context and legacy reply cases.
 
@@ -70,8 +76,30 @@ or admit a hardware trial. Token/sequence semantics remain a separate protocol
 fact to establish; the tests do not manufacture a firmware echo guarantee.
 
 The boot group executes the actual OSLOG dispatcher with synthetic fixed-width
-words. Known opaque event types remain visible, unknown types retain warnings,
+words. Opaque event types 2-5 use debug logging, unknown types retain warnings,
 and only the existing buffer-request path can allocate/ACK buffers. The EDID
 service-rebind group also distinguishes intentional optional EOPNOTSUPP from
 required admission failures and genuine optional-service errors, and proves
 refused services never OPEN or publish. No captured firmware values are used.
+
+The ATC lane/PIPE and DWC3 teardown fixtures use a shared host adapter around
+both the extracted Type-C target-mode mapper and the extracted locked mux body.
+They omit USB PM at that boundary. The PM fixtures replace the adapter with the
+actual mux update and callback, including the scoped no-op check: a clean
+same-mode request needs neither root-hub lookup nor PM, while dirty lanes,
+pending PIPE work and a mismatched PIPE still require ownership. KUnit static
+redirects are disabled in host fixtures so the production bodies execute.
+CD321x probe uses the actual optional-router lookup with a modeled deferred
+probe decision; both supplier waiting and optional-router fallback are checked.
+
+With the fixed-hub SuperSpeed handover the locked mux body is
+atcphy_mux_switch(), and the PM fixtures run the actual USB side around it:
+the SuperSpeed root port goes down before the PIPE moves, the device on it
+with it, and comes up only once the PIPE is back on the USB3 backend of the
+running host. A modeled port refuses PIPE moves while it is up, and its
+power-off and power-on failures, a port someone else switched off and the
+retries the update queues are checked. The adapter of the lane fixtures takes
+no port down and checks that none comes up. A failed USB3 power-off or reset
+leaves dwc3 out of host mode, and a fixed-hub host whose PIPE cannot be routed
+still starts. Each fixture detects these from the source, so the expectations
+for sources without the handover remain.

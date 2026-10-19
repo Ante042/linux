@@ -102,6 +102,8 @@ struct dcp_display_mode {
 	struct dcp_color_mode sdr;
 	struct dcp_color_mode best;
 	bool vrr;
+	/* IsPreferred, outside the external SDR path */
+	bool preferred;
 	bool metadata_timing_valid;
 	bool automatic_rgb8_quirk;
 	u64 automatic_connection_sequence;
@@ -119,8 +121,21 @@ struct dimension {
 	s64 pixel_repetition;
 };
 
+/*
+ * Upper bound on the TimingElements catalog. DCP reports one element per
+ * timing it derived from the sink's EDID and DisplayID, and every catalog
+ * logged on J700 so far holds at most 14. The cap leaves ample headroom
+ * while keeping the retained array (320 bytes per entry) below 1 MiB.
+ */
+#define DCP_MAX_TIMING_MODES 1024
+
 int parse(const void *blob, size_t size, struct dcp_parse_ctx *ctx);
 bool dcp_property_complete(const void *blob, size_t received, size_t advertised);
+#if IS_ENABLED(CONFIG_KUNIT)
+bool dcp_mode_ranks_above(bool preferred, s64 score, bool best_preferred,
+			  s64 best_score);
+#endif
+
 struct dcp_display_mode *enumerate_modes(struct dcp_parse_ctx *handle,
 					 unsigned int *count, int width_mm,
 					 int height_mm, unsigned notch_height,
@@ -145,6 +160,8 @@ u64 dcp_modes_transfer_begin(struct apple_dcp *dcp);
 int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *handle,
 		      u64 generation);
 
+int parse_array_count(const struct dcp_parse_ctx *handle, u32 *count);
+
 /* Caller serializes readers against replacement. */
 int replace_modes(struct dcp_parse_ctx *handle,
 		  struct dcp_display_mode **modes, unsigned int *count,
@@ -152,8 +169,6 @@ int replace_modes(struct dcp_parse_ctx *handle,
 		  bool internal);
 int parse_display_attributes(struct dcp_parse_ctx *handle, int *width_mm,
 			     int *height_mm, bool *backlight_control);
-int parse_display_attributes_h17p(struct dcp_parse_ctx *handle, int *width_mm,
-				  int *height_mm);
 int parse_epic_service_init(struct dcp_parse_ctx *handle, const char **name,
 			    const char **class, s64 *unit, bool h17p_keys);
 

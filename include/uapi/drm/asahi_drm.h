@@ -94,10 +94,7 @@ enum drm_asahi_ioctl_id {
 	/** @DRM_ASAHI_SUBMIT: Submit commands to a queue. */
 	DRM_ASAHI_SUBMIT,
 
-	/**
-	 * @DRM_ASAHI_GEM_MADVISE: Mark a VM-private object purgeable or needed.
-	 * Only the G17P runtime accepts it; others fail with EINVAL.
-	 */
+	/** @DRM_ASAHI_GEM_MADVISE: Mark a VM-private object purgeable or needed. */
 	DRM_ASAHI_GEM_MADVISE,
 };
 
@@ -1074,8 +1071,8 @@ enum drm_asahi_render_flags {
 	/**
 	 * @DRM_ASAHI_RENDER_RSRC_SPEC_HI: The appended resource-specifier high
 	 * dwords are present. A kernel that cannot use them rejects the flag
-	 * instead of silently truncating the values. This kernel accepts it on
-	 * T6030 only. The G17P runtime also accepts it.
+	 * instead of silently truncating the values. This kernel accepts it
+	 * from the G17P runtime only.
 	 */
 	DRM_ASAHI_RENDER_RSRC_SPEC_HI = (1U << 4),
 

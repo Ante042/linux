@@ -60,8 +60,8 @@ static_assert!(HEADER_WIRE == 4 + HEADER_SIZE as usize);
 pub(crate) enum Version {
     V1,
     /// Negotiated from the `0x4d` capability word. Laid out as version 1, but
-    /// the payload hash covers the header through the trailer, where version 1
-    /// stops before it.
+    /// the payload hash covers the header through the
+    /// trailer, where version 1 stops before it.
     V2,
 }
 

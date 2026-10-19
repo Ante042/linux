@@ -213,6 +213,22 @@ static inline bool afk_service_matches(struct apple_epic_service *service,
 	return found;
 }
 
+/*
+ * True if this slot last served @channel and was retired or discarded on our
+ * side: the co-processor may still close that channel afterwards.
+ */
+static inline bool afk_service_retired(struct apple_epic_service *service,
+				       u32 channel)
+{
+	unsigned long flags;
+	bool retired;
+
+	spin_lock_irqsave(&service->lock, flags);
+	retired = service->channel == channel && service->torndown;
+	spin_unlock_irqrestore(&service->lock, flags);
+	return retired;
+}
+
 /* The caller holds service->lock. */
 static inline bool afk_service_reclaimable(struct apple_epic_service *service)
 {
@@ -287,6 +303,47 @@ struct afk_qe {
 	__le32 type;
 	u8 data[];
 };
+
+static inline bool afk_ring_payload_fits(u32 ptr, u32 bytes, size_t bufsz)
+{
+	return ptr <= bufsz && sizeof(struct afk_qe) <= bufsz - ptr &&
+	       bytes <= bufsz - ptr - sizeof(struct afk_qe);
+}
+
+/*
+ * Check the receive ring pointers before reading an entry. The consumer
+ * only advances rptr in whole blocks of @stride bytes and stops when it
+ * meets wptr, so the producer has to keep wptr block aligned and inside
+ * the ring as well; wptr == bufsz is never written, it wraps to 0.
+ */
+static inline bool afk_ring_ptrs_valid(u32 rptr, u32 wptr, size_t bufsz,
+				       u32 stride)
+{
+	return stride && bufsz >= sizeof(struct afk_qe) &&
+	       rptr <= bufsz - sizeof(struct afk_qe) && wptr < bufsz &&
+	       !(rptr % stride) && !(wptr % stride);
+}
+
+/*
+ * One RECV notification drains at most as many entries as the ring has
+ * blocks, so a producer that keeps moving wptr cannot hold the ordered
+ * receive worker. Entries written after this pass come with their own
+ * RECV notification.
+ */
+static inline unsigned int afk_ring_drain_budget(size_t bufsz, u32 stride)
+{
+	return stride ? bufsz / stride : 1;
+}
+
+static inline unsigned int afk_ring_drain(bool (*recv)(void *ctx), void *ctx,
+					  unsigned int budget)
+{
+	unsigned int n = 0;
+
+	while (n < budget && recv(ctx))
+		n++;
+	return n;
+}
 
 struct epic_hdr {
 	u8 version;
@@ -437,6 +494,21 @@ int afk_service_call_timeout(struct apple_epic_service *service, u16 group,
 			     u32 command, const void *data, size_t data_len,
 			     size_t data_pad, void *output, size_t output_len,
 			     size_t output_pad, unsigned int timeout_ms);
+int afk_service_call_len(struct apple_epic_service *service, u16 group,
+			 u32 command, const void *data, size_t data_len,
+			 size_t data_pad, void *output, size_t output_len,
+			 size_t output_pad, size_t *received);
+/*
+ * As afk_service_call_timeout(), but the length the reply declares is checked
+ * against what arrived and against @output_len + @output_pad, and @received
+ * is set to the number of bytes of @output that the reply filled.
+ */
+int afk_service_call_timeout_len(struct apple_epic_service *service, u16 group,
+				 u32 command, const void *data, size_t data_len,
+				 size_t data_pad, void *output, size_t output_len,
+				 size_t output_pad, unsigned int timeout_ms,
+				 size_t *received);
+
 /* Strict variants return only firmware-reported bytes; legacy callers unchanged. */
 int afk_send_command_with_reply_len(struct apple_epic_service *service, u8 type,
 		const void *payload, size_t payload_len, void *output,
@@ -445,9 +517,4 @@ int afk_service_call_with_reply_len(struct apple_epic_service *service,
 		u16 group, u32 command, const void *data, size_t data_len,
 		size_t data_pad, void *output, size_t output_len,
 		size_t output_pad, size_t *reply_len);
-int afk_service_call_len(struct apple_epic_service *service, u16 group,
-			 u32 command, const void *data, size_t data_len,
-			 size_t data_pad, void *output, size_t output_len,
-			 size_t output_pad, size_t *received);
-
 #endif

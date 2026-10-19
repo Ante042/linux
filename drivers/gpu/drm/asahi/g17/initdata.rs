@@ -10,7 +10,7 @@ use super::{
     object::{CpuMap, KernelObject, Placement},
     Config, Role,
 };
-use crate::{driver::AsahiDevice, hw::t8140, mmu};
+use crate::{driver::AsahiDrmDevice, hw::t8140, mmu};
 use core::ops::Range;
 use core::sync::atomic::{fence, AtomicU32, Ordering};
 use kernel::{c_str, prelude::*};
@@ -168,7 +168,7 @@ pub(super) struct InitData {
 
 /// Placement inputs shared by the build steps.
 struct BuildEnv<'a> {
-    dev: &'a AsahiDevice,
+    dev: &'a AsahiDrmDevice,
     vm: &'a mmu::Vm,
     lower: &'a mmu::Vm,
     render: &'a mmu::Vm,
@@ -689,7 +689,7 @@ impl InitData {
     /// Constructs the graph after the firmware has published the high-root entries.
     pub(super) fn build(
         &mut self,
-        dev: &AsahiDevice,
+        dev: &AsahiDrmDevice,
         cfg: &Config,
         uat: &mmu::Uat,
         render: &mmu::Vm,
@@ -717,7 +717,13 @@ impl InitData {
         for window in &t8140::REGISTER_WINDOWS {
             let (phys, va, size) = window.mapping().ok_or(EINVAL)?;
             self.aliases.push(
-                env.vm.map_io(va, phys.try_into()?, size.try_into()?, mmu::PROT_FW_MMIO_RW)?,
+                env.vm.map_io(
+                    env.dev.as_ref().as_ref(),
+                    va,
+                    phys.try_into()?,
+                    size.try_into()?,
+                    mmu::PROT_FW_MMIO_RW,
+                )?,
                 GFP_KERNEL,
             )?;
         }
@@ -1174,8 +1180,8 @@ impl InitData {
             .load(Ordering::Relaxed))
     }
 
-    fn opps(dev: &AsahiDevice) -> Result<KVec<abi::Opp>> {
-        let node = dev.as_ref().of_node().ok_or(EIO)?;
+    fn opps(dev: &AsahiDrmDevice) -> Result<KVec<abi::Opp>> {
+        let node = dev.as_ref().as_ref().of_node().ok_or(EIO)?;
         let table = node
             .parse_phandle(c_str!("operating-points-v2"), 0)
             .ok_or(EIO)?;

@@ -245,8 +245,11 @@ dchid_get_interface(struct dockchannel_hid *dchid, int index, const char *name)
 		firmware_managed_reset =
 			of_property_read_bool(of_node, "apple,firmware-managed-reset");
 		if (firmware_managed_reset &&
-		    (strcmp(name, "multi-touch") || power_method != DCHID_POWER_METHOD_2))
+		    (strcmp(name, "multi-touch") || power_method != DCHID_POWER_METHOD_2)) {
+			dev_err(dchid->dev, "Firmware-managed reset is not supported for %s\n",
+				name);
 			goto err_put_node;
+		}
 		if (power_method != DCHID_POWER_METHOD_1 &&
 		    power_method != DCHID_POWER_METHOD_2) {
 			dev_err(dchid->dev, "Unsupported power method %u for %s\n",
@@ -301,6 +304,18 @@ static u32 dchid_checksum(void *p, size_t length)
 
 	WARN_ON_ONCE(length);
 	return sum;
+}
+
+static bool dchid_verify_checksum(struct dchid_hdr *hdr, void *data, u32 *checksum)
+{
+	if (!IS_ALIGNED(hdr->length, sizeof(u32))) {
+		*checksum = 0;
+		return false;
+	}
+
+	*checksum = dchid_checksum(hdr, sizeof(*hdr));
+	*checksum += dchid_checksum(data, hdr->length + sizeof(u32));
+	return *checksum == U32_MAX;
 }
 
 static int dchid_send(struct dchid_iface *iface, u32 flags, void *msg, size_t size)
@@ -548,8 +563,8 @@ static int dchid_request_gpio(struct dchid_iface *iface)
 	if (iface->gpio)
 		return 0;
 
-	dev_info(iface->dchid->dev, "Requesting GPIO %s#%d: %s\n",
-		 iface->name, iface->gpio_id, iface->gpio_name);
+	dev_dbg(iface->dchid->dev, "Requesting GPIO %s#%d: %s\n",
+		iface->name, iface->gpio_id, iface->gpio_name);
 
 	/* A power method 2 interface holds its reset line from probe on. */
 	if (iface->power_method == DCHID_POWER_METHOD_2 &&
@@ -584,7 +599,7 @@ static int dchid_start_interface(struct dchid_iface *iface)
 		return -EINPROGRESS;
 	}
 
-	dev_info(iface->dchid->dev, "Starting interface %s\n", iface->name);
+	dev_dbg(iface->dchid->dev, "Starting interface %s\n", iface->name);
 
 	iface->starting = true;
 
@@ -604,7 +619,7 @@ static int dchid_start_interface(struct dchid_iface *iface)
 	if (fw && size) {
 
 		/* Send firmware to the device */
-		dev_info(iface->dchid->dev, "Sending firmware for %s\n", iface->name);
+		dev_dbg(iface->dchid->dev, "Sending firmware for %s\n", iface->name);
 		ret = dchid_send_firmware(iface, fw, size);
 		if (ret < 0) {
 			dev_err(iface->dchid->dev, "Failed to send %s firmware\n", iface->name);
@@ -612,7 +627,7 @@ static int dchid_start_interface(struct dchid_iface *iface)
 		}
 
 		/* After loading firmware, multi-touch needs a reset */
-		dev_info(iface->dchid->dev, "Resetting %s\n", iface->name);
+		dev_dbg(iface->dchid->dev, "Resetting %s\n", iface->name);
 		if (iface->power_method == DCHID_POWER_METHOD_2) {
 			ret = dchid_pm2_set_power(iface, DCHID_POWER_STATE_OFF);
 			if (ret < 0)
@@ -749,7 +764,7 @@ static void dchid_create_interface_work(struct work_struct *ws)
 		return;
 	}
 
-	dev_info(dchid->dev, "New interface %s\n", iface->name);
+	dev_dbg(dchid->dev, "New interface %s\n", iface->name);
 
 	/* Start the interface. This is not the entire init process, as firmware is loaded later on device open. */
 	ret = dchid_enable_interface(iface);
@@ -951,8 +966,8 @@ static void dchid_handle_init(struct dockchannel_hid *dchid, void *data, size_t 
 				dev_warn(dchid->dev, "Unterminated product name for %s\n",
 					 iface->name);
 			} else {
-				dev_info(dchid->dev, "Product name for %s: %s\n",
-					 iface->name, product);
+				dev_dbg(dchid->dev, "Product name for %s: %s\n",
+					iface->name, product);
 			}
 			break;
 		}
@@ -1011,7 +1026,7 @@ static void dchid_handle_gpio(struct dockchannel_hid *dchid, void *data, size_t 
 		goto err;
 	}
 
-	dev_info(dchid->dev, "GPIO command: %s#%d: %d\n", iface->name, cmd->gpio, cmd->cmd);
+	dev_dbg(dchid->dev, "GPIO command: %s#%d: %d\n", iface->name, cmd->gpio, cmd->cmd);
 
 	switch (cmd->cmd) {
 	case 3:
@@ -1199,10 +1214,7 @@ static void dchid_handle_packet(void *cookie, size_t avail)
 		goto done;
 	}
 
-	checksum = dchid_checksum(&hdr, sizeof(hdr));
-	checksum += dchid_checksum(dchid->pkt_buf, hdr.length + 4);
-
-	if (checksum != 0xffffffff) {
+	if (!dchid_verify_checksum(&hdr, dchid->pkt_buf, &checksum)) {
 		dev_err(dchid->dev, "Checksum mismatch (iface %d): 0x%08x != 0xffffffff\n",
 			hdr.iface, checksum);
 		goto done;
@@ -1382,7 +1394,8 @@ static int dockchannel_hid_probe(struct platform_device *pdev)
 	if (ret)
 		dev_warn(dev, "Failed to set up wakeup: %d\n", ret);
 
-	dchid->new_iface_wq = alloc_workqueue("dchid-new", WQ_MEM_RECLAIM, 0);
+	dchid->new_iface_wq = alloc_workqueue("dchid-new",
+					      WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
 	if (!dchid->new_iface_wq)
 		return -ENOMEM;
 
@@ -1393,7 +1406,7 @@ static int dockchannel_hid_probe(struct platform_device *pdev)
 		return -EIO;
 	}
 
-	dev_info(dchid->dev, "Initialized, awaiting packets\n");
+	dev_dbg(dchid->dev, "Initialized, awaiting packets\n");
 	platform_set_drvdata(pdev, dchid);
 	dockchannel_await(dchid->dc, dchid_handle_packet, dchid, sizeof(struct dchid_hdr));
 
@@ -1452,3 +1465,7 @@ module_platform_driver(dockchannel_hid_driver);
 MODULE_DESCRIPTION("Apple DockChannel HID transport driver");
 MODULE_AUTHOR("Hector Martin <marcan@marcan.st>");
 MODULE_LICENSE("Dual MIT/GPL");
+
+#if IS_ENABLED(CONFIG_HID_DOCKCHANNEL_PARSER_KUNIT_TEST)
+#include "dockchannel-hid-parser-test.c"
+#endif

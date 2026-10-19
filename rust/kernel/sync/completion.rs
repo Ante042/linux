@@ -90,32 +90,11 @@ impl Completion {
         self.inner.get()
     }
 
-    /// Publish one completion token, including from interrupt context.
-    #[inline]
-    pub fn complete(&self) {
-        // SAFETY: The pinned completion remains initialized for this call.
-        unsafe { bindings::complete(self.as_raw()) };
-    }
-
-    /// Consume one pending token without blocking.
-    #[inline]
-    pub fn try_wait_for_completion(&self) -> bool {
-        // SAFETY: The pinned completion remains initialized for this call.
-        unsafe { bindings::try_wait_for_completion(self.as_raw()) }
-    }
-
-    /// Wait for a token for at most `timeout` jiffies; return whether one arrived.
-    #[inline]
-    pub fn wait_for_completion_timeout(&self, timeout: crate::time::Jiffies) -> bool {
-        let timeout = timeout.min(core::ffi::c_long::MAX as _);
-        // SAFETY: The completion remains live while this method waits.
-        unsafe { bindings::wait_for_completion_timeout(self.as_raw(), timeout as _) != 0 }
-    }
-
     /// Signal all tasks waiting on this completion.
     ///
     /// This method wakes up all tasks waiting on this completion; after this operation the
     /// completion is permanently done, i.e. signals all current and future waiters.
+    #[inline]
     pub fn complete_all(&self) {
         // SAFETY: `self.as_raw()` is a pointer to a valid `struct completion`.
         unsafe { bindings::complete_all(self.as_raw()) };
@@ -127,6 +106,7 @@ impl Completion {
     /// timeout.
     ///
     /// See also [`Completion::complete_all`].
+    #[inline]
     pub fn wait_for_completion(&self) {
         // SAFETY: `self.as_raw()` is a pointer to a valid `struct completion`.
         unsafe { bindings::wait_for_completion(self.as_raw()) };

@@ -5,7 +5,6 @@
 //! C header: [`include/linux/soc/apple/rtkit.h`](../../../../include/linux/gpio/driver.h)
 
 use crate::{
-    alloc::flags::*,
     bindings,
     device,
     error::{
@@ -13,7 +12,12 @@ use crate::{
         from_result,
         to_result, //
     },
-    iosys_map::IoSysMapRef,
+    io::{
+        register,
+        Io,
+        IoSysMap,
+        Region, //
+    },
     prelude::*,
     str::CStrExt,
     types::{
@@ -26,6 +30,14 @@ use core::marker::PhantomData;
 use core::ptr;
 use macros::vtable;
 
+register! {
+    /// ASC CPU control register
+    pub ASC_CPU_CONTROL(u32) @ 0x44 {
+        /// CPU run bit.
+        4:4 cpu_run;
+    }
+}
+
 /// Trait to represent allocatable buffers for the RTKit core.
 ///
 /// Users must implement this trait for their own representation of those allocations.
@@ -36,7 +48,7 @@ pub trait Buffer {
 
     /// Returns a mutable byte slice of the buffer contents, or an
     /// error if unavailable.
-    fn buf(&mut self) -> Result<IoSysMapRef<'_, u8>>;
+    fn buf(&mut self) -> Result<IoSysMap<'_, Region>>;
 }
 
 /// Callback operations for an RTKit client.
@@ -48,7 +60,11 @@ pub trait Operations {
     /// Type representing an allocated buffer for RTKit.
     type Buffer: Buffer;
 
-    /// Firmware chooses and announces shared-buffer addresses.
+    /// Whether the coprocessor places its shared buffers itself.
+    ///
+    /// If set, buffer requests that carry an IOVA are served by [`Operations::shmem_map`] and
+    /// acknowledged by sending the request back unchanged, and the crashlog endpoint is started
+    /// before the endpoint map is acknowledged.
     const COPROC_PLACES_BUFFERS: bool = false;
 
     /// Called when RTKit crashes.
@@ -108,24 +124,6 @@ pub struct RtKit<T: Operations> {
 // The wrapper owns opaque pointers. Neither the C allocation nor the foreign
 // callback context points back to this Rust wrapper, so moving it is safe.
 impl<T: Operations> Unpin for RtKit<T> {}
-/// Discovery result type retained for compile compatibility with optional backends.
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub struct EpmapSnapshot {
-    /// Raw HELLO message.
-    pub raw_hello: u64,
-    /// Minimum protocol version.
-    pub hello_min_version: u16,
-    /// Maximum protocol version.
-    pub hello_max_version: u16,
-    /// Endpoint bitmap.
-    pub endpoints: [u64; 4],
-}
-impl EpmapSnapshot {
-    /// Test an advertised endpoint.
-    pub fn has_endpoint(&self, endpoint: u8) -> bool {
-        self.endpoints[endpoint as usize / 64] & (1u64 << (endpoint % 64)) != 0
-    }
-}
 
 unsafe extern "C" fn crashed_callback<T: Operations>(
     cookie: *mut core::ffi::c_void,
@@ -183,18 +181,16 @@ unsafe extern "C" fn shmem_setup_callback<T: Operations>(
         };
 
         let iova = buf.iova()?;
-        let iosys_map = buf.buf()?;
-
-        // The C transport accesses this pointer as normal system memory.
-        if iosys_map.is_iomem() {
+        let IoSysMap::Sys(sysmem) = buf.buf()? else {
             return Err(EINVAL);
-        }
-        if iosys_map.size() < bfr_mut.size {
+        };
+
+        if sysmem.size() < bfr_mut.size {
             return Err(ENOMEM);
         }
 
         bfr_mut.iova = iova as u64;
-        bfr_mut.buffer = iosys_map.as_mut_ptr() as *mut _;
+        bfr_mut.buffer = sysmem.as_ptr() as *mut _;
 
         // Now box the returned buffer type and stash it in the private pointer of the
         // `apple_rtkit_shmem` struct for safekeeping.
@@ -221,7 +217,11 @@ unsafe extern "C" fn shmem_destroy_callback<T: Operations>(
 
 impl<T: Operations> RtKit<T> {
     const VTABLE: bindings::apple_rtkit_ops = bindings::apple_rtkit_ops {
-        flags: if T::COPROC_PLACES_BUFFERS { bindings::APPLE_RTKIT_COPROC_PLACES_BUFFERS } else { 0 },
+        flags: if T::COPROC_PLACES_BUFFERS {
+            bindings::APPLE_RTKIT_COPROC_PLACES_BUFFERS
+        } else {
+            0
+        },
         crashed: Some(crashed_callback::<T>),
         recv_message: Some(recv_message_callback::<T>),
         recv_message_early: Some(recv_message_early_callback::<T>),
@@ -304,23 +304,6 @@ impl<T: Operations> RtKit<T> {
         to_result(unsafe { bindings::apple_rtkit_boot(self.rtk) })
     }
 
-
-
-    /// Passive endpoint discovery is not supported in the M3 runtime path.
-    pub fn new_epmap_only(
-        _dev: &device::Device,
-        _mbox_name: Option<&'static CStr>,
-        _mbox_idx: usize,
-        _data: T::Data,
-    ) -> Result<Self> {
-        Err(crate::error::Error::from_errno(-(bindings::EOPNOTSUPP as i32)))
-    }
-
-    /// Refuse unsupported discovery instead of changing normal RTKit boot.
-    pub fn discover_epmap(self: Pin<&mut Self>) -> Result<EpmapSnapshot> {
-        Err(crate::error::Error::from_errno(-(bindings::EOPNOTSUPP as i32)))
-    }
-
     /// Starts a non-system endpoint.
     pub fn start_endpoint(self: Pin<&mut Self>, endpoint: u8) -> Result {
         // SAFETY: `rtk` is valid per the type invariant.
@@ -338,18 +321,6 @@ impl<T: Operations> RtKit<T> {
     /// Checks if an endpoint is present
     pub fn has_endpoint(self: Pin<&mut Self>, endpoint: u8) -> bool {
         unsafe { bindings::apple_rtkit_has_endpoint(self.rtk, endpoint) }
-    }
-
-    /// Returns whether the coprocessor is running (not crashed, IOP and AP power states on).
-    pub fn is_running(&self) -> bool {
-        // SAFETY: `rtk` is valid per the type invariant. The call only reads state.
-        unsafe { bindings::apple_rtkit_is_running(self.rtk) }
-    }
-
-    /// Returns whether the coprocessor has reported a crash.
-    pub fn is_crashed(&self) -> bool {
-        // SAFETY: `rtk` is valid per the type invariant. The call only reads state.
-        unsafe { bindings::apple_rtkit_is_crashed(self.rtk) }
     }
 }
 

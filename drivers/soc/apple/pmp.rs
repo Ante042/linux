@@ -17,7 +17,6 @@ use kernel::{
         self,
         Core, //
     },
-    devres::Devres,
     dma::{
         Coherent,
         CoherentBox,
@@ -25,17 +24,22 @@ use kernel::{
         DmaMask, //
     },
     io::{
-        mem::IoMem,
-        Io, //
+        Io,
+        IoBase,
+        IoSysMap,
+        Mmio,
+        Region, //
     },
-    iosys_map::IoSysMapRef,
     kvec,
     module_platform_driver,
     new_condvar, new_mutex,
     of,
     platform,
     prelude::*,
-    soc::apple::rtkit,
+    soc::apple::rtkit::{
+        self,
+        ASC_CPU_CONTROL, //
+    },
     str::CString,
     sync::{
         aref::ARef,
@@ -54,8 +58,6 @@ const PMP_MIN_MMIO_SIZE: usize = 0x80000;
 const ASC_MMIO_SIZE: usize = 0x4000;
 const BOOTARGS_OFFSET: usize = 0x22c;
 const BOOTARGS_SIZE: usize = 0x230;
-const CPU_CONTROL: usize = 0x44;
-const CPU_RUN: u32 = 0x1 << 4;
 const PMP_ENDPOINT: u8 = 0x20;
 const PM_COMMAND_MARKER: u64 = pmp_power::MARKER;
 const PM_COMMAND_SHIFT: u32 = pmp_power::SHIFT;
@@ -130,11 +132,6 @@ impl PmpState {
 #[pin_data]
 struct PmpData {
     dev: ARef<device::Device>,
-    /// T8140 firmware is not sent the UPDATE_IOREG confirmation, and its
-    /// messages are not taken as device-power replies.
-    t8140: bool,
-    pmp_mmio: Pin<KBox<Devres<IoMem<PMP_MIN_MMIO_SIZE>>>>,
-    asc_mmio: Pin<KBox<Devres<IoMem<ASC_MMIO_SIZE>>>>,
     #[pin]
     rtkit: Mutex<Option<rtkit::RtKit<PmpData>>>,
     #[pin]
@@ -146,18 +143,11 @@ struct PmpData {
 }
 
 impl PmpData {
-    fn new(dev: &platform::Device<Core>, t8140: bool) -> Result<Arc<PmpData>> {
-        let pmp_req = dev.io_request_by_name(c"pmp").ok_or(EINVAL)?;
-        let pmp_mmio = KBox::pin_init(pmp_req.iomap_sized::<PMP_MIN_MMIO_SIZE>(), GFP_KERNEL)?;
-        let asc_req = dev.io_request_by_name(c"asc").ok_or(EINVAL)?;
-        let asc_mmio = KBox::pin_init(asc_req.iomap_sized::<ASC_MMIO_SIZE>(), GFP_KERNEL)?;
+    fn new(dev: &platform::Device<Core<'_>>) -> Result<Arc<PmpData>> {
         Arc::pin_init(
             try_pin_init!(
                 PmpData {
                     dev: dev.as_ref().into(),
-                    t8140,
-                    pmp_mmio,
-                    asc_mmio,
                     rtkit <- new_mutex!(None),
                     state <- new_mutex!(PmpState::new()?),
                     power_command <- new_mutex!(Command::Idle),
@@ -167,31 +157,34 @@ impl PmpData {
             GFP_KERNEL,
         )
     }
-    fn start_cpu(&self, dev: &platform::Device<Core>) -> Result<()> {
-        let asc_mmio = self.asc_mmio.access(dev.as_ref())?.relaxed();
-        let val = asc_mmio.read32(CPU_CONTROL);
-        asc_mmio.write32(val | CPU_RUN, CPU_CONTROL);
-        Ok(())
-    }
     fn start(&self) -> Result<()> {
         let mut guard = self.rtkit.lock();
         let mut rtk = guard.as_mut().as_pin_mut().unwrap();
         rtk.as_mut().wake()?;
         rtk.start_endpoint(PMP_ENDPOINT)
     }
-    fn patch_bootargs(&self, dev: &platform::Device<Core>, patches: &[(u32, u32)]) -> Result<()> {
-        let io = self.pmp_mmio.access(dev.as_ref())?.relaxed();
+    fn patch_bootargs(
+        &self,
+        pmp_mmio: &Mmio<'_, Region<PMP_MIN_MMIO_SIZE>>,
+        patches: &[(u32, u32)],
+    ) -> Result<()> {
+        let io = pmp_mmio.as_view().relaxed();
         let offset = io.read32(BOOTARGS_OFFSET) as usize;
         let size = io.read32(BOOTARGS_SIZE) as usize;
-        if !pmp_bootargs::region_valid(offset, size, io.maxsize()) {
+        if !pmp_bootargs::region_valid(offset, size, io.size()) {
             return Err(EINVAL);
         }
         let mut arg_bytes = kvec![0u8; size]?;
-        io.try_memcpy_fromio(&mut arg_bytes, offset)?;
+        for (idx, byte) in arg_bytes.iter_mut().enumerate() {
+            *byte = io.try_read8(offset + idx)?;
+        }
         if !pmp_bootargs::patch(&mut arg_bytes, patches) {
             return Err(EINVAL);
         }
-        io.try_memcpy_toio(offset, &arg_bytes)
+        for (idx, byte) in arg_bytes.iter().enumerate() {
+            io.try_write8(*byte, offset + idx)?;
+        }
+        Ok(())
     }
     fn get_iova_table(&self) -> Result<u64> {
         let mut state = self.state.lock();
@@ -365,8 +358,7 @@ impl PmpData {
     }
     fn recv_message(&self, msg: u64) -> Result<()> {
         let pm_command = (msg >> PM_COMMAND_SHIFT) & 0xff;
-        if !self.t8140 && msg & PM_COMMAND_MARKER != 0 && (pm_command == 0x0f || pm_command == 0x10)
-        {
+        if msg & PM_COMMAND_MARKER != 0 && (pm_command == 0x0f || pm_command == 0x10) {
             let mut state = self.power_command.lock();
             state.reply(msg);
             if *state == Command::Failed {
@@ -385,7 +377,7 @@ impl PmpData {
             OPC_SET_IOREG => self.set_ioreg(msg & SET_IOREG_INDEX_MASK)?,
             // Firmware waits for this confirmation before publishing reports.
             // Do not echo the registry index/payload or add a generic ACK bit.
-            OPC_UPDATE_IOREG if !self.t8140 => OPC_CONFIRM_IOREG << OPC_SHIFT,
+            OPC_UPDATE_IOREG => OPC_CONFIRM_IOREG << OPC_SHIFT,
             _ => {
                 dev_err!(self.dev, "Got unknown message {}", msg);
                 return Err(EIO);
@@ -466,7 +458,7 @@ impl rtkit::Buffer for NoBuffer {
     fn iova(&self) -> Result<usize> {
         unreachable!()
     }
-    fn buf(&mut self) -> Result<IoSysMapRef<'_, u8>> {
+    fn buf(&mut self) -> Result<IoSysMap<'_, Region>> {
         unreachable!()
     }
 }
@@ -493,6 +485,20 @@ impl rtkit::Operations for PmpData {
 #[allow(dead_code)]
 struct PmpDriver(Arc<PmpData>);
 
+/// Per-SoC configuration.
+struct PmpHwConfig {
+    /// DMA mask to set before the firmware allocates anything, or `None` to
+    /// keep the default.
+    dma_mask: Option<DmaMask>,
+}
+
+const HW_CFG_DEFAULT: PmpHwConfig = PmpHwConfig { dma_mask: None };
+
+/// T8140: the DART translates 42 bits and its DMA window starts at 1 TiB.
+const HW_CFG_T8140: PmpHwConfig = PmpHwConfig {
+    dma_mask: Some(DmaMask::new::<42>()),
+};
+
 impl Drop for PmpDriver {
     fn drop(&mut self) {
         // SAFETY: The Arc remains live until unregister has joined any caller.
@@ -503,24 +509,37 @@ impl Drop for PmpDriver {
 kernel::of_device_table!(
     OF_TABLE,
     MODULE_OF_TABLE,
-    bool,
-    [(of::DeviceId::new(c"apple,t8140-pmp-v2"), true),
-     (of::DeviceId::new(c"apple,t6000-pmp-v2"), false)]
+    <PmpDriver as platform::Driver>::IdInfo,
+    [
+        (of::DeviceId::new(c"apple,t8140-pmp-v2"), &HW_CFG_T8140),
+        (of::DeviceId::new(c"apple,t6000-pmp-v2"), &HW_CFG_DEFAULT),
+    ]
 );
 
 impl platform::Driver for PmpDriver {
-    type IdInfo = bool;
+    type IdInfo = &'static PmpHwConfig;
+    type Data<'bound> = PmpDriver;
 
     const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
 
-    fn probe(pdev: &platform::Device<Core>, info: Option<&bool>) -> impl PinInit<Self, Error> {
+    fn probe<'bound>(
+        pdev: &'bound platform::Device<Core<'_>>,
+        info: Option<&'bound Self::IdInfo>,
+    ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
         let dev: ARef<device::Device> = pdev.as_ref().into();
-        let t8140 = info.copied().unwrap_or(false);
-        if t8140 {
-            // SAFETY: The T8140 DART accepts 42-bit IOVAs; no DMA allocations exist yet.
-            unsafe { pdev.dma_set_mask_and_coherent(DmaMask::new::<42>())? };
+        let cfg = info.ok_or(ENODEV)?;
+        if let Some(mask) = cfg.dma_mask {
+            // SAFETY: No DMA allocations or mappings exist for this device
+            // yet.
+            unsafe { pdev.dma_set_mask_and_coherent(mask)? };
         }
-        let data = PmpData::new(pdev, t8140)?;
+        let pmp_req = pdev.io_request_by_name(c"pmp").ok_or(EINVAL)?;
+        let pmp_mmio = pmp_req.iomap_sized::<PMP_MIN_MMIO_SIZE>()?;
+        let pmp_mmio = pmp_mmio.as_view();
+        let asc_req = pdev.io_request_by_name(c"asc").ok_or(EINVAL)?;
+        let asc_mmio = asc_req.iomap_sized::<ASC_MMIO_SIZE>()?;
+        let asc_mmio = asc_mmio.as_view().relaxed();
+        let data = PmpData::new(pdev)?;
         let node = dev.fwnode().ok_or(EIO)?;
         let dvid = node
             .property_read(c"apple,dram-vendor-id")
@@ -528,7 +547,7 @@ impl platform::Driver for PmpDriver {
         let bdid = node.property_read(c"apple,board-id").required_by(&dev)?;
         match node.property_read(c"apple,dram-capacity").optional() {
             Some(dcap) => data.patch_bootargs(
-                pdev,
+                &pmp_mmio,
                 &[
                     (from_fourcc(b"BDID"), bdid),
                     (from_fourcc(b"DCAP"), dcap),
@@ -536,13 +555,13 @@ impl platform::Driver for PmpDriver {
                 ],
             )?,
             None => data.patch_bootargs(
-                pdev,
+                &pmp_mmio,
                 &[(from_fourcc(b"BDID"), bdid), (from_fourcc(b"DVID"), dvid)],
             )?,
         };
         let rtkit = rtkit::RtKit::<PmpData>::new(&dev, None, 0, data.clone())?;
-        *data.rtkit.lock() = Some(rtkit);
-        data.start_cpu(pdev)?;
+        data.rtkit.lock().as_mut().set(Some(rtkit));
+        asc_mmio.update(ASC_CPU_CONTROL, |r| r.with_const_cpu_run::<1>());
         data.start()?;
         dev_info!(dev, "PMP firmware and endpoint ready");
         // SAFETY: PmpDriver retains this Arc and unregisters it before dropping it.

@@ -4,9 +4,9 @@ config DRM_APPLE
 	depends on DRM && OF && ARM64
 	depends on ARCH_APPLE || COMPILE_TEST
 	depends on APPLE_RTKIT
+	depends on TYPEC || !TYPEC
 	depends on OF_ADDRESS
 	select APPLE_PMP_REPORT
-	select APPLE_J613_DISPLAY_GATE if ARCH_APPLE
 	select OF_DYNAMIC
 	select DRM_CLIENT_SELECTION
 	select DRM_KMS_HELPER
@@ -41,18 +41,31 @@ config DRM_APPLE_KUNIT_TEST
 	select DRM_KUNIT_TEST_HELPERS if DRM_APPLE
 	default KUNIT_ALL_TESTS
 	help
-	  Test modeset and hotplug state transitions without display hardware,
-	  including link changes that race with a modeset and recovery after
-	  failed modesets. These tests can run on other architectures and do
-	  not require the Apple display driver to be enabled.
-	  With the Apple display driver enabled, also build tests for AFK
-	  service ownership and pending commands across disconnect and
-	  reannouncement, for its AFK ring parser (header strides used by
-	  older firmware and larger rings, malformed ring size combinations),
-	  the H17P backlight policy (takeover, DPMS, suspend, fades and
-	  present completion) and the system resume of a CRTC whose mode is
-	  no longer admissible. These tests use the driver, so with the
-	  driver built as a module they can only be built as modules too.
+	  Build tests for the Apple display driver's AFK ring parser and
+	  backlight policy (takeover, DPMS, suspend, fades and present
+	  completion).
+	  The tests cover the header strides used by older firmware and
+	  larger rings, as well as malformed ring size combinations.
+	  This option is intended for developer test kernels.
+	  Also test the Type-C modeset, hotplug and service ownership state,
+	  the system resume of a CRTC whose mode is no longer admissible,
+	  when an external display is ready to be reported to userspace, and
+	  which display processors must have started before the boot
+	  framebuffer is taken over.
+	  The AFK service lifetime test uses the display driver and is built
+	  with it. When the driver is a module, these tests can only be
+	  built as modules too. The standalone modeset state test can still
+	  be built without the driver.
+
+config DRM_APPLE_PARSER_KUNIT_TEST
+	bool "KUnit tests for Apple firmware message parsers" if !KUNIT_ALL_TESTS
+	depends on DRM_APPLE && KUNIT=y
+	default KUNIT_ALL_TESTS
+	help
+	  Build tests for AFKv2 lengths, DMA ownership and reply correlation,
+	  legacy EPIC replies, and H17P IOMFB callback envelopes and sizes.
+	  The tests use allocated buffers and fake devices and do not require
+	  an Apple display controller or any firmware.
 
 config DRM_APPLE_DISPLAY_KUNIT_TEST
 	bool "KUnit tests for Apple display mode probing" if !KUNIT_ALL_TESTS
@@ -63,8 +76,8 @@ config DRM_APPLE_DISPLAY_KUNIT_TEST
 	help
 	  Test the production timing parser and display reply bounds without
 	  Apple display hardware, including incomplete records and stable
-	  preferred mode selection. Exercise mode list replacement and EDID
-	  invalidation when a sink or display route changes. Check connector
+	  preferred mode selection. Exercise mode list replacement and
+	  catalog admission for each display attachment. Check connector
 	  status updates before hotplug notifications and same-state retrains.
 	  Check which 14.x board record an internal display gets on which
 	  machine, and which DCP firmware image each record admits.

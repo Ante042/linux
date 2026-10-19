@@ -15,6 +15,7 @@ struct apple_connector;
 #include "dcp-internal.h"
 
 void dcp_hotplug(struct work_struct *work);
+bool dcp_connector_connected(struct apple_connector *connector);
 void dcp_queue_hotplug(struct apple_connector *connector);
 void dcp_route_failure_notify(struct apple_connector *connector);
 void dcp_retrain_oob(struct apple_connector *connector);
@@ -51,12 +52,10 @@ struct apple_connector {
 	u32 candidate_crtcs;
 
 	const struct drm_edid *drm_edid;
-	/* Serializes cache ownership and fetch invalidation across sink changes. */
-	struct mutex edid_lock;
-	u64 edid_generation;
-	bool edid_live;
 	bool drm_edid_firmware_derived;
 	bool edid_invalidation_pending;
+	/* The sink is live on this pipeline; a change invalidates its EDID. */
+	bool edid_live;
 	u64 drm_edid_generation;
 	u64 drm_edid_service_epoch;
 
@@ -95,13 +94,6 @@ void apple_connector_invalidate_edid(struct apple_connector *connector);
 void apple_connector_edid_set_live(struct apple_connector *connector, bool live);
 void apple_connector_set_pipeline(struct apple_connector *connector,
 				  struct platform_device *pdev);
-bool apple_connector_edid_begin(struct apple_connector *connector,
-				struct platform_device *pdev, u64 *generation);
-bool apple_connector_edid_install(struct apple_connector *connector,
-				  struct platform_device *pdev, u64 generation,
-				  const struct drm_edid *edid);
-const struct drm_edid *apple_connector_edid_dup(struct apple_connector *connector,
-						struct platform_device *pdev);
 
 void apple_connector_debugfs_init(struct drm_connector *connector, struct dentry *root);
 

@@ -77,7 +77,7 @@ def main():
     p.add_argument('--mutation', action='store_true')
     args = p.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
-    source = (subprocess.check_output(['git','show','990a45b609dd:'+PATH], cwd=ROOT,text=True)
+    source = (subprocess.check_output(['git','show','990a45b609dd:'+PATH.replace('/asahi/', '/asahi-neo/')], cwd=ROOT,text=True)
               if args.old else (ROOT/PATH).read_text())
     structure = item(source, 'pub(super) struct Generation').replace('pub(super)', '')
     constructor = item(source[source.index('impl Generation'):], '    fn new(')

@@ -2,7 +2,6 @@
 /* Copyright The Asahi Linux Contributors */
 
 #include "dpavservep.h"
-#include "dpavservep-edid.h"
 #include "dpavserv-edid.h"
 
 #define EDID_EXT_BLOCK_COUNT_OFFSET 0x7E
@@ -103,8 +102,8 @@ static int dcpavserv_revalidate(struct apple_epic_service *service, const char *
 	return ret;
 }
 
-static void dcpavserv_init_h17p(struct apple_epic_service *service, const char *name,
-			       const char *class, s64 unit)
+static void dcpavserv_init(struct apple_epic_service *service, const char *name,
+			  const char *class, s64 unit)
 {
 	struct apple_dcp *dcp = service->ep->dcp;
 	bool v2 = service->ep->wire_v2;
@@ -139,6 +138,9 @@ static void dcpavserv_init_h17p(struct apple_epic_service *service, const char *
 		dev_dbg(dcp->dev, "DCPAVSERV: AFKV2 EDID service ready on channel %u\n",
 			service->channel);
 		dcpavserv_notify_edid(service);
+	} else {
+		/* Also report announcements arriving after the discovery window. */
+		dev_dbg(dcp->dev, "DCPAVSERV: legacy EDID service published\n");
 	}
 }
 
@@ -156,53 +158,6 @@ static void dcpavserv_invalidate_edid(struct apple_dcp *dcp)
 		schedule_work(&connector->hotplug_wq);
 }
 
-static void dcpavserv_teardown_h17p(struct apple_epic_service *service)
-{
-	struct apple_dcp *dcp = service->ep->dcp;
-	bool owned = false;
-
-	mutex_lock(&dcp->dcpavserv.lock);
-	if (dcp->dcpavserv.service == service) {
-		dcp->dcpavserv.enabled = false;
-		dcp->dcpavserv.service = NULL;
-		dcp->dcpavserv.epoch++;
-		dcpavserv_invalidate_edid(dcp);
-		reinit_completion(&dcp->dcpavserv.enable_completion);
-		owned = true;
-	}
-	mutex_unlock(&dcp->dcpavserv.lock);
-	if (owned)
-		afk_service_put(service);
-}
-
-/*
- * Every firmware other than H17P (M1/M2/M3): integration's service
- * lifetime. The H17P variants below add admission, service epochs and
- * connector EDID invalidation.
- */
-static void dcpavserv_init(struct apple_epic_service *service, const char *name,
-			  const char *class, s64 unit)
-{
-	struct apple_dcp *dcp = service->ep->dcp;
-
-	trace_dcpavserv_init(dcp, unit);
-
-	if (unit == 0 && name && !strcmp(name, "dcpav-service-epic")) {
-		mutex_lock(&dcp->dcpavserv.lock);
-		if (dcp->dcpavserv.enabled) {
-			mutex_unlock(&dcp->dcpavserv.lock);
-			dev_err(dcp->dev,
-				"DCPAVSERV: unit %lld already exists\n", unit);
-			return;
-		}
-		dcp->dcpavserv.service = afk_service_get(service);
-		dcp->dcpavserv.enabled = true;
-		service->cookie = &dcp->dcpavserv;
-		complete(&dcp->dcpavserv.enable_completion);
-		mutex_unlock(&dcp->dcpavserv.lock);
-	}
-}
-
 static void dcpavserv_teardown(struct apple_epic_service *service)
 {
 	struct apple_dcp *dcp = service->ep->dcp;
@@ -212,7 +167,9 @@ static void dcpavserv_teardown(struct apple_epic_service *service)
 	if (dcp->dcpavserv.service == service) {
 		dcp->dcpavserv.enabled = false;
 		dcp->dcpavserv.service = NULL;
+		dcp->dcpavserv.epoch++;
 		dcp->dcpavserv.opened = NULL;
+		dcpavserv_invalidate_edid(dcp);
 		reinit_completion(&dcp->dcpavserv.enable_completion);
 		owned = true;
 	}
@@ -225,26 +182,13 @@ void dpavservep_detach(struct apple_dcp *dcp)
 {
 	struct apple_epic_service *service;
 
-	if (dcp->fw_compat != DCP_FIRMWARE_H17P) {
-		mutex_lock(&dcp->dcpavserv.lock);
-		service = dcp->dcpavserv.service;
-		dcp->dcpavserv.service = NULL;
-		dcp->dcpavserv.enabled = false;
-		dcp->dcpavserv.opened = NULL;
-		mutex_unlock(&dcp->dcpavserv.lock);
-		if (service) {
-			afk_service_disable(service);
-			afk_service_put(service);
-		}
-		return;
-	}
-
 	mutex_lock(&dcp->dcpavserv.lock);
 	service = dcp->dcpavserv.service;
 	dcp->dcpavserv.service = NULL;
 	dcp->dcpavserv.enabled = false;
 	/* Also reject an in-flight prepare/OPEN with no published owner yet. */
 	dcp->dcpavserv.epoch++;
+	dcp->dcpavserv.opened = NULL;
 	reinit_completion(&dcp->dcpavserv.enable_completion);
 	if (service) {
 		afk_service_retire(service);
@@ -290,6 +234,13 @@ struct dpavserv_copy_edid_cmd {
 	u8 _pad2[8];
 } __packed;
 
+struct dpavserv_copy_edid_resp {
+	__le64 max_size;
+	u8 _pad1[24];
+	__le64 used_size;
+	u8 _pad2[8];
+	u8 data[];
+} __packed;
 static_assert(sizeof(struct dpavserv_copy_edid_resp) == 48);
 
 static int parse_report(struct apple_epic_service *service, enum epic_subtype type,
@@ -359,39 +310,12 @@ static int dcpdpserv_report(struct apple_epic_service *service,
 	return parse_report(service, type, data, data_size);
 }
 
-/* Integration's bounded read, for every firmware other than H17P. */
-static const struct drm_edid *dcpavserv_read_edid(struct apple_epic_service *service)
-{
-	struct dpavserv_copy_edid_cmd cmd;
-	struct dpavserv_copy_edid_resp *resp __free(kfree) = NULL;
-	size_t resp_size = sizeof(*resp) + DPAVSERV_EDID_BUF_SIZE;
-	size_t reply_size, edid_size;
-	int ret;
-
-	memset(&cmd, 0, sizeof(cmd));
-	cmd.max_size = cpu_to_le64(DPAVSERV_EDID_BUF_SIZE);
-	resp = kzalloc(resp_size, GFP_KERNEL);
-	if (!resp)
-		return ERR_PTR(-ENOMEM);
-
-	ret = afk_service_call_with_reply_len(service, 1, 7, &cmd, sizeof(cmd),
-					      DPAVSERV_EDID_BUF_SIZE, resp,
-					      resp_size, 0, &reply_size);
-	if (ret < 0)
-		return ERR_PTR(ret);
-
-	ret = dcpavserv_edid_size(resp, reply_size, &edid_size);
-	if (ret)
-		return ERR_PTR(ret);
-
-	return drm_edid_alloc(resp->data + DPAVSERV_EDID_LEADING_SIZE, edid_size);
-}
-
 static const struct drm_edid *dcpavserv_read_edid_legacy(struct apple_epic_service *service)
 {
 	struct dpavserv_copy_edid_cmd cmd;
 	struct dpavserv_copy_edid_resp *resp __free(kfree) = NULL;
 	size_t resp_size = sizeof(*resp) + EDID_BUF_SIZE;
+	size_t reply_size;
 	int num_blocks;
 	u64 data_size;
 	int ret;
@@ -402,20 +326,20 @@ static const struct drm_edid *dcpavserv_read_edid_legacy(struct apple_epic_servi
 	if (!resp)
 		return ERR_PTR(-ENOMEM);
 
-	ret = afk_service_call(service, 1, 7, &cmd, sizeof(cmd), EDID_BUF_SIZE, resp,
-			       resp_size, 0);
+	ret = afk_service_call_with_reply_len(service, 1, 7, &cmd, sizeof(cmd),
+					      EDID_BUF_SIZE, resp, resp_size, 0,
+					      &reply_size);
 	if (ret < 0)
 		return ERR_PTR(ret);
 
-	if (le64_to_cpu(resp->max_size) != EDID_BUF_SIZE)
+	if (reply_size < sizeof(*resp) ||
+	    le64_to_cpu(resp->max_size) != EDID_BUF_SIZE)
 		return ERR_PTR(-EIO);
 
-	// print_hex_dump(KERN_DEBUG, "dpavserv EDID cmd: ", DUMP_PREFIX_NONE,
-	// 	       16, 1, resp, 192, true);
-
+	/* Only complete EDID blocks within the received reply may be copied. */
 	data_size = le64_to_cpu(resp->used_size);
 	if (data_size < EDID_LEADING_DATA_SIZE + EDID_BLOCK_SIZE ||
-	    data_size > EDID_BUF_SIZE)
+	    data_size > EDID_BUF_SIZE || data_size > reply_size - sizeof(*resp))
 		return ERR_PTR(-EIO);
 
 	/*
@@ -484,49 +408,6 @@ const struct drm_edid *dcpavserv_copy_edid(struct apple_dcp *dcp, u64 generation
 	struct apple_epic_service *service;
 	const struct drm_edid *edid;
 
-	if (dcp->fw_compat != DCP_FIRMWARE_H17P) {
-		mutex_lock(&dcp->dcpavserv.lock);
-		service = afk_service_get(dcp->dcpavserv.service);
-		*epoch = dcp->dcpavserv.epoch;
-		mutex_unlock(&dcp->dcpavserv.lock);
-		if (!service)
-			return ERR_PTR(-ENODEV);
-
-		/*
-		 * The 14.7 firmware of an external processor answers EDID
-		 * requests once its service has been opened; open each
-		 * announced instance once.
-		 *
-		 * Only on Aurora's DCPLink session (T6030). The T8122 dcpext,
-		 * which Linux starts and drives through the IOMFB template,
-		 * reads the EDID directly, as in AsahiLinux/linux#607. Its
-		 * firmware never answers the open call and drops the display
-		 * link instead, about 50 ms after it, which brings the display
-		 * back 4 s later: hotplug in a loop.
-		 */
-		if (dcp->fw_compat == DCP_FIRMWARE_V_14_7 &&
-		    READ_ONCE(dcp->dcpavserv.opened) != service) {
-			int ret = afk_service_call(service, 4, 6, NULL, 0, 32, NULL, 0, 32);
-
-			if (ret) {
-				afk_service_put(service);
-				return ERR_PTR(ret);
-			}
-			WRITE_ONCE(dcp->dcpavserv.opened, service);
-		}
-
-		edid = dcpavserv_read_edid(service);
-		mutex_lock(&dcp->dcpavserv.lock);
-		if (dcp->dcpavserv.service != service) {
-			if (!IS_ERR(edid))
-				drm_edid_free(edid);
-			edid = ERR_PTR(-ENODEV);
-		}
-		mutex_unlock(&dcp->dcpavserv.lock);
-		afk_service_put(service);
-		return edid;
-	}
-
 	scoped_guard(mutex, &dcp->hpd_mutex) {
 		if (!dcpavserv_edid_current(dcp, generation))
 			return ERR_PTR(-ESTALE);
@@ -537,6 +418,27 @@ const struct drm_edid *dcpavserv_copy_edid(struct apple_dcp *dcp, u64 generation
 	mutex_unlock(&dcp->dcpavserv.lock);
 	if (!service)
 		return ERR_PTR(-ENODEV);
+
+	/*
+	 * The 14.7 firmware of an external processor answers EDID requests
+	 * once its service has been opened; open each announced instance once.
+	 *
+	 * Only on Aurora's DCPLink session (T6030). The T8122 dcpext, which
+	 * Linux starts and drives through the IOMFB template, reads the EDID
+	 * directly, as in AsahiLinux/linux#607. Its firmware never answers the
+	 * open call and drops the display link instead, about 50 ms after it,
+	 * which brings the display back 4 s later: hotplug in a loop.
+	 */
+	if (dcp->fw_compat == DCP_FIRMWARE_V_14_7 &&
+	    READ_ONCE(dcp->dcpavserv.opened) != service) {
+		int ret = afk_service_call(service, 4, 6, NULL, 0, 32, NULL, 0, 32);
+
+		if (ret) {
+			afk_service_put(service);
+			return ERR_PTR(ret);
+		}
+		WRITE_ONCE(dcp->dcpavserv.opened, service);
+	}
 
 	edid = service->ep->wire_v2 ? dcpavserv_read_edid_inline(service) :
 		dcpavserv_read_edid_legacy(service);
@@ -563,29 +465,10 @@ static const struct apple_epic_service_ops dpavservep_ops[] = {
 	{
 		.name = "dcpav-service-epic",
 		.reusable = true,
-		.init = dcpavserv_init,
-		.teardown = dcpavserv_teardown,
-		.report = dcpavserv_report,
-	},
-	{
-		.name = "dcpdp-service-epic",
-		.reusable = true,
-		.init = dcpdpserv_init,
-		.teardown = dcpdpserv_teardown,
-		.report = dcpdpserv_report,
-	},
-	{},
-};
-
-/* H17P (T8140, T8142): admission before OPEN, and the optional DP service. */
-static const struct apple_epic_service_ops dpavservep_h17p_ops[] = {
-	{
-		.name = "dcpav-service-epic",
-		.reusable = true,
 		.prepare = dcpavserv_prepare,
 		.revalidate = dcpavserv_revalidate,
-		.init = dcpavserv_init_h17p,
-		.teardown = dcpavserv_teardown_h17p,
+		.init = dcpavserv_init,
+		.teardown = dcpavserv_teardown,
 		.report = dcpavserv_report,
 	},
 	{
@@ -609,9 +492,7 @@ int dpavservep_init(struct apple_dcp *dcp)
 
 	ep = afk_init(dcp, dcp->hw.iomfb_method_profile ==
 		      DCP_IOMFB_METHODS_H17P_EXTERNAL ?
-		      DPAVSERV_ENDPOINT_V2 : DPAVSERV_ENDPOINT,
-		      dcp->fw_compat == DCP_FIRMWARE_H17P ?
-		      dpavservep_h17p_ops : dpavservep_ops);
+		      DPAVSERV_ENDPOINT_V2 : DPAVSERV_ENDPOINT, dpavservep_ops);
 	if (IS_ERR(ep))
 		return PTR_ERR(ep);
 	/* External H17P uses AFKV2 service calls with host-owned OOB buffers. */
@@ -634,15 +515,15 @@ int dpavservep_init(struct apple_dcp *dcp)
 	if (ep->wire_v2)
 		return 0;
 
-	ret = wait_for_completion_timeout(&dcp->dcpavserv.enable_completion,
-					  msecs_to_jiffies(1000));
-	/* Integration: a missing announcement is not an error elsewhere. */
-	if (dcp->fw_compat != DCP_FIRMWARE_H17P)
-		return 0;
-	if (!ret) {
-		dev_warn(dcp->dev, "DCPAVSERV: timed out waiting for EDID service announcement\n");
-		return -ETIMEDOUT;
-	}
+	/*
+	 * Legacy firmware need not announce an EDID service. Give it the same
+	 * discovery window so an early announcement can precede get_modes,
+	 * but absence is not an endpoint failure.
+	 * Only dcpavserv_init() may publish a service that actually arrived.
+	 */
+	if (!wait_for_completion_timeout(&dcp->dcpavserv.enable_completion,
+					 msecs_to_jiffies(1000)))
+		dev_dbg(dcp->dev, "DCPAVSERV: no legacy EDID service within 1 s\n");
 
 	return 0;
 }

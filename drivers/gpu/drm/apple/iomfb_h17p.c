@@ -8,6 +8,7 @@
 #include "iomfb_h17p.h"
 #include "iomfb_v12_3.h"
 #include "iomfb_v13_3.h"
+#include "iomfb_v14_7_tpl.h"
 #include "version_utils.h"
 
 struct dcp_callback_size {
@@ -452,7 +453,7 @@ static bool trampoline_provider_property_h17p(struct apple_dcp *dcp, int tag,
 		memset(reply, 0, sizeof(*reply));
 		memcpy(reply->data, property->legacy_data, property->length);
 		reply->length = cpu_to_le32(property->length);
-		dev_warn_once(dcp->dev,
+		dev_info_once(dcp->dev,
 			      "missing provider property %s (%u bytes); using the J700 defaults\n",
 			      property->dt_name, property->length);
 		return true;
@@ -815,6 +816,24 @@ int iomfb_h17p_first_unbounded_callback(void)
 		if (cb_handlers[tag] && !callback_sizes[tag].valid)
 			return tag;
 	return -1;
+}
+
+/*
+ * Hands a completion of @swap_id to the swap_complete_ap_gated callback, as
+ * the firmware would.  The caller holds the IOMFB lock, as the receiver does.
+ */
+int iomfb_h17p_deliver_swap_complete(struct apple_dcp *dcp, u32 swap_id)
+{
+	struct dc_swap_complete_resp_h17p *resp;
+
+	lockdep_assert_held(&dcp->iomfb.lock);
+	resp = kzalloc_obj(*resp);
+	if (!resp)
+		return -ENOMEM;
+	resp->swap_id = swap_id;
+	cb_handlers[590](dcp, 590, NULL, resp);
+	kfree(resp);
+	return 0;
 }
 #endif
 

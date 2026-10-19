@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 
 #include <stdio.h>
 #include <string.h>
@@ -46,16 +47,35 @@ struct bcm4377_data;
 struct firmware { const unsigned char *data; int size; };
 struct hci_dev { struct bcm4377_data *data; unsigned int flags; void *req_workqueue,*workqueue; struct work_struct power_on,cmd_sync_work,cmd_work; struct delayed_work cmd_timer,ncmd_timer; int req_lock,cmd_cnt,suspend_state,wake_reason,wake_addr_type; bdaddr_t wake_addr; int *req_skb; void (*reset)(struct hci_dev*); bdaddr_t setup_addr,public_addr,bdaddr; };
 struct ring { bool enabled; };
-struct pci_dev { int dev; void *data; };
+struct pci_dev {
+	int irq, dev;
+	void *data;
+};
 struct device { struct pci_dev *pci; };
 struct bcm4377_hw { unsigned int id; int (*send_calibration)(struct bcm4377_data*); int (*send_ptb)(struct bcm4377_data*,const struct firmware*); };
 struct bcm4377_data {
  struct hci_dev *hdev; struct pci_dev *pdev; struct bcm4377_hw *hw;
- bool needs_reset,cal_needed,cal_loaded,setup_retry_used,setup_retry_pending,setup_retry_blocked;
- struct delayed_work setup_retry_work; bdaddr_t bdaddr; char *bar0; pthread_mutex_t resume_lock; uint64_t resume_epoch,resume_pending; bool resume_armed,resume_blocked,resume_powered; struct work_struct resume_work;
+	bool wake_armed, quiesced, needs_reset, cal_needed, cal_loaded;
+	bool setup_retry_used, setup_retry_pending, setup_retry_blocked;
+	struct delayed_work setup_retry_work;
+	bdaddr_t bdaddr;
+	char *bar0;
+	pthread_mutex_t resume_lock;
+	uint64_t resume_epoch, resume_pending;
+	bool resume_armed, resume_blocked, resume_powered;
+	bool resume_guarded, resume_recovering;
+	struct work_struct resume_work;
  struct ring acl_d2h_ring,acl_h2d_ring,sco_d2h_ring,sco_h2d_ring,hci_d2h_ring,hci_h2d_ring,sco_event_ring,sco_ack_ring,hci_acl_event_ring,hci_acl_ack_ring;
 };
 static int cal_count,ptb_count,reset_count,open_count,queued_count,addr_count,cal_failures,ptb_error,addr_error,reset_error,rings_error,close_error;
+static int rebind_count;
+
+/* Controlled boundary for the existing driver's asynchronous rebind work. */
+static void bcm4377_hci_reset(struct hci_dev *hdev)
+{
+	rebind_count++;
+}
+
 static bool missing_blob;
 static bool active_callback_pause,active_running;
 static pthread_barrier_t active_started,active_release;
@@ -103,6 +123,12 @@ static void cancel_delayed_work_sync(struct delayed_work *w) {if(w==&active->hde
 static struct pci_dev *to_pci_dev(struct device *d) {return d->pci;}
 static void *pci_get_drvdata(struct pci_dev *p) {return p->data;}
 static void iowrite32(int val,void *addr) {if(val==1){assert(!request.fn && !active->resume_work.queued && !active_running);quiesces++;}}
+static bool fixture_wakeup;
+static bool device_may_wakeup(struct device *d) { return fixture_wakeup; }
+static void pci_save_state(struct pci_dev *p) {}
+static int enable_irq_wake(int irq) { return 0; }
+static void disable_irq_wake(int irq) {}
+static int ioread32(void *addr) { return 0; }
 static int hci_suspend_dev(struct hci_dev *h);
 static int hci_resume_dev(struct hci_dev *h);
 static void hci_unregister_dev(struct hci_dev *h) {assert(!request.fn&&!active->resume_work.queued&&!active_running);h->flags|=HCI_UNREGISTER;unregistered++;}

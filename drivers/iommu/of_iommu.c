@@ -45,12 +45,10 @@ static int of_iommu_configure_dev_id(struct device_node *master_np,
 				     struct device *dev,
 				     const u32 *id)
 {
-	struct of_phandle_args iommu_spec = { .args_count = 1 };
+	struct of_phandle_args iommu_spec = {};
 	int err;
 
-	err = of_map_id(master_np, *id, "iommu-map",
-			 "iommu-map-mask", &iommu_spec.np,
-			 iommu_spec.args);
+	err = of_map_iommu_id(master_np, *id, &iommu_spec);
 	if (err)
 		return err;
 
@@ -249,7 +247,18 @@ void of_iommu_get_resv_regions(struct device *dev, struct list_head *list)
 			phandle = be32_to_cpup(maps++);
 			np = of_find_node_by_phandle(phandle);
 			if (!np) {
-				dev_warn(dev, "Invalid iommu-addresses phandle %#x\n", phandle);
+				/*
+				 * A boot loader writes phandle 0 for an owner that has
+				 * none. Such a tuple cannot name this device, and its
+				 * cell count is unknown, so stop as for any unknown
+				 * owner, without warning about the loader's form.
+				 */
+				if (phandle)
+					dev_warn(dev, "Invalid iommu-addresses phandle %#x\n",
+						 phandle);
+				else
+					dev_dbg(dev, "%pOF: iommu-addresses owner without a phandle\n",
+						it.node);
 				break;
 			}
 

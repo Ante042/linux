@@ -2,9 +2,9 @@
 //! Host tests of the production batch admission and lifetime policies.
 //! Run: rustc --edition=2021 --test tools/asahi/m3-batching-tests.rs -o /tmp/m3-batching-tests
 #![allow(dead_code)]
-#[path = "../../drivers/gpu/drm/asahi/m3_batch_policy.rs"]
+#[path = "../../drivers/gpu/drm/asahi/m3/m3_batch_policy.rs"]
 mod policy;
-#[path = "../../drivers/gpu/drm/asahi/m3_timeline.rs"]
+#[path = "../../drivers/gpu/drm/asahi/m3/m3_timeline.rs"]
 mod timeline;
 use policy::*;
 

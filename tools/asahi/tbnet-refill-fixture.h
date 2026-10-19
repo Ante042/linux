@@ -41,6 +41,8 @@
 #define netdev_dbg(...) ((void)0)
 #define netdev_err(...) ((void)0)
 #define netdev_warn(...) ((void)0)
+#define lockdep_assert_held(...) ((void)0)
+#define TB_MAX_FRAME_SIZE 4096
 #define IS_ERR(x) ((intptr_t)(x)<0)
 #define PTR_ERR(x) ((intptr_t)(x))
 typedef uint16_t u16;
@@ -58,6 +60,7 @@ struct page { struct page_pool *pool; int owner; char *mem; dma_addr_t dma; };
 struct ring_frame { dma_addr_t buffer_phy; unsigned int size,flags; struct page *unused; };
 struct tb_ring { int hop; bool running,is_tx,freed,masked; void (*start_poll)(void*); void *poll_data; struct work_struct work; struct ring_frame *queue[TBNET_RING_SIZE]; unsigned int queued,completed; };
 struct tbnet_frame { struct ring_frame frame; struct page *page; struct net_device *dev; };
+static inline size_t tb_ring_frame_size(const struct ring_frame *frame){return frame->size?frame->size:TB_MAX_FRAME_SIZE;}
 struct tbnet_ring { unsigned int cons,prod; struct tb_ring *ring; struct page_pool *pool; struct tbnet_frame frames[TBNET_RING_SIZE]; };
 struct thunderbolt_ip_frame_header { u32 frame_size; u16 frame_index,frame_id; u32 frame_count; };
 struct skb_shared_info { unsigned int nr_frags; };
@@ -73,7 +76,7 @@ static int pause_at,paused,resume_poll,teardown_entered,completion_ok=1,alloc_li
 static bool tail_pending,setup_active,pool_alloc_active;
 static int schedule_calls,retry_queues,retry_delay;
 static bool cancel_waiting;
-static int system_wq;
+static int system_dfl_wq;
 #define msecs_to_jiffies(x) (x)
 #define INIT_DELAYED_WORK(w,f) ((w)->work.fn=(f))
 static _Thread_local int heldmutex;

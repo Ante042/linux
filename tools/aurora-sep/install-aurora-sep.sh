@@ -6446,7 +6446,7 @@ fingerprint.
    naming the newer one. To check without installing:
 
      curl -fsSL https://api.github.com/repos/omacom/linux-aurora/releases/latest \
-       | grep -m1 '"tag_name"' 
+       | grep -m1 '"tag_name"'
 
    Always fetch the script from the "latest" URL rather than a tag you were
    handed, so you get the current one automatically:

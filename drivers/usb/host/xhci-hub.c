@@ -226,9 +226,8 @@ static int xhci_create_usb3x_bos_desc(struct xhci_hcd *xhci, char *buf,
 					   USB_SSP_SUBLINK_SPEED_ST_SYM_RX);
 			ssp_cap->bmSublinkSpeedAttr[offset++] = cpu_to_le32(attr);
 
-			attr &= ~USB_SSP_SUBLINK_SPEED_ST;
-			attr |= FIELD_PREP(USB_SSP_SUBLINK_SPEED_ST,
-					   USB_SSP_SUBLINK_SPEED_ST_SYM_TX);
+			FIELD_MODIFY(USB_SSP_SUBLINK_SPEED_ST, &attr,
+				     USB_SSP_SUBLINK_SPEED_ST_SYM_TX);
 			ssp_cap->bmSublinkSpeedAttr[offset++] = cpu_to_le32(attr);
 			break;
 		case PLT_ASYM_RX:
@@ -620,7 +619,8 @@ static void xhci_clear_port_change_bit(struct xhci_hcd *xhci, u16 wValue, struct
 		/* Should never happen */
 		return;
 	}
-	/* Change bits are all write 1 to clear */
+	/* Change bits are all write 1 to clear, also when held in software */
+	port->held_changes &= ~status;
 	xhci_portsc_writel(port, portsc | status);
 	portsc = xhci_portsc_readl(port);
 
@@ -639,7 +639,7 @@ struct xhci_hub *xhci_get_rhub(struct usb_hcd *hcd)
 
 /*
  * xhci_set_port_power() must be called with xhci->lock held.
- * It will release and re-aquire the lock while calling ACPI
+ * It will release and re-acquire the lock while calling ACPI
  * method.
  */
 static void xhci_set_port_power(struct xhci_hcd *xhci, struct xhci_port *port,
@@ -1144,6 +1144,9 @@ static u32 xhci_get_port_status(struct usb_hcd *hcd, struct xhci_bus_state *bus_
 
 	rhub = xhci_get_rhub(hcd);
 	port = rhub->ports[portnum];
+
+	/* Changes held while running in suspend-to-idle count as set */
+	portsc |= port->held_changes;
 
 	/* common wPortChange bits */
 	if (portsc & PORT_CSC)
@@ -1661,6 +1664,8 @@ int xhci_hub_status_data(struct usb_hcd *hcd, char *buf)
 			break;
 		}
 		trace_xhci_hub_status_data(ports[i], temp);
+		/* Changes held while running in suspend-to-idle count as set */
+		temp |= ports[i]->held_changes & mask;
 
 		if ((temp & mask) != 0 ||
 			(bus_state->port_c_suspend & 1 << i) ||

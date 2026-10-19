@@ -48,6 +48,7 @@ static bool of_machine_is_compatible(const char *compatible)
 #define drm_crtc_index(crtc) ((crtc)->index)
 static bool dcp_typec_route_busy(struct apple_dcp_typec_route *r) { return false; }
 static bool dcp_typec_tunnel_held(struct apple_dcp *d) { return false; }
+static bool dcp_typec_safe_held(struct apple_dcp *d) { return false; }
 static enum dcp_fabric_presence_state dcp_hdmi_presence(struct apple_dcp *d)
 {
     return DCP_FABRIC_ABSENT;

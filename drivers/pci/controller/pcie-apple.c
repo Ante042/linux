@@ -93,7 +93,8 @@ static const char *const apple_pcie_tunnel_cold_init_machines[] = {
  */
 bool apple_pcie_tunnel_needs_cold_init(struct device_node *np)
 {
-	struct device_node *dart = NULL;
+	struct of_phandle_args iommu_spec = {};
+	struct device_node *dart;
 	bool tunables;
 	u32 status;
 
@@ -106,8 +107,9 @@ bool apple_pcie_tunnel_needs_cold_init(struct device_node *np)
 	    status == 1)
 		return false;
 
-	if (of_map_id(np, 0, "iommu-map", "iommu-map-mask", &dart, NULL) || !dart)
+	if (of_map_iommu_id(np, 0, &iommu_spec) || !iommu_spec.np)
 		return false;
+	dart = iommu_spec.np;
 	tunables = of_property_present(dart, "apple,tunable");
 	if (!tunables)
 		pr_warn_once("%pOF: no PCIe-C DART tunables, not cold-initializing\n",
@@ -487,6 +489,7 @@ static struct irq_chip apple_msi_bottom_chip = {
 	.irq_eoi		= irq_chip_eoi_parent,
 	.irq_set_affinity	= irq_chip_set_affinity_parent,
 	.irq_set_type		= irq_chip_set_type_parent,
+	.irq_set_wake		= irq_chip_set_wake_parent,
 	.irq_compose_msi_msg	= apple_msi_compose_msg,
 };
 
@@ -1799,6 +1802,26 @@ err_teardown:
 	return ret;
 }
 
+/*
+ * Each MSI vector is an AIC interrupt of its own, so a vector can wake the
+ * system exactly when the AIC line behind it can. Forward the wake setting
+ * from the per-device PCI/MSI chip down to the AIC, which otherwise fails
+ * enable_irq_wake() for every MSI and leaves PCIe functions without a way
+ * to end suspend-to-idle.
+ */
+static bool apple_msi_init_dev_msi_info(struct device *dev,
+					struct irq_domain *domain,
+					struct irq_domain *real_parent,
+					struct msi_domain_info *info)
+{
+	if (!msi_lib_init_dev_msi_info(dev, domain, real_parent, info))
+		return false;
+
+	if (!info->chip->irq_set_wake)
+		info->chip->irq_set_wake = irq_chip_set_wake_parent;
+	return true;
+}
+
 static const struct msi_parent_ops apple_msi_parent_ops = {
 	.supported_flags	= (MSI_GENERIC_FLAGS_MASK	|
 				   MSI_FLAG_PCI_MSIX		|
@@ -1808,7 +1831,7 @@ static const struct msi_parent_ops apple_msi_parent_ops = {
 				   MSI_FLAG_PCI_MSI_MASK_PARENT),
 	.chip_flags		= MSI_CHIP_FLAG_SET_EOI,
 	.bus_select_token	= DOMAIN_BUS_PCI_MSI,
-	.init_dev_msi_info	= msi_lib_init_dev_msi_info,
+	.init_dev_msi_info	= apple_msi_init_dev_msi_info,
 };
 
 /* T6030 has one shared AIC MSI window, partitioned by its ADT bridges. */
@@ -1857,10 +1880,17 @@ static int apple_msi_init(struct apple_pcie *pcie)
 		    of_address_to_resource(to_of_node(fwnode), 0, &ecam))
 			goto invalid_slice;
 		switch (ecam.start) {
-		case 0x730000000ULL: expected_base = 0x20; break;
-		case 0xb30000000ULL: expected_base = 0x40; break;
-		case 0xf30000000ULL: expected_base = 0x60; break;
-		default: goto invalid_slice;
+		case 0x730000000ULL:
+			expected_base = 0x20;
+			break;
+		case 0xb30000000ULL:
+			expected_base = 0x40;
+			break;
+		case 0xf30000000ULL:
+			expected_base = 0x60;
+			break;
+		default:
+			goto invalid_slice;
 		}
 		if (args.args_count != 3 || args.args[0] != 0 ||
 		    args.args[2] != IRQ_TYPE_EDGE_RISING)
@@ -1872,8 +1902,9 @@ static int apple_msi_init(struct apple_pcie *pcie)
 				      "apple,msi-vector-base", NULL) &&
 		    args.args[1] == 1342 && pcie->nvecs == 512) {
 			/*
-			 * Older device trees gave each host the global MSI window.
-			 * Correct it here so those device trees keep working.
+			 * Old experimental boot DTs exposed the global window to
+			 * each host. Correct it here so old recovery kernels can
+			 * continue using the unchanged shared bootloader DT.
 			 */
 			pcie->msi_vector_base = expected_base;
 			pcie->nvecs = 32;
@@ -1977,6 +2008,7 @@ static int apple_pcie_enable_device(struct pci_host_bridge *bridge, struct pci_d
 	struct resource *res;
 	u32 sid, val, readback, rid = pci_dev_id(pdev);
 	struct apple_pcie_port *port;
+	struct of_phandle_args iommu_spec = {};
 	int idx, err;
 
 	/* A generic rescan must not enable cached children of failed admission. */
@@ -2011,11 +2043,12 @@ static int apple_pcie_enable_device(struct pci_host_bridge *bridge, struct pci_d
 	dev_dbg(&pdev->dev, "added to bus %s, index %d\n",
 		pci_name(pdev->bus->self), port->idx);
 
-	err = of_map_id(port->pcie->dev->of_node, rid, "iommu-map",
-			"iommu-map-mask", NULL, &sid);
+	err = of_map_iommu_id(port->pcie->dev->of_node, rid, &iommu_spec);
 	if (err)
 		return err;
 
+	of_node_put(iommu_spec.np);
+	sid = iommu_spec.args[0];
 	mutex_lock(&port->pcie->lock);
 
 	if (port->pcie->hw->sid_indexed_rid2sid) {
@@ -2681,8 +2714,9 @@ static int apple_pcie_probe(struct platform_device *pdev)
 	if (IS_ERR(pcie->base))
 		return PTR_ERR(pcie->base);
 	if (pcie->hw->tunneled) {
-		pcie->kernel_init = of_property_read_bool(dev->of_node,
-							  "apple,pciec-kernel-init");
+		pcie->kernel_init =
+			of_device_is_compatible(dev->of_node, "apple,t8103-pciec") &&
+			of_property_read_bool(dev->of_node, "apple,pciec-kernel-init");
 		pcie->tunnel_cold_init =
 			apple_pcie_tunnel_needs_cold_init(dev->of_node);
 		ret = apple_pcie_tunnel_init_resources(pdev, pcie);
@@ -3104,6 +3138,13 @@ int apple_pcie_tunnel_prepare(struct device *dev, struct device_node *tunnel)
 	if (!np)
 		return 0;
 
+	/* A qualified bootloader handoff needs no cold initialization. */
+	if (!of_property_read_u32(np, "apple,pciec-preinit-status", &stat) &&
+	    stat == 1) {
+		ret = 0;
+		goto out_np;
+	}
+
 	match = of_match_node(apple_pcie_of_match, np);
 	if (!match) {
 		ret = -ENODEV;
@@ -3154,6 +3195,11 @@ int apple_pcie_tunnel_prepare(struct device *dev, struct device_node *tunnel)
 
 	pcie->dev = dev;
 	pcie->hw = match->data;
+	/* Keep the previous fallback on unqualified M3-family machines. */
+	if (pcie->hw == &t8122_pciec_hw &&
+	    !of_machine_is_compatible("apple,t6030") &&
+	    of_device_is_compatible(dev->of_node, "apple,t8103-pciec"))
+		pcie->hw = &t8103_pciec_hw;
 	pcie->kernel_init = kernel_init;
 	pcie->early_cfg = config.base;
 	pcie->debug_base = debug.base;

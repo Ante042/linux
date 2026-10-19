@@ -3,7 +3,7 @@
 //! Immutable submissions and the DRM scheduler boundary for independent engines.
 
 use super::{command::Validated, completion::Completion, context::Context};
-use crate::driver::AsahiDevice;
+use crate::driver::AsahiDrmDevice;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
 use kernel::{
     bindings, c_str,
@@ -288,7 +288,6 @@ impl<B: Backend> Drop for Job<B> {
 impl<B: Backend> sched::JobImpl for Job<B> {
     type TimeoutData = Timeout<B>;
     const MODULE: Option<&'static kernel::ThisModule> = Some(&crate::THIS_MODULE);
-    const SYNCHRONIZED_CANCEL: bool = true;
 
     fn timeout_data(&self) -> Timeout<B> {
         Timeout {
@@ -344,12 +343,12 @@ pub(crate) struct Fences {
 }
 
 impl<B: Backend> Scheduler<B> {
-    pub(crate) fn new(dev: &AsahiDevice, backend: Arc<B>, engine: Engine) -> Result<Self> {
+    pub(crate) fn new(dev: &AsahiDrmDevice, backend: Arc<B>, engine: Engine) -> Result<Self> {
         let (credits, name) = match engine {
             Engine::Render => (RENDER_CREDITS, c_str!("asahi_g17_render")),
             Engine::Compute => (COMPUTE_CREDITS, c_str!("asahi_g17_compute")),
         };
-        let scheduler = sched::Scheduler::new(dev.as_ref(), 1, credits, 0, TIMEOUT_MS, name)?;
+        let scheduler = sched::Scheduler::new(dev.as_ref().as_ref(), 1, credits, 0, TIMEOUT_MS, name)?;
         let entity = sched::Entity::new(&scheduler, sched::Priority::Kernel)?;
         Ok(Self {
             entity,

@@ -39,6 +39,7 @@ typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32; typedef int32_t 
 #define dev_err(...) ((void)0)
 #define dev_warn(...) ((void)0)
 #define dev_info_ratelimited(...) ((void)0)
+#define dev_dbg(...) ((void)0)
 #define WARN_ON_ONCE(x) ((void)(x))
 #define spin_lock_irqsave(l,f) ((f)=0)
 #define spin_unlock_irqrestore(l,f) ((void)(f))
@@ -59,10 +60,10 @@ static int devm_add_action_or_reset(struct device*d,void(*f)(void*),void*p){if(a
 static int devm_device_init_wakeup(struct device*d){wakeup_calls++;if(!wakeup_error)d->wakeup=true;return wakeup_error;}
 static int devm_pm_set_wake_irq(struct device*d,int i){irq_calls++;if(!irq_error)d->wake_irq=i;return irq_error;}
 enum dwc3_apple_state {DWC3_APPLE_PROBE_PENDING,DWC3_APPLE_NO_CABLE,DWC3_APPLE_HOST,DWC3_APPLE_DEVICE,DWC3_APPLE_SUSPENDED};
-struct dwc3 {int unused;};
-struct dwc3_apple {struct device*dev;struct dwc3 dwc;int lock,reset;enum dwc3_apple_state state;bool fixed_hub;};
+struct dwc3 {int num_usb3_ports,num_usb2_ports;int usb3_generic_phy[2],usb2_generic_phy[2],usb3_phy,usb2_phy;};
+struct dwc3_apple {struct device*dev;struct dwc3 dwc;int lock,reset;enum dwc3_apple_state state;bool fixed_hub,core_active,core_exit_pending,reset_pending;unsigned usb3_power_off_pending,usb2_power_off_pending;};
 static int core_error,host_error,gadget_error,reset_error;
-static int dwc3_apple_core_start(struct dwc3_apple*a,enum dwc3_apple_state s){return core_error;}
+static int dwc3_apple_core_start(struct dwc3_apple*a,enum dwc3_apple_state s){if(core_error)return core_error;a->core_active=true;a->reset_pending=true;return 0;}
 static void dwc3_apple_set_role(struct dwc3_apple*a,enum dwc3_apple_state s){}
 static int dwc3_host_init(struct dwc3*d){return host_error;}
 static int dwc3_gadget_init(struct dwc3*d){return gadget_error;}
@@ -71,6 +72,11 @@ static void dwc3_gadget_exit(struct dwc3*d){role_exits++;}
 static void dwc3_enable_susphy(struct dwc3*d,bool v){assert(v);}
 static void dwc3_core_exit(struct dwc3*d){core_exits++;}
 static int reset_control_assert(int r){reset_calls++;return reset_error;}
+#define BIT(x) (1UL << (x))
+static void dwc3_event_buffers_cleanup(struct dwc3*d){}
+static int phy_power_off(int p){return 0;}
+static void usb_phy_set_suspend(int p,int suspend){}
+static void dwc3_core_exit_after_phy_power_off(struct dwc3*d){core_exits++;}
 static u16 get_unaligned_le16(const u8*p){return p[0]|p[1]<<8;}
 static u32 get_unaligned_le32(const u8*p){return p[0]|p[1]<<8|p[2]<<16|p[3]<<24;}
 static void put_unaligned_le16(u16 v,u8*p){p[0]=v;p[1]=v>>8;}
@@ -81,6 +87,7 @@ static void put_unaligned_le32(u32 v,u8*p){p[0]=v;p[1]=v>>8;p[2]=v>>16;p[3]=v>>2
 #define IEEE80211_CHAN_NO_20MHZ 8
 #define IEEE80211_CHAN_PSD 16
 #define IEEE80211_CHAN_IR_CONCURRENT 32
+#define IEEE80211_CHAN_NO_IR 64
 #define WLAN_REASON_DEAUTH_LEAVING 3
 #define __assign_bit(i,b,v) ((b)[(i)/64]=((b)[(i)/64]&~(1ULL<<((i)%64)))|((uint64_t)!!(v)<<((i)%64)))
 #define for_each_set_bit(i,b,n) for((i)=0;(i)<(n);(i)++) if((b)[(i)/64]&(1ULL<<((i)%64)))
@@ -93,7 +100,10 @@ static void rtnl_lock(void){assert(!rtnl_depth++);}
 static void rtnl_unlock(void){assert(rtnl_depth--==1);}
 static void wiphy_lock(struct wiphy*w){assert(rtnl_depth&& !wiphy_depth++);}
 static void wiphy_unlock(struct wiphy*w){assert(wiphy_depth--==1);}
-struct mt7932 {struct ieee80211_channel channels[13],channels5[4];struct wiphy*wiphy;struct net_device*netdev;struct {struct device dev;}*pdev;struct mt7932_reg_snapshot reg_desired;unsigned reg_generation,response_lock,startup_work;bool reg_pending,stopping,interface_registered,connecting;int connect_error,assoc_start,assoc_done,discovery_done;uint64_t policy_disabled[1];};
+struct mt7932 {struct ieee80211_channel channels[MT7932_CHANNELS_2G],channels5[MT7932_CHANNELS_5G];struct wiphy*wiphy;struct net_device*netdev;struct {struct device dev;}*pdev;struct mt7932_reg_snapshot reg_desired,reg_deferred;unsigned reg_generation,response_lock,startup_work;bool reg_pending,stopping,interface_registered,connecting,connected,disconnecting,reg_deferral,data_ready;int data_lock;int connect_error,assoc_start,assoc_done,discovery_done;uint64_t policy_disabled[1];};
+#define spin_lock(l) ((void)(l))
+#define spin_unlock(l) ((void)(l))
+static void mt_data_kick_locked(struct mt7932*m){assert(0 && "unexpected TX boundary");}
 static struct mt7932 *mt_from_wiphy(struct wiphy*w){return w->priv;}
 static int mt7932_domain_5g_bw(void){return 0;}
 static void netif_stop_queue(struct net_device*n){}
@@ -109,9 +119,6 @@ int main(int argc,char**argv){
   wakeup_error=-ENOMEM;assert(dockchannel_init_wakeup(&dc)==-ENOMEM&&irq_calls==1);
   wakeup_error=0;irq_error=-EINVAL;assert(dockchannel_init_wakeup(&dc)==-EINVAL);
  }else if(!strcmp(argv[1],"sep")){
-  domain_count=-ENOENT;assert(!sep_pm_keep_domains(&d)&&!attach_calls);
-  domain_count=-EINVAL;assert(sep_pm_keep_domains(&d)==-EINVAL&&!attach_calls);
-  domain_count=0;assert(!sep_pm_keep_domains(&d)&&!attach_calls);
   domain_count=1;assert(!sep_pm_keep_domains(&d)&&!attach_calls);
   domain_count=2;attach_error=-EAGAIN;assert(sep_pm_keep_domains(&d)==-EAGAIN&&!pd0.syscore);
   attach_error=0;assert(!sep_pm_keep_domains(&d)&&pd0.syscore&&pd1.syscore&&cleanup);
@@ -125,26 +132,38 @@ int main(int argc,char**argv){
    unsigned n=core_exits;assert(!dwc3_apple_exit(&a)&&core_exits==n);
    core_error=-EIO;assert(dwc3_apple_init(&a,role)==-EIO&&!d.syscore);core_error=0;
    host_error=gadget_error=-ENOMEM;n=core_exits;assert(dwc3_apple_init(&a,role)==-ENOMEM&&!d.syscore&&core_exits==n+1);host_error=gadget_error=0;
-   assert(!dwc3_apple_init(&a,role)&&d.syscore);reset_error=-EIO;assert(dwc3_apple_exit(&a)==-EIO&&!d.syscore);reset_error=0;
+   assert(!dwc3_apple_init(&a,role)&&d.syscore);reset_error=-EIO;assert(dwc3_apple_exit(&a)==-EIO&&d.syscore&&a.reset_pending);
+   reset_error=0;n=core_exits;unsigned exits=role_exits;
+   assert(!dwc3_apple_exit(&a)&&!d.syscore&&!a.reset_pending);
+   assert(core_exits==n&&role_exits==exits);
   }
  }else if(!strcmp(argv[1],"regulatory")){
   struct mt7932 m={.reg_generation=7};struct wiphy w={.priv=&m};m.wiphy=&w;
   struct mt7932_policy p={};u8 tables[9][1020]={};
   for(unsigned i=0;i<9;i++){p.table[i+1]=tables[i];tables[i][4]=0;}
-  tables[0][4]=8;tables[1][4]=5;tables[2][4]=4;
-  for(unsigned i=0;i<17;i++){unsigned t=i<8?0:i<13?1:2,j=i<8?i:i<13?i-8:i-13;
-   struct ieee80211_channel*c=mt_channel(&m,i);c->hw_value=i<13?i+1:36+(i-13)*4;c->max_power=20;
+  for(unsigned i=0;i<MT7932_CHANNELS;i++){
+   unsigned t=i<8?0:i<MT7932_CHANNELS_2G?1:2+(i-MT7932_CHANNELS_2G)/8;
+   unsigned j=i<8?i:i<MT7932_CHANNELS_2G?i-8:(i-MT7932_CHANNELS_2G)%8;
+   tables[t][4]=j+1;
+   struct ieee80211_channel*c=mt_channel(&m,i);
+   c->hw_value=i<MT7932_CHANNELS_2G?i+1:mt7932_channel_5g(i-MT7932_CHANNELS_2G);c->max_power=20;
    memset(tables[t]+44+j*122,0xc4,122);tables[t][44+j*122]=c->hw_value;
    if(i!=10)tables[t][45+j*122]=1;
   }
-  assert(!mt7932_policy_permits(&p,11)&&mt7932_policy_permits(&p,10)&&!mt7932_policy_permits(&p,165));
+  assert(!mt7932_policy_permits(&p,11)&&mt7932_policy_permits(&p,10)&&mt7932_policy_permits(&p,165)&&!mt7932_policy_permits(&p,14));
   struct regulatory_request request={.alpha2={'U','S'}};mt_regulatory_notify(&w,&request);m.reg_pending=false;
   unsigned generation=m.reg_generation;mt_policy_disable(&m,&p,generation-1);assert(!m.channels[10].flags&&!m.policy_disabled[0]);
   mt_policy_disable(&m,&p,generation);assert(m.channels[10].flags==1&&m.policy_disabled[0]==(1ULL<<10));
-  struct mt7932_reg_snapshot reg=m.reg_desired;mt7932_policy_filter(&reg,&p);assert(reg.length==12+16*8&&reg.domain[8]==12&&reg.domain[9]==4);
-  for(unsigned i=0;i<16;i++)assert(get_unaligned_le16(reg.domain+12+i*8)!=11);
+  struct mt7932_reg_snapshot reg=m.reg_desired;mt7932_policy_filter(&reg,&p);assert(reg.length==12+(MT7932_CHANNELS-1)*8&&reg.domain[8]==12&&reg.domain[9]==MT7932_CHANNELS_5G);
+  for(unsigned i=0;i<MT7932_CHANNELS-1;i++)assert(get_unaligned_le16(reg.domain+12+i*8)!=11);
   m.channels[10].flags=0;mt_regulatory_notify(&w,&request);assert(m.reg_generation==generation&&m.channels[10].flags==1);
   m.channels[10].flags=0;request.alpha2[0]='C';request.alpha2[1]='A';mt_regulatory_notify(&w,&request);assert(m.reg_generation==generation+1&&!m.policy_disabled[0]);
+  m.reg_pending=false;m.connected=true;unsigned applied=m.reg_generation;
+  put_unaligned_le32(IEEE80211_CHAN_NO_IR,m.reg_desired.domain+16);
+  mt_regulatory_notify(&w,&request);
+  assert(m.reg_generation==applied&&!m.reg_pending&&m.reg_deferral);
+  assert(get_unaligned_le32(m.reg_desired.domain+16)==IEEE80211_CHAN_NO_IR);
+  assert(get_unaligned_le32(m.reg_deferred.domain+16)==0);
   m.stopping=true;unsigned n=m.reg_generation;request.alpha2[0]='U';mt_regulatory_notify(&w,&request);assert(m.reg_generation==n);
  }
  puts("PASS");return 0;
@@ -163,7 +182,7 @@ def main():
     files = {
         'drivers/soc/apple/dockchannel.c': ['dockchannel_init_wakeup'],
         'drivers/soc/apple/pm_shim.c': ['sep_pm_release_domains', 'sep_pm_keep_domains'],
-        'drivers/usb/dwc3/dwc3-apple.c': ['dwc3_apple_init', 'dwc3_apple_exit'],
+        'drivers/usb/dwc3/dwc3-apple.c': ['dwc3_apple_core_stop', 'dwc3_apple_init', 'dwc3_apple_exit'],
         'drivers/net/wireless/mediatek/mt7932/startup.c': ['mt_channel', 'mt_policy_disable', 'mt_regulatory_notify'],
     }
     bodies = {}
@@ -171,10 +190,13 @@ def main():
         source = (ROOT/path).read_text()
         for name in names:
             text = source
-            if args.old_usb and path.endswith('dwc3-apple.c') or args.old_regulatory and name == 'mt_regulatory_notify':
+            if args.old_usb and path.endswith('dwc3-apple.c') and name != 'dwc3_apple_core_stop' or args.old_regulatory and name == 'mt_regulatory_notify':
                 text = subprocess.check_output(['git', 'show', '990a45b609dd:'+path], cwd=ROOT, text=True)
             bodies[name] = function(text, name)
-    header = (ROOT/'drivers/net/wireless/mediatek/mt7932/regulatory.h').read_text()
+    headers = [ROOT/'drivers/net/wireless/mediatek/mt7932/channels.h',
+               ROOT/'drivers/net/wireless/mediatek/mt7932/regulatory.h']
+    header = '\n'.join(re.sub(r'^#include .*\n', '', path.read_text(), flags=re.M)
+                       for path in headers)
     at = PREFIX.index('struct mt7932 {')
     code = PREFIX[:at] + header + PREFIX[at:] + '\n'.join(bodies.values()) + MAIN
     if not args.old_usb:

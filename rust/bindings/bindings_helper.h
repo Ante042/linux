@@ -28,12 +28,10 @@
  */
 #include <linux/hrtimer_types.h>
 
-#include <crypto/sha2.h>
 #include <linux/acpi.h>
 #include <linux/gpu_buddy.h>
 #include <drm/drm_device.h>
 #include <drm/drm_drv.h>
-#include <drm/drm_exec.h>
 #include <drm/drm_file.h>
 #include <drm/drm_gem.h>
 #include <drm/drm_gem_shmem_helper.h>
@@ -55,7 +53,6 @@
 #include <linux/cpumask.h>
 #include <linux/cred.h>
 #include <linux/debugfs.h>
-#include <linux/devcoredump.h>
 #include <linux/device/faux.h>
 #include <linux/dma-direction.h>
 #include <linux/dma-fence.h>
@@ -63,7 +60,6 @@
 #include <linux/dma-mapping.h>
 #include <linux/dma-resv.h>
 #include <linux/errname.h>
-#include <linux/soc/apple/pmp.h>
 #include <linux/ethtool.h>
 #include <linux/fdtable.h>
 #include <linux/file.h>
@@ -72,6 +68,7 @@
 #include <linux/i2c.h>
 #include <linux/iio/iio.h>
 #include <linux/iio/types.h>
+#include <linux/input.h>
 #include <linux/interrupt.h>
 #include <linux/io-pgtable.h>
 #include <linux/iommu.h>
@@ -102,9 +99,9 @@
 #include <linux/slab.h>
 #include <linux/soc/apple/mailbox.h>
 #include <linux/soc/apple/rtkit.h>
+#include <linux/soc/apple/pmp.h>
 #include <linux/sys_soc.h>
 #include <linux/task_work.h>
-#include <linux/thermal.h>
 #include <linux/tracepoint.h>
 #include <linux/usb.h>
 #include <linux/wait.h>
@@ -114,6 +111,7 @@
 #include <sound/dmaengine_pcm.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
+#include <sound/jack.h>
 #include <sound/pcm.h>
 #include <sound/soc.h>
 #include <sound/soc-dpcm.h>
@@ -143,10 +141,8 @@ const gfp_t RUST_CONST_HELPER___GFP_ZERO = __GFP_ZERO;
 const gfp_t RUST_CONST_HELPER___GFP_HIGHMEM = ___GFP_HIGHMEM;
 const gfp_t RUST_CONST_HELPER___GFP_NOWARN = ___GFP_NOWARN;
 const blk_features_t RUST_CONST_HELPER_BLK_FEAT_ROTATIONAL = BLK_FEAT_ROTATIONAL;
-const uint32_t RUST_CONST_HELPER_DRM_EXEC_INTERRUPTIBLE_WAIT = DRM_EXEC_INTERRUPTIBLE_WAIT;
-const uint32_t RUST_CONST_HELPER_DRM_EXEC_IGNORE_DUPLICATES = DRM_EXEC_IGNORE_DUPLICATES;
-const u32 RUST_CONST_HELPER_APPLE_RTKIT_COPROC_PLACES_BUFFERS = APPLE_RTKIT_COPROC_PLACES_BUFFERS;
 const fop_flags_t RUST_CONST_HELPER_FOP_UNSIGNED_OFFSET = FOP_UNSIGNED_OFFSET;
+const u32 RUST_CONST_HELPER_APPLE_RTKIT_COPROC_PLACES_BUFFERS = APPLE_RTKIT_COPROC_PLACES_BUFFERS;
 
 const u64 BINDINGS_SNDRV_PCM_FMTBIT_FLOAT_LE = SNDRV_PCM_FMTBIT_FLOAT_LE;
 const u64 BINDINGS_SNDRV_PCM_FMTBIT_S32_LE = SNDRV_PCM_FMTBIT_S32_LE;
@@ -189,6 +185,9 @@ const vm_flags_t RUST_CONST_HELPER_VM_SOFTDIRTY = VM_SOFTDIRTY;
 const vm_flags_t RUST_CONST_HELPER_VM_MIXEDMAP = VM_MIXEDMAP;
 const vm_flags_t RUST_CONST_HELPER_VM_HUGEPAGE = VM_HUGEPAGE;
 const vm_flags_t RUST_CONST_HELPER_VM_NOHUGEPAGE = VM_NOHUGEPAGE;
+
+const u32 RUST_CONST_HELPER_DRM_EXEC_INTERRUPTIBLE_WAIT = DRM_EXEC_INTERRUPTIBLE_WAIT;
+const u32 RUST_CONST_HELPER_DRM_EXEC_IGNORE_DUPLICATES = DRM_EXEC_IGNORE_DUPLICATES;
 
 #if IS_ENABLED(CONFIG_GPU_BUDDY)
 const unsigned long RUST_CONST_HELPER_GPU_BUDDY_RANGE_ALLOCATION = GPU_BUDDY_RANGE_ALLOCATION;

@@ -379,8 +379,8 @@ pub(crate) mod qos {
     pub(crate) const CLOCK_HZ: u64 = 24_000_000;
 }
 
-/// Firmware scheduling profiles of the DRM queue priorities. Medium-priority
-/// user queues use priority class 2 with policy 2.
+/// Firmware scheduling profiles of the DRM queue priorities. Native user
+/// queues use priority class 2 with policy 2.
 pub(crate) mod scheduling {
     use crate::g17::fw::queue::Policy;
 

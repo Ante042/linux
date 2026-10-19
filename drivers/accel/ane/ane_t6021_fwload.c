@@ -1,19 +1,61 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /*
- * T602x/T8112 ANE image staging. Validate size, checksum, load-command
- * bounds and segment layout, then copy into a zeroed 0x500000-byte
- * coherent allocation mapped through the device IOMMU. Populate runtime
- * boot fields from the current device before CPU release.
+ * T602x/T8112 ANE firmware loader.
  *
- * The default uses driver-owned RAM. Reserved-memory mode is optional
- * and requires DT no-map coverage for both windows. A latched RVBAR
- * entry requires an IOMMU alias: resolve every source page through the
- * DMA domain, reject occupied destination pages, map and verify each
- * page. Physical pages need not be contiguous. Record each mapped
- * extent and reject all subsequent DMA allocations overlapping it.
+ * Implements, behind fw_load=1 (default on):
+ *   1. request_firmware() of the SoC's pinned 13.5 image
+ *      (ane_t602x_soc.fw: selene on T602x, bia on T8112)
+ *   2. Validation via ane_fw_validate.h: sha256 pin, strict
+ *      exact-image assertions (5 load commands, 2 pinned segments,
+ *      entry 0, bounded LC walk).
+ *   3. dma_alloc_coherent on the ANE platform device: the buffer is
+ *      DART-mapped through the device's iommu group (stream 0 of the
+ *      three bound instances). Segment-wise copy
+ *      (__TEXT fileoff 0x4000 -> vm 0, __DATA -> its vmaddr; vmsize
+ *      tail zero from the coherent alloc). Coherent memory needs no
+ *      explicit cache clean.
+ *   4. Which copy runs. By default the staged copy (own memory). The
+ *      option fw_alias_reserved=1 (T6021 only) maps the copy iBoot
+ *      preloaded at SEG0/SEGi; probe refuses it unless no-map
+ *      /reserved-memory nodes cover both windows (m1n1 1.6.1 adds
+ *      none). The staged copy runs: ane_fw_apply_boot_patches() first
+ *      writes iBoot's runtime patches into it (DATA base, RTK_soc,
+ *      revision, ASC addresses, stack guard, ASC tunables), and then it
+ *      equals the preload byte for byte except the random guard. That
+ *      needs no reserved memory and no preload address, so it is the
+ *      only mode on SoCs without a recorded placement (T6020, T6022,
+ *      T8112).
+ *   5. Entry alias: the staged fw pages are ALIASED at the latched
+ *      RVBAR entry on the device's default DMA domain. Placement:
+ *        - RVBAR read64 = 0x10000000001 (bit0 latched, entry
+ *          bits 0x10000000000 = dart-ane vm base); lifecycle rule:
+ *          bit0 set => the RVBAR write branch is skipped, so the ASC
+ *          fetches AT the latched entry;
+ *        - a CPU release with nothing mapped there faults in
+ *          apple-dart ("translation fault ... code:0x2 (NO PGD FOR
+ *          IOVA) at 0x100000dca10"): the ASC fetches the entry region;
+ *        - a walk of the DART tables shows entry pgd[16] = 0 while the
+ *          fw leaves are valid -> the region the hardware fetches is
+ *          unmapped and the fw surface is physically NON-contiguous
+ *          (consecutive leaf PAs differ by -0x4000). The alias
+ *          therefore copies each page's PA from the live fw
+ *          translation (iommu_iova_to_phys), never from the kernel VA,
+ *          and verifies every target page unmapped before mapping it.
+ *      Driver-managed only: iommu_map() on the attached domain —
+ *      apple_dart implements .map_pages + .iotlb_sync_map, so the
+ *      driver flushes the DART TLB; no raw TTBR/TCR writes.
+ *      Collision ceiling: the iovad allocates top-down from ~4 TiB,
+ *      so even with all RAM mapped (96 GiB: allocator floor
+ *      4 TiB - 96 GiB = 0x3e800000000) it stays far above the alias
+ *      ceiling 0x10005000000; the per-page zero-check additionally
+ *      guards each map.
  *
- * Staging and CPU release are separate. Load failures release the
- * image and owned buffer and clear fw_buf; load is nonfatal to probe.
+ * The boot step itself (CPU release + SCRATCH) is in ane_t6021_boot.c;
+ * with the alias in place a release no longer faults the entry fetch.
+ *
+ * Error ownership: every failure path releases the firmware and, once
+ * allocated, the coherent buffer, and clears ane->fw_buf — remove()
+ * frees only what fw_buf still names. Load is non-fatal to probe.
  */
 #include <crypto/sha2.h>
 #include <linux/dma-map-ops.h>
@@ -39,22 +81,24 @@ MODULE_FIRMWARE(ANE_FW_BIA_NAME);
 static bool fw_load = true;
 module_param(fw_load, bool, 0444);
 MODULE_PARM_DESC(fw_load,
-		 "Validate and map the supported image through DART (default on)");
+		 "Validate + DART-map the 13.5 PRELOAD payload (default on).");
 
 static unsigned int fw_extra_ram = 0x200000;
 module_param(fw_extra_ram, uint, 0444);
 MODULE_PARM_DESC(fw_extra_ram,
-		 "Page-aligned owned RAM after the 5 MiB image allocation (default 2 MiB, maximum 16 MiB)");
+		 "Page-aligned owned RAM after the 5 MiB firmware allocation (default 0x200000; maximum 16 MiB).");
 
-/*
- * Optional reserved-memory mapping at the latched entry. Disabled by
- * default; driver-owned staging needs no reserved RAM. Require DT
- * no-map coverage before using either reserved window.
+/* Preloaded-placement alias: map the iBoot-reserved SEG0/SEGi
+ * phys at the entry IOVAs (the preload, with iBoot's patches in place).
+ * Default off: the own-memory copy needs no reserved RAM, so it runs with
+ * a stock m1n1. Only SoCs whose placement is recorded honor it
+ * (ane_t602x_soc.preload_placement), and only over reserved RAM
+ * (ane_t6021_fwload_placement_ok).
  */
 static bool fw_alias_reserved;
 module_param(fw_alias_reserved, bool, 0444);
 MODULE_PARM_DESC(fw_alias_reserved,
-		 "T6021: map both reserved image windows at the entry IOVA; requires DT no-map coverage (default off, use owned RAM)");
+		 "T6021: map reserved SEG0 0x10000848000+0xc4000 at entry and SEG1 0x10001400000+0x438000 after it (probe refuses unless no-map /reserved-memory nodes cover both); 0 (default) = run the staged copy with iBoot's patches replayed (own memory, the only mode on T6020/T6022).");
 
 static bool ane_t6021_fw_alias_is_reserved(struct device *dev)
 {
@@ -63,15 +107,17 @@ static bool ane_t6021_fw_alias_is_reserved(struct device *dev)
 	return fw_alias_reserved && soc->preload_placement;
 }
 
-/* Physical windows used by the optional T6021 reserved-memory mapping. */
+/* iBoot's T6021 SEG0/SEGi placement (pinned ADT segment-ranges record):
+ * the physical pages fw_alias_reserved=1 hands to the ASC.
+ */
 static const struct { u64 phys, len; } ane_t6021_fw_preload[] = {
 	{ 0x10000848000ull, 0xc4000ull },
 	{ 0x10001400000ull, 0x438000ull },
 };
 
-/*
- * Only DT no-map reserved-memory coverage excludes these pages from kernel
- * allocation.
+/* Only a no-map /reserved-memory node that the kernel took at boot keeps
+ * it off those pages. m1n1 1.6.1 adds none, so this mode needs a boot
+ * loader that reserves both windows (e.g. as ane-firmware@ nodes).
  */
 static bool ane_t6021_fw_preload_reserved(void)
 {
@@ -112,26 +158,38 @@ bool ane_t6021_fwload_requested(void)
 	return fw_load;
 }
 
-/* DART pages are 16 KiB; the firmware allocation size is a page multiple. */
+/* DART page size on t6021 (apple_dart probe line: "pagesize 4000");
+ * fw_size is a multiple. Shared with the probe-top predicate below.
+ */
 #define ANE_T6021_FW_ALIAS_PAGE	0x4000
 
 bool ane_t6021_fwload_options_ok(void)
 {
-	/*
-	 * Check staging options before allocation, power or CPU release.
-	 * The allocation check also enforces 16 KiB alignment and a 16 MiB
-	 * limit. Both alias modes map the complete allocation.
+	/* BINDING probe-top predicate. MUST be called before
+	 * devm_kzalloc / power / CPU release at every probe site.
+	 * The alloc-time check below runs as defense in depth.
+	 * fw_extra_ram must be 16 KiB-aligned and <= 16 MiB. Both alias
+	 * modes map the whole allocation, so the bound needs no mode.
 	 */
 	return fw_extra_ram <= SZ_16M &&
 	       IS_ALIGNED(fw_extra_ram, ANE_T6021_FW_ALIAS_PAGE);
 }
 
-/*
- * Per-SoC boot parameters and power-state layout. T6020 uses revision
- * 1, T6021/T6022 use 0x11; T8112 reads its revision from two fuse words.
- * The power service requires its PMGR page mapped with IOVA == PA.
- * T8112 checks SET +0x8b8 before power-state and engine reads, and has
- * no supported TD sampling offset.
+/* Per-SoC data. RTK_soc_revision on T602x is a measured constant: m1n1
+ * gives Linux no chip-revision. T6021: 0x11, as in the preloaded images;
+ * T6020: ANEMinorVersion 1; T6022: ANEMinorVersion 17. T6020 and T6022
+ * have the T6021 die-0 addresses (13.5 ADTs).
+ *
+ * pmu_pa: the firmware's power service programs the seven ANE ps words
+ * through its DART at IOVA == PA (the PMU base it is given is the ANE_TD
+ * word: selene 0x28e084008, bia 0x23b70c010).
+ * macOS maps the page first; without it the first access faults (NO PMD
+ * FOR IOVA 0x28e084008) and the firmware halts.
+ *
+ * T8112: the revision comes from the eFuse words iBoot reads, the
+ * ANE_SYS_CPU word is pmgr +0xc008, and the macOS (type 0x70) opens
+ * PWGATE "set" +0x8b8 before the ps words. The TM TD word is not known
+ * there, so trace_td is off.
  */
 const struct ane_t602x_soc ane_t6020_soc = {
 	.soc = 0x6020, .soc_revision = 0x01,
@@ -218,11 +276,19 @@ static int ane_t6021_fw_alias_map(struct ane_t6021 *ane, bool reserved)
 		prot |= IOMMU_CACHE;
 
 	if (reserved) {
-		/*
-		 * Map both reserved windows at the entry IOVAs. Track the
-		 * mapped
-		 * bytes for each window independently so cleanup never assumes
-		 * adjacency or unmaps an untouched range.
+		/* Preloaded placement: the two reserved windows mapped at
+		 * the entry IOVAs. SEG0 0xc4000 is TEXT and SEG1 0x438000
+		 * is DATA (the 13.5 layout, ane_fw_selene.segs).
+		 * The windows are adjacent, so the mapping is one
+		 * contiguous run of `mapped` bytes starting at entry —
+		 * tracked exactly, because teardown must never unmap a
+		 * page that was not mapped (dart_unmap_pages WARNs on holes).
+		 * SEG1 IOVA = entry + 0xc4000 = 0x100000c4000 per the
+		 * pinned ADT segment-ranges record (0x10000000000 ->
+		 * 0x10000848000 0xc4000; 0x100000c4000 -> 0x10001400000
+		 * 0x438000). Note 0x100000c4000, not 0x1000000c4000:
+		 * one hex digit more maps DATA at 16 TiB and leaves the
+		 * fw DATA section unmapped past the SEG0 head.
 		 */
 		struct { u64 iova, phys, len; } win[] = {
 			{ 0x10000000000ull, ane_t6021_fw_preload[0].phys,
@@ -232,7 +298,12 @@ static int ane_t6021_fw_alias_map(struct ane_t6021 *ane, bool reserved)
 		};
 		unsigned int w, windows = fw_extra_ram ? ARRAY_SIZE(win) : 2;
 
-		/* Derive SEG1 base from SEG0 base plus its length. */
+		/* The remap is contiguous: SEG1 base = SEG0 base + SEG0
+		 * len (segment-ranges order). Derived, never hand-written:
+		 * a standalone literal is easy to get one digit off.
+		 * The remap base must also equal the latched entry, or
+		 * the fetch head is not where we mapped.
+		 */
 		win[1].iova = win[0].iova + win[0].len;
 		if (win[0].iova != entry) {
 			dev_err(ane->dev,
@@ -291,9 +362,10 @@ static int ane_t6021_fw_alias_map(struct ane_t6021 *ane, bool reserved)
 		return ane_t6021_pmu_map(ane, dom);
 
 err_unmap_mapped:
-		/*
-		 * Unmap only each window's successfully mapped bytes, leaving
-		 * foreign mappings intact.
+		/* Cleanup exactly the per-window bytes we mapped; windows
+		 * are not assumed adjacent (there can be a hole between
+		 * SEG0 and SEGi), and foreign collision mappings are
+		 * never touched.
 		 */
 		for (w = 0; w < windows; w++)
 			if (ane->fw_alias_ext_len[w])
@@ -357,9 +429,10 @@ err_unmap_mapped:
 		"fwalias: entry %#llx <- %u dart pages aliased from fw %pad (first %pa, roundtrip OK)\n",
 		entry, ane->fw_size / ANE_T6021_FW_ALIAS_PAGE,
 		&ane->fw_iova, &pa0);
-	/*
-	 * The device power service requires the PMGR page mapped with IOVA ==
-	 * PA.
+	/* The firmware's power service needs the pmgr sub-block mapped
+	 * IOVA == PA in every mode, this staged-DMA alias branch
+	 * included; without it the firmware faults (NO PMD FOR IOVA
+	 * 0x28e084008) and halts.
 	 */
 	return ane_t6021_pmu_map(ane, dom);
 
@@ -369,9 +442,12 @@ err_unmap:
 	return ret;
 }
 
-/*
- * T8112 revision comes from the DT fuse window using two non-posted
- * 32-bit reads. Decode only those words; no other fuse access is needed.
+/* RTK_soc_revision. T8112 reads it as iBoot does: the two eFuse words
+ * of the DT "fuse" window (0x23d2c8060, 8 bytes), decoded by
+ * ane_t8112_fuse_revision(). Two non-posted 32-bit reads and nothing
+ * else: the eFuse block (ADT pmgr reg[36]) is always on, and m1n1 reads
+ * its ATC and GPU fuses at 0x23d2c8484 and 0x23d2c84dc on every T8112
+ * boot. Without the window the revision is unknown, so the load refuses.
  */
 static int ane_t6021_soc_revision(struct ane_t6021 *ane,
 				  const struct ane_t602x_soc *soc, u32 *rev)
@@ -403,9 +479,10 @@ static int ane_t6021_soc_revision(struct ane_t6021 *ane,
 	return 0;
 }
 
-/*
- * Patch the owned image with the entry DVA, DT engine address, SoC
- * revision and a fresh guard value from the running system.
+/* Own memory (header item 4): iBoot's runtime patches, with values from
+ * the running system: the latched entry (or the staged DVA that the boot
+ * path programs when RVBAR is not latched), the DT engine window (probe
+ * already refused a node without it), the compatible, a fresh guard.
  */
 static int ane_t6021_fw_patch(struct ane_t6021 *ane, u8 *img)
 {
@@ -418,7 +495,7 @@ static int ane_t6021_fw_patch(struct ane_t6021 *ane, u8 *img)
 	u64 guard = get_random_u64();
 	struct ane_fw_boot_patch p = {
 		.exec_base = entry ?: ane->fw_iova,
-		/* The random guard contains one zero byte. */
+		/* iBoot's guards have one zero byte at a random position */
 		.stack_guard = guard & ~(0xffull << (8 * (guard >> 61))),
 		.soc = soc->soc,
 		.cpu_pa = res->start + ANE_ASC_CPU_BASE,
@@ -436,7 +513,7 @@ static int ane_t6021_fw_patch(struct ane_t6021 *ane, u8 *img)
 		return -EINVAL;
 	}
 	dev_dbg(ane->dev,
-		"fwload: owned image boot fields (soc %#x rev %#x DATA %#llx cpu %#llx wrapper %#llx)\n",
+		"fwload: own memory: iBoot patches replayed (soc %#x rev %#x DATA %#llx cpu %#llx wrapper %#llx)\n",
 		p.soc, p.soc_revision,
 		p.exec_base + soc->fw->segs[1].vmaddr, p.cpu_pa,
 		p.wrapper_pa);
@@ -494,7 +571,9 @@ int ane_t6021_fwload_probe(struct ane_t6021 *ane)
 		return 0;
 	if (fw_extra_ram > SZ_16M || !IS_ALIGNED(fw_extra_ram, ANE_T6021_FW_ALIAS_PAGE))
 		return -EINVAL;
-	/* Set the coherent DMA mask once at probe, before any ring allocation. */
+	/* The 64-bit coherent mask is set once in ane_t6021_probe,
+	 * BEFORE rtkit_init allocates the rings.
+	 */
 
 	ret = request_firmware(&fw, img->name, ane->dev);
 	if (ret) {
@@ -555,9 +634,11 @@ void ane_t6021_fwload_remove(struct ane_t6021 *ane)
 		struct iommu_domain *dom = iommu_get_domain_for_dev(ane->dev);
 		int i;
 
-		/*
-		 * Unmap only the recorded extents; reserved windows need not
-		 * be adjacent.
+		/* Unmap exactly the per-window recorded extents: the
+		 * reserved-alias windows are not assumed adjacent (there
+		 * can be a hole between SEG0 and SEGi) and unmapping bytes
+		 * that were never mapped trips a WARN in dart_unmap_pages
+		 * (io-pgtable-dart.c).
 		 */
 		if (dom)
 			for (i = 0; i < ane->fw_alias_extn; i++)

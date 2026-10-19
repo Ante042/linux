@@ -13,7 +13,7 @@ use super::{
     recovery::Class,
     status::VmStatus,
 };
-use crate::{driver::AsahiDevice, file, hw::t8140::{dynamic, resources as cfg}, mmu};
+use crate::{driver::AsahiDrmDevice, file, hw::t8140::{dynamic, resources as cfg}, mmu};
 use core::sync::atomic::{fence as barrier, AtomicBool, AtomicI32, AtomicU8, Ordering};
 use kernel::{
     dma_fence::{Fence, FenceContexts, RawDmaFence, UserFence},
@@ -152,7 +152,7 @@ struct ComputeTimestamps {
 }
 
 impl ComputeTimestamps {
-    fn new(dev: &AsahiDevice, vm: &mmu::Vm) -> Result<Self> {
+    fn new(dev: &AsahiDrmDevice, vm: &mmu::Vm) -> Result<Self> {
         let object = KernelObject::backing(dev, mmu::UAT_PGSZ, CpuMap::WriteCombined)?;
         let mapping = object.alias_in(
             vm,
@@ -191,7 +191,7 @@ pub(crate) struct Completion {
 
 impl Completion {
     pub(crate) fn new(
-        dev: &AsahiDevice,
+        dev: &AsahiDrmDevice,
         contexts: &FenceContexts,
         context: &Arc<Context>,
         member: Member,

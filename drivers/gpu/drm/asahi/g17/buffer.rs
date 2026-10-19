@@ -302,7 +302,7 @@ pub(crate) fn automatic_growth_target(used_pages: usize, current: usize) -> Opti
 }
 
 use super::object::{CpuMap, KernelObject};
-use crate::{driver::AsahiDevice, mmu};
+use crate::{driver::AsahiDrmDevice, mmu};
 use core::ops::Range;
 
 pub(crate) fn compact_alias(
@@ -371,7 +371,7 @@ impl Tvb {
         Ok(mapping)
     }
     pub(crate) fn new(
-        dev: &AsahiDevice,
+        dev: &AsahiDrmDevice,
         vm: &mmu::Vm,
         blocks: usize,
     ) -> Result<(Self, KVec<mmu::KernelMapping>)> {
@@ -416,7 +416,7 @@ impl Tvb {
 
     pub(crate) fn prepare_growth(
         &mut self,
-        dev: &AsahiDevice,
+        dev: &AsahiDrmDevice,
         vm: &mmu::Vm,
         target: usize,
     ) -> Result<Option<TvbGrowth>> {
@@ -558,21 +558,21 @@ pub(crate) struct Manager {
     shrink: Shrink,
 }
 
-/// Tiler-heap shrink policy for growth beyond what recent work used.
-/// Once per
+/// Native tiler-heap shrink policy, matching the heap behaviour seen
+/// under macOS. Once per
 /// period the page high-water folds into an average,
 /// `max((sample + 4 * average) / 5, sample)`. Each period whose average
 /// stays below a quarter of the capacity earns one 512 KiB block of shrink,
 /// and a heap idle for ten seconds returns to its minimum. Only an idle heap
 /// is rebuilt here, by whole growth extensions.
 ///
-/// The minimum keeps what the recent work needs: never below
+/// Unlike macOS, the minimum keeps what the recent work needs: never below
 /// the size at which the automatic growth check would grow the heap again
 /// for the largest high-water sample of the last ten active periods. A
 /// shrink then never makes the next pass at the recent load grow back.
 const SHRINK_PERIOD_NS: u64 = 1_000_000_000;
 const SHRINK_IDLE_NS: u64 = 10_000_000_000;
-/// Blocks in one 512 KiB parameter-buffer block.
+/// Blocks in one native 512 KiB parameter-buffer block.
 const SHRINK_STEP_BLOCKS: usize = 0x8_0000 / cfg::TVB_BLOCK_SIZE;
 /// Active periods in the recent-load window.
 const SHRINK_WINDOW: usize = (SHRINK_IDLE_NS / SHRINK_PERIOD_NS) as usize;
@@ -851,7 +851,7 @@ impl Manager {
     /// the firmware-owned page list and PB state untouched.
     pub(crate) fn prepare_growth(
         &mut self,
-        dev: &AsahiDevice,
+        dev: &AsahiDrmDevice,
         vm: &mmu::Vm,
         target: usize,
         descriptor: Option<[u32; 4]>,

@@ -14,7 +14,7 @@ struct apple_dcp;
 struct apple_dcp_v26;
 struct dcp_v26_board;
 struct device;
-struct drm_atomic_state;
+struct drm_atomic_commit;
 struct drm_crtc;
 struct drm_crtc_state;
 
@@ -34,11 +34,21 @@ void iomfb_v26_6_unbind(struct apple_dcp *dcp);
 /* DCPLink, start signal, first client open and the panel mode. */
 int iomfb_v26_6_start(struct apple_dcp *dcp);
 
+/*
+ * The PMP device-power API (include/linux/soc/apple/pmp.h, exported by the
+ * PMP driver). Declared here until that header is in this tree; the backend
+ * resolves both with symbol_get() and fails closed without a provider.
+ */
+#ifndef _LINUX_SOC_APPLE_PMP_H
+int apple_pmp_link_device(struct device *consumer);
+int apple_pmp_set_device_power(u8 command, u16 device_id, u32 enabled);
+#endif
+
 int iomfb_v26_6_atomic_check(struct apple_dcp *dcp, struct drm_crtc *crtc,
-			     struct drm_atomic_state *state);
+			     struct drm_atomic_commit *state);
 int iomfb_v26_6_modeset(struct apple_dcp *dcp, struct drm_crtc_state *crtc_state);
 void iomfb_v26_6_flush(struct apple_dcp *dcp, struct drm_crtc *crtc,
-		       struct drm_atomic_state *state);
+		       struct drm_atomic_commit *state);
 void iomfb_v26_6_poweron(struct apple_dcp *dcp);
 void iomfb_v26_6_poweroff(struct apple_dcp *dcp);
 

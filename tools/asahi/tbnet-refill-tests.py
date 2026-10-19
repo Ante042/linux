@@ -15,11 +15,11 @@ out.mkdir(parents=True, exist_ok=True)
 wt = Path(__file__).resolve().parents[2]
 ref = args.ref
 source=(wt/'drivers/net/thunderbolt/main.c').read_text() if ref=='WORKTREE' else subprocess.check_output(['git','show',ref+':drivers/net/thunderbolt/main.c'],cwd=wt,text=True)
-names=['tbnet_rx_refill_work','tbnet_free_buffers','tbnet_disable_napi','tbnet_tear_down','tbnet_available_buffers','tbnet_alloc_rx_buffers','tbnet_connected_work','tbnet_frame_size','tbnet_check_frame','tbnet_poll','tbnet_start_poll','tbnet_open','tbnet_stop','tbnet_shutdown','tbnet_suspend','tbnet_resume']
+names=['tbnet_rx_refill_work','tbnet_free_buffers','tbnet_disable_napi','tbnet_tear_down','tbnet_available_buffers','tbnet_alloc_rx_buffers','tbnet_connect_failed_locked','tbnet_connected_work','tbnet_check_frame','tbnet_poll','tbnet_start_poll','tbnet_open','tbnet_stop','tbnet_shutdown','tbnet_suspend','tbnet_resume']
 def extract(name,text=source):
  m=re.search(r'^static[^;\n]*\b'+name+r'\([^;]*?\n\{',text,re.M)
  if not m:
-  assert name=='tbnet_rx_refill_work';return ''
+  assert name in ('tbnet_rx_refill_work','tbnet_connect_failed_locked');return ''
  a=m.start();b=m.end();n=1
  # Functions contain no braces in strings; avoid comment braces here.
  while n:

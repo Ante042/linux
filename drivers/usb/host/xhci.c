@@ -8,6 +8,7 @@
  * Some code borrowed from the Linux EHCI driver.
  */
 
+#include <kunit/static_stub.h>
 #include <linux/jiffies.h>
 #include <linux/pci.h>
 #include <linux/iommu.h>
@@ -43,6 +44,8 @@ MODULE_PARM_DESC(quirks, "Bit flags for quirks to be enabled as default");
 
 void xhci_portsc_writel(struct xhci_port *port, u32 val)
 {
+	KUNIT_STATIC_STUB_REDIRECT(xhci_portsc_writel, port, val);
+
 	trace_xhci_portsc_writel(port, val);
 	writel(val, &port->port_reg->portsc);
 }
@@ -50,6 +53,8 @@ EXPORT_SYMBOL_GPL(xhci_portsc_writel);
 
 u32 xhci_portsc_readl(struct xhci_port *port)
 {
+	KUNIT_STATIC_STUB_REDIRECT(xhci_portsc_readl, port);
+
 	return readl(&port->port_reg->portsc);
 }
 EXPORT_SYMBOL_GPL(xhci_portsc_readl);
@@ -102,17 +107,10 @@ int xhci_handshake(void __iomem *ptr, u32 mask, u32 done, u64 timeout_us)
  */
 void xhci_quiesce(struct xhci_hcd *xhci)
 {
-	u32 halted;
 	u32 cmd;
-	u32 mask;
-
-	mask = ~(XHCI_IRQS);
-	halted = readl(&xhci->op_regs->status) & STS_HALT;
-	if (!halted)
-		mask &= ~CMD_RUN;
 
 	cmd = readl(&xhci->op_regs->command);
-	cmd &= mask;
+	cmd &= ~(CMD_RUN | XHCI_IRQS);
 	writel(cmd, &xhci->op_regs->command);
 }
 
@@ -144,6 +142,18 @@ int xhci_halt(struct xhci_hcd *xhci)
 
 	return ret;
 }
+
+/*
+ * Stop a controller that is about to be reported dead: mask its interrupts and
+ * halt it, as the other error paths do before xhci_hc_died(). A controller whose
+ * registers no longer answer is left alone. Called with xhci->lock held.
+ */
+void xhci_quiesce_dying(struct xhci_hcd *xhci)
+{
+	if (readl(&xhci->op_regs->status) != ~(u32)0)
+		xhci_halt(xhci);
+}
+EXPORT_SYMBOL_GPL(xhci_quiesce_dying);
 
 /*
  * Set the run bit and wait for the host to be running.
@@ -558,7 +568,7 @@ static void xhci_init(struct usb_hcd *hcd)
 	xhci_set_cmd_ring_deq(xhci);
 
 	/* Set Device Context Base Address Array pointer */
-	xhci_write_64(xhci, xhci->dcbaa->dma, &xhci->op_regs->dcbaa_ptr);
+	xhci_write_64(xhci, xhci->dcbaa.dma, &xhci->op_regs->dcbaa_ptr);
 
 	/* Set Doorbell array pointer */
 	xhci_set_doorbell_ptr(xhci);
@@ -934,7 +944,7 @@ static bool xhci_pending_portevent(struct xhci_hcd *xhci)
 	ports = xhci->usb2_rhub.ports;
 	while (port_index--) {
 		portsc = xhci_portsc_readl(ports[port_index]);
-		if (portsc & PORT_CHANGE_MASK ||
+		if (portsc & PORT_CHANGE_MASK || ports[port_index]->held_changes ||
 		    (portsc & PORT_PLS_MASK) == XDEV_RESUME)
 			return true;
 	}
@@ -942,7 +952,7 @@ static bool xhci_pending_portevent(struct xhci_hcd *xhci)
 	ports = xhci->usb3_rhub.ports;
 	while (port_index--) {
 		portsc = xhci_portsc_readl(ports[port_index]);
-		if (portsc & (PORT_CHANGE_MASK | PORT_CAS) ||
+		if (portsc & (PORT_CHANGE_MASK | PORT_CAS) || ports[port_index]->held_changes ||
 		    (portsc & PORT_PLS_MASK) == XDEV_RESUME)
 			return true;
 	}
@@ -998,6 +1008,10 @@ int xhci_suspend(struct xhci_hcd *xhci, bool do_wakeup)
 		clear_bit(HCD_FLAG_HW_ACCESSIBLE, &xhci->shared_hcd->flags);
 	/* step 1: stop endpoint */
 	/* skipped assuming that port suspend has done */
+
+	/* Check if command ring is empty */
+	if (!list_empty(&xhci->cmd_list))
+		xhci_warn(xhci, "Suspending and stopping xHC with pending command!\n");
 
 	/* step 2: clear Run/Stop bit */
 	command = readl(&xhci->op_regs->command);
@@ -1291,6 +1305,85 @@ done:
 	return retval;
 }
 EXPORT_SYMBOL_GPL(xhci_resume);
+
+/**
+ * xhci_run_in_s2idle_begin - Leave the controller running in suspend-to-idle
+ * @xhci: The controller, with its root hubs suspended or kept awake for wakeup
+ *
+ * For platforms without a wake signal for a halted controller. A running
+ * controller interrupts for every event, not just for the ones that a halted
+ * controller would signal as a wakeup, so with the interrupt kept enabled the
+ * event handling makes that decision instead: it wakes the system for those
+ * events and holds any other port change for the USB core until resume, see
+ * xhci_s2idle_port_wakeup() and xhci_s2idle_port_change().
+ *
+ * The root hubs are not polled until resume, as for a halted controller in
+ * xhci_suspend(). Changes that the ports latched before, and that the hub
+ * driver has not cleared yet, are then decided on as if the ports had just
+ * posted an event for them, so that each port posts an event for its next
+ * change.
+ */
+void xhci_run_in_s2idle_begin(struct xhci_hcd *xhci)
+{
+	struct usb_hcd *hcds[] = { xhci->usb2_rhub.hcd, xhci->usb3_rhub.hcd };
+	unsigned int i;
+
+	spin_lock_irq(&xhci->lock);
+	xhci->running_in_s2idle = 1;
+	spin_unlock_irq(&xhci->lock);
+
+	for (i = 0; i < ARRAY_SIZE(hcds); i++) {
+		if (!hcds[i])
+			continue;
+		clear_bit(HCD_FLAG_POLL_RH, &hcds[i]->flags);
+		timer_delete_sync(&hcds[i]->rh_timer);
+	}
+
+	spin_lock_irq(&xhci->lock);
+	xhci_s2idle_latched_changes(xhci);
+	spin_unlock_irq(&xhci->lock);
+}
+EXPORT_SYMBOL_GPL(xhci_run_in_s2idle_begin);
+
+/**
+ * xhci_run_in_s2idle_end - Hand the controller back after suspend-to-idle
+ * @xhci: The controller, still running
+ *
+ * Passes the port changes that were held during suspend-to-idle up to the USB
+ * core and polls the root hubs again, as xhci_resume() does for a halted
+ * controller, unless the controller has been reported dead in the meantime.
+ */
+void xhci_run_in_s2idle_end(struct xhci_hcd *xhci)
+{
+	struct xhci_hub *rhubs[] = { &xhci->usb2_rhub, &xhci->usb3_rhub };
+	bool held[ARRAY_SIZE(rhubs)] = {};
+	unsigned int i, j;
+	bool dying;
+
+	spin_lock_irq(&xhci->lock);
+	xhci->running_in_s2idle = 0;
+	dying = xhci->xhc_state & XHCI_STATE_DYING;
+	for (i = 0; i < ARRAY_SIZE(rhubs); i++) {
+		for (j = 0; j < rhubs[i]->num_ports; j++)
+			held[i] |= !!rhubs[i]->ports[j]->held_changes;
+	}
+	spin_unlock_irq(&xhci->lock);
+
+	if (dying)
+		return;
+
+	for (i = 0; i < ARRAY_SIZE(rhubs); i++) {
+		struct usb_hcd *hcd = rhubs[i]->hcd;
+
+		if (!hcd)
+			continue;
+		if (held[i] && hcd->state == HC_STATE_SUSPENDED)
+			usb_hcd_resume_root_hub(hcd);
+		set_bit(HCD_FLAG_POLL_RH, &hcd->flags);
+		usb_hcd_poll_rh_status(hcd);
+	}
+}
+EXPORT_SYMBOL_GPL(xhci_run_in_s2idle_end);
 #endif	/* CONFIG_PM */
 
 /*-------------------------------------------------------------------------*/
@@ -4469,9 +4562,9 @@ static int xhci_setup_device(struct usb_hcd *hcd, struct usb_device *udev,
 	xhci_dbg_trace(xhci, trace_xhci_dbg_address,
 		"Slot ID %d dcbaa entry @%p = %#016llx",
 		udev->slot_id,
-		&xhci->dcbaa->dev_context_ptrs[udev->slot_id],
+		&xhci->dcbaa.ctx_array[udev->slot_id],
 		(unsigned long long)
-		le64_to_cpu(xhci->dcbaa->dev_context_ptrs[udev->slot_id]));
+		le64_to_cpu(xhci->dcbaa.ctx_array[udev->slot_id]));
 	xhci_dbg_trace(xhci, trace_xhci_dbg_address,
 			"Output Context DMA address = %#08llx",
 			(unsigned long long)virt_dev->out_ctx->dma);
@@ -5436,6 +5529,7 @@ int xhci_gen_setup(struct usb_hcd *hcd, xhci_get_quirks_t get_quirks)
 	struct device		*dev = hcd->self.sysdev;
 	int			retval;
 	u32			hcs_params1;
+	u32			hc_capbase;
 
 	/* Accept arbitrarily long scatter-gather lists */
 	hcd->self.sg_tablesize = ~0;
@@ -5456,21 +5550,25 @@ int xhci_gen_setup(struct usb_hcd *hcd, xhci_get_quirks_t get_quirks)
 	mutex_init(&xhci->mutex);
 	xhci->main_hcd = hcd;
 	xhci->cap_regs = hcd->regs;
-	xhci->op_regs = hcd->regs +
-		HC_LENGTH(readl(&xhci->cap_regs->hc_capbase));
+	hc_capbase = readl(&xhci->cap_regs->hc_capbase);
+	if (hc_capbase == U32_MAX) {
+		xhci_warn(xhci, "Host controller not accessible, removed?\n");
+		return -ENODEV;
+	}
+	xhci->op_regs = hcd->regs + HC_LENGTH(hc_capbase);
 	xhci->run_regs = hcd->regs +
 		(readl(&xhci->cap_regs->run_regs_off) & RTSOFF_MASK);
 	/* Cache read-only capability registers */
 	hcs_params1 = readl(&xhci->cap_regs->hcs_params1);
 	xhci->hcs_params2 = readl(&xhci->cap_regs->hcs_params2);
 	xhci->hcs_params3 = readl(&xhci->cap_regs->hcs_params3);
-	xhci->hci_version = HC_VERSION(readl(&xhci->cap_regs->hc_capbase));
+	xhci->hci_version = HC_VERSION(hc_capbase);
 	xhci->hcc_params = readl(&xhci->cap_regs->hcc_params);
 	if (xhci->hci_version > 0x100)
 		xhci->hcc_params2 = readl(&xhci->cap_regs->hcc_params2);
 
 	xhci->dma_mask_bits = 64;
-	xhci->max_slots = HCS_MAX_SLOTS(hcs_params1);
+	xhci->max_slots = min(HCS_MAX_SLOTS(hcs_params1), MAX_HC_SLOTS);
 	xhci->max_ports = min(HCS_MAX_PORTS(hcs_params1), MAX_HC_PORTS);
 	/* xhci-plat or xhci-pci might have set max_interrupters already */
 	if (!xhci->max_interrupters)
@@ -5546,8 +5644,6 @@ int xhci_gen_setup(struct usb_hcd *hcd, xhci_get_quirks_t get_quirks)
 	INIT_DELAYED_WORK(&xhci->cmd_timer, xhci_handle_command_timeout);
 	init_completion(&xhci->cmd_ring_stop_completion);
 	xhci_hcd_page_size(xhci);
-
-	memset(xhci->devs, 0, MAX_HC_SLOTS * sizeof(*xhci->devs));
 
 	/* Allocate xHCI data structures */
 	retval = xhci_mem_init(xhci, GFP_KERNEL);

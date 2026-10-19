@@ -50,6 +50,7 @@ typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32; typedef uint64_t
 #define WLAN_EID_EXT_HE_CAPABILITY 35
 #define dev_info(...) ((void)0)
 #define dev_dbg_ratelimited(...) ((void)0)
+#define dev_dbg(...) ((void)0)
 #define spin_lock_irqsave(l,f) ((void)(l),(f)=0)
 #define spin_unlock_irqrestore(l,f) ((void)(l),(void)(f))
 #define msecs_to_jiffies(x) (x)
@@ -75,6 +76,7 @@ struct mt7932 {
  bool connecting,connected,disconnecting,disconnect_seen,disconnect_event_received;
  bool disconnect_local,connect_open,assoc_request_seen,peer_valid,link_failed,stopping,rf_ready;
  u8 connect_channel,connect_center,peer_wtbl,smart_version,waiting;
+ int waiting_eid;
  struct cfg80211_chan_def connect_chandef;
  struct test_band band2,band5;
  int connect_error;u16 disconnect_reason;
@@ -173,7 +175,7 @@ int main(void){struct mt7932 m;unsigned cases=0;
  for(unsigned i=0;i<4;i++){cal_null(&m,90+i);assert(m.cal_state.received==i+1&&m.cal_state.done==(i==3));}
  assert(m.cal_state.done&&!m.link_failed&&m.cal_request_count==1);cases++;
  // D6 ownership precedes ordinary pending command sequence matching.
- reset(&m,SUCCESS);m.waiting=88;assert(!mt7932_cal_begin(&m.cal_state,1));cal_null(&m,88);assert(m.cal_state.done&&!m.reply_length&&!m.response.done);cases++;
+ reset(&m,SUCCESS);m.waiting=88;m.waiting_eid=0xd6;assert(!mt7932_cal_begin(&m.cal_state,1));cal_null(&m,88);assert(m.cal_state.done&&!m.reply_length&&!m.response.done);cases++;
  cal_null(&m,89);assert(m.link_failed&&m.cal_state.error==-EPROTO&&!m.rf_ready);cases++;
  reset(&m,SUCCESS);m.disconnecting=true;receive(&m,0xd7,91,request,16,0);assert(!m.cal_request_count&&!scheduled&&m.link_failed);cases++;
  reset(&m,SUCCESS);m.cal_request_count=32;receive(&m,0xd7,92,request,16,0);assert(m.cal_request_count==32&&m.link_failed&&!scheduled);cases++;

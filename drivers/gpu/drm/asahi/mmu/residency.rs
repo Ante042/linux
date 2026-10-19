@@ -353,14 +353,14 @@ impl Vm {
             return 0;
         }
         let idle = gate.idle();
-        let Some(mut inner) = self.inner.try_lock_private() else {
+        let Some(mut inner) = self.gpuvm.try_lock_private() else {
             return 0;
         };
         let mut pages = 0usize;
         // SAFETY: Counting changes no logical mapping/list. Private BOs share
         // this reservation; linked aliases retain their borrowed BO and GEM.
         let _ = unsafe { inner.for_each_private_bo(|_, bo| {
-            let object = bo.object();
+            let object = bo.obj();
             // Purgeable objects count on busy VMs too; idle backing only on idle ones.
             if object.idle_reclaim_candidate()
                 && (object.madv_locked() > 0 || idle)
@@ -389,7 +389,7 @@ impl Vm {
         {
             return 0;
         }
-        let Some(mut inner) = self.inner.try_lock_private() else {
+        let Some(mut inner) = self.gpuvm.try_lock_private() else {
             return 0;
         };
         let uat = inner.uat_inner.clone();
@@ -402,13 +402,13 @@ impl Vm {
         // Callbacks change PTEs/flags only; all aliases stay linked.
         let _ = unsafe { inner.for_each_private_bo(|inner, bo| {
             if purged >= target { return Ok(false); }
-            let object = bo.object();
+            let object = bo.obj();
             if !object.idle_reclaim_candidate() || object.madv_locked() <= 0 {
                 return Ok(true);
             }
             {
-                let Some(bo_inner) = bo.inner().inner.try_lock() else { return Ok(true); };
-                if bo_inner.sgt.is_some() && !object.sole_sg_lease_releasable_locked() {
+                let Some(segments) = bo.data().segments.try_lock() else { return Ok(true); };
+                if segments.is_some() && !object.sole_sg_lease_releasable_locked() {
                     return Ok(true);
                 }
             }
@@ -432,12 +432,11 @@ impl Vm {
                 return Err(error);
             }
             {
-                let Some(mut bo_inner) = bo.inner().inner.try_lock() else {
+                let Some(mut segments) = bo.data().segments.try_lock() else {
                     gate.note_evicted();
                     return Ok(true);
                 };
-                bo_inner.sg_vec = None;
-                bo_inner.sgt = None;
+                *segments = None;
             }
             if object.purge_locked().is_ok() {
                 crate::gem::set_mapping_held(object, false);
@@ -476,7 +475,7 @@ impl Vm {
         {
             return purged;
         }
-        let Some(mut inner) = self.inner.try_lock_private() else {
+        let Some(mut inner) = self.gpuvm.try_lock_private() else {
             return purged;
         };
         let uat = inner.uat_inner.clone();
@@ -490,12 +489,12 @@ impl Vm {
         // logical aliases stay linked and retain their borrowed BO/GEM.
         let _ = unsafe { inner.for_each_private_bo(|inner, bo| {
             if unpinned >= target { return Ok(false); }
-            let object = bo.object();
+            let object = bo.obj();
             if !object.idle_reclaim_candidate() { return Ok(true); }
             {
                 // Avoid inversion against preparation (VmBoInner -> resv).
-                let Some(bo_inner) = bo.inner().inner.try_lock() else { return Ok(true); };
-                if bo_inner.sgt.is_none() || !object.sole_sg_lease_releasable_locked() {
+                let Some(segments) = bo.data().segments.try_lock() else { return Ok(true); };
+                if segments.is_none() || !object.sole_sg_lease_releasable_locked() {
                     return Ok(true);
                 }
             }
@@ -512,9 +511,8 @@ impl Vm {
                 Ok(())
             })?;
             {
-                let Some(mut bo_inner) = bo.inner().inner.try_lock() else { return Ok(true); };
-                bo_inner.sg_vec = None;
-                bo_inner.sgt = None;
+                let Some(mut segments) = bo.data().segments.try_lock() else { return Ok(true); };
+                *segments = None;
             }
             // Every private GPUVA alias was removed from the device page
             // tables above. Kernel mappings and other SG owners are excluded;
@@ -542,9 +540,9 @@ impl Vm {
         let mut cursor = 0u64;
         loop {
             let map = loop {
-                if let Some(inner) = self.inner.try_lock_private() {
+                if let Some(inner) = self.gpuvm.try_lock_private() {
                     let map = inner.next_private_mapping(
-                        &mut cursor, gpuvm::GpuVaFlags::INVALIDATED,
+                        &mut cursor, GpuVaFlag::INVALIDATED.into(),
                     )?;
                     // Purged (DONTNEED) objects have no contents to restore;
                     // their mappings stay INVALIDATED until unbound.
@@ -553,7 +551,7 @@ impl Vm {
                     break (map, purged);
                 }
                 // Wait for reservation ownership without retaining a mapping.
-                drop(self.inner.exec_lock(None, true)?);
+                drop(lock_vm(&self.gpuvm, None, true)?);
             };
             // The reservation guard has dropped before pinning backing, and
             // before any returned object reference can be released on failure.
@@ -562,43 +560,49 @@ impl Vm {
                 continue;
             }
             let mut restored = 0u64;
-            let bo_owner = self.inner.find_bo(&map.object).ok_or(EFAULT)?;
+            let bo_owner = lock_vm(&self.gpuvm, None, true)?
+                .0
+                .unique_gpuvm
+                .find_bo(&map.object)
+                .ok_or(EFAULT)?;
             {
-                let needs_sgt = bo_owner.inner().inner.lock().sgt.is_none();
-                if needs_sgt {
+                let needs_segments = bo_owner.data().segments.lock().is_none();
+                if needs_segments {
                     // Preserve review1's reservation/BO lock order: the getter
                     // may acquire the object reservation; never hold BO here.
-                    let sgt = crate::gem::held_sg_table(&map.object)?;
-                    let mut bo = bo_owner.inner().inner.lock();
-                    if bo.sgt.is_none() { bo.sgt = Some(sgt); }
+                    // SAFETY: As in `Vm::bind_object()`.
+                    let dev = unsafe { self.dev.as_bound() };
+                    let segments = prefetch_sgt_segments(dev, &map.object)?;
+                    let mut bo = bo_owner.data().segments.lock();
+                    if bo.is_none() { bo.replace(segments); }
                     drop(bo);
                 }
             }
-            let mut inner = self.inner.exec_lock(None, true)?;
-            let bo = bo_owner.inner().inner.lock();
-            let sgt = bo.sgt.as_ref().ok_or(EFAULT)?;
+            let mut inner = lock_vm(&self.gpuvm, None, true)?;
+            let bo = bo_owner.data().segments.lock();
+            let sgt = bo.as_ref().ok_or(EFAULT)?;
             let result = (|| -> Result {
                 let end = map.addr.checked_add(map.range).ok_or(EOVERFLOW)?;
                 let _mutation = inner.mapping_mutation();
                 inner.page_table.discard_partial_map(map.addr..end)?;
                 inner.tlbi_contexts_naming_root(map.addr, map.range as usize);
                 let prot = map.inner.prot.ok_or(EINVAL)?;
-                let repeat = map.flags.contains(gpuvm::GpuVaFlags::REPEAT);
+                let repeat = map.flags.contains(GpuVaFlag::REPEAT);
                 let mut skip = map
                     .offset
                     .checked_add(if repeat { 0 } else { restored })
                     .ok_or(EOVERFLOW)? as usize;
                 let mut left = map.range.checked_sub(restored).ok_or(EOVERFLOW)? as usize;
-                for entry in sgt.iter() {
+                for &(dma_address, dma_len) in sgt.iter() {
                     if left == 0 {
                         break;
                     }
-                    let len = entry.dma_len() as usize;
+                    let len = dma_len as usize;
                     if skip >= len {
                         skip -= len;
                         continue;
                     }
-                    let physical = entry.dma_address() as usize + skip;
+                    let physical = dma_address as usize + skip;
                     let bytes = if repeat { left } else { left.min(len - skip) };
                     let start = map.addr.checked_add(restored).ok_or(EOVERFLOW)?;
                     let end = start.checked_add(bytes as u64).ok_or(EOVERFLOW)?;

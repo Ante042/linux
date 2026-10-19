@@ -59,7 +59,7 @@ use kernel::{
 const DEBUG_CLASS: DebugFlags = DebugFlags::Buffer;
 
 /// There are 127 GPU/firmware-side buffer manager slots (yes, 127, not 128).
-pub(crate) const NUM_BUFFERS: u32 = 127;
+const NUM_BUFFERS: u32 = 127;
 
 /// Page size bits for buffer pages (32K). VAs must be aligned to this size.
 pub(crate) const PAGE_SHIFT: usize = 15;
@@ -321,8 +321,8 @@ pub(crate) struct Buffer {
 #[versions(AGX)]
 impl Buffer::ver {
     /// Create a new Buffer for a given VM, given the per-VM allocators.
-    pub(crate) fn new(
-        gpu: &dyn gpu::GpuManager,
+    pub(crate) fn new<'drm>(
+        gpu: &'drm dyn gpu::GpuManager,
         alloc: &mut gpu::KernelAllocators,
         ualloc: Arc<Mutex<alloc::DefaultAllocator>>,
         ualloc_priv: Arc<Mutex<alloc::DefaultAllocator>>,

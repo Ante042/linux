@@ -49,21 +49,12 @@ impl F32 {
         F32(u)
     }
 
-    /// The raw 32-bit representation of an F32
-    pub(crate) const fn to_bits(self) -> u32 {
-        self.0
-    }
-
     // Convert a `f32` value into an F32
     //
     // This must ONLY be used in const context. Use the `f32!{}` macro to do it safely.
     #[doc(hidden)]
     pub(crate) const fn from_f32(v: f32) -> F32 {
-        // Replace with to_bits() after kernel Rust minreq is >= 1.83.0
-        #[allow(clippy::transmute_float_to_int)]
-        #[allow(unnecessary_transmutes)]
-        // SAFETY: Transmuting f32 to u32 is always safe
-        F32(unsafe { core::mem::transmute::<f32, u32>(v) })
+        F32(v.to_bits())
     }
 
     // Convert an F32 into a `f32` value

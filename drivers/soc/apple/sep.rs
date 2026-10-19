@@ -38,6 +38,7 @@ mod transfer;
 mod trusted;
 mod xarm;
 mod xart_apfs;
+mod xart_guard;
 mod xart_store;
 
 use kernel::{
@@ -60,6 +61,10 @@ use kernel::{
         atomic::{
             Atomic,
             Relaxed, //
+        },
+        barrier::{
+            dma_rmb,
+            dma_wmb, //
         },
         new_condvar,
         Arc,
@@ -93,6 +98,20 @@ static_assert!(ENROL_WORK_ID != SETTLE_WORK_ID && ENROL_WORK_ID != 0);
 const VERIFY_WORK_ID: u64 = 3;
 static_assert!(VERIFY_WORK_ID != ENROL_WORK_ID && VERIFY_WORK_ID != SETTLE_WORK_ID);
 static_assert!(VERIFY_WORK_ID != 0);
+const LATE_ATTACH_WORK_ID: u64 = 4;
+static_assert!(LATE_ATTACH_WORK_ID != VERIFY_WORK_ID && LATE_ATTACH_WORK_ID != ENROL_WORK_ID);
+static_assert!(LATE_ATTACH_WORK_ID != SETTLE_WORK_ID && LATE_ATTACH_WORK_ID != 0);
+
+// When an attach-time sensor bring-up falls short, one more round runs this
+// long after Touch ID was activated. A round that cannot run yet, because the
+// boot-time bring-up is still going or the system is going to sleep, is put
+// off by the same delay, at most this many times.
+const LATE_ATTACH_DELAY_MS: time::Msecs = 10_000;
+const LATE_ATTACH_DEFERS: u32 = 3;
+
+// The step in which a pause between bring-up attempts checks whether the
+// result is still wanted.
+const BRINGUP_PAUSE_STEP_MS: u32 = 100;
 
 // J700 traces show the key-store endpoint arriving around 43 s after boot,
 // well after the first infrastructure endpoints. The wait exits promptly on
@@ -131,7 +150,7 @@ const SCRD_MAX_CAPTURE: usize = 8;
 const SCRD_TIMEOUT_MS: time::Msecs = 2000;
 
 const SKS_TIMEOUT_MS: time::Msecs = 2000;
-/// The 13.5 key store's per-try wait.
+/// The per-try wait for the 13.5 key store.
 const SKS_TIMEOUT_13_MS: time::Msecs = 6000;
 
 const SKS_TIMEOUT_PER_KIB_MS: time::Msecs = 6000;
@@ -169,9 +188,19 @@ const OOL_WRITE_POLL_ATTEMPTS: u32 = 200;
 const OOL_POISON_INBOUND: u8 = 0xA5;
 const OOL_POISON_OUTBOUND: u8 = 0x5A;
 
+// transfer::take_header() tells a landed SBIO header from the fill by its
+// words, which a valid reply cannot hold as four equal nonzero bytes.
+static_assert!(OOL_POISON_OUTBOUND != 0);
+
 const PROTECTED_DATA_AVAILABLE: bool = true;
 
 const RNG_MAX_WORDS_PER_READ: usize = 16;
+
+// How long going to sleep waits for an entropy request in flight: the
+// mailbox's 500 ms wait for room, then the wait for the reply. Only a request
+// already being written can still go out once the sleep has begun; see
+// `send_entropy_request()`.
+const RNG_SLEEP_DRAIN_MS: u32 = proto::CONTROL_TIMEOUT_MS + 1000;
 
 extern "C" {
     fn sep_cancel_work_sync(work: *mut c_void);
@@ -205,6 +234,10 @@ struct OolPair {
 
 fn sks_declared_sizes() -> (usize, usize) {
     (0x8000, 0x4000)
+}
+
+fn boottime_ms() -> u64 {
+    shim::boottime_ns() / 1_000_000
 }
 
 struct Hex<'a>(&'a [u8]);
@@ -566,6 +599,8 @@ struct SepData {
 
     #[pin]
     endpoints: Mutex<EndpointTable>,
+    #[pin]
+    trusted_ready: CondVar,
 
     #[pin]
     control: Mutex<control::ControlState>,
@@ -645,6 +680,15 @@ struct SepData {
     // The enclave accepted an identification of the sensor since it booted,
     // even if the registration it began then failed.
     sensor_held: Atomic<bool>,
+    // The enclave may hold a serial registration whose session never opened;
+    // see registration::authenticate.
+    serial_unfinished: Atomic<bool>,
+    sensor_test_fault_done: Atomic<bool>,
+
+    // Activation left the sensor short of attached; the opener queues the
+    // late attach. And how often that has been put off.
+    late_attach_wanted: Atomic<bool>,
+    late_attach_defers: Atomic<u32>,
 
     #[pin]
     ool_sks: Mutex<Option<OolPair>>,
@@ -720,6 +764,10 @@ struct SepData {
     // and `capture_end`.
     captures_running: Atomic<u32>,
 
+    // Signalled when an enrol or verify work item has stopped.
+    #[pin]
+    worker_gone: CondVar,
+
     // Held by an enrol or verify work item for its whole run and by a
     // deletion while it removes identities and saves the Catacombs, so two
     // Catacomb save sequences never interleave.
@@ -730,10 +778,6 @@ struct SepData {
     // deletion durable failed; the next deletion retries the save. Changed
     // only under `catacomb_writer`.
     deletion_unsaved: Atomic<bool>,
-
-    // Signalled when an enrol or verify work item has stopped.
-    #[pin]
-    worker_gone: CondVar,
 
     #[pin]
     rx_work: Work<SepData>,
@@ -746,6 +790,9 @@ struct SepData {
 
     #[pin]
     verify_work: Work<SepData, VERIFY_WORK_ID>,
+
+    #[pin]
+    late_attach_work: DelayedWork<SepData, LATE_ATTACH_WORK_ID>,
 }
 
 impl_has_work! {
@@ -756,6 +803,7 @@ impl_has_work! {
 
 impl_has_delayed_work! {
     impl HasDelayedWork<Self, 1> for SepData { self.settle_work }
+    impl HasDelayedWork<Self, LATE_ATTACH_WORK_ID> for SepData { self.late_attach_work }
 }
 
 // SAFETY: every field is either internally synchronised (the mutexes, the
@@ -767,10 +815,10 @@ unsafe impl Send for SepData {}
 unsafe impl Sync for SepData {}
 
 impl SepData {
-    fn new(pdev: &platform::Device<device::Core>) -> Result<Arc<SepData>> {
+    fn new(pdev: &platform::Device<device::Core<'_>>) -> Result<Arc<SepData>> {
         let profile = profile::detect()?;
         let built = shmem::build(pdev, profile.shmem_capacity, profile.shmem_first_item)?;
-        let dev: &device::Device<device::Core> = pdev.as_ref();
+        let dev: &device::Device<device::Core<'_>> = pdev.as_ref();
         dev_info!(dev, "SEP platform profile: {}\n", profile.name);
 
         let buf = built.buf;
@@ -799,8 +847,18 @@ impl SepData {
 
         let xart_writes = *module_parameters::xart_writes.value() != 0;
         let xart_start = *module_parameters::xart_start_sector.value();
+        let xart_guard =
+            xart_guard::level(*module_parameters::xart_guard.value(), profile.xart_guard);
         let store = match xart_store::Store::open_owner(xart_writes, xart_start) {
-            Ok(store) => {
+            Ok(mut store) => {
+                match xart_guard {
+                    Some(level) if store.writes_enabled() => store.set_guard(level)?,
+                    None if store.writes_enabled() => dev_info!(
+                        dev,
+                        "xART guard off: the enclave may rewrite any session record\n"
+                    ),
+                    _ => {}
+                }
                 let (slots, records, revision, malformed, duplicates, repaired, writable) =
                     store.summary();
                 let base = store.base();
@@ -850,6 +908,7 @@ impl SepData {
                 mbox <- new_mutex!(None),
                 shmem <- new_mutex!(Some(buf)),
                 endpoints <- new_mutex!(EndpointTable::new()),
+                trusted_ready <- new_condvar!("SepData::trusted_ready"),
                 control <- new_mutex!(control::ControlState::new()),
                 control_wq <- new_condvar!("SepData::control_wq"),
                 sks_seq: Atomic::new(0),
@@ -858,6 +917,10 @@ impl SepData {
                 sks_wedged: Atomic::new(0),
                 bringup: Atomic::new(BRINGUP_FRESH),
                 sensor_held: Atomic::new(false),
+                serial_unfinished: Atomic::new(false),
+                sensor_test_fault_done: Atomic::new(false),
+                late_attach_wanted: Atomic::new(false),
+                late_attach_defers: Atomic::new(0),
                 keybag_designated: Atomic::new(false),
                 bringup_started: Atomic::new(false),
                 touchid_started: Atomic::new(false),
@@ -912,13 +975,14 @@ impl SepData {
                 suspending: Atomic::new(false),
                 sleep_over <- new_condvar!("SepData::sleep_over"),
                 captures_running: Atomic::new(0),
+                worker_gone <- new_condvar!("SepData::worker_gone"),
                 catacomb_writer <- new_mutex!(()),
                 deletion_unsaved: Atomic::new(false),
-                worker_gone <- new_condvar!("SepData::worker_gone"),
                 rx_work <- new_work!("SepData::rx_work"),
                 enrol_work <- new_work!("SepData::enrol_work"),
                 verify_work <- new_work!("SepData::verify_work"),
                 settle_work <- new_delayed_work!("SepData::settle_work"),
+                late_attach_work <- new_delayed_work!("SepData::late_attach_work"),
             }),
             GFP_KERNEL,
         )
@@ -958,7 +1022,7 @@ impl SepData {
         }
         self.registered.store(true, Relaxed);
 
-        self.mbox.lock().as_ref().ok_or(EINVAL)?.send(msg, false)?;
+        Self::ring(self.mbox.lock().as_ref().ok_or(EINVAL)?, msg)?;
 
         // no ack on 0xFE; success is the discovery burst on 0xFD
         Ok(())
@@ -1111,7 +1175,20 @@ impl SepData {
         if self.shutting_down.load(Relaxed) {
             return Err(ENODEV);
         }
-        self.mbox.lock().as_ref().ok_or(ENODEV)?.send(msg, false)
+        Self::ring(self.mbox.lock().as_ref().ok_or(ENODEV)?, msg)
+    }
+
+    /// Puts `msg` in the mailbox once the enclave can see what the CPU wrote
+    /// to the buffers before it: a request payload, an SBIO header's poison,
+    /// the shared memory a registration hands over. Those are coherent
+    /// allocations, which have no sync call to order them, and the mailbox
+    /// write is relaxed MMIO, which is not ordered after them either.
+    /// Without the barrier the enclave could read old bytes, or have its
+    /// reply's header overwritten by a refill that lands late. dma_wmb() is
+    /// what writel() would put there, and what RTKit puts before its sends.
+    fn ring(mbox: &Mailbox<SepData>, msg: Message) -> Result<()> {
+        dma_wmb();
+        mbox.send(msg, false)
     }
 
 
@@ -1174,25 +1251,27 @@ impl SepData {
             return Err(EINVAL);
         }
 
-        self.control.lock().entropy_begin()?;
+        self.control.lock().entropy_begin(boottime_ms())?;
 
         let msg = proto::encode_control(&op, proto::TAG_ENTROPY);
-        if let Err(e) = self.send(msg) {
-            self.control.lock().entropy_end();
+        if let Err(e) = self.send_entropy_request(msg) {
+            self.control
+                .lock()
+                .entropy_end(control::EntropyEnd::not_sent(e), boottime_ms());
             return Err(e);
         }
 
         let mut remaining = time::msecs_to_jiffies(op.timeout_ms());
         let mut guard = self.control.lock();
-        let result = loop {
+        let (result, end) = loop {
             if let Some(value) = guard.entropy_take() {
-                break Ok(value);
+                break (Ok(value), control::EntropyEnd::Answered);
             }
             if self.rng_shutdown.load(Relaxed) {
-                break Err(ECANCELED);
+                break (Err(ECANCELED), control::EntropyEnd::Abandoned);
             }
             if remaining == 0 {
-                break Err(ETIMEDOUT);
+                break (Err(ETIMEDOUT), control::EntropyEnd::TimedOut);
             }
             match self
                 .control_wq
@@ -1203,8 +1282,97 @@ impl SepData {
                 CondVarTimeoutResult::Timeout => remaining = 0,
             }
         };
-        guard.entropy_end();
+        guard.entropy_end(end, boottime_ms());
         result
+    }
+
+    /// As [`Self::get_entropy_word`], for a reader that blocks. While requests
+    /// are held back, wait for that to end, for as long as a request waits
+    /// for its reply, rather than fail at once. EAGAIN if it does not end
+    /// in that time, ERESTARTSYS if a signal comes.
+    fn get_entropy_word_blocking(&self) -> Result<u32> {
+        let limit = u64::from(proto::CONTROL_TIMEOUT_MS);
+        let deadline = boottime_ms().saturating_add(limit);
+        loop {
+            // As `hwrng_fill()` checks before each word: a removal wakes the
+            // wait below, and no request may go out after it.
+            if self.rng_shutdown.load(Relaxed) {
+                return Err(ENODEV);
+            }
+            match self.get_entropy_word() {
+                Err(e) if e == EAGAIN => {}
+                done => return done,
+            }
+            let mut guard = self.control.lock();
+            let now = boottime_ms();
+            let left = deadline.saturating_sub(now);
+            match guard.entropy_held_ms(now, left) {
+                // It ended since; ask now.
+                None if left > 0 => continue,
+                None | Some(0) => return Err(EAGAIN),
+                Some(ms) => {
+                    if self.rng_shutdown.load(Relaxed) {
+                        return Err(ENODEV);
+                    }
+                    let ms = u32::try_from(ms).unwrap_or(proto::CONTROL_TIMEOUT_MS);
+                    if let CondVarTimeoutResult::Signal { .. } = self
+                        .control_wq
+                        .wait_interruptible_timeout(&mut guard, time::msecs_to_jiffies(ms))
+                    {
+                        return Err(ERESTARTSYS);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Sends an entropy request claimed by `entropy_begin()`, or EAGAIN if
+    /// the system has begun going to sleep since. The check is made with the
+    /// mailbox lock held. A sender can wait for that lock behind others, such
+    /// as a Touch ID capture still running, for longer than the drain on the
+    /// way to sleep waits for it. It must not then write its request into
+    /// the suspend. Lock order: mailbox, then control.
+    fn send_entropy_request(&self, msg: Message) -> Result<()> {
+        if self.shutting_down.load(Relaxed) {
+            return Err(ENODEV);
+        }
+        let mbox = self.mbox.lock();
+        let mbox = mbox.as_ref().ok_or(ENODEV)?;
+        if !self.control.lock().entropy_may_send() {
+            return Err(EAGAIN);
+        }
+        Self::ring(mbox, msg)
+    }
+
+    /// The system is about to suspend: send no entropy request until it has
+    /// resumed, and let one already sent be answered while the enclave can
+    /// still answer it. On a T6000 a request sent while devices were
+    /// suspended was never answered, and the enclave did not read its mailbox
+    /// again after the resume.
+    pub(crate) fn rng_sleep_prepare(&self) {
+        if !self.control.lock().entropy_sleep() {
+            return;
+        }
+        let idle = control::wait_idle(
+            RNG_SLEEP_DRAIN_MS,
+            10,
+            || self.control.lock().entropy_busy(),
+            |ms| kernel::time::delay::fsleep(kernel::time::Delta::from_millis(i64::from(ms))),
+        );
+        if !idle {
+            dev_warn!(
+                self.dev,
+                "hwrng: a request was still in flight after {} ms; suspending anyway\n",
+                RNG_SLEEP_DRAIN_MS
+            );
+        }
+    }
+
+    /// The system has resumed, or the suspend was aborted.
+    pub(crate) fn rng_sleep_finished(&self) {
+        self.control.lock().entropy_wake();
+        // A blocking hwrng reader may be waiting for this.
+        self.control_wq.notify_all();
     }
 
     fn control_survey(&self) {
@@ -1235,24 +1403,38 @@ impl SepData {
         if this.rng.lock().is_some() {
             return;
         }
-        let attempt = this.rng_survey_attempts.load(Relaxed) + 1;
-        if attempt > RNG_SURVEY_ATTEMPTS {
+        let used = this.rng_survey_attempts.load(Relaxed);
+        let Some((attempt, next)) =
+            control::survey_step(used, RNG_SURVEY_ATTEMPTS, || this.survey_hwrng())
+        else {
             return;
-        }
+        };
         this.rng_survey_attempts.store(attempt, Relaxed);
-        match this.survey_hwrng() {
-            Ok(()) => dev_info!(this.dev, "hwrng: registered after ready-phase survey (attempt {})\n", attempt),
-            Err(e) if attempt < RNG_SURVEY_ATTEMPTS => {
+        match next {
+            control::Survey::Registered => dev_info!(
+                this.dev,
+                "hwrng: registered after ready-phase survey (attempt {})\n",
+                attempt
+            ),
+            // Asleep, or holding back after a request that went unanswered:
+            // this attempt did not ask the enclave anything.
+            control::Survey::Held => Self::arm_settle(this),
+            control::Survey::Retry(e) => {
                 dev_warn!(this.dev, "hwrng: survey attempt {} failed ({:?}); retrying\n", attempt, e);
                 Self::arm_settle(this);
             }
-            Err(e) => dev_err!(this.dev, "hwrng: survey failed after {} attempts ({:?})\n", attempt, e),
+            control::Survey::GiveUp(e) => dev_err!(
+                this.dev,
+                "hwrng: survey failed after {} attempts ({:?})\n",
+                attempt,
+                e
+            ),
         }
     }
 
 
     fn alloc_ool(
-        dev: &device::Device<device::Core>,
+        dev: &device::Device<device::Core<'_>>,
         endpoint: u8,
         allocated: usize,
         declared: (usize, usize),
@@ -1493,6 +1675,40 @@ impl SepData {
         }
 
         Ok(payload)
+    }
+
+    /// Copies `out.len()` bytes at `off` of the outbound buffer into `out`;
+    /// `false` once the buffers are gone or the range is outside them.
+    fn ool_peek(&self, slot: &Mutex<Option<OolPair>>, off: usize, out: &mut [u8]) -> bool {
+        let guard = slot.lock();
+        let Some(buffers) = guard.as_ref() else {
+            return false;
+        };
+        if off + out.len() > buffers.allocated {
+            return false;
+        }
+        // SAFETY: the region is within the allocation as checked above, and
+        // the driver is the only host-side accessor.
+        out.copy_from_slice(unsafe { &buffers.outbound.as_ref()[off..off + out.len()] });
+        true
+    }
+
+    /// Fills `len` bytes at `off` of the outbound buffer with the poison
+    /// again, once the message they held has been read.
+    fn ool_repoison(&self, slot: &Mutex<Option<OolPair>>, off: usize, len: usize) {
+        let guard = slot.lock();
+        let Some(buffers) = guard.as_ref() else {
+            return;
+        };
+        if off + len > buffers.allocated {
+            return;
+        }
+        // SAFETY: the region is within the allocation as checked above, and
+        // the driver is the only host-side accessor. The enclave writes the
+        // region only to deliver a message, and the one it held has been
+        // looked at. If part of it was still landing, that part may land over
+        // the fill afterwards, as a header that has not landed yet does.
+        unsafe { buffers.outbound.as_mut()[off..off + len].fill(OOL_POISON_OUTBOUND) };
     }
 
     fn ool_await_written(&self, slot: &Mutex<Option<OolPair>>, off: usize, len: usize) -> bool {
@@ -1828,18 +2044,13 @@ impl SepData {
                 failure = Some(ENODEV);
                 break;
             }
-            // The hwrng fill thread is not frozen for system sleep. On J414s
-            // its requests during s2idle got no reply, the sends timed out,
-            // and every Touch ID command after resume failed. Ask nothing
-            // between the sleep notification and resume; on an error the core
-            // retries 10 s later.
-            if self.suspending.load(Relaxed) {
-                if written > 0 {
-                    break;
-                }
-                return EAGAIN.to_errno();
-            }
-            match self.get_entropy_word() {
+            // Only a read that has nothing yet waits while requests are held.
+            let word = if written == 0 {
+                self.get_entropy_word_blocking()
+            } else {
+                self.get_entropy_word()
+            };
+            match word {
                 Ok(value) => {
                     // SAFETY: the core guarantees `buf` is valid for `max`
                     // bytes and aligned for any type, and `i < max / 4`.
@@ -1853,12 +2064,12 @@ impl SepData {
             }
         }
 
-        if written > 0 {
-            return written as c_int;
-        }
-
-        // must return a negative errno, not 0: a blocking reader would spin on 0
-        let e = failure.unwrap_or(EIO);
+        let e = match control::read_end(written, failure) {
+            control::ReadEnd::Bytes(n) => return n as c_int,
+            // Held back for as long as the read could wait, or interrupted.
+            control::ReadEnd::Held(e) => return e.to_errno(),
+            control::ReadEnd::Failed(e) => e,
+        };
         let n = self.rng_failures.load(Relaxed).wrapping_add(1);
         self.rng_failures.store(n, Relaxed);
         if n == 1 {
@@ -1912,7 +2123,7 @@ impl SepData {
             return;
         }
         let delay = time::msecs_to_jiffies(SETTLE_MS);
-        let _ = workqueue::system()
+        let _ = workqueue::system_dfl()
             .enqueue_delayed::<Arc<SepData>, SETTLE_WORK_ID>(this.clone(), delay);
     }
 
@@ -1955,7 +2166,7 @@ impl SepData {
             );
             diag::attach(false);
             diag::bringup_ended();
-            this.phase.store(PHASE_READY, Relaxed);
+            this.finish_bringup();
             return;
         }
         dev_info!(
@@ -1977,7 +2188,7 @@ impl SepData {
                 e
             );
             diag::bringup_ended();
-            this.phase.store(PHASE_READY, Relaxed);
+            this.finish_bringup();
             return;
         }
 
@@ -2018,8 +2229,48 @@ impl SepData {
 
         this.run_bringup();
         diag::bringup_ended();
-        this.phase.store(PHASE_READY, Relaxed);
+        this.finish_bringup();
         Self::arm_settle(this);
+    }
+
+    // Publish completion under the same lock that trusted consumers wait on.
+    // PHASE_READY ends discovery/initialisation; it is not proof of success.
+    fn finish_bringup(&self) {
+        let _guard = self.endpoints.lock();
+        self.phase.store(PHASE_READY, Relaxed);
+        self.trusted_ready.notify_all();
+    }
+
+    /// Trusted-key callbacks can run as soon as probe publishes the source,
+    /// while endpoint discovery and key-store initialisation are still running.
+    /// Wait only in those consumers, leaving bringup free to establish the key.
+    pub(crate) fn wait_for_trusted_ready(&self) -> Result<()> {
+        let mut remaining = time::msecs_to_jiffies(EXCHANGE_TIMEOUT_MS);
+        let mut guard = self.endpoints.lock();
+        loop {
+            if self.shutting_down.load(Relaxed) {
+                return Err(ENODEV);
+            }
+            if self.phase.load(Relaxed) == PHASE_READY {
+                // A completed but failed attach must not look ready.
+                if !guard.eps.iter().any(|e| e.id == proto::EP_SKS) {
+                    return Err(ENODEV);
+                }
+                if !self.sks_initialized.load(Relaxed) {
+                    return Err(EIO);
+                }
+                return Ok(());
+            }
+            if remaining == 0 {
+                dev_err!(self.dev, "trusted-keys: key-store bringup timed out\n");
+                return Err(ETIMEDOUT);
+            }
+            match self.trusted_ready.wait_interruptible_timeout(&mut guard, remaining) {
+                CondVarTimeoutResult::Woken { jiffies } => remaining = jiffies,
+                CondVarTimeoutResult::Signal { .. } => return Err(ERESTARTSYS),
+                CondVarTimeoutResult::Timeout => remaining = 0,
+            }
+        }
     }
 
     fn endpoint_present(&self, id: u8) -> bool {
@@ -2066,6 +2317,15 @@ impl SepData {
             control::Delivery::Entropy => {
                 self.control_wq.notify_all();
             }
+            control::Delivery::EntropyLate { recovered: true } => {
+                dev_info!(
+                    self.dev,
+                    "hwrng: the enclave answered a request that had timed out; reads resume\n"
+                );
+                // A blocking hwrng reader may be waiting for this.
+                self.control_wq.notify_all();
+            }
+            control::Delivery::EntropyLate { recovered: false } => {}
             control::Delivery::Matched => self.control_wq.notify_all(),
             control::Delivery::Unmatched => {}
         }
@@ -2093,6 +2353,10 @@ impl SepData {
 
     fn remove(&self) {
         self.shutting_down.store(true, Relaxed);
+        {
+            let _guard = self.endpoints.lock();
+            self.trusted_ready.notify_all();
+        }
         bio::release(&mut self.bio_session.lock());
         self.worker_gone.notify_all();
         self.rng_shutdown.store(true, Relaxed);
@@ -2121,7 +2385,7 @@ impl SepData {
 
         *self.mbox.lock() = None;
 
-        // SAFETY: all four pointers refer to pinned work fields in `self`.
+        // SAFETY: all five pointers refer to pinned work fields in `self`.
         // Shutdown blocks requeueing, and the mailbox can no longer add work.
         unsafe {
             sep_cancel_work_sync(Work::raw_get(core::ptr::addr_of!(self.rx_work)).cast());
@@ -2129,6 +2393,9 @@ impl SepData {
             sep_cancel_work_sync(Work::raw_get(core::ptr::addr_of!(self.verify_work)).cast());
             sep_cancel_delayed_work_sync(
                 DelayedWork::raw_as_work(core::ptr::addr_of!(self.settle_work)).cast(),
+            );
+            sep_cancel_delayed_work_sync(
+                DelayedWork::raw_as_work(core::ptr::addr_of!(self.late_attach_work)).cast(),
             );
         }
 
@@ -2177,7 +2444,17 @@ unsafe extern "C" fn bio_open_trampoline(ctx: *mut c_void) -> c_int {
     // SAFETY: per the contract above.
     let this = unsafe { &*ctx.cast::<SepData>() };
     match this.bio_open() {
-        Ok(()) => 0,
+        Ok(()) => {
+            if this.take_late_attach() {
+                // SAFETY: as in `bio_ioctl_trampoline`: `ctx` is the pointer
+                // the driver's own `Arc<SepData>` was made from, and that
+                // `Arc` outlives every callback.
+                let borrow =
+                    unsafe { kernel::sync::ArcBorrow::<SepData>::from_raw(ctx.cast::<SepData>()) };
+                SepData::queue_late_attach(borrow.into());
+            }
+            0
+        }
         Err(e) => e.to_errno(),
     }
 }
@@ -2247,6 +2524,9 @@ impl MailCallback for SepData {
         if data.shutting_down.load(Relaxed) {
             return;
         }
+        // The message was read from the mailbox with relaxed MMIO. Read the
+        // buffers the enclave wrote before it only after that, as RTKit does.
+        dma_rmb();
         if !data.rx.push(msg) && data.rx.dropped() == 1 {
             dev_err!(
                 data.dev,
@@ -2256,7 +2536,7 @@ impl MailCallback for SepData {
         }
 
         let this: Arc<SepData> = data.into();
-        let _ = workqueue::system().enqueue::<Arc<SepData>, 0>(this);
+        let _ = workqueue::system_dfl().enqueue::<Arc<SepData>, 0>(this);
     }
 }
 
@@ -2284,19 +2564,24 @@ impl WorkItem<SETTLE_WORK_ID> for SepData {
     }
 }
 
+impl WorkItem<LATE_ATTACH_WORK_ID> for SepData {
+    type Pointer = Arc<SepData>;
+
+    fn run(this: Arc<SepData>) {
+        SepData::run_late_attach(&this);
+    }
+}
+
 impl WorkItem<ENROL_WORK_ID> for SepData {
     type Pointer = Arc<SepData>;
 
     fn run(this: Arc<SepData>) {
+        // Serialize saves before joining the suspend drain.
+        let _writer = this.catacomb_writer.lock();
         let epoch = this.capture_epoch.load(Relaxed);
-        {
-            // Taken before `capture_begin`, so the sleep drain never counts the
-            // wait for it.
-            let _writer = this.catacomb_writer.lock();
-            if !this.shutting_down.load(Relaxed) && this.capture_begin() {
-                this.run_enrolment();
-                this.capture_end();
-            }
+        if !this.shutting_down.load(Relaxed) && this.capture_begin() {
+            this.run_enrolment();
+            this.capture_end();
         }
         this.capture_worker_stopped(epoch);
     }
@@ -2306,13 +2591,12 @@ impl WorkItem<VERIFY_WORK_ID> for SepData {
     type Pointer = Arc<SepData>;
 
     fn run(this: Arc<SepData>) {
+        // Serialize saves before joining the suspend drain.
+        let _writer = this.catacomb_writer.lock();
         let epoch = this.capture_epoch.load(Relaxed);
-        {
-            let _writer = this.catacomb_writer.lock();
-            if !this.shutting_down.load(Relaxed) && this.capture_begin() {
-                this.run_verify();
-                this.capture_end();
-            }
+        if !this.shutting_down.load(Relaxed) && this.capture_begin() {
+            this.run_verify();
+            this.capture_end();
         }
         this.capture_worker_stopped(epoch);
     }
@@ -2330,14 +2614,15 @@ const OF_TABLE: kernel::device_id::IdArray<of::DeviceId, (), 1> =
 
 impl platform::Driver for SepDriver {
     type IdInfo = ();
+    type Data<'bound> = SepDriver;
 
     const OF_ID_TABLE: Option<of::IdTable<()>> = Some(&OF_TABLE);
 
-    fn probe(
-        pdev: &platform::Device<device::Core>,
-        _info: Option<&()>,
-    ) -> impl PinInit<Self, Error> {
-        let dev: &device::Device<device::Core> = pdev.as_ref();
+    fn probe<'bound>(
+        pdev: &'bound platform::Device<device::Core<'_>>,
+        _info: Option<&'bound Self::IdInfo>,
+    ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
+        let dev: &device::Device<device::Core<'_>> = pdev.as_ref();
         if *module_parameters::provision_keybag.value() != 0
             && *module_parameters::xart_writes.value() == 0
         {
@@ -2370,7 +2655,8 @@ impl platform::Driver for SepDriver {
 
         // As soon as the fixed facts are known, so a tool can watch the attach
         // from "pending" on. Diagnostics are not worth failing the probe for.
-        if let Err(e) = diag::register(dev, data.profile, data.xart_writable()) {
+        let guard = data.with_store(|store| store.guard_state()).flatten();
+        if let Err(e) = diag::register(dev, data.profile, data.xart_writable(), guard) {
             dev_warn!(dev, "diag: could not add the sysfs attributes ({:?})\n", e);
         }
 
@@ -2424,7 +2710,7 @@ impl kernel::InPlaceModule for SepModule {
                 match profile::detect() {
                     Ok(p) => {
                         if matches!(p.bootstrap, profile::Bootstrap::WarmRegister) {
-                            dt::enable_sep_and_dart()?;
+                            dt::enable_sep_and_dart(p.dart_window)?;
                         }
                     }
                     // Without this the module loads, probes nothing and logs
@@ -2452,7 +2738,7 @@ module! {
     params: {
         xart_writes: u8 {
             default: 1,
-            description: "Shared xART writes, when APFS proves a single unsnapshotted .gl extent; Touch ID enrol and verify need it",
+            description: "Allow shared xART writes only if APFS proves a single unsnapshotted .gl extent; set to 0 for read-only operation",
         },
         xart_start_sector: u64 {
             default: 0,
@@ -2461,6 +2747,10 @@ module! {
         provision_keybag: u8 {
             default: 1,
             description: "Create the Linux identity keybag when none exists; set to 0 to disable first-boot provisioning; requires xart_writes=1",
+        },
+        xart_guard: i8 {
+            default: -1,
+            description: "-1: the platform's level, 1 on M1, M2 and M3 Macs and 0 on the MacBook Neo; 0: off; 1: refuse the enclave's writes and deletes of xART session records this Linux install did not create; 2: also refuse writes to the shared root records",
         },
         os_uuid_hi: u64 {
             default: 0,
@@ -2473,6 +2763,10 @@ module! {
         sensor_trace: u8 {
             default: 0,
             description: "Trace Touch ID sensor registration steps and timing, never sensor data",
+        },
+        sensor_test_fault: u8 {
+            default: 0,
+            description: "Test only: stop the first nonce-session sensor authentication of the boot after REGISTER_SERIAL, leaving the enclave an unfinished registration to recover from",
         },
         xarm_trace: u8 {
             default: 0,

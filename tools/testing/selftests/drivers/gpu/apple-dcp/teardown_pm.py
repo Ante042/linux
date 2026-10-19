@@ -54,11 +54,32 @@ static void observed_controller_write(void) {
  unit=unit.replace(old,new)
  old=block(unit,'static void device_unlock(')
  new=r'''static void device_unlock(struct device *d) {
- if(d==&host_device){assert(host_locked);host_locked=false;pthread_mutex_unlock(&host_mutex);}
- else {assert(d==&controller.dev&&controller_locked);if(!remover)atomic_store(&handoff_active,false);controller_locked=false;pthread_mutex_unlock(&controller_mutex);}
+ if(d==&host_device){
+  assert(host_locked);
+  if(!remover&&remove_target){
+   /* Direct xHCI removal is fenced by this lock, not the controller's. */
+   assert(!root_locked&&!link_locked&&!pm_phy->lock&&!pm_refs&&!link_pm_refs);
+   atomic_store(&handoff_active,false);
+  }
+  host_locked=false;pthread_mutex_unlock(&host_mutex);
+  if(!remover&&remove_target){
+   /* Force teardown into the gap before the controller lock is released. */
+   pthread_mutex_lock(&schedule_mutex);
+   while(!removal_started)pthread_cond_wait(&schedule_cond,&schedule_mutex);
+   pthread_mutex_unlock(&schedule_mutex);
+  }
+ }else{
+  assert(d==&controller.dev&&controller_locked);
+  if(!remover&&!remove_target){
+   assert(!root_locked&&!link_locked&&!pm_phy->lock&&!pm_refs&&!link_pm_refs);
+   atomic_store(&handoff_active,false);
+  }
+  controller_locked=false;pthread_mutex_unlock(&controller_mutex);
+ }
 }'''
  unit=unit.replace(old,new)
- # The scheduler injection is a child-lookup interleaving, as in the review.
+ # The scheduler injection is a child-lookup interleaving, as in the review, or
+ # the root resume for a source that takes the SuperSpeed port down instead.
  unit=unit.replace('if(detach_at_lookup)usb_set_device_state(u,USB_STATE_NOTATTACHED);','if(inject_remove){inject_remove=false;start_remove();}\n if(detach_at_lookup)usb_set_device_state(u,USB_STATE_NOTATTACHED);',1)
  unit=unit.replace('static void pm_runtime_put_noidle(struct device *d) {','static void pm_runtime_put_noidle(struct device *d) {\n if(remover&&d==&host_device)return;',1)
  # Old source lacks platform-lock helpers. Keep fixture-only API definitions

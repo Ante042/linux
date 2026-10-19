@@ -3,7 +3,6 @@
 
 #include <linux/atomic.h>
 #include <linux/device.h>
-#include <linux/of.h>
 #include <linux/delay.h>
 #include <linux/slab.h>
 #include <linux/unaligned.h>
@@ -430,7 +429,7 @@ int ibootep_query_modes(struct apple_dcp *dcp)
 	if (atomic_cmpxchg(&query->busy, 0, 1))
 		return -EBUSY;
 	/* AFK replies run on ep->wq; waiting on that same queue deadlocks. */
-	queue_work(system_unbound_wq, &query->work);
+	queue_work(system_dfl_wq, &query->work);
 	return 0;
 }
 
@@ -747,29 +746,12 @@ int ibootep_init(struct apple_dcp *dcp)
 	const struct apple_epic_service_ops *ops = ibootep_ops;
 	int ret;
 
-	/* H17P firmware (T8140, T8142): aurora-wip's service ops and errors. */
-	if (dcp->fw_compat == DCP_FIRMWARE_H17P) {
-		if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL)
-			ops = external_ibootep_ops;
-		dcp->ibootep = afk_init(dcp, DISP0_ENDPOINT, ops);
-		if (IS_ERR(dcp->ibootep))
-			return PTR_ERR(dcp->ibootep);
-		return afk_start(dcp->ibootep);
-	}
-
-	if (!of_machine_is_compatible("apple,t6030") &&
-	    !of_machine_is_compatible("apple,t6031") &&
-	    !of_machine_is_compatible("apple,t6032") &&
-	    !of_machine_is_compatible("apple,t6034") &&
-	    !of_machine_is_compatible("apple,t8122")) {
-		dcp->ibootep = afk_init(dcp, DISP0_ENDPOINT, ibootep_ops);
-		afk_start(dcp->ibootep);
-		return 0;
-	}
-
-	if (dcp->ibootep)
+	/* The T6030 external start path may race a second start. */
+	if (dcp->ibootep && dcp->fw_compat == DCP_FIRMWARE_V_14_7)
 		return -EBUSY;
-	dcp->ibootep = afk_init(dcp, DISP0_ENDPOINT, ibootep_ops);
+	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL)
+		ops = external_ibootep_ops;
+	dcp->ibootep = afk_init(dcp, DISP0_ENDPOINT, ops);
 	if (IS_ERR(dcp->ibootep)) {
 		ret = PTR_ERR(dcp->ibootep);
 		dcp->ibootep = NULL;

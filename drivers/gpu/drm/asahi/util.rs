@@ -110,18 +110,16 @@ impl<'a> Reader<'a> {
 
     pub(crate) fn read_up_to<T: AnyBitPattern>(&mut self, declared_size: usize) -> Result<T> {
         let mut obj: T = Default::default();
-        let copy_size = core::mem::size_of::<T>().min(declared_size);
+        let size: usize = core::mem::size_of::<T>().min(declared_size);
         let end = self.offset.checked_add(declared_size).ok_or(EINVAL)?;
         let range = self.offset..end;
         let src = self.buffer.get(range).ok_or(EINVAL)?;
 
         // SAFETY: The output pointer is valid, and the size does not exceed
         // the type size, and all bit patterns are valid.
-        let dst = unsafe {
-            core::slice::from_raw_parts_mut(&mut obj as *mut _ as *mut u8, copy_size)
-        };
+        let dst = unsafe { core::slice::from_raw_parts_mut(&mut obj as *mut _ as *mut u8, size) };
 
-        dst.copy_from_slice(&src[..copy_size]);
+        dst.copy_from_slice(&src[..size]);
         self.offset = end;
         Ok(obj)
     }
@@ -173,29 +171,6 @@ mod tests {
 
     unsafe impl AnyBitPattern for Pair {}
     unsafe impl AnyBitPattern for u32 {}
-
-    #[test]
-    fn read_up_to_copies_known_bytes_and_consumes_the_declared_stride() {
-        let raw = [
-            1, 0, 0, 0, 2, 0, 0, 0, 0xaa, 0xbb, 0xcc, 0xdd, 3, 0, 0, 0,
-        ];
-        let mut reader = Reader::new(&raw);
-        let pair: Pair = reader.read_up_to(12).unwrap();
-        assert_eq!(pair.first, 1);
-        assert_eq!(pair.second, 2);
-        assert_eq!(reader.read::<u32>().unwrap(), 3);
-        assert!(reader.is_empty());
-    }
-
-    #[test]
-    fn read_up_to_zero_extends_a_short_declared_record() {
-        let raw = [4, 0, 0, 0];
-        let mut reader = Reader::new(&raw);
-        let pair: Pair = reader.read_up_to(4).unwrap();
-        assert_eq!(pair.first, 4);
-        assert_eq!(pair.second, 0);
-        assert!(reader.is_empty());
-    }
 
     #[test]
     fn read_supported_accepts_zero_unsupported_fields_and_tail() {

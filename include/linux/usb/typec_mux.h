@@ -97,25 +97,37 @@ struct typec_mux_desc {
 	typec_mux_set_fn_t set;
 	const char *name;
 	void *drvdata;
-	/*
-	 * Optional transaction phases, run by typec_mux_set() only for the
-	 * providers that register them: every provider's prepare runs before
-	 * any provider's set, and finish and then commit after all of them.
-	 * A failure in any phase calls abort, in reverse order, on the
-	 * providers whose prepare stage was reached.
-	 */
 	/* Quiesce consumers before any provider changes the shared route. */
 	typec_mux_set_fn_t prepare;
 	/* Fallible finalization retains ownership; commit cannot fail. */
 	typec_mux_set_fn_t finish;
 	typec_mux_notify_fn_t commit;
 	typec_mux_notify_fn_t abort;
+	/* SAFE needs the USB role consumer to stop the shared PHY first. */
+	bool safe_after_role;
+	/*
+	 * -ETIMEDOUT from @set only means that the hardware held the change up
+	 * for now: the same state can be applied again later, and is worth
+	 * applying again for longer than after other failures. Consumers learn
+	 * it from typec_mux_timeout_transient().
+	 */
+	bool transient_timeouts;
 };
 
 #if IS_ENABLED(CONFIG_TYPEC)
 
 struct typec_mux *fwnode_typec_mux_get(struct fwnode_handle *fwnode);
 void typec_mux_put(struct typec_mux *mux);
+/* begin/end must run in the same task; failure retains provider recovery state. */
+/* Same-task begin/end; retain the handle and state pointees until end/abort. */
+int typec_mux_begin(struct typec_mux *mux, struct typec_mux_state *state);
+/* Apply the providers while retaining the transaction and ownership. */
+int typec_mux_apply(struct typec_mux *mux);
+bool typec_mux_safe_after_role(struct typec_mux *mux);
+bool typec_mux_timeout_transient(struct typec_mux *mux);
+int typec_mux_end(struct typec_mux *mux);
+void typec_mux_abort(struct typec_mux *mux);
+int typec_mux_prepare(struct typec_mux *mux, struct typec_mux_state *state);
 int typec_mux_set(struct typec_mux *mux, struct typec_mux_state *state);
 
 struct typec_mux_dev *
@@ -133,6 +145,31 @@ static inline struct typec_mux *fwnode_typec_mux_get(struct fwnode_handle *fwnod
 }
 
 static inline void typec_mux_put(struct typec_mux *mux) {}
+
+static inline int typec_mux_begin(struct typec_mux *mux, struct typec_mux_state *state)
+{
+	return 0;
+}
+
+static inline int typec_mux_apply(struct typec_mux *mux) { return 0; }
+
+static inline bool typec_mux_safe_after_role(struct typec_mux *mux)
+{
+	return false;
+}
+
+static inline bool typec_mux_timeout_transient(struct typec_mux *mux)
+{
+	return false;
+}
+
+static inline int typec_mux_end(struct typec_mux *mux) { return 0; }
+static inline void typec_mux_abort(struct typec_mux *mux) {}
+
+static inline int typec_mux_prepare(struct typec_mux *mux, struct typec_mux_state *state)
+{
+	return 0;
+}
 
 static inline int typec_mux_set(struct typec_mux *mux, struct typec_mux_state *state)
 {

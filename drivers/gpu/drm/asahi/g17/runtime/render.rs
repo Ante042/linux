@@ -648,7 +648,7 @@ impl Registry {
             || !self.render.retired.is_empty()
             || !self.teardown.is_empty()
     }
-    /// Applies the tiler-heap shrink policy (`buffer::Manager::
+    /// Applies the native tiler-heap shrink policy (`buffer::Manager::
     /// shrink_target`) to every grown heap at `now` and rebuilds the heaps of
     /// idle pairs that are due, removing whole growth extensions. The removed
     /// aliases and backing go to the worker's deferred batch, which frees them

@@ -13,6 +13,7 @@
 #include <keys/trusted_dcp.h>
 #include <keys/trusted_tpm.h>
 #include <keys/trusted_pkwm.h>
+#include <kunit/visibility.h>
 #include <linux/capability.h>
 #include <linux/err.h>
 #include <linux/hex.h>
@@ -30,6 +31,12 @@
 static char *trusted_rng = "default";
 module_param_named(rng, trusted_rng, charp, 0);
 MODULE_PARM_DESC(rng, "Select trusted key RNG");
+
+#ifdef CONFIG_TRUSTED_KEYS_DEBUG
+bool trusted_debug;
+module_param_named(debug, trusted_debug, bool, 0);
+MODULE_PARM_DESC(debug, "Enable trusted keys debug traces (default: 0)");
+#endif
 
 static char *trusted_key_source;
 module_param_named(source, trusted_key_source, charp, 0);
@@ -59,11 +66,19 @@ DEFINE_STATIC_CALL_NULL(trusted_key_unseal,
 DEFINE_STATIC_CALL_NULL(trusted_key_get_random,
 			*trusted_key_sources[0].ops->get_random);
 static void (*trusted_key_exit)(void);
-static unsigned char migratable;
+static unsigned char migratable __ro_after_init;
 
 static DEFINE_MUTEX(trusted_key_source_lock);
 static bool trusted_key_source_active;
 static struct trusted_key_source *trusted_key_source_registered;
+/*
+ * trusted_key_exit and migratable belong to the built-in source and only
+ * init_trusted() sets them; migratable is read-only after init. A source
+ * registered later keeps its migration policy here, -1 while there is none.
+ */
+static int trusted_key_source_migratable = -1;
+/* trusted_key_core_init() has run once, from init_trusted(). */
+static bool trusted_key_core_done;
 
 /* Defined below; registration needs it before its definition. */
 static int kernel_get_random(unsigned char *key, size_t key_len);
@@ -136,8 +151,7 @@ int register_trusted_key_source(struct trusted_key_source *src)
 	static_call_update(trusted_key_seal, src->ops->seal);
 	static_call_update(trusted_key_unseal, src->ops->unseal);
 	static_call_update(trusted_key_get_random, get_random);
-	trusted_key_exit = src->ops->exit;
-	migratable = src->ops->migratable;
+	WRITE_ONCE(trusted_key_source_migratable, src->ops->migratable);
 	trusted_key_source_active = true;
 	trusted_key_source_registered = src;
 
@@ -168,10 +182,9 @@ void unregister_trusted_key_source(struct trusted_key_source *src)
 	static_call_update(trusted_key_unseal, trusted_key_absent_unseal);
 	static_call_update(trusted_key_get_random, trusted_key_absent_get_random);
 
-	if (trusted_key_exit)
-		trusted_key_exit();
-	trusted_key_exit = NULL;
-	migratable = 0;
+	if (src->ops->exit)
+		src->ops->exit();
+	WRITE_ONCE(trusted_key_source_migratable, -1);
 	trusted_key_source_active = false;
 	trusted_key_source_registered = NULL;
 
@@ -260,6 +273,14 @@ static int datablob_parse(char **datablob, struct trusted_key_payload *p)
 	return ret;
 }
 
+/* The migration policy of the source that seals new keys. */
+static unsigned char trusted_key_migratable(void)
+{
+	int m = READ_ONCE(trusted_key_source_migratable);
+
+	return m < 0 ? migratable : m;
+}
+
 static struct trusted_key_payload *trusted_payload_alloc(struct key *key)
 {
 	struct trusted_key_payload *p = NULL;
@@ -272,7 +293,7 @@ static struct trusted_key_payload *trusted_payload_alloc(struct key *key)
 	if (!p)
 		goto err;
 
-	p->migratable = migratable;
+	p->migratable = trusted_key_migratable();
 err:
 	return p;
 }
@@ -473,18 +494,49 @@ static int kernel_get_random(unsigned char *key, size_t key_len)
 	return get_random_bytes_wait(key, key_len) ?: key_len;
 }
 
-static int __init init_trusted(void)
+/**
+ * trusted_key_core_init - give the source slot to a built-in source
+ * @sources: the built-in sources, in order of preference
+ * @n: the number of @sources
+ *
+ * A source module that is built in, such as apple_sep, can register from
+ * its probe at device_initcall, before init_trusted() runs at
+ * late_initcall. Such a source keeps the slot: the built-in sources are
+ * not tried, and the dispatch stays with it. Otherwise the first built-in
+ * source to initialise takes the slot, and with none the dispatch goes to
+ * the absent stubs, so that a source module can register later.
+ *
+ * init_trusted() calls this once, with trusted_key_sources. The KUnit tests
+ * call it later, with synthetic sources of their own. Only the first call
+ * gives the slot to a built-in source: one that takes it is never withdrawn,
+ * as unregister_trusted_key_source() withdraws only a registered source,
+ * and a test's source is gone once the test ends.
+ *
+ * Return: 0, the error of trusted.rng or of a built-in source's init(), or
+ * -EBUSY for a built-in source that initialises after the first call.
+ */
+VISIBLE_IF_KUNIT int
+trusted_key_core_init(const struct trusted_key_source *sources, size_t n)
 {
 	int (*get_random)(unsigned char *key, size_t key_len);
 	/* -ENODEV when the built-in array is empty or nothing matches, so a
 	 * later module source can still register instead of hitting -EBUSY.
 	 */
-	int i, ret = -ENODEV;
+	int ret = -ENODEV;
+	size_t i;
 
-	for (i = 0; i < ARRAY_SIZE(trusted_key_sources); i++) {
+	mutex_lock(&trusted_key_source_lock);
+
+	/* A source module that is built in may have registered first. */
+	if (trusted_key_source_active) {
+		ret = 0;
+		goto out;
+	}
+
+	for (i = 0; i < n; i++) {
 		if (trusted_key_source &&
-		    strncmp(trusted_key_source, trusted_key_sources[i].name,
-			    strlen(trusted_key_sources[i].name)))
+		    strncmp(trusted_key_source, sources[i].name,
+			    strlen(sources[i].name)))
 			continue;
 
 		/*
@@ -492,31 +544,38 @@ static int __init init_trusted(void)
 		 * well as trusted.rng=$trusted.source if the trust source
 		 * defines its own get_random callback.
 		 */
-		get_random = trusted_key_sources[i].ops->get_random;
+		get_random = sources[i].ops->get_random;
 		if (trusted_rng && strcmp(trusted_rng, "default")) {
 			if (!strcmp(trusted_rng, "kernel")) {
 				get_random = kernel_get_random;
-			} else if (strcmp(trusted_rng, trusted_key_sources[i].name) ||
+			} else if (strcmp(trusted_rng, sources[i].name) ||
 				   !get_random) {
 				pr_warn("Unsupported RNG. Supported: kernel");
 				if (get_random)
-					pr_cont(", %s", trusted_key_sources[i].name);
+					pr_cont(", %s", sources[i].name);
 				pr_cont(", default\n");
-				return -EINVAL;
+				ret = -EINVAL;
+				goto out;
 			}
 		}
 
 		if (!get_random)
 			get_random = kernel_get_random;
 
-		ret = trusted_key_sources[i].ops->init();
+		ret = sources[i].ops->init();
+		if (!ret && trusted_key_core_done) {
+			if (sources[i].ops->exit)
+				sources[i].ops->exit();
+			ret = -EBUSY;
+			goto out;
+		}
 		if (!ret) {
-			static_call_update(trusted_key_seal, trusted_key_sources[i].ops->seal);
-			static_call_update(trusted_key_unseal, trusted_key_sources[i].ops->unseal);
+			static_call_update(trusted_key_seal, sources[i].ops->seal);
+			static_call_update(trusted_key_unseal, sources[i].ops->unseal);
 			static_call_update(trusted_key_get_random, get_random);
 
-			trusted_key_exit = trusted_key_sources[i].ops->exit;
-			migratable = trusted_key_sources[i].ops->migratable;
+			trusted_key_exit = sources[i].ops->exit;
+			migratable = sources[i].ops->migratable;
 		}
 
 		if (!ret || ret != -ENODEV)
@@ -537,13 +596,23 @@ static int __init init_trusted(void)
 		static_call_update(trusted_key_unseal, trusted_key_absent_unseal);
 		static_call_update(trusted_key_get_random,
 				   trusted_key_absent_get_random);
-		return 0;
+		ret = 0;
+		goto out;
 	}
 
 	if (!ret)
 		trusted_key_source_active = true;
-
+out:
+	trusted_key_core_done = true;
+	mutex_unlock(&trusted_key_source_lock);
 	return ret;
+}
+EXPORT_SYMBOL_IF_KUNIT(trusted_key_core_init);
+
+static int __init init_trusted(void)
+{
+	return trusted_key_core_init(trusted_key_sources,
+				     ARRAY_SIZE(trusted_key_sources));
 }
 
 static void __exit cleanup_trusted(void)

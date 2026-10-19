@@ -208,8 +208,8 @@ version 1, header length, data length and interface-byte offset. See
 offset of zero means no patching. The payload must
 be prepared from firmware and any required calibration belonging to the
 user's own machine. A filename is a lookup contract, not a firmware payload.
-The file is supplied from outside the kernel tree, and any tool that
-produces a valid container can provide it without changing the
+No Apple firmware, captured command buffers or calibration bytes are bundled.
+Future IPSW/macOS extraction tools can provide this file without changing the
 driver. A missing or invalid file fails trackpad startup; it does not prevent
 the keyboard or temperature monitor from registering.
 

@@ -36,7 +36,12 @@ struct dcp_fabric_drain_ops {
 	void (*lock)(void *ctx);
 };
 
-/* Shared production ordering; drain waits with neither fabric nor tb held. */
+/*
+ * The source's production ordering; drain waits with neither fabric nor tb
+ * held. This tree has no tb_retiring to keep the pipeline reserved while the
+ * fabric lock is dropped, so its fabric retires under the lock instead (see
+ * dcp_tb_binding_retire()); the KUnit cases keep the ordering contract.
+ */
 static inline void dcp_fabric_drain_binding(const struct dcp_fabric_drain_ops *ops,
 					    void *ctx)
 {

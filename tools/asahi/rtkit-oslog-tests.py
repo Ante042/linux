@@ -31,7 +31,7 @@ PREFIX = r'''
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-typedef uint8_t u8; typedef uint32_t u32; typedef uint64_t u64;
+typedef uint8_t u8; typedef uint64_t u64; typedef uint32_t u32;
 #define GENMASK_ULL(h,l) ((~0ULL << (l)) & (~0ULL >> (63-(h))))
 #define FIELD_GET(m,v) (((v) & (m)) >> __builtin_ctzll(m))
 #define ARRAY_SIZE(x) (sizeof(x)/sizeof((x)[0]))
@@ -45,7 +45,9 @@ struct apple_rtkit {
  void *dev, *wq;
  struct mailbox *mbox;
  struct apple_rtkit_shmem oslog_buffer, syslog_buffer, ioreport_buffer, crashlog_buffer;
- bool oslog_inherited, syslog_inherited, crashlog_inherited, crashed, shutting_down;
+ struct apple_rtkit_shmem kdebug_buffer0, kdebug_buffer1;
+ int sync_ack_fifo;
+ bool sync_syslog_ack, oslog_inherited, syslog_inherited, crashlog_inherited, crashed, shutting_down;
  unsigned iop_power_state, ap_power_state;
  unsigned long endpoints[4];
  char *syslog_msg_buffer;
@@ -55,6 +57,11 @@ struct apple_rtkit {
 static unsigned sent, warnings, errors, requests, detachments, flushes, freed, checks;
 static int send_error, setup_error, start_error;
 static u64 sent_message;
+static bool neo, m5;
+static bool of_machine_is_compatible(const char *s)
+{ return (!strcmp(s, "apple,t8140") && neo) || (!strcmp(s, "apple,t8142") && m5); }
+#define kfifo_reset(f) (*(f)=0)
+#define dev_dbg(...) ((void)0)
 #define dev_warn(...) (++warnings)
 #define dev_err(...) (++errors)
 static void set_bit(unsigned n, unsigned long *b) { b[n/64] |= 1UL << (n%64); }
@@ -96,7 +103,7 @@ int main(void)
   for (unsigned i=0;i<ARRAY_SIZE(counters);i++) event(&r,type|counters[i],owner!=0);
   for (unsigned bit=32;bit<56;bit++) event(&r,type|(1ULL<<bit)|23,false);
   for (unsigned kind=0;kind<256;kind++) {
-   if (kind==APPLE_RTKIT_OSLOG_BUFFER_REQUEST || kind==APPLE_RTKIT_OSLOG_LOG) continue;
+   if (kind==APPLE_RTKIT_OSLOG_BUFFER_REQUEST || kind==APPLE_RTKIT_OSLOG_LOG || (kind>=3 && kind<=5)) continue;
    event(&r,(u64)kind<<56,false);
   }
  }
@@ -118,10 +125,15 @@ int main(void)
   detachments=flushes=freed=0;start_error=fail?-5:0;
   assert(apple_rtkit_reinit(&r)==start_error);
   assert(!r.oslog_inherited && !r.syslog_inherited && !r.crashlog_inherited);
-  assert(!r.oslog_buffer.size && !r.crashed && !r.syslog_msg_size && freed==4);
+  assert(!r.oslog_buffer.size && !r.crashed && !r.syslog_msg_size && freed==6);
   assert(r.endpoints[0]==(1UL<<APPLE_RTKIT_EP_MGMT));
   assert(detachments==(fail?2U:1U) && flushes==(fail?2U:1U));
   event(&r,type|1,false);++checks;
+ }
+ for (unsigned policy=0;policy<3;policy++) {
+  neo=policy==0; m5=policy==1; r.sync_syslog_ack=policy==2;
+  reset(); apple_rtkit_oslog_rx(&r,type|23);
+  assert(sent==0 && warnings==0 && errors==0); ++checks;
  }
  printf("%u OSLog counter/channel/session controls passed\n",checks);
  return 0;

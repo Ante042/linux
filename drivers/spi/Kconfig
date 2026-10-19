@@ -136,12 +136,12 @@ config SPI_APPLE_QSPI
 	help
 	  This enables support for Apple's command-FIFO QSPIMC controller.
 	  Unlike the ordinary Apple SPIMC block, QSPIMC accepts packed SPI
-	  memory descriptors and is used for the boot NOR (and its NVRAM)
-	  on T8122 (J613 25G83), T8132 (M4) and T8140 systems. On T8122 and
-	  T8132 the driver defaults read-only, and only the pinned J613 NVRAM
-	  layout can enable bounded writes through an explicit root runtime
-	  opt-in. On T8140 only the nvram partition accepts programs and
-	  erases; the rest of the boot NOR is read-only.
+	  memory descriptors and is used for the boot NOR on T8140 systems.
+
+	  T8122/T8132 controllers default to read-only access. Only the pinned
+	  J613 NVRAM layout admits bounded writes after a runtime opt-in.
+	  On T8140 only the nvram partition accepts programs and erases; the
+	  rest of the boot NOR is read-only.
 
 config SPI_APPLE_QSPI_KUNIT_TEST
 	tristate "KUnit tests for the Apple QSPIMC boot NOR write window" if !KUNIT_ALL_TESTS
@@ -1108,6 +1108,15 @@ config SPI_SG2044_NOR
 	  which supports Dual/Quad read and write operations while
 	  also supporting 3Byte address devices and 4Byte address
 	  devices.
+
+config SPI_SPACEMIT_K1
+	tristate "K1 SPI Controller"
+	depends on ARCH_SPACEMIT || COMPILE_TEST
+	depends on OF
+	imply MMP_PDMA if ARCH_SPACEMIT
+	default m if ARCH_SPACEMIT
+	help
+	  Enable support for the SpacemiT K1 SPI controller.
 
 config SPI_SPRD
 	tristate "Spreadtrum SPI controller"

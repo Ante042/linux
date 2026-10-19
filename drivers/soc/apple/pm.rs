@@ -4,8 +4,10 @@
 //! talking to the sensor over SPI, so one left running into a suspend is still
 //! active while devices go down. A J313 that suspended with the lock screen's
 //! capture in flight did not wake. Before the system suspends, end any capture
-//! in progress and hold new ones until it has resumed. The notifier itself
-//! is in `pm_shim.c`; the capture handling is on [`SepData`].
+//! in progress and hold new ones until it has resumed. The hwrng fill thread
+//! is not frozen either, so entropy requests are held over the same window.
+//! The notifier itself is in `pm_shim.c`; the capture and entropy handling is
+//! on [`SepData`].
 
 use core::sync::atomic::{AtomicPtr, Ordering};
 
@@ -39,6 +41,43 @@ pub(crate) fn keep_domains(dev: &kernel::device::Device) -> Result<()> {
     Ok(())
 }
 
+/// The holds a sleep event takes and releases, on [`SepData`].
+trait SleepHolds {
+    /// Holds entropy requests, once any in flight is answered.
+    fn hold_entropy(&self);
+    /// Ends any Touch ID capture and holds new ones.
+    fn hold_captures(&self);
+    fn release_captures(&self);
+    fn release_entropy(&self);
+}
+
+impl SleepHolds for SepData {
+    fn hold_entropy(&self) {
+        self.rng_sleep_prepare();
+    }
+    fn hold_captures(&self) {
+        self.sleep_prepare()
+    }
+    fn release_captures(&self) {
+        self.sleep_finished();
+    }
+    fn release_entropy(&self) {
+        self.rng_sleep_finished();
+    }
+}
+
+/// `entering`: the system is about to sleep; otherwise it has resumed, or
+/// the suspend was aborted.
+fn sleep_event(sep: &impl SleepHolds, entering: bool) {
+    if entering {
+        sep.hold_entropy();
+        sep.hold_captures();
+    } else {
+        sep.release_captures();
+        sep.release_entropy();
+    }
+}
+
 /// # Safety
 /// Called by `pm_shim.c` from the PM notifier chain, in process context.
 unsafe extern "C" fn pm_event(entering: bool) {
@@ -50,11 +89,7 @@ unsafe extern "C" fn pm_event(entering: bool) {
     // `unregister` only after `sep_pm_unregister` has waited out any running
     // notifier call, so it is live for this borrow.
     let sep = unsafe { <Arc<SepData> as ForeignOwnable>::borrow(ptr) };
-    if entering {
-        sep.sleep_prepare();
-    } else {
-        sep.sleep_finished();
-    }
+    sleep_event(&*sep, entering);
 }
 
 pub(crate) fn register(sep: Arc<SepData>) -> Result<()> {
@@ -102,5 +137,85 @@ pub(crate) fn unregister() {
         // SAFETY: `ptr` came from `into_foreign` in `register`, and the
         // notifier can no longer call `pm_event`.
         drop(unsafe { <Arc<SepData> as ForeignOwnable>::from_foreign(ptr) });
+    }
+}
+
+#[kernel::macros::kunit_tests(apple_sep_pm)]
+mod tests {
+    use super::*;
+    use core::cell::{Cell, RefCell};
+
+    const HOLD_ENTROPY: u8 = 1;
+    const HOLD_CAPTURES: u8 = 2;
+    const RELEASE_CAPTURES: u8 = 3;
+    const RELEASE_ENTROPY: u8 = 4;
+
+    struct Calls {
+        made: RefCell<[u8; 8]>,
+        count: Cell<usize>,
+    }
+
+    impl Calls {
+        fn new() -> Self {
+            Calls {
+                made: RefCell::new([0; 8]),
+                count: Cell::new(0),
+            }
+        }
+        fn call(&self, which: u8) {
+            let n = self.count.get();
+            self.made.borrow_mut()[n] = which;
+            self.count.set(n + 1);
+        }
+        fn made(&self) -> [u8; 8] {
+            *self.made.borrow()
+        }
+    }
+
+    impl SleepHolds for Calls {
+        fn hold_entropy(&self) {
+            self.call(HOLD_ENTROPY);
+        }
+        fn hold_captures(&self) {
+            self.call(HOLD_CAPTURES);
+        }
+        fn release_captures(&self) {
+            self.call(RELEASE_CAPTURES);
+        }
+        fn release_entropy(&self) {
+            self.call(RELEASE_ENTROPY);
+        }
+    }
+
+    #[test]
+    fn going_to_sleep_holds_entropy_then_captures() {
+        let calls = Calls::new();
+        sleep_event(&calls, true);
+        assert_eq!(
+            calls.made(),
+            [HOLD_ENTROPY, HOLD_CAPTURES, 0, 0, 0, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn sleep_holds_stay_until_the_post_event() {
+        let calls = Calls::new();
+        sleep_event(&calls, true);
+        assert_eq!(calls.count.get(), 2);
+        sleep_event(&calls, false);
+        assert_eq!(
+            calls.made(),
+            [HOLD_ENTROPY, HOLD_CAPTURES, RELEASE_CAPTURES, RELEASE_ENTROPY, 0, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn waking_releases_captures_then_entropy() {
+        let calls = Calls::new();
+        sleep_event(&calls, false);
+        assert_eq!(
+            calls.made(),
+            [RELEASE_CAPTURES, RELEASE_ENTROPY, 0, 0, 0, 0, 0, 0]
+        );
     }
 }

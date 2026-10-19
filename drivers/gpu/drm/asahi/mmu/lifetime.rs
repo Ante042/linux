@@ -134,9 +134,6 @@ impl Vm {
         mappings: KVec<KernelMapping>,
         reserved: KVec<Range<u64>>,
     ) -> Result {
-        if !self.published() {
-            return self.m3_install_driver_mappings(mappings, reserved);
-        }
         let lifetime = self.lifetime.as_ref().ok_or(EINVAL)?;
         let mut driver = lifetime.driver.lock();
         if driver.is_some() {
@@ -338,9 +335,6 @@ impl Vm {
 
     /// Tests mappings and reservations which userspace must never replace.
     pub(crate) fn driver_range_overlaps(&self, range: Range<u64>) -> bool {
-        if !self.published() {
-            return self.m3_driver_range_overlaps(range);
-        }
         let Some(lifetime) = self.lifetime.as_ref() else {
             return false;
         };
@@ -567,9 +561,6 @@ impl Vm {
 
     /// Closes admission permanently and preserves mappings referenced by accepted jobs.
     pub(crate) fn unmap_user_ranges(&self, user: Range<u64>, kernel: Range<u64>) -> Result {
-        if !self.published() {
-            return self.m3_unmap_user_ranges(user, kernel);
-        }
         if let Some(lifetime) = self.lifetime.as_ref() {
             let mut state = lifetime.state.lock();
             state.blocked = true;
@@ -590,7 +581,7 @@ impl Vm {
         // User mappings alone have GPUVA nodes. Kernel and driver aliases use
         // mm::Node and are untouched; GPUVM's embedded kernel cutout is skipped.
         // Closed admission and zero accepted jobs make whole-node teardown safe.
-        let mut inner = self.inner.lock_inner();
+        let mut inner = self.gpuvm.lock_inner();
         let result = inner.unmap_all(VmInner::unmap_gpuva);
         if result.is_ok() {
             self.untrack_shared_range(user.start, user.end - user.start);
