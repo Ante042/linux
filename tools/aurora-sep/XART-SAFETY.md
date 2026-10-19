@@ -97,12 +97,39 @@ the kernel log names the refused kind. What to do depends on the case:
   until it has been checked there.
 - A warm-attach Mac set up under the guard whose verify is refused: report
   the log line. `xart_guard=0` restores use at the cost of the protection.
-- A list that could not be read or is full (see "The list of Linux's
-  records"): every record that existed at boot is protected and nothing can
-  be adopted, so new records cannot be written either.
+- A list that could not be read: every record that existed at boot is
+  protected and nothing can be adopted, so new records cannot be written
+  either.
+- A full list (see "The list of Linux's records"): new records can't be
+  adopted, so they cannot be written; existing ownership still applies, and
+  the records already on the list stay writable.
 
 Turning the guard back on later does not list the records written while it
 was off.
+
+### What `aurora-sep-ready` reports
+
+"Touch ID: restored N" says the fingerprints came back; it does not say a
+match can save its state. The driver's `diag` attributes (see
+`Documentation/ABI/testing/sysfs-driver-apple-sep`) report the guard's
+effective level (`xart_guard`), whether its list loaded
+(`xart_guard_list`), how many writes it refused (`xart_guard_refusals`),
+and from those `matching`:
+
+| `matching` | When | `aurora-sep-ready` |
+| --- | --- | --- |
+| `usable` | xART writes enabled, no guard | ready |
+| `unverified` | guard on a warm-attach Mac, list loaded, nothing refused yet | restored, matching UNVERIFIED (not called ready; exit 0) |
+| `blocked` | xART writes disabled, a refusal seen, no list, or a guard on a cold-boot Mac | NOT ready (exit 1), with the reason and the `xart_guard=0` opt-out |
+| absent | a kernel that does not report it | restored, matching UNVERIFIED (exit 0) |
+
+The diag ABI stays at version 2: these attributes were added to it, and a
+reader tests for them rather than for a version.
+
+An empty list next to an existing keybag is not taken as a sign that Touch
+ID was set up without the guard: a guarded keybag creation on an M2 wrote no
+record, and a rollback can empty the list. Such a Mac stays `unverified`
+until the guard refuses a write.
 
 ### The list of Linux's records
 
@@ -111,7 +138,8 @@ record the enclave created under the guard. It is read at probe and
 appended before each new record is written. The driver refuses to open a
 list longer than 4096 entries, counting torn and repeated ones, and stops
 appending at the same length, so it never writes a list it would refuse.
-A full list protects every existing record, and no new one can be written.
+With a full list, new records can't be adopted; existing ownership still
+applies, so the records already on it stay writable.
 
 The list is a host file, so what happens to the root file system happens to
 it:
