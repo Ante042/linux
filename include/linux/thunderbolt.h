@@ -19,6 +19,7 @@ struct device;
 
 #if IS_REACHABLE(CONFIG_USB4)
 
+#include <linux/atomic.h>
 #include <linux/device.h>
 #include <linux/idr.h>
 #include <linux/list.h>
@@ -69,6 +70,7 @@ enum tb_security_level {
  * @dev: Domain device
  * @lock: Big lock. Must be held when accessing any struct
  *	  tb_switch / struct tb_port.
+ * @remote_activity: Successful stock remote discovery exchanges
  * @nhi: Pointer to the NHI structure
  * @ctl: Control channel for this domain
  * @wq: Ordered workqueue for all domain specific work
@@ -82,6 +84,7 @@ enum tb_security_level {
 struct tb {
 	struct device dev;
 	struct mutex lock;
+	atomic64_t remote_activity;
 	struct tb_nhi *nhi;
 	struct tb_ctl *ctl;
 	struct workqueue_struct *wq;
@@ -515,6 +518,8 @@ void tb_service_properties_changed(struct tb_service *svc);
  *		    MSI-X is used.
  * @hop_count: Number of rings (end point hops) supported by NHI.
  * @quirks: NHI specific quirks if any
+ * @host_dp_policy: Host display tunnel policies supplied by the NHI glue
+ * @host_dp_dual_stream: The host connector has two physically wired DP-IN streams
  * @domain_released: Completed when domain has been fully released
  */
 struct tb_nhi {
@@ -530,6 +535,8 @@ struct tb_nhi {
 	struct work_struct interrupt_work;
 	u32 hop_count;
 	unsigned long quirks;
+	unsigned long host_dp_policy;
+	bool host_dp_dual_stream;
 	struct completion domain_released;
 };
 
