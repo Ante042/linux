@@ -4434,6 +4434,7 @@ F:	tools/aurora-display-notifier/
 AURORA KERNEL CI
 M:	Chris Kearney <303316+iconidentify@users.noreply.github.com>
 S:	Maintained
+F:	.github/workflows/kernel-ci*.yml
 F:	tools/aurora-ci/
 
 AUTOFDO BUILD
