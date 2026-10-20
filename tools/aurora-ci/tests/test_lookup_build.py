@@ -72,15 +72,61 @@ class LookupTest(TempDirTestCase):
         self.assertEqual(self.key(), before)
 
 
+REPO = 1000
+
+
+def artifact(run, created, head_repo=REPO, expired=False, name="kernel-package-x"):
+    return {"name": name, "expired": expired, "created_at": created,
+            "workflow_run": {"id": run, "repository_id": REPO, "head_repository_id": head_repo}}
+
+
+def run(event="push", path=".github/workflows/kernel-ci.yml", head_repo=REPO):
+    return {"event": event, "path": path, "repository": {"id": REPO}, "head_repository": {"id": head_repo}}
+
+
 class ApiTest(TempDirTestCase):
-    def test_newest_unexpired_artifact(self):
-        api = lookup.Api("https://api.example", "o/r", "token")
-        api.get = lambda path, **query: {"artifacts": [
-            {"name": query["name"], "expired": True, "created_at": "2026-10-20", "workflow_run": {"id": 1}},
-            {"name": query["name"], "expired": False, "created_at": "2026-10-18", "workflow_run": {"id": 2}},
-            {"name": query["name"], "expired": False, "created_at": "2026-10-19", "workflow_run": {"id": 3}},
-            {"name": "other", "expired": False, "created_at": "2026-10-21", "workflow_run": {"id": 4}},
-        ]}
+    def api(self, artifacts, runs):
+        api = lookup.Api("https://api.example", "o/r", "token", str(REPO))
+        api.calls = []
+
+        def get(path, **query):
+            api.calls.append(path)
+            if path == "actions/artifacts":
+                return {"artifacts": [a for a in artifacts if a["name"] == query["name"]]}
+            return runs[int(path.rsplit("/", 1)[1])]
+        api.get = get
+        return api
+
+    def test_newest_unexpired_artifact_from_a_trusted_run(self):
+        api = self.api([artifact(1, "2026-10-20", expired=True), artifact(2, "2026-10-18"),
+                        artifact(3, "2026-10-19"), artifact(4, "2026-10-21", name="other")],
+                       {2: run(), 3: run("merge_group")})
         self.assertEqual(api.newest_artifact("kernel-package-x"), "3")
-        api.get = lambda path, **query: {"artifacts": []}
-        self.assertEqual(api.newest_artifact("kernel-package-x"), "")
+        self.assertEqual(self.api([], {}).newest_artifact("kernel-package-x"), "")
+
+    def test_a_fork_run_is_never_reused(self):
+        # A fork's pull request uploads a newer artifact under the same name.
+        api = self.api([artifact(2, "2026-10-18"), artifact(9, "2026-10-20", head_repo=2000)],
+                       {2: run(), 9: run("pull_request", head_repo=2000)})
+        self.assertEqual(api.newest_artifact("kernel-package-x"), "2")
+        self.assertNotIn("actions/runs/9", api.calls)
+
+    def test_the_run_itself_must_be_trusted(self):
+        # The artifact claims this repository, but the run says otherwise.
+        cases = {
+            "fork head": run("pull_request", head_repo=2000),
+            "another workflow": run(path=".github/workflows/something-else.yml"),
+            "an untrusted event": run("pull_request_target"),
+        }
+        for name, untrusted in cases.items():
+            with self.subTest(name):
+                api = self.api([artifact(5, "2026-10-20")], {5: untrusted})
+                self.assertEqual(api.newest_artifact("kernel-package-x"), "")
+
+    def test_branches_of_this_repository_and_every_trusted_event(self):
+        for event in sorted(lookup.TRUSTED_EVENTS):
+            with self.subTest(event):
+                api = self.api([artifact(5, "2026-10-20")], {5: run(event)})
+                self.assertEqual(api.newest_artifact("kernel-package-x"), "5")
+        api = self.api([artifact(6, "2026-10-20")], {6: run("pull_request", ".github/workflows/kernel-ci-label.yml")})
+        self.assertEqual(api.newest_artifact("kernel-package-x"), "6")
