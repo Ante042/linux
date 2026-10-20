@@ -133,7 +133,11 @@ new push.
 
 On a ``pull_request`` event GitHub runs the workflow files from the pull
 request itself, so these rules decide cost, not security: a fork could edit
-them. What keeps untrusted code off paid runners is GitHub's setting to
+them. For the same reason a fork's run is never trusted as a source of
+results: earlier packages, verification records and baselines are reused only
+from runs of the kernel CI workflows on this repository's own branches, the
+merge queue, the nightly run and manual runs (``lookup-build.py``), so a fork
+cannot plant a package that a later run would skip testing and attest. What keeps untrusted code off paid runners is GitHub's setting to
 require approval before running workflows from outside collaborators, and,
 for a runner like Namespace's, a runner group limited to this repository.
 

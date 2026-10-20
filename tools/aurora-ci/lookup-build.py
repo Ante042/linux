@@ -19,7 +19,9 @@ builder installs from) is what the nightly rebuild is for.
                            the CI), the baseline a later change is compared with
 
 This script computes the key, pins the omarchy-pkgs commit it was computed
-from, and looks those artifacts up through the Actions API.
+from, and looks those artifacts up through the Actions API. It accepts only
+artifacts that this repository's kernel CI uploaded from its own branches,
+never one from a fork's pull request (see TRUSTED_WORKFLOWS).
 """
 
 import argparse
@@ -76,9 +78,20 @@ def build_key(kernel_tree, recipe_trees):
     return hashlib.sha256(text.encode()).hexdigest()[:32]
 
 
+# Runs whose artifacts may be reused. Every artifact name is chosen by the
+# workflow that uploads it, and a pull request from a fork runs its own copy
+# of the workflow files, so a name alone proves nothing: reuse only artifacts
+# from runs of this repository's kernel CI on this repository's own branches
+# and events. Pushing a branch here needs write access; a fork does not.
+TRUSTED_WORKFLOWS = {".github/workflows/kernel-ci.yml", ".github/workflows/kernel-ci-label.yml"}
+TRUSTED_EVENTS = {"push", "merge_group", "schedule", "workflow_dispatch", "pull_request"}
+
+
 class Api:
-    def __init__(self, url, repository, token):
+    def __init__(self, url, repository, token, repository_id):
         self.url, self.repository, self.token = url.rstrip("/"), repository, token
+        self.repository_id = int(repository_id)
+        self._runs = {}
 
     def get(self, path, **query):
         address = f"{self.url}/repos/{self.repository}/{path}"
@@ -92,12 +105,31 @@ class Api:
         with urllib.request.urlopen(request, timeout=60) as response:
             return json.load(response)
 
+    def trusted_run(self, run_id):
+        """Whether a run is this repository's kernel CI on one of its own
+        branches (or the queue, a schedule or a manual run), not a fork's."""
+        if run_id not in self._runs:
+            run = self.get(f"actions/runs/{run_id}")
+            self._runs[run_id] = (
+                run.get("event") in TRUSTED_EVENTS
+                and run.get("path") in TRUSTED_WORKFLOWS
+                and (run.get("repository") or {}).get("id") == self.repository_id
+                and (run.get("head_repository") or {}).get("id") == self.repository_id)
+        return self._runs[run_id]
+
     def newest_artifact(self, name):
-        """Run ID of the newest unexpired artifact with this exact name, or ''."""
-        data = self.get("actions/artifacts", name=name, per_page=20)
-        live = [a for a in data.get("artifacts", []) if not a.get("expired") and a.get("name") == name]
+        """Run ID of the newest unexpired artifact with this exact name that a
+        trusted run uploaded, or ''."""
+        data = self.get("actions/artifacts", name=name, per_page=100)
+        live = [a for a in data.get("artifacts", [])
+                if not a.get("expired") and a.get("name") == name
+                and a.get("workflow_run", {}).get("repository_id") == self.repository_id
+                and a.get("workflow_run", {}).get("head_repository_id") == self.repository_id]
         live.sort(key=lambda a: a.get("created_at", ""), reverse=True)
-        return str(live[0]["workflow_run"]["id"]) if live else ""
+        for artifact in live:
+            if self.trusted_run(artifact["workflow_run"]["id"]):
+                return str(artifact["workflow_run"]["id"])
+        return ""
 
 
 def lookup(api, kernel, recipe_repo, base_sha, force):
@@ -126,7 +158,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     api = Api(os.environ.get("GITHUB_API_URL", "https://api.github.com"),
-              os.environ["GITHUB_REPOSITORY"], os.environ["GITHUB_TOKEN"])
+              os.environ["GITHUB_REPOSITORY"], os.environ["GITHUB_TOKEN"],
+              os.environ["GITHUB_REPOSITORY_ID"])
     try:
         result = lookup(api, args.kernel, args.recipe_repo, args.base_sha, args.force == "true")
     except (subprocess.CalledProcessError, OSError, KeyError, ValueError) as error:
