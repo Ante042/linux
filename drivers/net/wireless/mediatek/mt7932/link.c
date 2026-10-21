@@ -89,7 +89,7 @@ void mt_rf_fail_locked(struct mt7932 *m, int error)
 	}
 }
 
-/* One owned station, firmware WPA2-PSK handshake; no host key fabrication. */
+/* One owned station and firmware handshake; no host key fabrication. */
 static int mt_peer_reserve(struct mt7932 *m)
 {
 	u8 *ids = (u8 *)&m->peer_ids;
@@ -176,11 +176,19 @@ void mt_link_event(struct mt7932 *m, const struct mt7932_event *event)
 			complete(&m->assoc_start);
 			complete(&m->assoc_done);
 		} else {
+			const struct element *ht;
 			const struct element *he = cfg80211_find_ext_elem(
 				WLAN_EID_EXT_HE_CAPABILITY, m->assoc_request_ies, ret);
 
 			m->assoc_request_ie_len = ret;
 			m->assoc_request_seen = true;
+			ht = cfg80211_find_elem(WLAN_EID_HT_CAPABILITY,
+						m->assoc_request_ies, ret);
+			if (ht)
+				dev_dbg(&m->pdev->dev,
+					"ASSOC_HT_CAPABILITIES: epoch=%u cap=%04x ampdu=%02x mcs=%02x/%02x\n",
+					m->connection_generation, get_unaligned_le16(ht->data),
+					ht->data[2], ht->data[3], ht->data[4]);
 			/* Generated station request, not the AP's capability or a
 			 * rate-control setting. Bounds were checked by the exporter.
 			 */
@@ -212,6 +220,12 @@ void mt_link_event(struct mt7932 *m, const struct mt7932_event *event)
 		/* OPEN reports retain cipher as numeric metadata only; it neither
 		 * installs a key nor changes the immutable requested security mode.
 		 */
+		if (length >= 52 && get_unaligned_le16(body)) {
+			m->connect_error = -ECONNREFUSED;
+			complete(&m->assoc_start);
+			complete(&m->assoc_done);
+			break;
+		}
 		if (!mt7932_assoc_resources(body, length, &m->peer_ids, m->connect_channel, m->connect_open)) {
 			m->connect_error = -EPROTO;
 			complete(&m->assoc_start);
@@ -271,6 +285,9 @@ static void mt_peer_release(struct mt7932 *m)
 	memset(&m->peer_ids, 0, sizeof(m->peer_ids));
 	memset(m->duplicates, 0, sizeof(m->duplicates));
 	memzero_explicit(m->connect_pmk, sizeof(m->connect_pmk));
+	memzero_explicit(m->connect_sae_pwd, sizeof(m->connect_sae_pwd));
+	m->connect_sae_pwd_length = 0;
+	m->connect_pmk_valid = false;
 	m->peer_valid = false;
 	m->peer_wtbl = 0;
 	m->event_cipher = 0;
@@ -390,58 +407,119 @@ struct cfg80211_bss *mt_connect_find_bss(struct mt7932 *m)
 	return bss;
 }
 
-void mt_connect_work(struct work_struct *work)
+/* command_mutex held. Select an admitted scan candidate and own six IDs. */
+static int mt_connect_prepare(struct mt7932 *m, bool *peer_owned)
 {
-	struct mt7932 *m = container_of(work, struct mt7932, connect_work);
-	struct cfg80211_connect_resp_params response = {};
-	u8 *body, mac[8] = {}, queue[32];
 	unsigned long flags;
-	bool submitted = false, peer_owned = false, cancelled;
-	u16 reason;
 	int ret;
 
-	mutex_lock(&m->command_mutex);
-	body = kzalloc(856, GFP_KERNEL);
-	ret = body ? 0 : -ENOMEM;
-	if (ret)
-		goto report;
-	if (!mt_rf_allowed(m) || READ_ONCE(m->connect_error)) {
-		ret = -ECANCELED;
-		goto free;
-	}
+	if (!mt_rf_allowed(m) || READ_ONCE(m->connect_error))
+		return -ECANCELED;
 	if (!m->connect_bss) {
 		dev_dbg(&m->pdev->dev, "CONNECT_DISCOVERY: refreshing missing scan candidate\n");
 		ret = mt_connect_discover(m);
 		if (ret)
-			goto free;
+			return ret;
 	}
 	if (m->connect_bss->channel->flags & (IEEE80211_CHAN_DISABLED | IEEE80211_CHAN_NO_IR |
 					    IEEE80211_CHAN_NO_20MHZ | IEEE80211_CHAN_RADAR)) {
-		ret = -EINVAL;
-		goto free;
+		return -EINVAL;
 	}
 	spin_lock_irqsave(&m->response_lock, flags);
 	ret = m->connect_error ?: mt_peer_reserve(m);
 	if (!ret) {
-		peer_owned = true;
+		*peer_owned = true;
 		m->connect_channel = m->connect_bss->channel->hw_value;
 		memcpy(m->connect_bssid, m->connect_bss->bssid, ETH_ALEN);
 	}
 	spin_unlock_irqrestore(&m->response_lock, flags);
+	return ret;
+}
+
+/* command_mutex held on entry and return. Use the ordinary teardown fences
+ * for both a cold OWE session and a failed authentication attempt.
+ */
+static int mt_owe_retire_attempt(struct mt7932 *m, bool *submitted,
+				 bool *peer_owned, bool *retirement_attempted)
+{
+	unsigned long flags;
+	int ret;
+
+	spin_lock_irqsave(&m->response_lock, flags);
+	m->disconnecting = true;
+	spin_unlock_irqrestore(&m->response_lock, flags);
+	*submitted = true;
+	mutex_unlock(&m->command_mutex);
+	*retirement_attempted = true;
+	ret = mt_retire_connection(m);
+	mutex_lock(&m->command_mutex);
 	if (ret)
-		goto free;
-	/* Initial station policy: framework M=0 branch and no optional flags.
-	 * This yields flag2 independently of credentials; no scan-result count
-	 * belongs in this field. The original driver uses listen interval 20.
-	 * Other platform flag policies remain unsupported, not guessed mappings.
+		return ret;
+
+	*submitted = false;
+	*peer_owned = false;
+	*retirement_attempted = false;
+	spin_lock_irqsave(&m->response_lock, flags);
+	if (m->connect_cancelled) {
+		ret = -ECANCELED;
+	} else if (m->link_failed || !mt_rf_allowed(m)) {
+		ret = -EIO;
+	} else {
+		m->owe_cold_prepared = true;
+		m->connect_error = 0;
+		m->disconnecting = false;
+		m->disconnect_seen = false;
+		m->disconnect_event_received = false;
+		reinit_completion(&m->assoc_start);
+		reinit_completion(&m->assoc_done);
+		reinit_completion(&m->disconnect_done);
+		m->assoc_request_ie_len = 0;
+		m->assoc_request_seen = false;
+		m->connect_center = 0;
+		memset(&m->connect_chandef, 0, sizeof(m->connect_chandef));
+		m->connection_generation++;
+	}
+	spin_unlock_irqrestore(&m->response_lock, flags);
+	return ret;
+}
+
+/* command_mutex held on entry and return. D7 calibration remains serviceable
+ * while waiting for association events. A retry has one ten-second deadline.
+ */
+static int mt_connect_attempt(struct mt7932 *m, bool *submitted,
+			      bool *peer_owned, bool *auth_submitted, bool retry)
+{
+	u8 *body, mac[8] = {}, queue[32];
+	unsigned long deadline, timeout;
+	int ret;
+
+	ret = mt_connect_prepare(m, peer_owned);
+	if (ret)
+		return ret;
+	body = kzalloc(856, GFP_KERNEL);
+	ret = body ? 0 : -ENOMEM;
+	if (ret)
+		goto out;
+	/* Keep policy value 2 and listen interval 20 for all security arms.
+	 * SAE is qualified with the same policy after correcting key_cipher.
 	 */
+	if (m->connect_sae_pwd_length && !m->connect_pmk_valid) {
+		ret = mt7932_sae_pmk(m->connect_pmk, m->connect_sae_pwd,
+				     m->connect_sae_pwd_length, m->connect_ssid,
+				     m->connect_ssid_length);
+		if (ret)
+			goto free;
+	}
 	ret = mt7932_connect_body(body, 856, m->connect_ssid, m->connect_ssid_length,
-		m->connect_open ? NULL : m->connect_pmk, m->connect_bssid,
-		m->connect_channel, 20, 2, &m->peer_ids, m->connect_open);
+		m->connect_open || m->connect_owe ? NULL : m->connect_pmk, m->connect_bssid,
+		m->connect_channel, 20, 2, &m->peer_ids, m->connect_open,
+		m->connect_sae_pwd_length ? m->connect_sae_pwd : NULL,
+		m->connect_sae_pwd_length, m->connect_owe);
 	if (ret < 0)
 		goto free;
+	/* Reprogram the same on-air station identity for either attempt. */
 	memcpy(mac + 2, m->mac, ETH_ALEN);
-	submitted = true;
+	*submitted = true;
 	ret = mt_request(m, 0xb8, true, true, false, mac, sizeof(mac));
 	ret = ret ?: READ_ONCE(m->connect_error);
 	if (!ret)
@@ -454,37 +532,104 @@ void mt_connect_work(struct work_struct *work)
 free:
 	kfree_sensitive(body);
 	memzero_explicit(m->connect_pmk, sizeof(m->connect_pmk));
+	memzero_explicit(m->connect_sae_pwd, sizeof(m->connect_sae_pwd));
+	m->connect_sae_pwd_length = 0;
+	m->connect_pmk_valid = false;
 	if (ret)
-		goto report;
+		goto out;
 	dev_dbg(&m->pdev->dev, "CONNECT_SUBMITTED: BSSID=%pM channel=%u\n",
 		m->connect_bssid, m->connect_channel);
+	*auth_submitted = true;
+	deadline = jiffies + msecs_to_jiffies(10000);
 	/* Genuine D7 requests must remain serviceable during asynchronous waits. */
 	mutex_unlock(&m->command_mutex);
-	ret = wait_for_completion_timeout(&m->assoc_start, msecs_to_jiffies(5000)) ? 0 : -ETIMEDOUT;
+	timeout = msecs_to_jiffies(retry ? 10000 : 5000);
+	ret = wait_for_completion_timeout(&m->assoc_start, timeout) ? 0 : -ETIMEDOUT;
 	mutex_lock(&m->command_mutex);
 	if (ret) {
 		ret = -ETIMEDOUT;
-		goto report;
+		goto out;
 	}
 	ret = READ_ONCE(m->connect_error);
 	if (ret)
-		goto report;
+		goto out;
 	ret = mt_association_calibration(m);
 	ret = ret ?: READ_ONCE(m->connect_error);
 	if (ret)
-		goto report;
+		goto out;
 	dev_dbg(&m->pdev->dev, "ASSOCIATION_CALIBRATED: primary=%u center=%u\n",
 		m->connect_channel, m->connect_center);
+	if (retry && time_after_eq(jiffies, deadline)) {
+		ret = -ETIMEDOUT;
+		goto out;
+	}
 	mt7932_peer_queue(queue, m->peer_ids.station[0], true);
 	ret = mt_request(m, 0x6b, true, true, false, queue, sizeof(queue));
 	if (ret)
-		goto report;
+		goto out;
+	if (retry && time_after_eq(jiffies, deadline)) {
+		ret = -ETIMEDOUT;
+		goto out;
+	}
 	mutex_unlock(&m->command_mutex);
-	if (!wait_for_completion_timeout(&m->assoc_done, msecs_to_jiffies(10000)))
+	timeout = retry ? max_t(long, 1, deadline - jiffies) : msecs_to_jiffies(10000);
+	if (!wait_for_completion_timeout(&m->assoc_done, timeout))
 		ret = -ETIMEDOUT;
 	else
 		ret = READ_ONCE(m->connect_error);
 	mutex_lock(&m->command_mutex);
+out:
+	return ret ?: READ_ONCE(m->connect_error);
+}
+
+void mt_connect_work(struct work_struct *work)
+{
+	struct mt7932 *m = container_of(work, struct mt7932, connect_work);
+	struct cfg80211_connect_resp_params response = {};
+	unsigned long flags;
+	bool submitted = false, peer_owned = false, cancelled, retry = false;
+	bool retirement_attempted = false, auth_submitted = false;
+	u16 reason;
+	int ret;
+
+	mutex_lock(&m->command_mutex);
+	/* A fresh firmware session needs the same typed cleanup as a retired
+	 * OWE connection. Reserve temporary live IDs rather than inventing a
+	 * peer identity, and perform this once before the first OWE request.
+	 */
+	if (m->connect_owe && !m->owe_cold_prepared) {
+		ret = mt_connect_prepare(m, &peer_owned);
+		if (ret)
+			goto report;
+		ret = mt_owe_retire_attempt(m, &submitted, &peer_owned,
+					    &retirement_attempted);
+		if (ret)
+			goto report;
+	}
+	ret = mt_connect_attempt(m, &submitted, &peer_owned, &auth_submitted, false);
+	/* The first OWE authentication can stall after a firmware load. Retry
+	 * once, only after the normal typed disconnect, queue retirement and
+	 * DMA/reader fences have released the old peer. Cancellation and an
+	 * uncertain firmware owner must never be turned into another attempt.
+	 */
+	spin_lock_irqsave(&m->response_lock, flags);
+	if (m->connect_owe && auth_submitted &&
+	    (ret == -ETIMEDOUT || ret == -ECONNREFUSED || ret == -ECONNRESET) &&
+	    !m->connect_cancelled &&
+	    !m->link_failed && mt_rf_allowed(m)) {
+		m->disconnecting = true;
+		retry = true;
+	}
+	spin_unlock_irqrestore(&m->response_lock, flags);
+	if (retry) {
+		dev_dbg(&m->pdev->dev, "OWE_RETRY: first attempt failed: %d\n", ret);
+		mt_transport_snapshot(m);
+		ret = mt_owe_retire_attempt(m, &submitted, &peer_owned,
+					    &retirement_attempted);
+		if (!ret)
+			ret = mt_connect_attempt(m, &submitted, &peer_owned,
+						 &auth_submitted, true);
+	}
 report:
 	ret = ret ?: READ_ONCE(m->connect_error);
 	if (!ret && !mt_rf_allowed(m))
@@ -495,14 +640,17 @@ report:
 	if (ret && !READ_ONCE(m->stopping))
 		mt_transport_snapshot(m);
 	memzero_explicit(m->connect_pmk, sizeof(m->connect_pmk));
+	memzero_explicit(m->connect_sae_pwd, sizeof(m->connect_sae_pwd));
+	m->connect_sae_pwd_length = 0;
+	m->connect_pmk_valid = false;
 	if (ret) {
 		spin_lock_irqsave(&m->response_lock, flags);
 		m->disconnecting = true;
 		spin_unlock_irqrestore(&m->response_lock, flags);
 		mutex_unlock(&m->command_mutex);
-		if (submitted && !READ_ONCE(m->stopping)) {
+		if (submitted && !retirement_attempted && !READ_ONCE(m->stopping)) {
 			mt_retire_connection(m);
-		} else if (peer_owned && !submitted) {
+		} else if (peer_owned && !submitted && !retirement_attempted) {
 			mutex_lock(&m->command_mutex);
 			spin_lock_irqsave(&m->response_lock, flags);
 			mt_peer_release(m);
@@ -592,7 +740,7 @@ report:
 			READ_ONCE(m->data_ready));
 	else if (!ret)
 		dev_dbg(&m->pdev->dev,
-			"WPA2_AUTHORIZED: firmware handshake complete; Ethernet=%u\n",
+			"FIRMWARE_AUTHORIZED: handshake complete; Ethernet=%u\n",
 			READ_ONCE(m->data_ready));
 	else if (cancelled)
 		dev_dbg(&m->pdev->dev, "CONNECT_CANCELLED: %d\n", ret);
@@ -629,7 +777,7 @@ int mt_connect(struct wiphy *wiphy, struct net_device *netdev,
 	struct mt7932 *m = mt_from_wiphy(wiphy);
 	unsigned long flags;
 	bool open = mt_open_request(params);
-	int ret = 0;
+	int auth, ret = 0;
 
 	if (netdev == m->netdev)
 		mt_retry_missing_policy(m);
@@ -642,13 +790,9 @@ int mt_connect(struct wiphy *wiphy, struct net_device *netdev,
 		!!params->crypto.psk, params->mfp, params->ie_len);
 	if (!params->ssid_len || params->ssid_len > 32)
 		return -EINVAL;
-	if (!open && (params->crypto.wpa_versions != NL80211_WPA_VERSION_2 ||
-	    params->crypto.n_ciphers_pairwise != 1 || params->crypto.ciphers_pairwise[0] != WLAN_CIPHER_SUITE_CCMP ||
-	    params->crypto.cipher_group != WLAN_CIPHER_SUITE_CCMP ||
-	    !params->crypto.n_akm_suites || params->crypto.akm_suites[0] != WLAN_AKM_SUITE_PSK ||
-	    !params->crypto.psk || params->mfp == NL80211_MFP_REQUIRED ||
-	    !params->ssid_len || params->ssid_len > 32))
-		return -EOPNOTSUPP;
+	auth = open ? 0 : mt7932_connect_auth(params);
+	if (auth < 0)
+		return auth;
 	if (params->bssid && !is_valid_ether_addr(params->bssid))
 		return -EINVAL;
 	mutex_lock(&m->command_mutex);
@@ -674,9 +818,21 @@ int mt_connect(struct wiphy *wiphy, struct net_device *netdev,
 	memcpy(m->connect_ssid, params->ssid, params->ssid_len);
 	m->connect_ssid_length = params->ssid_len;
 	m->connect_open = open;
+	m->connect_owe = auth == WLAN_AKM_SUITE_OWE;
 	memzero_explicit(m->connect_pmk, sizeof(m->connect_pmk));
-	if (!open)
+	memzero_explicit(m->connect_sae_pwd, sizeof(m->connect_sae_pwd));
+	m->connect_sae_pwd_length = 0;
+	m->connect_pmk_valid = false;
+	if (auth == WLAN_AKM_SUITE_SAE) {
+		m->connect_sae_pwd_length = params->crypto.sae_pwd_len;
+		memcpy(m->connect_sae_pwd, params->crypto.sae_pwd,
+		       m->connect_sae_pwd_length);
+	}
+	/* Transition requests may already carry a PMK; pure SAE needs derivation. */
+	if (!open && params->crypto.psk) {
 		memcpy(m->connect_pmk, params->crypto.psk, 32);
+		m->connect_pmk_valid = true;
+	}
 	m->connect_error = 0;
 	m->assoc_request_ie_len = 0;
 	m->assoc_request_seen = false;

@@ -14,6 +14,7 @@
 #include <linux/of.h>
 #include <linux/of_net.h>
 #include <linux/etherdevice.h>
+#include <linux/ethtool.h>
 #include <linux/if_vlan.h>
 #include <linux/pci.h>
 #include <linux/random.h>
@@ -121,6 +122,8 @@ struct mt7932 {
 	bool reg_deferral;
 	/* Channels the applied country package leaves out; under RTNL. */
 	DECLARE_BITMAP(policy_disabled, MT7932_CHANNELS);
+	/* Last package pass for the current request; under response_lock. */
+	struct mt7932_policy_choice policy_choice;
 	struct net_device *netdev;
 	struct wireless_dev wdev;
 	struct cfg80211_scan_request *scan_request;
@@ -145,12 +148,15 @@ struct mt7932 {
 	u8 connect_bssid_req[ETH_ALEN], connect_bssid_hint[ETH_ALEN];
 	bool discovering, discovery_finished, connect_cancelled;
 	u8 connect_ssid[32], connect_pmk[32], connect_bssid[6];
+	u8 connect_sae_pwd[MT7932_SAE_PASSWORD_MAX], connect_sae_pwd_length;
+	bool connect_pmk_valid;
 	u8 assoc_request_ies[512];
 	u16 assoc_request_ie_len;
 	bool assoc_request_seen;
 	u32 connection_generation;
 	u8 connect_ssid_length, connect_channel, peer_wtbl;
-	bool connecting, connected, peer_valid, link_failed, connect_open;
+	bool connecting, connected, peer_valid, link_failed, connect_open, connect_owe;
+	bool owe_cold_prepared;
 	bool disconnecting, disconnect_seen, disconnect_event_received, disconnect_local;
 	/* The connect worker is reporting its outcome; an RF failure meanwhile
 	 * sets connect_lost for the worker to report. Under response_lock.
@@ -180,6 +186,10 @@ struct mt7932 {
 	bool data_live[512], data_token[512], data_retired[512];
 	struct mt7932_duplicate duplicates[17];
 	u64 tx_released, rx_ethernet;
+	/* Lifetime host RX observations, protected by response_lock. */
+	u64 rx_integrity, rx_malformed, rx_unsupported;
+	u64 rx_wrong_peer, rx_unprotected, rx_duplicate, rx_no_memory;
+	u64 rx_retry, rx_amsdu;
 	/* TX0 descriptors published since the last doorbell; data_lock. */
 	unsigned int data_unkicked;
 	bool data_ready;
@@ -193,6 +203,7 @@ struct mt7932 {
 bool mt_rf_allowed(struct mt7932 *m);
 void mt_retry_missing_policy(struct mt7932 *m);
 void mt_reg_apply_deferred_locked(struct mt7932 *m);
+void mt_policy_debugfs_init(struct mt7932 *m);
 int mt_net_open(struct net_device *netdev);
 int mt_request_input(struct mt7932 *m, const struct firmware **fw, const char *name);
 /* response_lock held; closes RF admission and reports terminal host state. */
@@ -221,6 +232,7 @@ void mt_bss_presence(struct mt7932 *m, const struct mt7932_event *event);
 void mt_data_complete(struct mt7932 *m, const u8 *packet, size_t length);
 netdev_tx_t mt_net_xmit(struct sk_buff *skb, struct net_device *netdev);
 void mt_data_receive(struct mt7932 *m, const struct mt7932_rx_frame *frame);
+extern const struct ethtool_ops mt_ethtool_ops;
 int mt_data_prepare(struct mt7932 *m);
 struct mt7932 *mt_from_wiphy(struct wiphy *wiphy);
 void mt_scan_event(struct mt7932 *m, const struct mt7932_event *event);
