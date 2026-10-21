@@ -33,7 +33,7 @@ associated, but never probes or joins an access point there, and scans made
 while associated skip them. A channel whose restrictions the driver cannot
 apply (reduced power, no OFDM, PSD limits) is disabled rather than used, and
 so is a channel the country package does not permit: every power limit of
-that channel in ``policy/<CC>.bin`` is left undefined.
+that channel in the applied country package is left undefined.
 
 Use the ordinary cfg80211 regulatory database and applicable country policy.
 The validated first-admission fallback is kernel country 00 with firmware XZ.
@@ -67,6 +67,31 @@ while probing, so build it as a module. The tested Wi-Fi driver owns function
 Use a saved NetworkManager WPA2 profile matching the current interface.
 KDE audio requires BlueZ, PipeWire, its PulseAudio compatibility service,
 WirePlumber and Bluetooth audio plugins in the logged-in user's session.
+
+Country packages
+----------------
+
+Every regulatory change selects a country package again, without a reload.
+For country CC the driver uses the first of these that exists and is valid:
+
+1. ``policy/CC.bin``: J7RP version 1 (2.4 and 5 GHz, at most 16 KiB);
+2. ``policy/world-XZ.bin``: the world package.
+
+Country 00 and cfg80211's numeric codes use only the world package.
+
+A country without a usable package of its own falls back to the world
+package and logs one ``REGULATORY_FALLBACK`` line. cfg80211 keeps the
+requested country and its channel list; the firmware gets domain XZ and
+only the channels both the country and the world package permit.
+Installing the country's package takes effect on the next regulatory
+change. Only a missing or invalid world package leaves the radio without a
+regulatory domain.
+
+The applied package can be read back, as root, from
+``/sys/kernel/debug/ieee80211/phyN/mt7932_policy``: requested country,
+firmware domain, source directory and path, J7RP version, size, the first
+eight bytes of its SHA-256, the fallback reason and the result of each
+lookup.
 
 Station security
 ----------------
@@ -157,8 +182,9 @@ Wi-Fi requests the following files under ``mediatek/mt7932/``:
 * ``config-original.bin``: the bounded J7CF package with the original 64 or
   65 configuration records, including all required keys.
 * ``policy/world-XZ.bin`` and, when available, the matching country package
-  under ``policy/``: J7RP containers with original-derived modes and power
-  tables. Relabeling a different country's payload is unsupported.
+  under ``policy/`` (see `Country packages`_): J7RP containers with
+  original-derived modes and power tables. Relabeling a different country's
+  payload is unsupported.
 
 Bluetooth requests these files under ``mediatek/``:
 

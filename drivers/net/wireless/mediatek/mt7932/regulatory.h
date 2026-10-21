@@ -5,6 +5,7 @@
 /* Private, versioned packaging of original-derived country policy. This is
  * not firmware code and does not replace cfg80211's regulatory database.
  */
+#include <crypto/sha2.h>
 #include <net/cfg80211.h>
 
 #include "channels.h"
@@ -183,5 +184,70 @@ static inline void mt7932_policy_filter(struct mt7932_reg_snapshot *reg,
 	memset(reg->domain + 12 + kept * 8, 0, (count - kept) * 8);
 	reg->length = 12 + kept * 8;
 }
+
+/*
+ * Country package lookup. policy/ holds J7RP version 1 packages (2.4 and
+ * 5 GHz, at most 16 KiB): the country's own one, then the world one.
+ */
+enum mt7932_policy_source {
+	MT7932_POLICY_NONE,
+	MT7932_POLICY_V1,	/* policy/<CC>.bin */
+	MT7932_POLICY_WORLD,	/* policy/world-XZ.bin */
+};
+
+#define MT7932_POLICY_CANDIDATES 2
+#define MT7932_POLICY_PATH_MAX 48
+
+struct mt7932_policy_file {
+	const void *handle;
+	const u8 *data;
+	size_t size;
+};
+
+/* get() returns 0 with @file filled in, or an error; put() releases it. */
+struct mt7932_policy_loader {
+	int (*get)(void *ctx, const char *path, struct mt7932_policy_file *file);
+	void (*put)(void *ctx, struct mt7932_policy_file *file);
+	void *ctx;
+};
+
+/* What was applied, for the debugfs readback. */
+struct mt7932_policy_choice {
+	u8 alpha2[2], domain[2];
+	enum mt7932_policy_source source;
+	u16 version;
+	u32 size;
+	u8 sha256[SHA256_DIGEST_SIZE];
+	/* Why the country's own package was not used: -ENOENT, -EINVAL, or
+	 * -EOPNOTSUPP for a numeric cfg80211 code.
+	 */
+	int fallback;
+	int error;
+	u32 generation;
+	unsigned int n_tried;
+	struct {
+		enum mt7932_policy_source source;
+		int error;
+	} tried[MT7932_POLICY_CANDIDATES];
+};
+
+/* An ISO 3166 alpha2, which may have a package of its own. */
+static inline bool mt7932_policy_country(const u8 alpha2[2])
+{
+	return alpha2[0] >= 'A' && alpha2[0] <= 'Z' && alpha2[1] >= 'A' && alpha2[1] <= 'Z';
+}
+
+unsigned int mt7932_policy_candidates(const u8 alpha2[2],
+				      enum mt7932_policy_source sources[MT7932_POLICY_CANDIDATES]);
+void mt7932_policy_path(char *buf, size_t len, enum mt7932_policy_source source,
+			const u8 alpha2[2]);
+/*
+ * Load the first usable package for @reg's country, parse it into @policy
+ * and filter @reg's CID0f domain with it. On success @file holds the
+ * package @policy points into; the caller releases it with loader->put().
+ */
+int mt7932_policy_select(const struct mt7932_policy_loader *loader,
+			 struct mt7932_reg_snapshot *reg, struct mt7932_policy *policy,
+			 struct mt7932_policy_file *file, struct mt7932_policy_choice *choice);
 
 #endif
