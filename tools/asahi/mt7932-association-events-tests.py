@@ -49,6 +49,7 @@ typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32; typedef uint64_t
 #define WLAN_REASON_UNSPECIFIED 1
 #define WLAN_EID_EXTENSION 255
 #define WLAN_EID_EXT_HE_CAPABILITY 35
+#define WLAN_EID_HT_CAPABILITY 45
 #define dev_info(...) ((void)0)
 #define dev_dbg_ratelimited(...) ((void)0)
 #define dev_dbg(...) ((void)0)
@@ -99,6 +100,7 @@ static bool cfg80211_chandef_valid(const struct cfg80211_chan_def*d){return true
 static bool cfg80211_chandef_usable(void*w,const struct cfg80211_chan_def*d,int flags){return usable;}
 static bool mt7932_assoc_phy_valid(const void*b,const void*p,size_t n){return true;}
 static const struct element *cfg80211_find_ext_elem(int id,const void*p,size_t n){return NULL;}
+static const struct element *cfg80211_find_elem(int id,const void*p,size_t n){return NULL;}
 static void netif_carrier_off(void*n){}
 static void netif_stop_queue(void*n){}
 static void schedule_work(void*w){scheduled++;}
