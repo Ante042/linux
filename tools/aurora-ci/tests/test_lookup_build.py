@@ -80,8 +80,14 @@ def artifact(run, created, head_repo=REPO, expired=False, name="kernel-package-x
             "workflow_run": {"id": run, "repository_id": REPO, "head_repository_id": head_repo}}
 
 
-def run(event="push", path=".github/workflows/kernel-ci.yml", head_repo=REPO):
-    return {"event": event, "path": path, "repository": {"id": REPO}, "head_repository": {"id": head_repo}}
+QUEUE = "gh-readonly-queue/integration/aurora/pr-7-0123456789abcdef0123456789abcdef01234567"
+
+
+def run(event="push", path=".github/workflows/kernel-ci.yml", head_repo=REPO, branch=None):
+    if branch is None:
+        branch = QUEUE if event == "merge_group" else "integration/aurora"
+    return {"event": event, "path": path, "head_branch": branch,
+            "repository": {"id": REPO}, "head_repository": {"id": head_repo}}
 
 
 class ApiTest(TempDirTestCase):
@@ -117,16 +123,26 @@ class ApiTest(TempDirTestCase):
             "fork head": run("pull_request", head_repo=2000),
             "another workflow": run(path=".github/workflows/something-else.yml"),
             "an untrusted event": run("pull_request_target"),
+            "a pull request from this repository": run("pull_request", branch="topic"),
+            "a labelled build": run("pull_request", ".github/workflows/kernel-ci-label.yml", branch="topic"),
+            "a manual run of another branch": run("workflow_dispatch", branch="topic"),
+            "a push to another branch": run("push", branch="topic"),
+            "a queue for another branch": run("merge_group", branch="gh-readonly-queue/topic/pr-7-0123"),
+            "the branch name as a queue": run("merge_group", branch="integration/aurora"),
         }
         for name, untrusted in cases.items():
             with self.subTest(name):
                 api = self.api([artifact(5, "2026-10-20")], {5: untrusted})
                 self.assertEqual(api.newest_artifact("kernel-package-x"), "")
 
-    def test_branches_of_this_repository_and_every_trusted_event(self):
+    def test_every_trusted_event_on_the_branch_or_its_queue(self):
         for event in sorted(lookup.TRUSTED_EVENTS):
             with self.subTest(event):
                 api = self.api([artifact(5, "2026-10-20")], {5: run(event)})
                 self.assertEqual(api.newest_artifact("kernel-package-x"), "5")
-        api = self.api([artifact(6, "2026-10-20")], {6: run("pull_request", ".github/workflows/kernel-ci-label.yml")})
-        self.assertEqual(api.newest_artifact("kernel-package-x"), "6")
+
+    def test_an_unreviewed_run_is_skipped_for_an_older_reviewed_one(self):
+        # A writer's pull request uploads a newer artifact under the same name.
+        api = self.api([artifact(2, "2026-10-18"), artifact(9, "2026-10-20")],
+                       {2: run(), 9: run("pull_request", branch="topic")})
+        self.assertEqual(api.newest_artifact("kernel-package-x"), "2")

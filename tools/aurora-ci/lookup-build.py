@@ -20,8 +20,9 @@ builder installs from) is what the nightly rebuild is for.
 
 This script computes the key, pins the omarchy-pkgs commit it was computed
 from, and looks those artifacts up through the Actions API. It accepts only
-artifacts that this repository's kernel CI uploaded from its own branches,
-never one from a fork's pull request (see TRUSTED_WORKFLOWS).
+artifacts that kernel-ci.yml uploaded after review: from the branch, the
+merge queue, the nightly run or a manual run of the branch, never from a
+pull request (see TRUSTED_EVENTS).
 """
 
 import argparse
@@ -79,12 +80,21 @@ def build_key(kernel_tree, recipe_trees):
 
 
 # Runs whose artifacts may be reused. Every artifact name is chosen by the
-# workflow that uploads it, and a pull request from a fork runs its own copy
-# of the workflow files, so a name alone proves nothing: reuse only artifacts
-# from runs of this repository's kernel CI on this repository's own branches
-# and events. Pushing a branch here needs write access; a fork does not.
-TRUSTED_WORKFLOWS = {".github/workflows/kernel-ci.yml", ".github/workflows/kernel-ci-label.yml"}
-TRUSTED_EVENTS = {"push", "merge_group", "schedule", "workflow_dispatch", "pull_request"}
+# workflow that uploads it, and a pull request, or a manual run of a branch,
+# runs that branch's own copy of the workflow files, before anyone reviewed
+# them. So a name alone proves nothing: reuse only artifacts from runs of
+# reviewed code, the branch itself and the merge queue's branches, which
+# only a merged or queued pull request reaches.
+TRUSTED_WORKFLOWS = {".github/workflows/kernel-ci.yml"}
+TRUSTED_EVENTS = {"push", "merge_group", "schedule", "workflow_dispatch"}
+TRUSTED_BRANCH = "integration/aurora"
+QUEUE_PREFIX = f"gh-readonly-queue/{TRUSTED_BRANCH}/"
+
+
+def trusted_branch(event, branch):
+    if event == "merge_group":
+        return branch.startswith(QUEUE_PREFIX)
+    return branch == TRUSTED_BRANCH
 
 
 class Api:
@@ -106,12 +116,14 @@ class Api:
             return json.load(response)
 
     def trusted_run(self, run_id):
-        """Whether a run is this repository's kernel CI on one of its own
-        branches (or the queue, a schedule or a manual run), not a fork's."""
+        """Whether a run is this repository's kernel CI on reviewed code:
+        the branch or the merge queue, never a pull request or another
+        branch."""
         if run_id not in self._runs:
             run = self.get(f"actions/runs/{run_id}")
             self._runs[run_id] = (
                 run.get("event") in TRUSTED_EVENTS
+                and trusted_branch(run.get("event"), run.get("head_branch") or "")
                 and run.get("path") in TRUSTED_WORKFLOWS
                 and (run.get("repository") or {}).get("id") == self.repository_id
                 and (run.get("head_repository") or {}).get("id") == self.repository_id)
