@@ -649,6 +649,16 @@
    ]
   },
   {
+   "name": "tools/asahi/mt7932-owe-retry-tests.py",
+   "group": "tools",
+   "argv": [
+    "python3",
+    "tools/asahi/mt7932-owe-retry-tests.py",
+    "--out",
+    "{output}"
+   ]
+  },
+  {
    "name": "tools/asahi/neo-auxiliary-tests.py",
    "group": "tools",
    "argv": [
