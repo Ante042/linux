@@ -182,10 +182,12 @@ kernel::of_device_table!(
             of::DeviceId::new(c"apple,agx-t8122"),
             ProbeConfig::M3(crate::m3::Chip::T8122)
         ),
+        #[cfg(not(CONFIG_DRM_ASAHI_G15))]
         (
             of::DeviceId::new(c"apple,agx-t6030"),
             ProbeConfig::M3(crate::m3::Chip::T6030)
         ),
+        #[cfg(not(CONFIG_DRM_ASAHI_G15))]
         (
             of::DeviceId::new(c"apple,agx-t6031"),
             ProbeConfig::M3(crate::m3::Chip::T6031)
@@ -305,6 +307,33 @@ impl platform::Driver for AsahiPlatformDriver {
 }
 
 impl AsahiPlatformDriver {
+    #[cfg(CONFIG_DRM_ASAHI_G15)]
+    pub(crate) fn probe_g15<'bound>(
+        pdev: &'bound platform::Device<Core<'_>>,
+        cfg: &'static crate::g15::Config,
+    ) -> Result<AsahiPlatformDriverData<'bound>> {
+        // SAFETY: Admission checks the SoC and the UAT output width before DMA starts.
+        unsafe { pdev.dma_set_mask_and_coherent(DmaMask::try_new(cfg.uat_oas)?)? };
+        let resources = regs::Resources::new(pdev)?;
+        let drm = drm::UnregisteredDevice::<AsahiDrmDriver>::new(pdev, Ok(()))?;
+        let gpu = crate::g15::Gpu::new(pdev, &drm, cfg)?;
+        let data = try_pin_init!(AsahiDrmRegistrationData {
+            gpu: gpu as Arc<dyn gpu::Gpu>,
+            resources,
+        });
+        // SAFETY: The registration is stored and unregistered by platform data destruction.
+        // G15 retains its firmware-visible state independently until reboot, even on error.
+        let reg = unsafe { drm::Registration::new(pdev.as_ref(), drm, data, 0)? };
+        Ok(AsahiPlatformDriverData {
+            _device: reg.device().into(),
+            _reg: reg,
+            g17: None,
+            raw_dev: core::ptr::null_mut(),
+            raw_stats: core::ptr::null_mut(),
+            stats: None,
+        })
+    }
+
     fn probe_g17<'bound>(
         pdev: &'bound platform::Device<Core<'_>>,
         cfg: &'static g17::Config,
