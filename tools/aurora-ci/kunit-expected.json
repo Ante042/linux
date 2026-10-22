@@ -19,13 +19,5 @@
    "reason": "By design when built in: the case skips while system_state < SYSTEM_RUNNING, because built-in KUnit runs before mark_readonly(). It only runs when trusted_source_kunit is loaded as a module after boot, which kunit.py run does not do (security/keys/trusted-keys/tests/trusted_source_kunit.c)."
   }
  },
- "warnings": {
-  "apple-display-parser.parser_attribute_deferred": [
-   {
-    "site": "kernel/workqueue.c:__queue_work",
-    "count": 1,
-    "reason": "WARN_ON(!list_empty(&work->entry)): dcp_attributes_replace() schedules dcp->connector->hotplug_wq, but the test allocates the connector with kunit_kzalloc() and never calls INIT_WORK() on it, so the work is refused. The test still passes."
-   }
-  ]
- }
+ "warnings": {}
 }
