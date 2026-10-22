@@ -2,7 +2,7 @@
 # omacom/linux-aurora (integration/aurora).
 #
 # Run with tools/testing/kunit/kunit.py run --arch=arm64 (QEMU virt, -cpu max)
-# and --make_options LLVM=... . At 1b4997bbab62 this builds one kernel with
+# and --make_options LLVM=... . Historical result at 1b4997bbab62:
 # 98 suites / 1399 cases (expected: 3 skips, 0 failures).
 # Needs a Rust toolchain: the SEP, AOP, T8140 audio and Asahi GPU code is Rust.
 # The kernel uses 16K pages and 48-bit VA, as the shipped kernel does:
@@ -168,6 +168,14 @@ CONFIG_SND_SOC=y
 CONFIG_DMADEVICES=y
 CONFIG_DMA_ENGINE=y
 CONFIG_SND_SOC_APPLE_T8140_AOP_AUDIO=y
+
+# Cirrus jack codecs: clock switching and playback resume/prepare recovery
+# I2C is enabled above; build the codecs in with their real KUnit suites.
+CONFIG_SND_SOC_CS42L42=y
+CONFIG_SND_SOC_CS42L42_CORE=y
+CONFIG_SND_SOC_CS42L42_TEST=y
+CONFIG_SND_SOC_CS42L84=y
+CONFIG_SND_SOC_CS42L84_TEST=y
 
 # Wireless and Bluetooth: brcmfmac scan timeout, MT7932 (J700)
 CONFIG_NET=y
