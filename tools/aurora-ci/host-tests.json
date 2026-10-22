@@ -1947,6 +1947,17 @@
    ]
   },
   {
+   "name": "tools/testing/selftests/drivers/gpu/apple-dcp/plane-layout.py",
+   "group": "tools",
+   "argv": [
+    "python3",
+    "tools/testing/selftests/drivers/gpu/apple-dcp/plane-layout.py",
+    "--mutations",
+    "--output",
+    "{output}"
+   ]
+  },
+  {
    "name": "tools/testing/selftests/drivers/gpu/apple-dcp/run.sh",
    "group": "tools",
    "argv": [
