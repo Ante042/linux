@@ -2078,6 +2078,22 @@
    "note": "Actual production-body host control plus runtime mutants; kernel services modeled, no private hardware fixtures."
   },
   {
+   "name": "tools/asahi/g15-retention-tests.py",
+   "group": "tools",
+   "commits": [
+    "31da169251bd34d5810a0874563d9a019b85bf56"
+   ],
+   "argv": [
+    "python3",
+    "tools/asahi/g15-retention-tests.py",
+    "--mutations",
+    "--output",
+    "{output}"
+   ],
+   "rust": "1.93.1",
+   "note": "Actual G15 and KBox ownership bodies with drop-count allocation failures; old-source P1 controls must fail at runtime. Public synthetic inputs only."
+  },
+  {
    "name": "tools/asahi/g15-maintained-handoff-tests.py",
    "group": "tools",
    "argv": [
