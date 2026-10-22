@@ -31,7 +31,8 @@
   "tools/aurora-*",
   "tools/testing/apple",
   "tools/testing/selftests/drivers/apple",
-  "tools/testing/selftests/drivers/gpu/apple-*"
+  "tools/testing/selftests/drivers/gpu/apple-*",
+  "tools/testing/selftests/drivers/gpu/asahi-g15"
  ],
  "suites": [
   {
@@ -2036,10 +2037,113 @@
     "--out",
     "{output}"
    ]
+  },
+  {
+   "name": "tools/asahi/g15-input-error-tests.py",
+   "group": "tools",
+   "argv": [
+    "python3",
+    "tools/asahi/g15-input-error-tests.py",
+    "--mutations",
+    "--output",
+    "{output}"
+   ],
+   "rust": "1.93.1",
+   "note": "Actual production-body host control plus runtime mutants; kernel services modeled, no private hardware fixtures."
+  },
+  {
+   "name": "tools/asahi/g15-queue-credit-tests.py",
+   "group": "tools",
+   "argv": [
+    "python3",
+    "tools/asahi/g15-queue-credit-tests.py",
+    "--mutations",
+    "--output",
+    "{output}"
+   ],
+   "rust": "1.93.1",
+   "note": "Actual production-body host control plus runtime mutants; kernel services modeled, no private hardware fixtures."
+  },
+  {
+   "name": "tools/asahi/g15-probe-init-tests.py",
+   "group": "tools",
+   "argv": [
+    "python3",
+    "tools/asahi/g15-probe-init-tests.py",
+    "--mutations",
+    "--output",
+    "{output}"
+   ],
+   "rust": "1.93.1",
+   "note": "Actual production-body host control plus runtime mutants; kernel services modeled, no private hardware fixtures."
+  },
+  {
+   "name": "tools/asahi/g15-maintained-handoff-tests.py",
+   "group": "tools",
+   "argv": [
+    "python3",
+    "tools/asahi/g15-maintained-handoff-tests.py",
+    "--mutations",
+    "--output",
+    "{output}"
+   ],
+   "rust": "1.93.1",
+   "note": "Actual production-body host control plus runtime mutants; kernel services modeled, no private hardware fixtures."
+  },
+  {
+   "name": "tools/asahi/g15-zero-words-tests.py",
+   "group": "tools",
+   "argv": [
+    "python3",
+    "tools/asahi/g15-zero-words-tests.py",
+    "--mutations",
+    "--evidence",
+    "{output}"
+   ],
+   "rust": "1.93.1",
+   "note": "Actual production-body host control plus runtime mutants; kernel services modeled, no private hardware fixtures."
+  },
+  {
+   "name": "tools/asahi/g15-pb-growth-tests.py",
+   "group": "tools",
+   "argv": [
+    "python3",
+    "tools/asahi/g15-pb-growth-tests.py",
+    "--mutations",
+    "--output",
+    "{output}"
+   ],
+   "rust": "1.93.1",
+   "note": "Actual production-body host control plus runtime mutants; kernel services modeled, no private hardware fixtures."
+  },
+  {
+   "name": "tools/asahi/g15-stats-drain-tests.py",
+   "group": "tools",
+   "argv": [
+    "python3",
+    "tools/asahi/g15-stats-drain-tests.py",
+    "--mutations",
+    "--output",
+    "{output}"
+   ],
+   "rust": "1.93.1",
+   "note": "Actual production-body host control plus runtime mutants; kernel services modeled, no private hardware fixtures."
+  },
+  {
+   "name": "tools/testing/selftests/drivers/gpu/asahi-g15/run.py",
+   "group": "tools",
+   "argv": [
+    "python3",
+    "tools/testing/selftests/drivers/gpu/asahi-g15/run.py"
+   ],
+   "rust": "1.93.1",
+   "note": "Public synthetic Rust/C host cases; two unavailable private-hardware fixture cases remain explicitly ignored."
   }
  ],
  "helpers": {
-  "tools/testing/selftests/drivers/gpu/apple-dcp/run.py": "the implementation behind tools/testing/selftests/drivers/gpu/apple-dcp/run.sh, which is listed"
+  "tools/testing/selftests/drivers/gpu/apple-dcp/run.py": "the implementation behind tools/testing/selftests/drivers/gpu/apple-dcp/run.sh, which is listed",
+  "tools/testing/selftests/drivers/gpu/asahi-g15/uat-owner.c": "compiled and executed by the registered asahi-g15/run.py actual reservation-owner fixture",
+  "tools/testing/selftests/drivers/gpu/asahi-g15/pmp-bridge.c": "compiled and executed by the registered asahi-g15/run.py maintained PMP fixture"
  },
  "excluded": {
   "tools/aurora-sep/tests/coordinator/runtime-check.sh": "Needs /dev/sep-bio, a running kernel booted with trusted.source=applesep, the hw_random sysfs interface and fprintd. Coordinator payload for an approved device.",
