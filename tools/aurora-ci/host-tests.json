@@ -1983,6 +1983,37 @@
     "--output",
     "{output}"
    ]
+  },
+  {
+   "name": "tools/asahi/t6030-clock-tests.py",
+   "group": "tools",
+   "argv": [
+    "python3",
+    "tools/asahi/t6030-clock-tests.py",
+    "--out",
+    "{output}"
+   ]
+  },
+  {
+   "name": "tools/asahi/t6030-wiring-tests.py",
+   "group": "tools",
+   "argv": [
+    "python3",
+    "tools/asahi/t6030-wiring-tests.py",
+    "--out",
+    "{output}"
+   ]
+  },
+  {
+   "name": "tools/asahi/tiled-split-tests.py",
+   "group": "tools",
+   "argv": [
+    "python3",
+    "tools/asahi/tiled-split-tests.py",
+    "--mutations",
+    "--out",
+    "{output}"
+   ]
   }
  ],
  "helpers": {
