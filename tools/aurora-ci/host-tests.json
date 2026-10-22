@@ -2025,6 +2025,17 @@
     "--output",
     "{output}"
    ]
+  },
+  {
+   "name": "tools/asahi/atc-usb3-tests.py",
+   "group": "tools",
+   "argv": [
+    "python3",
+    "tools/asahi/atc-usb3-tests.py",
+    "--mutations",
+    "--out",
+    "{output}"
+   ]
   }
  ],
  "helpers": {
