@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0
 import json
+import subprocess
 
 from support import TempDirTestCase, commit_file, git, load
 
@@ -31,6 +32,33 @@ class RangeTest(TempDirTestCase):
         self.assertEqual([c["subject"] for c in report["commits"]], ["drivers: add a", "drivers: add b"])
         self.assertEqual(report["failures"], [])
         self.assertEqual(report["uapi"], [])
+
+    def test_non_utf8_patch_reaches_checkpatch_unchanged(self):
+        source = self.origin / "fixture.c"
+        source.write_bytes(b"/* legacy byte: \xc0 */\n")
+        git(self.origin, "add", "fixture.c")
+        git(self.origin, "commit", "--quiet", "-m", "legacy source" + SIGNED)
+        head = git(self.origin, "rev-parse", "HEAD")
+        scripts = self.origin / "scripts"
+        scripts.mkdir()
+        (scripts / "checkpatch.pl").write_text(
+            'use strict; use warnings;\n'
+            'binmode STDIN; binmode STDOUT;\n'
+            'local $/; my $patch = <STDIN>;\n'
+            'open my $out, ">:raw", "seen.patch" or die $!;\n'
+            'print {$out} $patch; close $out or die $!;\n'
+            'print "fixture.c:1: WARNING:NON_UTF8: legacy byte \\xc0\\n";\n'
+        )
+        expected = subprocess.check_output(
+            ["git", "-C", str(self.origin), "format-patch", "-1", "--stdout", head])
+        self.assertIn(b"\xc0", expected)
+        report = checks.check(self.origin, "origin", self.base, head,
+                              max_commits=100)
+        self.assertEqual((self.origin / "seen.patch").read_bytes(), expected)
+        self.assertEqual(report["failures"], [])
+        finding, = report["commits"][0]["checkpatch"]
+        self.assertEqual(finding["type"], "NON_UTF8")
+        self.assertEqual(finding["message"], "legacy byte \ufffd")
 
     def test_unsigned_commit_fails(self):
         unsigned = commit_file(self.origin, "drivers/a.c", "a\n", "drivers: add a\n\nNo trailer here.")

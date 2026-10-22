@@ -36,8 +36,8 @@ CHECKPATCH_LINE = re.compile(r"^(?P<file>[^:\s]+):(?P<line>\d+): (?P<level>ERROR
 DEPTHS = (64, 256, 1024, 4096)
 
 
-def git(repo, *args, check=True):
-    return subprocess.run(["git", "-C", str(repo), *args], check=check, text=True,
+def git(repo, *args, check=True, text=True):
+    return subprocess.run(["git", "-C", str(repo), *args], check=check, text=text,
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
@@ -64,13 +64,15 @@ def describe(repo, sha):
 
 def run_checkpatch(repo, sha):
     """checkpatch.pl findings for one commit, as dicts."""
-    patch = git(repo, "format-patch", "-1", "--stdout", sha).stdout
+    # A patch may contain non-UTF-8 source text. Preserve its bytes for perl;
+    # only diagnostic output is decoded for the report.
+    patch = git(repo, "format-patch", "-1", "--stdout", sha, text=False).stdout
     result = subprocess.run(
         ["perl", "scripts/checkpatch.pl", "--terse", "--showfile", "--show-types", "--no-summary",
-         "--color=never", "-"], cwd=repo, input=patch, text=True,
+         "--color=never", "-"], cwd=repo, input=patch,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     findings = []
-    for line in result.stdout.splitlines():
+    for line in result.stdout.decode("utf-8", errors="replace").splitlines():
         match = CHECKPATCH_LINE.match(line.strip())
         if match:
             findings.append(match.groupdict())
@@ -154,7 +156,10 @@ def main(argv=None):
         report = check(args.repo, args.remote, args.base, args.head, args.max_commits,
                        checkpatch=not args.no_checkpatch)
     except subprocess.CalledProcessError as error:
-        print(f"::error title=Commit checks::{' '.join(error.cmd)} failed: {escape(error.stderr or '')}",
+        stderr = error.stderr or ""
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", errors="replace")
+        print(f"::error title=Commit checks::{' '.join(error.cmd)} failed: {escape(stderr)}",
               file=sys.stderr)
         return 1
     if args.report:
