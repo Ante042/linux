@@ -1972,6 +1972,17 @@
     "tools/testing/selftests/drivers/net/mt7932_e2e_test.py",
     "-v"
    ]
+  },
+  {
+   "name": "tools/asahi/tb-dp-repair-tests.py",
+   "group": "tools",
+   "argv": [
+    "python3",
+    "tools/asahi/tb-dp-repair-tests.py",
+    "--mutations",
+    "--output",
+    "{output}"
+   ]
   }
  ],
  "helpers": {
