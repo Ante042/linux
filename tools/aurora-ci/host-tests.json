@@ -54,6 +54,17 @@
    "known_failure": "its mocks predate the current apple-dart.c (no u32, fw_mirror/fw_handoff, apple_dart_fw_invalidate; apple_dart_hw_sync_locked takes three arguments now)"
   },
   {
+   "name": "tools/asahi/avd-codec-tail-tests.py",
+   "group": "tools",
+   "argv": [
+    "python3",
+    "tools/asahi/avd-codec-tail-tests.py",
+    "--mutations",
+    "--output",
+    "{output}"
+   ]
+  },
+  {
    "name": "tools/asahi/avd-av1-tail-tests.py",
    "group": "tools",
    "argv": [
