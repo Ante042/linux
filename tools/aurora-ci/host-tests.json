@@ -2138,12 +2138,59 @@
    ],
    "rust": "1.93.1",
    "note": "Public synthetic Rust/C host cases; two unavailable private-hardware fixture cases remain explicitly ignored."
+  },
+  {
+   "name": "tools/asahi/t6030-pmp-graph-tests.py",
+   "group": "tools",
+   "argv": [
+    "python3",
+    "tools/asahi/t6030-pmp-graph-tests.py",
+    "--mutations",
+    "--output",
+    "{output}"
+   ],
+   "note": "Actual production-body host boundaries and runtime mutants; no firmware or hardware qualification."
+  },
+  {
+   "name": "tools/asahi/t6030-display-admission-tests.py",
+   "group": "tools",
+   "argv": [
+    "python3",
+    "tools/asahi/t6030-display-admission-tests.py",
+    "--mutations",
+    "--output",
+    "{output}"
+   ],
+   "note": "Actual production-body host boundaries and runtime mutants; no firmware or hardware qualification."
+  },
+  {
+   "name": "tools/asahi/t6030-display-linkage-tests.py",
+   "group": "tools",
+   "setup": [
+    [
+     "make",
+     "-s",
+     "O={output}-conf",
+     "allnoconfig"
+    ]
+   ],
+   "argv": [
+    "python3",
+    "tools/asahi/t6030-display-linkage-tests.py",
+    "--conf",
+    "{output}-conf/scripts/kconfig/conf",
+    "--output",
+    "{output}"
+   ],
+   "note": "Build only the host Kconfig tool in an isolated output directory; check all built-in/module dependency combinations."
   }
  ],
  "helpers": {
   "tools/testing/selftests/drivers/gpu/apple-dcp/run.py": "the implementation behind tools/testing/selftests/drivers/gpu/apple-dcp/run.sh, which is listed",
   "tools/testing/selftests/drivers/gpu/asahi-g15/uat-owner.c": "compiled and executed by the registered asahi-g15/run.py actual reservation-owner fixture",
-  "tools/testing/selftests/drivers/gpu/asahi-g15/pmp-bridge.c": "compiled and executed by the registered asahi-g15/run.py maintained PMP fixture"
+  "tools/testing/selftests/drivers/gpu/asahi-g15/pmp-bridge.c": "compiled and executed by the registered asahi-g15/run.py maintained PMP fixture",
+  "tools/asahi/t6030-pmp-graph-tests.c": "compiled and executed by the corresponding registered Python actual-body host suite",
+  "tools/asahi/t6030-display-admission-tests.c": "compiled and executed by the corresponding registered Python actual-body host suite"
  },
  "excluded": {
   "tools/aurora-sep/tests/coordinator/runtime-check.sh": "Needs /dev/sep-bio, a running kernel booted with trusted.source=applesep, the hw_random sysfs interface and fprintd. Coordinator payload for an approved device.",
