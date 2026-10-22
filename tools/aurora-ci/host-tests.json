@@ -2014,6 +2014,17 @@
     "--out",
     "{output}"
    ]
+  },
+  {
+   "name": "tools/asahi/t6030-pmp-supplier-tests.py",
+   "group": "tools",
+   "argv": [
+    "python3",
+    "tools/asahi/t6030-pmp-supplier-tests.py",
+    "--mutations",
+    "--output",
+    "{output}"
+   ]
   }
  ],
  "helpers": {
