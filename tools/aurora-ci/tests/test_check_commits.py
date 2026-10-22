@@ -60,6 +60,24 @@ class RangeTest(TempDirTestCase):
         self.assertEqual(finding["type"], "NON_UTF8")
         self.assertEqual(finding["message"], "legacy byte \ufffd")
 
+    def test_shallow_merge_fetches_the_whole_added_branch(self):
+        git(self.origin, "checkout", "--quiet", "-b", "topic")
+        for i in range(70):
+            commit_file(self.origin, "drivers/a.c", f"{i}\n",
+                        f"topic {i}" + SIGNED)
+        topic = git(self.origin, "rev-parse", "HEAD")
+        git(self.origin, "checkout", "--quiet", "main")
+        base = commit_file(self.origin, "README", "main update\n",
+                           "main update" + SIGNED)
+        git(self.origin, "merge", "--quiet", "--no-ff", "-m", "Merge topic", topic)
+        head = git(self.origin, "rev-parse", "HEAD")
+        clone = self.shallow_clone(head)
+        report = checks.check(clone, "origin", base, head,
+                              max_commits=100, checkpatch=False)
+        self.assertEqual([c["subject"] for c in report["commits"]],
+                         [f"topic {i}" for i in range(70)])
+        self.assertEqual(report["failures"], [])
+
     def test_unsigned_commit_fails(self):
         unsigned = commit_file(self.origin, "drivers/a.c", "a\n", "drivers: add a\n\nNo trailer here.")
         head = commit_file(self.origin, "drivers/b.c", "b\n", "drivers: add b" + SIGNED)

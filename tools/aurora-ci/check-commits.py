@@ -41,15 +41,30 @@ def git(repo, *args, check=True, text=True):
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
+def range_history_complete(repo, base, head):
+    if git(repo, "merge-base", base, head, check=False).returncode != 0:
+        return False
+    shallow = Path(git(repo, "rev-parse", "--path-format=absolute",
+                       "--git-path", "shallow").stdout.strip())
+    if not shallow.exists():
+        return True
+    # A recent merge can expose base while an older topic parent is still
+    # shallow. Such a boundary looks like a root commit to format-patch.
+    boundaries = set(shallow.read_text().split())
+    added = set(git(repo, "rev-list", f"{base}..{head}").stdout.split())
+    return boundaries.isdisjoint(added)
+
+
 def ensure_history(repo, remote, base, head):
     """Fetch base and head, deepening until they share history.
 
-    Returns False if they still do not meet at the deepest fetch."""
+    Also require every commit added by the range to have its parents.
+    Returns False if either condition remains unmet at the deepest fetch."""
     for depth in DEPTHS:
-        if git(repo, "merge-base", base, head, check=False).returncode == 0:
+        if range_history_complete(repo, base, head):
             return True
         git(repo, "fetch", "--quiet", "--no-tags", f"--depth={depth}", remote, base, head)
-    return git(repo, "merge-base", base, head, check=False).returncode == 0
+    return range_history_complete(repo, base, head)
 
 
 def commits_in(repo, base, head):
@@ -93,8 +108,9 @@ def check(repo, remote, base, head, max_commits, checkpatch=True):
               "mode": "full", "notes": []}
     if not ensure_history(repo, remote, base, head):
         report["mode"] = "unrelated"
-        report["notes"].append(f"{base[:12]} and {head[:12]} share no history within "
-                               f"{DEPTHS[-1]} commits; commit checks skipped")
+        report["notes"].append(f"Complete added history for {base[:12]}..{head[:12]} "
+                               f"was not established within {DEPTHS[-1]} commits; "
+                               "commit checks skipped")
         return report
 
     shas = commits_in(repo, base, head)
