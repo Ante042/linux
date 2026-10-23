@@ -1557,14 +1557,27 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 	}
 
 	if (!port->owner) {
+		/*
+		 * Nothing behind the port asserts HPD yet, a dock without a
+		 * display for one: leave the pipelines to ports with a display.
+		 * The port controller reports HPD as a new status when a sink
+		 * appears, and the port is routed then.  A port that already
+		 * owns a pipeline keeps it across an HPD drop, as before.
+		 */
+		if (!hpd) {
+			port->hpd = false;
+			port->applied_valid = true;
+			return 0;
+		}
+
 		best = dcp_typec_free_route(port);
-		if (!best && hpd)
+		if (!best)
 			best = dcp_typec_take_over_without_hpd(port);
 		if (IS_ERR(best))
 			return PTR_ERR(best);
 		/* Every pipeline is driving another port's display. */
 		if (!best)
-			return hpd ? dcp_typec_port_busy(port, route->dcp) : -ENOSPC;
+			return dcp_typec_port_busy(port, route->dcp);
 
 		ret = dcp_typec_route_activate(best, best->xbar);
 		if (ret)
