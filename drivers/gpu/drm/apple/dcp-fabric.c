@@ -1378,6 +1378,45 @@ static int dcp_typec_port_busy(struct apple_dcp_typec_port *port,
 	return -ENOSPC;
 }
 
+/*
+ * PD controllers report a DP state at probe for ports with no display behind
+ * them, an empty port or one with a dock that has none, and whichever port is
+ * routed first wins the pipeline.  A port whose sink asserts HPD and finds no
+ * free pipeline takes one over from a direct DP-alt port whose sink never
+ * did.  Tunnels, ports in a SAFE transition and pipelines whose fixed output
+ * is in use are left alone.  The released port drops its applied state, so
+ * its next update is routed again once a pipeline is free.
+ */
+static struct apple_dcp_typec_route *
+dcp_typec_take_over_without_hpd(struct apple_dcp_typec_port *port)
+{
+	struct apple_dcp_typec_route *candidate;
+
+	list_for_each_entry(candidate, &port->routes, port_link) {
+		struct apple_dcp_typec_route *held =
+			candidate->dcp->active_typec_route;
+		int ret;
+
+		if (!held || held->tunnel || held->port == port ||
+		    held->port->hpd || held->port->dp_hpd ||
+		    held->port->safe_pending ||
+		    dcp_typec_route_busy(candidate))
+			continue;
+
+		ret = dcp_typec_route_deactivate(held);
+		if (ret)
+			return ERR_PTR(ret);
+		held->port->owner = NULL;
+		held->port->applied_valid = false;
+		dev_info(candidate->dcp->dev,
+			 "released Type-C DPTX PHY %u held without HPD\n",
+			 held->dptx_phy);
+		return candidate;
+	}
+
+	return NULL;
+}
+
 static int dcp_typec_route_set(struct typec_mux_dev *mux,
 			       struct typec_mux_state *state)
 {
@@ -1519,6 +1558,10 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 
 	if (!port->owner) {
 		best = dcp_typec_free_route(port);
+		if (!best && hpd)
+			best = dcp_typec_take_over_without_hpd(port);
+		if (IS_ERR(best))
+			return PTR_ERR(best);
 		/* Every pipeline is driving another port's display. */
 		if (!best)
 			return hpd ? dcp_typec_port_busy(port, route->dcp) : -ENOSPC;
