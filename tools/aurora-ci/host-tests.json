@@ -31,7 +31,8 @@
   "tools/aurora-*",
   "tools/testing/apple",
   "tools/testing/selftests/drivers/apple",
-  "tools/testing/selftests/drivers/gpu/apple-*"
+  "tools/testing/selftests/drivers/gpu/apple-*",
+  "tools/testing/selftests/drivers/gpu/asahi-g15"
  ],
  "suites": [
   {
@@ -52,6 +53,17 @@
     "tools/asahi/apple-dart-range-tests.py"
    ],
    "known_failure": "its mocks predate the current apple-dart.c (no u32, fw_mirror/fw_handoff, apple_dart_fw_invalidate; apple_dart_hw_sync_locked takes three arguments now)"
+  },
+  {
+   "name": "tools/asahi/avd-codec-tail-tests.py",
+   "group": "tools",
+   "argv": [
+    "python3",
+    "tools/asahi/avd-codec-tail-tests.py",
+    "--mutations",
+    "--output",
+    "{output}"
+   ]
   },
   {
    "name": "tools/asahi/avd-av1-tail-tests.py",
@@ -1935,6 +1947,17 @@
    ]
   },
   {
+   "name": "tools/testing/selftests/drivers/gpu/apple-dcp/plane-layout.py",
+   "group": "tools",
+   "argv": [
+    "python3",
+    "tools/testing/selftests/drivers/gpu/apple-dcp/plane-layout.py",
+    "--mutations",
+    "--output",
+    "{output}"
+   ]
+  },
+  {
    "name": "tools/testing/selftests/drivers/gpu/apple-dcp/run.sh",
    "group": "tools",
    "argv": [
@@ -1961,10 +1984,240 @@
     "tools/testing/selftests/drivers/net/mt7932_e2e_test.py",
     "-v"
    ]
+  },
+  {
+   "name": "tools/asahi/tb-dp-repair-tests.py",
+   "group": "tools",
+   "argv": [
+    "python3",
+    "tools/asahi/tb-dp-repair-tests.py",
+    "--mutations",
+    "--output",
+    "{output}"
+   ]
+  },
+  {
+   "name": "tools/asahi/t6030-clock-tests.py",
+   "group": "tools",
+   "argv": [
+    "python3",
+    "tools/asahi/t6030-clock-tests.py",
+    "--out",
+    "{output}"
+   ]
+  },
+  {
+   "name": "tools/asahi/t6030-wiring-tests.py",
+   "group": "tools",
+   "argv": [
+    "python3",
+    "tools/asahi/t6030-wiring-tests.py",
+    "--out",
+    "{output}"
+   ]
+  },
+  {
+   "name": "tools/asahi/tiled-split-tests.py",
+   "group": "tools",
+   "argv": [
+    "python3",
+    "tools/asahi/tiled-split-tests.py",
+    "--mutations",
+    "--out",
+    "{output}"
+   ]
+  },
+  {
+   "name": "tools/asahi/t6030-pmp-supplier-tests.py",
+   "group": "tools",
+   "argv": [
+    "python3",
+    "tools/asahi/t6030-pmp-supplier-tests.py",
+    "--mutations",
+    "--output",
+    "{output}"
+   ]
+  },
+  {
+   "name": "tools/asahi/atc-usb3-tests.py",
+   "group": "tools",
+   "argv": [
+    "python3",
+    "tools/asahi/atc-usb3-tests.py",
+    "--mutations",
+    "--out",
+    "{output}"
+   ]
+  },
+  {
+   "name": "tools/asahi/g15-input-error-tests.py",
+   "group": "tools",
+   "argv": [
+    "python3",
+    "tools/asahi/g15-input-error-tests.py",
+    "--mutations",
+    "--output",
+    "{output}"
+   ],
+   "rust": "1.93.1",
+   "note": "Actual production-body host control plus runtime mutants; kernel services modeled, no private hardware fixtures."
+  },
+  {
+   "name": "tools/asahi/g15-queue-credit-tests.py",
+   "group": "tools",
+   "argv": [
+    "python3",
+    "tools/asahi/g15-queue-credit-tests.py",
+    "--mutations",
+    "--output",
+    "{output}"
+   ],
+   "rust": "1.93.1",
+   "note": "Actual production-body host control plus runtime mutants; kernel services modeled, no private hardware fixtures."
+  },
+  {
+   "name": "tools/asahi/g15-probe-init-tests.py",
+   "group": "tools",
+   "argv": [
+    "python3",
+    "tools/asahi/g15-probe-init-tests.py",
+    "--mutations",
+    "--output",
+    "{output}"
+   ],
+   "rust": "1.93.1",
+   "note": "Actual production-body host control plus runtime mutants; kernel services modeled, no private hardware fixtures."
+  },
+  {
+   "name": "tools/asahi/g15-retention-tests.py",
+   "group": "tools",
+   "commits": [
+    "31da169251bd34d5810a0874563d9a019b85bf56"
+   ],
+   "argv": [
+    "python3",
+    "tools/asahi/g15-retention-tests.py",
+    "--mutations",
+    "--output",
+    "{output}"
+   ],
+   "rust": "1.93.1",
+   "note": "Actual G15 and KBox ownership bodies with drop-count allocation failures; old-source P1 controls must fail at runtime. Public synthetic inputs only."
+  },
+  {
+   "name": "tools/asahi/g15-maintained-handoff-tests.py",
+   "group": "tools",
+   "argv": [
+    "python3",
+    "tools/asahi/g15-maintained-handoff-tests.py",
+    "--mutations",
+    "--output",
+    "{output}"
+   ],
+   "rust": "1.93.1",
+   "note": "Actual production-body host control plus runtime mutants; kernel services modeled, no private hardware fixtures."
+  },
+  {
+   "name": "tools/asahi/g15-zero-words-tests.py",
+   "group": "tools",
+   "argv": [
+    "python3",
+    "tools/asahi/g15-zero-words-tests.py",
+    "--mutations",
+    "--evidence",
+    "{output}"
+   ],
+   "rust": "1.93.1",
+   "note": "Actual production-body host control plus runtime mutants; kernel services modeled, no private hardware fixtures."
+  },
+  {
+   "name": "tools/asahi/g15-pb-growth-tests.py",
+   "group": "tools",
+   "argv": [
+    "python3",
+    "tools/asahi/g15-pb-growth-tests.py",
+    "--mutations",
+    "--output",
+    "{output}"
+   ],
+   "rust": "1.93.1",
+   "note": "Actual production-body host control plus runtime mutants; kernel services modeled, no private hardware fixtures."
+  },
+  {
+   "name": "tools/asahi/g15-stats-drain-tests.py",
+   "group": "tools",
+   "argv": [
+    "python3",
+    "tools/asahi/g15-stats-drain-tests.py",
+    "--mutations",
+    "--output",
+    "{output}"
+   ],
+   "rust": "1.93.1",
+   "note": "Actual production-body host control plus runtime mutants; kernel services modeled, no private hardware fixtures."
+  },
+  {
+   "name": "tools/testing/selftests/drivers/gpu/asahi-g15/run.py",
+   "group": "tools",
+   "argv": [
+    "python3",
+    "tools/testing/selftests/drivers/gpu/asahi-g15/run.py"
+   ],
+   "rust": "1.93.1",
+   "note": "Public synthetic Rust/C host cases; two unavailable private-hardware fixture cases remain explicitly ignored."
+  },
+  {
+   "name": "tools/asahi/t6030-pmp-graph-tests.py",
+   "group": "tools",
+   "argv": [
+    "python3",
+    "tools/asahi/t6030-pmp-graph-tests.py",
+    "--mutations",
+    "--output",
+    "{output}"
+   ],
+   "note": "Actual production-body host boundaries and runtime mutants; no firmware or hardware qualification."
+  },
+  {
+   "name": "tools/asahi/t6030-display-admission-tests.py",
+   "group": "tools",
+   "argv": [
+    "python3",
+    "tools/asahi/t6030-display-admission-tests.py",
+    "--mutations",
+    "--output",
+    "{output}"
+   ],
+   "note": "Actual production-body host boundaries and runtime mutants; no firmware or hardware qualification."
+  },
+  {
+   "name": "tools/asahi/t6030-display-linkage-tests.py",
+   "group": "tools",
+   "setup": [
+    [
+     "make",
+     "-s",
+     "O={output}-conf",
+     "allnoconfig"
+    ]
+   ],
+   "argv": [
+    "python3",
+    "tools/asahi/t6030-display-linkage-tests.py",
+    "--conf",
+    "{output}-conf/scripts/kconfig/conf",
+    "--output",
+    "{output}"
+   ],
+   "note": "Build only the host Kconfig tool in an isolated output directory; check all built-in/module dependency combinations."
   }
  ],
  "helpers": {
-  "tools/testing/selftests/drivers/gpu/apple-dcp/run.py": "the implementation behind tools/testing/selftests/drivers/gpu/apple-dcp/run.sh, which is listed"
+  "tools/testing/selftests/drivers/gpu/apple-dcp/run.py": "the implementation behind tools/testing/selftests/drivers/gpu/apple-dcp/run.sh, which is listed",
+  "tools/testing/selftests/drivers/gpu/asahi-g15/uat-owner.c": "compiled and executed by the registered asahi-g15/run.py actual reservation-owner fixture",
+  "tools/testing/selftests/drivers/gpu/asahi-g15/pmp-bridge.c": "compiled and executed by the registered asahi-g15/run.py maintained PMP fixture",
+  "tools/asahi/t6030-pmp-graph-tests.c": "compiled and executed by the corresponding registered Python actual-body host suite",
+  "tools/asahi/t6030-display-admission-tests.c": "compiled and executed by the corresponding registered Python actual-body host suite"
  },
  "excluded": {
   "tools/aurora-sep/tests/coordinator/runtime-check.sh": "Needs /dev/sep-bio, a running kernel booted with trusted.source=applesep, the hw_random sysfs interface and fprintd. Coordinator payload for an approved device.",

@@ -36,20 +36,35 @@ CHECKPATCH_LINE = re.compile(r"^(?P<file>[^:\s]+):(?P<line>\d+): (?P<level>ERROR
 DEPTHS = (64, 256, 1024, 4096)
 
 
-def git(repo, *args, check=True):
-    return subprocess.run(["git", "-C", str(repo), *args], check=check, text=True,
+def git(repo, *args, check=True, text=True):
+    return subprocess.run(["git", "-C", str(repo), *args], check=check, text=text,
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+def range_history_complete(repo, base, head):
+    if git(repo, "merge-base", base, head, check=False).returncode != 0:
+        return False
+    shallow = Path(git(repo, "rev-parse", "--path-format=absolute",
+                       "--git-path", "shallow").stdout.strip())
+    if not shallow.exists():
+        return True
+    # A recent merge can expose base while an older topic parent is still
+    # shallow. Such a boundary looks like a root commit to format-patch.
+    boundaries = set(shallow.read_text().split())
+    added = set(git(repo, "rev-list", f"{base}..{head}").stdout.split())
+    return boundaries.isdisjoint(added)
 
 
 def ensure_history(repo, remote, base, head):
     """Fetch base and head, deepening until they share history.
 
-    Returns False if they still do not meet at the deepest fetch."""
+    Also require every commit added by the range to have its parents.
+    Returns False if either condition remains unmet at the deepest fetch."""
     for depth in DEPTHS:
-        if git(repo, "merge-base", base, head, check=False).returncode == 0:
+        if range_history_complete(repo, base, head):
             return True
         git(repo, "fetch", "--quiet", "--no-tags", f"--depth={depth}", remote, base, head)
-    return git(repo, "merge-base", base, head, check=False).returncode == 0
+    return range_history_complete(repo, base, head)
 
 
 def commits_in(repo, base, head):
@@ -64,13 +79,15 @@ def describe(repo, sha):
 
 def run_checkpatch(repo, sha):
     """checkpatch.pl findings for one commit, as dicts."""
-    patch = git(repo, "format-patch", "-1", "--stdout", sha).stdout
+    # A patch may contain non-UTF-8 source text. Preserve its bytes for perl;
+    # only diagnostic output is decoded for the report.
+    patch = git(repo, "format-patch", "-1", "--stdout", sha, text=False).stdout
     result = subprocess.run(
         ["perl", "scripts/checkpatch.pl", "--terse", "--showfile", "--show-types", "--no-summary",
-         "--color=never", "-"], cwd=repo, input=patch, text=True,
+         "--color=never", "-"], cwd=repo, input=patch,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     findings = []
-    for line in result.stdout.splitlines():
+    for line in result.stdout.decode("utf-8", errors="replace").splitlines():
         match = CHECKPATCH_LINE.match(line.strip())
         if match:
             findings.append(match.groupdict())
@@ -91,8 +108,9 @@ def check(repo, remote, base, head, max_commits, checkpatch=True):
               "mode": "full", "notes": []}
     if not ensure_history(repo, remote, base, head):
         report["mode"] = "unrelated"
-        report["notes"].append(f"{base[:12]} and {head[:12]} share no history within "
-                               f"{DEPTHS[-1]} commits; commit checks skipped")
+        report["notes"].append(f"Complete added history for {base[:12]}..{head[:12]} "
+                               f"was not established within {DEPTHS[-1]} commits; "
+                               "commit checks skipped")
         return report
 
     shas = commits_in(repo, base, head)
@@ -154,7 +172,10 @@ def main(argv=None):
         report = check(args.repo, args.remote, args.base, args.head, args.max_commits,
                        checkpatch=not args.no_checkpatch)
     except subprocess.CalledProcessError as error:
-        print(f"::error title=Commit checks::{' '.join(error.cmd)} failed: {escape(error.stderr or '')}",
+        stderr = error.stderr or ""
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", errors="replace")
+        print(f"::error title=Commit checks::{' '.join(error.cmd)} failed: {escape(stderr)}",
               file=sys.stderr)
         return 1
     if args.report:
