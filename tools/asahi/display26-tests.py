@@ -29,7 +29,7 @@ def main():
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
-typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32; typedef uint64_t u64;
+typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32; typedef unsigned long long u64;
 ''')
         write(tmp, 'linux/string.h', '#include <string.h>\n')
         write(tmp, 'linux/bitops.h', '#pragma once\n#define BIT(x) (1U << (x))\nstatic int fls(unsigned x){return x?32-__builtin_clz(x):0;}\n')
@@ -87,9 +87,11 @@ int main(void) {
             '-I'+str(tmp), '-I'+str(ROOT), str(tmp/'profile.c'), '-o', str(tmp/'profile'))
         run(str(tmp/'profile'))
         # Platform functions are mocked; the bridge's actual decisions and cleanup execute.
-        for name in ('device', 'export', 'mutex', 'of'):
+        for name in ('device', 'export', 'mutex', 'of', 'bitfield', 'crc32', 'interrupt', 'io',
+                     'iopoll', 'mfd/syscon', 'of_address', 'of_platform', 'platform_device',
+                     'regmap', 'vmalloc'):
             write(tmp, 'linux/'+name+'.h', '#include "mock.h"\n')
-        write(tmp, 'linux/errno.h', '#define EPROBE_DEFER 517\n#define ENODEV 19\n#define EINVAL 22\n#define EBUSY 16\n#define EIO 5\n#define ETIMEDOUT 110\n')
+        write(tmp, 'linux/errno.h', '#define EPROBE_DEFER 517\n#define ENODEV 19\n#define EINVAL 22\n#define EBUSY 16\n#define EIO 5\n#define ETIMEDOUT 110\n#define EAGAIN 11\n#define ENOENT 2\n#define ENOMEM 12\n#define EALREADY 114\n#define EOPNOTSUPP 95\n')
         write(tmp, 'linux/kconfig.h', '#define IS_REACHABLE(x) 1\n#define IS_ENABLED(x) 1\n')
         write(tmp, 'mock.h', '''#pragma once
 #include <assert.h>
@@ -98,7 +100,9 @@ int main(void) {
 #include <pthread.h>
 #include <string.h>
 #include <linux/types.h>
-struct device_node { int id; }; struct device { struct device_node *of_node; bool bound; int refs; };
+struct device_node { int id; }; struct device { struct device_node *of_node; bool bound; int refs; struct device_driver *driver; };
+struct dev_pm_ops { int (*runtime_suspend)(struct device*); int (*runtime_resume)(struct device*); };
+struct device_driver { const struct dev_pm_ops *pm; };
 struct device_link { int unused; };
 struct mutex { pthread_mutex_t lock; };
 #define DEFINE_MUTEX(n) struct mutex n={PTHREAD_MUTEX_INITIALIZER}
@@ -116,11 +120,66 @@ static struct device_node *of_parse_phandle(struct device_node*n,const char*k,in
 static void of_node_put(struct device_node*n){}
 static bool device_is_bound(struct device*d){return d->bound;}
 static struct device *get_device(struct device*d){d->refs++;return d;}
-static void put_device(struct device*d){d->refs--;}
+static void put_device(struct device*d){if(d)d->refs--;}
 static struct device_link *device_link_add(struct device*c,struct device*s,unsigned flags){static struct device_link l;assert(flags==1);return link_fail?NULL:&l;}
 /* This harness exercises the J613/25G83 bridge, not the T6030 GFX report. */
 static bool of_machine_is_compatible(const char *name){return !strcmp(name,"apple,t8132");}
 static bool of_device_is_compatible(const struct device_node*n,const char*name){return false;}
+/* The T6000 power cycle for sleep: compiled with the bridge, never reached on J613. */
+#include <stdio.h>
+#include <linux/errno.h>
+#define BIT(x) (1U << (x))
+#define T6000_ONLY(r) (assert(!"T6000 power cycle reached on J613"), r)
+static inline __attribute__((format(printf,2,3))) void dev_log(const struct device*d,const char*f,...){}
+#define dev_dbg dev_log
+#define dev_info dev_log
+#define dev_warn dev_log
+#define dev_err dev_log
+#define __iomem
+#define ARRAY_SIZE(a) (sizeof(a)/sizeof((a)[0]))
+#define BIT_ULL(x) (1ULL << (x))
+#define GENMASK(h,l) ((~0U << (l)) & (~0U >> (31-(h))))
+#define FIELD_GET(m,v) (((v)&(m))/((m)&-(m)))
+#define FIELD_PREP(m,v) (((v)*((m)&-(m)))&(m))
+#define ERR_PTR(e) ((void*)(long)(e))
+#define PTR_ERR(p) ((long)(p))
+#define IS_ERR(p) ((unsigned long)(p)>=(unsigned long)-4095)
+#define IORESOURCE_MEM 0x200
+#define scnprintf snprintf
+#define wmb() ((void)0)
+struct resource { u64 start, end; }; struct platform_device { struct device dev; }; struct regmap;
+#define to_platform_device(d) ((struct platform_device*)((char*)(d)-offsetof(struct platform_device,dev)))
+/* The J613 supplier has no "asc" region. */
+static struct resource *platform_get_resource_byname(struct platform_device*p,unsigned t,const char*n){return NULL;}
+static struct resource *platform_get_resource(struct platform_device*p,unsigned t,unsigned i){return T6000_ONLY(NULL);}
+static int platform_get_irq(struct platform_device*p,unsigned i){return T6000_ONLY(-ENODEV);}
+static int platform_get_irq_byname(struct platform_device*p,const char*n){return T6000_ONLY(-ENODEV);}
+static u64 resource_size(const struct resource*r){return r->end-r->start+1;}
+static void *ioremap_np(u64 a,size_t s){return T6000_ONLY(NULL);}
+static void iounmap(volatile void*p){T6000_ONLY((void)0);}
+static u32 readl(const volatile void*a){return T6000_ONLY(0);}
+static u64 readq(const volatile void*a){return T6000_ONLY(0);}
+static void writel(u32 v,volatile void*a){T6000_ONLY((void)0);}
+static void writeq(u64 v,volatile void*a){T6000_ONLY((void)0);}
+#define readl_relaxed readl
+#define writel_relaxed writel
+#define readl_poll_timeout(a,v,c,d,t) ({ (v)=readl(a); (c)?0:-ETIMEDOUT; })
+static int regmap_read(struct regmap*m,unsigned r,u32*v){return T6000_ONLY(-EIO);}
+static int regmap_write(struct regmap*m,unsigned r,u32 v){return T6000_ONLY(-EIO);}
+#define regmap_read_poll_timeout_atomic(m,r,v,c,d,t) ({ regmap_read(m,r,&(v)) ?: ((c)?0:-ETIMEDOUT); })
+static struct regmap *syscon_node_to_regmap(struct device_node*n){return T6000_ONLY(ERR_PTR(-ENODEV));}
+static struct platform_device *of_find_device_by_node(struct device_node*n){return T6000_ONLY(NULL);}
+static struct device_node *of_get_parent(const struct device_node*n){return T6000_ONLY(NULL);}
+static struct device_node *of_get_next_child(const struct device_node*n,struct device_node*c){return T6000_ONLY(NULL);}
+#define for_each_child_of_node(p,c) for(c=of_get_next_child(p,NULL);c;c=of_get_next_child(p,c))
+static int of_property_read_string(const struct device_node*n,const char*p,const char**s){return T6000_ONLY(-EINVAL);}
+static int of_property_read_u32(const struct device_node*n,const char*p,u32*v){return T6000_ONLY(-EINVAL);}
+static void enable_irq(unsigned i){T6000_ONLY((void)0);}
+static void disable_irq(unsigned i){T6000_ONLY((void)0);}
+static void *vmalloc(unsigned long s){return T6000_ONLY(NULL);}
+static void vfree(const void*p){assert(!p);}
+static u32 crc32_le(u32 c,const unsigned char*p,size_t n){return T6000_ONLY(c);}
+static void udelay(unsigned long us){T6000_ONLY((void)0);}
 ''')
         write(tmp, 'bridge.c', '''#include <stdio.h>
 #include "drivers/soc/apple/pmp-export.c"
@@ -129,12 +188,17 @@ int apple_pmp_report_wait_supplier_ready(struct device*d,unsigned timeout){asser
 int apple_pmp_send_power_command(const void*data,u8 command,u16 id,u32 enabled){assert(data==pmp_data);calls++;return send_result;}
 int apple_pmp_report_check_t6030_gfx(struct device*d){assert(!"unexpected T6030 report on J613");return -EIO;}
 int apple_pmp_report_set_t6030_gfx(struct device*d,bool enabled){assert(!"unexpected T6030 report on J613");return -EIO;}
+void apple_pmp_report_gate(bool gate){T6000_ONLY((void)0);}
+int apple_pmp_set_sleep(const void*data,int op){return T6000_ONLY(-EIO);}
+static int (*s2r_hook)(int op);
+void apple_s2r_set_pmp_hook(int (*sleep)(int op)){s2r_hook=sleep;}
 int main(void){
  struct device_node n={1},wrong={2}; struct device supplier={&n,true,0},consumer={NULL,false,0}; int data;
  assert(apple_pmp_set_device_power(0xf,8,1)==-ENODEV);
  assert(apple_pmp_link_device(&consumer)==-EINVAL);
  phandle=&n;assert(apple_pmp_link_device(&consumer)==-EPROBE_DEFER);
- assert(apple_pmp_register(&supplier,&data)==0);
+ assert(apple_pmp_register(&supplier,&data)==0);assert(s2r_hook);
+ assert(s2r_hook(APPLE_S2R_PMP_STOP)==-ENODEV);
  assert(apple_pmp_register(&supplier,&data)==-EBUSY);
  supplier.bound=false;assert(apple_pmp_link_device(&consumer)==-EPROBE_DEFER);supplier.bound=true;
  phandle=&wrong;assert(apple_pmp_link_device(&consumer)==-EPROBE_DEFER);phandle=&n;
@@ -150,8 +214,9 @@ int main(void){
  send_result=0;assert(apple_pmp_set_device_power(0xf,8,1)==0);assert(calls==2);
  assert(apple_pmp_set_device_power(0xf,5,1)==0);assert(calls==3);
  assert(apple_pmp_set_device_power(0xe,5,0)==0);assert(calls==4);
+ pmp_pc.stopped=true;assert(apple_pmp_set_device_power(0xf,8,1)==-EAGAIN);assert(calls==4);pmp_pc.stopped=false;
  apple_pmp_unregister(&wrong);assert(pmp_data==&data);
- apple_pmp_unregister(&data);assert(!pmp_data && !pmp_device);
+ apple_pmp_unregister(&data);assert(!pmp_data && !pmp_device && !s2r_hook);
  assert(apple_pmp_set_device_power(0xf,8,1)==-ENODEV);
  puts("production PMP bridge supplier/ready/ack controls: PASS");
 }

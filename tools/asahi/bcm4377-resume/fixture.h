@@ -33,7 +33,10 @@
 #define BCM4377_BAR0_SLEEP_CONTROL 0
 #define BCM4377_BAR0_SLEEP_CONTROL_QUIESCE 1
 #define BCM4377_BAR0_SLEEP_CONTROL_UNQUIESCE 0
-#define system_freezable_wq 0
+#define BIT(nr) (1UL << (nr))
+struct workqueue_struct { int id; };
+static struct workqueue_struct freezable_wq;
+#define system_freezable_wq (&freezable_wq)
 #define container_of(p,t,m) ((t*)((char*)(p)-offsetof(t,m)))
 #define to_delayed_work(p) container_of(p,struct delayed_work,work)
 struct work_struct { int queued; };
@@ -69,6 +72,15 @@ struct bcm4377_data {
 };
 static int cal_count,ptb_count,reset_count,open_count,queued_count,addr_count,cal_failures,ptb_error,addr_error,reset_error,rings_error,close_error;
 static int rebind_count;
+/* Vendor config space as seen after sleep; the actual bcm4377_lost_power() reads it. */
+static bool cfg_window_lost, cfg_ctrl_lost;
+static int cfg_read_error, init_cfg_count, init_cfg_error, lost_rebind_count;
+static struct workqueue_struct *lost_rebind_wq;
+static const char *lost_rebind_why = "unset";
+static int pci_read_config_dword(struct pci_dev *p, int where, u32 *val);
+static int bcm4377_init_cfg(struct bcm4377_data *b) { init_cfg_count++; return init_cfg_error; }
+/* Controlled boundary for the driver's rebind work, as in bcm4377_hci_reset() below. */
+static void bcm4377_queue_rebind(struct bcm4377_data *b, struct workqueue_struct *wq, const char *why) { lost_rebind_count++; lost_rebind_wq = wq; lost_rebind_why = why; }
 
 /* Controlled boundary for the existing driver's asynchronous rebind work. */
 static void bcm4377_hci_reset(struct hci_dev *hdev)
@@ -93,8 +105,8 @@ static int bcm4377_destroy_completion_ring(struct bcm4377_data *b,struct ring *r
 static int bcm4377_hci_set_bdaddr(struct hci_dev *h,const bdaddr_t *a) { addr_count++;if(addr_error)return addr_error;h->bdaddr=*a;return 0; }
 static int bcm4377_pci_reset(struct bcm4377_data *b) { reset_count++;if(active_callback_pause){pthread_barrier_wait(&active_started);pthread_barrier_wait(&active_release);}if(reset_error)return reset_error;b->needs_reset=false;return 0; }
 static int bcm4377_hci_open_rings(struct bcm4377_data *b) { open_count++;return rings_error; }
-static int mod_delayed_work(int wq,struct delayed_work *w,int delay) { w->work.queued=1;return 1; }
-static int queue_work(void *wq,struct work_struct *w) { w->queued=1;queued_count++;return 1; }
+static bool mod_delayed_work(struct workqueue_struct *wq,struct delayed_work *w,unsigned long delay) { w->work.queued=1;return 1; }
+static bool queue_work(struct workqueue_struct *wq,struct work_struct *w) { w->queued=1;queued_count++;return 1; }
 
 typedef uint64_t u64;
 #define spin_lock_irqsave(l,f) do { (f)=0;pthread_mutex_lock(l); } while(0)

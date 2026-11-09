@@ -125,6 +125,10 @@ struct PmpState {
     allocs: KVec<PmpAllocation>,
     value_buf: Option<u64>,
     ioreg_entries: KVec<u32>,
+    /// The firmware was restarted after sleep and may set itself up again.
+    restarted: bool,
+    /// Clear the ioreg indices on the first registration after a restart.
+    ioreg_restart: bool,
 }
 
 impl PmpState {
@@ -134,6 +138,8 @@ impl PmpState {
             allocs: KVec::with_capacity(10, GFP_KERNEL)?,
             value_buf: None,
             ioreg_entries: KVec::with_capacity(340, GFP_KERNEL)?,
+            restarted: false,
+            ioreg_restart: false,
         })
     }
     fn find_alloc(&self, addr: u64) -> Option<usize> {
@@ -239,7 +245,11 @@ impl PmpData {
     }
     fn get_iova_table(&self) -> Result<u64> {
         let mut state = self.state.lock();
-        if state.iova_table.is_some() {
+        if let Some(table) = &state.iova_table {
+            if state.restarted {
+                // The PIO ranges are still mapped from the first boot.
+                return Ok((OPC_GET_IOVA_TABLE | OPC_ACK_MASK) << OPC_SHIFT | table.dma_address());
+            }
             dev_err!(self.dev, "Asked for iova table with existing buffer");
             return Err(EIO);
         }
@@ -319,7 +329,7 @@ impl PmpData {
     }
     fn set_buf(&self, addr: u64) -> Result<u64> {
         let mut state = self.state.lock();
-        if state.value_buf.is_some() {
+        if state.value_buf.is_some() && !state.restarted {
             dev_err!(self.dev, "Setting a buffer when one exists");
             return Err(EIO);
         }
@@ -340,6 +350,10 @@ impl PmpData {
     }
     fn register_ioreg(&self, addr: u64) -> Result<u64> {
         let mut state = self.state.lock();
+        if state.ioreg_restart {
+            state.ioreg_restart = false;
+            state.ioreg_entries.clear();
+        }
         let msg_buf = if let Some(s) = state.get_buf(addr) {
             s
         } else {
@@ -609,6 +623,55 @@ pub unsafe extern "C" fn apple_pmp_send_power_command(
         enabled
     );
     0
+}
+
+/// One RTKit step of stopping the PMP for system sleep and restarting it, as
+/// macOS RTBuddy does: APPLE_PMP_IDLE, then (CPU stopped and started again by
+/// the caller) APPLE_PMP_REINIT before RUN and APPLE_PMP_BOOT after it.
+///
+/// # Safety
+/// `data` must point to the live PmpData registered by PmpDriver.
+#[export]
+pub unsafe extern "C" fn apple_pmp_set_sleep(data: *const core::ffi::c_void, op: i32) -> i32 {
+    // SAFETY: The C bridge serializes calls against unregister in Drop.
+    let data = unsafe { &*data.cast::<PmpData>() };
+    let mut guard = data.rtkit.lock();
+    let Some(mut rtk) = guard.as_mut().as_pin_mut() else {
+        return ENODEV.to_errno();
+    };
+    let ret = match op as u32 {
+        bindings::APPLE_PMP_IDLE => {
+            if !rtk.is_running() {
+                return EINVAL.to_errno();
+            }
+            rtk.as_mut().idle()
+        }
+        bindings::APPLE_PMP_REINIT => {
+            let ret = rtk.as_mut().reinit();
+            if ret.is_ok() {
+                let mut state = data.state.lock();
+                state.restarted = true;
+                state.ioreg_restart = true;
+            }
+            ret
+        }
+        bindings::APPLE_PMP_BOOT => {
+            // The restarted firmware acks IOP power by itself; ask if it does not.
+            let ret = match rtk.as_mut().boot() {
+                Err(e) if e == ETIME => {
+                    dev_warn!(data.dev, "no IOP power ack after restart, sending INIT");
+                    rtk.as_mut().wake()
+                }
+                ret => ret,
+            };
+            ret.and_then(|()| rtk.as_mut().start_endpoint(PMP_ENDPOINT))
+        }
+        _ => Err(EINVAL),
+    };
+    match ret {
+        Ok(()) => 0,
+        Err(error) => error.to_errno(),
+    }
 }
 
 struct NoBuffer;

@@ -19,6 +19,7 @@
 #include <linux/pm_runtime.h>
 #include <linux/reset.h>
 #include <linux/spinlock.h>
+#include <linux/suspend.h>
 #include <linux/interrupt.h>
 
 #include "dmaengine.h"
@@ -124,6 +125,11 @@ struct admac_chan {
 	struct tasklet_struct tasklet;
 
 	u32 carveout;
+
+	/* Written at slave config, put back after suspend-to-RAM */
+	bool configured;
+	u32 bus_width;
+	u32 fifoctl;
 
 	spinlock_t lock;
 	struct admac_tx *current_tx;
@@ -873,6 +879,8 @@ static void admac_free_chan_resources(struct dma_chan *chan)
 	admac_synchronize(chan);
 	admac_free_sram_carveout(adchan->host, admac_chan_direction(adchan->no),
 				 adchan->carveout);
+	adchan->carveout = 0;
+	adchan->configured = false;
 	pm_runtime_put_autosuspend(adchan->host->dev);
 }
 
@@ -1142,9 +1150,12 @@ static int admac_device_config(struct dma_chan *chan,
 	 *
 	 * The numbers we set are more or less arbitrary.
 	 */
-	writel_relaxed(FIELD_PREP(CHAN_FIFOCTL_LIMIT, 0x30 * wordsize)
-		       | FIELD_PREP(CHAN_FIFOCTL_THRESHOLD, 0x18 * wordsize),
-		       ad->base + REG_CHAN_FIFOCTL(ad, adchan->no));
+	adchan->fifoctl = FIELD_PREP(CHAN_FIFOCTL_LIMIT, 0x30 * wordsize)
+			  | FIELD_PREP(CHAN_FIFOCTL_THRESHOLD, 0x18 * wordsize);
+	writel_relaxed(adchan->fifoctl, ad->base + REG_CHAN_FIFOCTL(ad, adchan->no));
+
+	adchan->bus_width = bus_width;
+	adchan->configured = true;
 
 	return 0;
 }
@@ -1175,8 +1186,45 @@ static int admac_runtime_resume(struct device *dev)
 	return 0;
 }
 
+/*
+ * Suspend-to-RAM clears the block. A client stops its transfers before that and
+ * submits new ones afterwards, so the rings need nothing, but a channel's setup
+ * is only written when it is requested and at slave config. An audio stream that
+ * stays open across suspend does neither.
+ */
+static int admac_pm_resume(struct device *dev)
+{
+	struct admac_data *ad = dev_get_drvdata(dev);
+	int i;
+
+	if (pm_suspend_target_state != PM_SUSPEND_MEM)
+		return 0;
+
+	for (i = 0; i < ad->nchannels; i++) {
+		struct admac_chan *adchan = &ad->channels[i];
+
+		if (!adchan->carveout)
+			continue;
+
+		writel_relaxed(adchan->carveout, ad->base + REG_CHAN_SRAM_CARVEOUT(ad, i));
+
+		if (!adchan->configured)
+			continue;
+
+		if (ad->set_unk28) {
+			writel_relaxed(T603X_UNK_28_VAL, ad->base + REG_UNK_28);
+			writel_relaxed(T603X_UNK_28_VAL, ad->base + REG_UNK_2C);
+		}
+		writel_relaxed(adchan->bus_width, ad->base + REG_BUS_WIDTH(ad, i));
+		writel_relaxed(adchan->fifoctl, ad->base + REG_CHAN_FIFOCTL(ad, i));
+	}
+
+	return 0;
+}
+
 /* Allocated channels must stay powered, including paused cyclic transfers. */
 static const struct dev_pm_ops admac_pm_ops = {
+	SYSTEM_SLEEP_PM_OPS(NULL, admac_pm_resume)
 	RUNTIME_PM_OPS(admac_runtime_suspend, admac_runtime_resume, NULL)
 };
 

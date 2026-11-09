@@ -35,6 +35,9 @@ static DEFINE_RAW_SPINLOCK(wakeup_irq_lock);
 /* If greater than 0 and the system is suspending, terminate the suspend. */
 static atomic_t pm_abort_suspend __read_mostly;
 
+/* The transition in progress can no longer be aborted, see pm_wakeup_hold() */
+static bool pm_wakeup_held __read_mostly;
+
 /*
  * Combined counters of registered wakeup events and wakeup events in progress.
  * They need to be modified together atomically, so it's better to use one
@@ -873,6 +876,9 @@ bool pm_wakeup_pending(void)
 	unsigned long flags;
 	bool ret = false;
 
+	if (READ_ONCE(pm_wakeup_held))
+		return false;
+
 	raw_spin_lock_irqsave(&events_lock, flags);
 	if (events_check_enabled) {
 		unsigned int cnt, inpr;
@@ -902,6 +908,20 @@ EXPORT_SYMBOL_GPL(pm_system_wakeup);
 void pm_system_cancel_wakeup(void)
 {
 	atomic_dec_if_positive(&pm_abort_suspend);
+}
+
+/**
+ * pm_wakeup_hold - Keep wakeup events from aborting the transition in progress.
+ * @hold: Whether to hold them.
+ *
+ * For a platform whose suspend cannot be turned around from some point on.
+ * While held, pm_wakeup_pending() returns false. The events are still
+ * registered, so the platform sees them once it lets go and can then make
+ * the sleep a short one.
+ */
+void pm_wakeup_hold(bool hold)
+{
+	WRITE_ONCE(pm_wakeup_held, hold);
 }
 
 void pm_wakeup_clear(unsigned int irq_number)

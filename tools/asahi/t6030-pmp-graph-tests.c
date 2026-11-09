@@ -158,6 +158,9 @@ struct apple_pmp_report {
 	struct apple_pmp_start *start;
 	/* Requests held until the PMP runs; T6030 does not defer them. */
 	u64 shadow, known;
+	/* Gated reports record requests without touching the PMP. */
+	u64 gated_tgt, always_on;
+	bool gated;
 	bool defer;
 	unsigned int polls;
 	struct delayed_work ready_work;
@@ -352,6 +355,8 @@ static void complete_all(struct completion *c)
 #define system_unbound_wq NULL
 /* Deferred requests are not part of the T6030 graph: never queued here. */
 #define INIT_DELAYED_WORK(w, f) INIT_WORK(&(w)->work, f)
+#define DECLARE_DELAYED_WORK(n, f) struct delayed_work n = { { f, false } }
+#define dev_dbg_ratelimited(dev, ...) ((void)(dev))
 #define system_freezable_power_efficient_wq NULL
 static void apple_pmp_report_ready_work(struct work_struct *w)
 {
@@ -751,6 +756,8 @@ static int j613_floor_probe(struct apple_pmp_report *rep)
 	return 0;
 }
 
+/* The post-ungate watch is sleep-only and never scheduled by this graph. */
+static void apple_pmp_report_watch_fn(struct work_struct *work) { (void)work; abort(); }
 #include "production.h"
 #if HOST_HAS_DRAM
 static int devm_device_add_group(struct device *dev, const struct attribute_group *group)

@@ -12,7 +12,7 @@ def extract(s,n):
  while depth:depth+=(s[b]=='{')-(s[b]=='}');b+=1
  return s[m.start():b]+'\n'
 s=(r/'drivers/bluetooth/hci_bcm4377.c').read_text();core=(r/'net/bluetooth/hci_sync.c').read_text();core_hci=(r/'net/bluetooth/hci_core.c').read_text()
-names=['bcm4377_setup_retry_allowed','bcm4377_queue_setup_retry','bcm4377_setup_retry_work','bcm4377_resume_recovery_supported','bcm4377_resume_recovery_allowed','bcm4377_resume_recovery_invalidate','bcm4377_resume_recovery_sync','bcm4377_resume_recovery_destroy','bcm4377_resume_recovery_work','bcm4377_hci_timeout','bcm4377_resume_recovery_stop','bcm4377_hci_open','bcm4377_hci_close','bcm4377_hci_setup_once','bcm4377_hci_setup','bcm4377_hci_post_init','bcm4377_hci_unregister_dev','bcm4377_suspend','bcm4377_resume']
+names=['bcm4377_setup_retry_allowed','bcm4377_queue_setup_retry','bcm4377_setup_retry_work','bcm4377_resume_recovery_supported','bcm4377_resume_recovery_allowed','bcm4377_resume_recovery_invalidate','bcm4377_resume_recovery_sync','bcm4377_resume_recovery_destroy','bcm4377_resume_recovery_work','bcm4377_hci_timeout','bcm4377_resume_recovery_stop','bcm4377_hci_open','bcm4377_hci_close','bcm4377_hci_setup_once','bcm4377_hci_setup','bcm4377_hci_post_init','bcm4377_hci_unregister_dev','bcm4377_suspend','bcm4377_lost_power','bcm4377_resume']
 bodies={n:extract(s,n) for n in names};shared=[]
 if a.old_ref:
  old=subprocess.check_output(['git','show',a.old_ref+':drivers/bluetooth/hci_bcm4377.c'],cwd=r,text=True)
@@ -36,7 +36,7 @@ hw_enum=re.search(r'^enum bcm4377_chip \{.*?^\};',s,re.M|re.S).group()
 hw_table=re.search(r'^static const struct bcm4377_hw bcm4377_hw_variants\[\] = \{.*?^\};',s,re.M|re.S).group()
 fixture=re.sub(r'^struct bcm4377_hw \{.*?\};', 'typedef uint32_t u32;\n'+hw_struct,fixture,count=1,flags=re.M)
 # The variant table names register offsets by macro; take their definitions from the driver.
-hw_macros='\n'+''.join(m.group()+'\n' for name in sorted(set(re.findall(r'\b[A-Z][A-Z0-9_]+\b',hw_table))) for m in [re.search(r'^#define '+name+r'\b.*$',s,re.M)] if m)
+hw_macros='\n'+''.join(m.group()+'\n' for name in sorted(set(re.findall(r'\b[A-Z][A-Z0-9_]+\b',hw_table+bodies['bcm4377_lost_power']))) for m in [re.search(r'^#define '+name+r'\b.*$',s,re.M)] if m)
 assert 'BAR2_CONTEXT_ADDR_HI' in hw_macros,hw_macros
 # bcm4377_suspend() undoes a failed wake arming through bcm4377_resume(), declared ahead of it.
 resume_decl=re.search(r'^static int bcm4377_resume\(struct device \*dev\);$',s,re.M).group()+'\n'
@@ -56,7 +56,7 @@ c=subprocess.run(['cc','-std=gnu11','-pthread','-Wall','-Wextra','-Wno-unused-fu
 (o/'compile.log').write_text(c.stdout+c.stderr);assert not c.returncode,c.stderr
 def no_core():resource.setrlimit(resource.RLIMIT_CORE,(0,0))
 results=[]
-for n in ([mutations[a.mutation][3]] if a.mutation else [0,1,2,28] if a.old_ref else range(46)):
+for n in ([mutations[a.mutation][3]] if a.mutation else [0,1,2,28] if a.old_ref else range(49)):
  c=subprocess.run([str(o/'controls'),str(n)],capture_output=True,text=True,preexec_fn=no_core,env=dict(env,ASAN_OPTIONS='detect_leaks=1'))
  results.append({'case':n,'exit':c.returncode,'stdout':c.stdout,'stderr':c.stderr})
 expected=-6 if a.old_ref or a.mutation else 0

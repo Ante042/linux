@@ -472,6 +472,7 @@ static inline bool pm_suspended_storage(void)
 extern bool pm_wakeup_pending(void);
 extern void pm_system_wakeup(void);
 extern void pm_system_cancel_wakeup(void);
+extern void pm_wakeup_hold(bool hold);
 extern void pm_wakeup_clear(unsigned int irq_number);
 extern void pm_system_irq_wakeup(unsigned int irq_number);
 extern unsigned int pm_wakeup_irq(void);
@@ -511,6 +512,7 @@ static inline void ksys_sync_helper(void) {}
 static inline bool pm_suspended_storage(void) { return false; }
 static inline bool pm_wakeup_pending(void) { return false; }
 static inline void pm_system_wakeup(void) {}
+static inline void pm_wakeup_hold(bool hold) {}
 static inline void pm_wakeup_clear(bool reset) {}
 static inline void pm_system_irq_wakeup(unsigned int irq_number) {}
 

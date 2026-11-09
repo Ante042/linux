@@ -25,9 +25,15 @@ void sep_cancel_delayed_work_sync(void *work);
 
 /* -- pm_shim.c ---------------------------------------------------------- */
 
-int sep_pm_register(void (*event)(bool entering));
+int sep_pm_register(void (*event)(bool entering), int (*sleep)(void),
+		    int (*wake)(void));
+int sep_pm_power_on(void *dev);
+void sep_pm_power_release(void *dev);
+int sep_pm_save_dart(void *dev);
+int sep_pm_restore_dart(void *dev);
 void sep_pm_unregister(void);
 int sep_pm_keep_domains(void *dev);
+int sep_pm_gate_dart(void *dev);
 
 /* -- hwrng_shim.c ------------------------------------------------------- */
 

@@ -4211,7 +4211,7 @@ static void atcphy_restore_after_pd_off(struct apple_atcphy *atcphy)
 
 	lockdep_assert_held(&atcphy->lock);
 
-	if (!atcphy->hw->restore_after_pd_off || !READ_ONCE(atcphy->pd_was_off))
+	if (!READ_ONCE(atcphy->pd_was_off))
 		return;
 	WRITE_ONCE(atcphy->pd_was_off, false);
 
@@ -4250,6 +4250,9 @@ static void atcphy_restore_after_pd_off(struct apple_atcphy *atcphy)
 					 "Failed to park the PIPE after its domain was off: %d\n",
 					 ret);
 			atcphy->pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY;
+			/* Clear after the power loss, and USB3 needs it for the PIPE lock */
+			if (pm_suspend_target_state == PM_SUSPEND_MEM)
+				atcphy_enable_dummy_phy(atcphy);
 		}
 		dev_dbg(atcphy->dev,
 			"power domain was off, restoring mode %d: PIPE mux=%08x lock=%08x/%08x aon=%08x nonsel=%08x\n",
@@ -6501,6 +6504,9 @@ static int atcphy_resume(struct device *dev)
 	 */
 	if (atcphy->idle_rpm && pm_runtime_status_suspended(dev))
 		return 0;
+	/* Suspend-to-RAM powers the SoC down without the PM domain knowing */
+	if (pm_suspend_target_state == PM_SUSPEND_MEM)
+		WRITE_ONCE(atcphy->pd_was_off, true);
 	atcphy_restore_after_pd_off(atcphy);
 
 	return 0;

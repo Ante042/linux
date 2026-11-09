@@ -96,6 +96,40 @@ impl<T: MailCallback> Mailbox<T> {
         // SAFETY: Calling the c function, `mbox` is a valid pointer
         to_result(unsafe { bindings::apple_mbox_send(self.mbox, msg, atomic) })
     }
+
+    /// Leaves received messages in the FIFO, without an interrupt.
+    pub fn hold_rx(&self) {
+        // SAFETY: Calling the c function, `mbox` is a valid pointer
+        unsafe { bindings::apple_mbox_hold_rx(self.mbox) }
+    }
+
+    /// Takes received messages again after [`Mailbox::hold_rx`].
+    pub fn release_rx(&self) {
+        // SAFETY: Calling the c function, `mbox` is a valid pointer
+        unsafe { bindings::apple_mbox_release_rx(self.mbox) }
+    }
+
+    /// Reads the A2I and I2A control registers.
+    pub fn control(&self) -> (u32, u32) {
+        let mut a2i: u32 = 0;
+        let mut i2a: u32 = 0;
+        // SAFETY: Calling the c function, `mbox` is a valid pointer and the
+        // out pointers are live locals.
+        unsafe { bindings::apple_mbox_read_control(self.mbox, &mut a2i, &mut i2a) };
+        (a2i, i2a)
+    }
+
+    /// Sets the inbox (A2I) enable bit.
+    pub fn set_inbox(&self, on: bool) {
+        // SAFETY: Calling the c function, `mbox` is a valid pointer
+        unsafe { bindings::apple_mbox_set_inbox(self.mbox, on) }
+    }
+
+    /// Sets the outbox enable bit, as the IOP's stopCPU and startCPU do.
+    pub fn set_outbox(&self, on: bool) {
+        // SAFETY: Calling the c function, `mbox` is a valid pointer
+        unsafe { bindings::apple_mbox_set_outbox(self.mbox, on) }
+    }
 }
 
 impl<T: MailCallback> Drop for Mailbox<T> {

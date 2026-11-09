@@ -33,6 +33,7 @@
 #include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/soc/apple/dart.h>
+#include <linux/soc/apple/s2r.h>
 #include <linux/soc/apple/t8132.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
@@ -62,6 +63,7 @@
 #endif
 
 #define DART_MAX_STREAMS 256
+
 #define DART_MAX_TTBR 4
 #define MAX_DARTS_PER_DEVICE 8
 #define DART_PCIEC_PAGE_SHIFT 14
@@ -378,6 +380,8 @@ struct apple_dart {
 	u32 fw_handoff : 1;
 	u32 tunnel_state_saved : 1;
 	u32 tunnel_state_restored : 1;
+	/* Registers saved before a self-gating device powered its island off. */
+	u32 island_saved : 1;
 	bool commands_gated;
 	/* Resume restored the translations, but the last steps of its reset failed. */
 	bool reset_incomplete;
@@ -460,6 +464,10 @@ struct apple_dart {
 
 	u32 save_tcr[DART_MAX_STREAMS];
 	u32 save_ttbr[DART_MAX_STREAMS][DART_MAX_TTBR];
+	/* Locked DART state kept for suspend-to-RAM, which resets the DART */
+	u32 save_config;
+	u32 save_enable[DART_MAX_STREAMS / 32];
+	bool locked_saved;
 
 	u64 *locked_ttbr[DART_MAX_STREAMS][DART_MAX_TTBR];
 	/* Values published by this driver into initially vacant root slots. */
@@ -5703,9 +5711,24 @@ static __maybe_unused int apple_dart_suspend(struct device *dev)
 	if (dart->power_retained || dart->retained_mtp)
 		return 0;
 
-	/* Locked DARTs can't be restored so skip saving their registers. */
-	if (dart->locked)
+	/*
+	 * Locked DARTs can't be restored so skip saving their registers, unless
+	 * suspend-to-RAM may reset them: the firmware's page tables stay in DRAM.
+	 * With deep sleep selected, a runtime suspend saves them too. Resume only
+	 * writes them back when the DART really lost its state.
+	 */
+	if (dart->locked && !apple_s2r_deep_sleep())
 		return 0;
+
+	if (dart->locked) {
+		unsigned int idx;
+
+		dart->save_config = apple_dart_readl(dart, dart->hw->lock);
+		for (idx = 0; idx < BITS_TO_U32(dart->num_streams); idx++)
+			dart->save_enable[idx] =
+				apple_dart_readl(dart, dart->hw->enable_streams + 4 * idx);
+		dart->locked_saved = true;
+	}
 
 	apple_dart_save_state(dart);
 	return 0;
@@ -5837,8 +5860,32 @@ static __maybe_unused int apple_dart_resume(struct device *dev)
 		return 0;
 
 	/* Locked DARTs can't be restored, and they should not need it */
-	if (dart->locked)
+	if (dart->locked && (!dart->locked_saved || apple_dart_state_retained(dart)))
 		return 0;
+
+	/*
+	 * Suspend-to-RAM reset it: put back what the bootloader set up, then
+	 * the lock, then drop whatever the TLBs picked up meanwhile.
+	 */
+	if (dart->locked) {
+		u32 cfg;
+
+		for (sid = 0; sid < dart->num_streams; sid++) {
+			for (idx = 0; idx < dart->hw->ttbr_count; idx++)
+				apple_dart_writel(dart, dart->save_ttbr[sid][idx],
+						  DART_TTBR(dart, sid, idx));
+			apple_dart_writel(dart, dart->save_tcr[sid], DART_TCR(dart, sid));
+		}
+		for (idx = 0; idx < BITS_TO_U32(dart->num_streams); idx++)
+			apple_dart_writel(dart, dart->save_enable[idx],
+					  dart->hw->enable_streams + 4 * idx);
+		apple_dart_writel(dart, dart->save_config, dart->hw->lock);
+		cfg = apple_dart_readl(dart, dart->hw->lock);
+		ret = apple_dart_invalidate_each_stream(dart);
+		dev_dbg(dev, "locked DART restored after suspend-to-RAM: config %#x -> %#x, flush %d\n",
+			dart->save_config, cfg, ret);
+		return 0;
+	}
 
 	if (apple_dart_state_retained(dart)) {
 		/* Nothing was lost, only drop what the TLBs may still hold. */
@@ -5881,6 +5928,52 @@ static __maybe_unused int apple_dart_resume(struct device *dev)
 	dart->reset_incomplete = ret;
 	return ret;
 }
+
+/*
+ * A DART inside a power island that its device gates by itself, as the SEP
+ * does after SLEEP, loses its registers with the island. Save them while it
+ * is still powered, before the device is told to sleep.
+ */
+int apple_dart_save_island_state(struct device *dev)
+{
+	struct apple_dart *dart = dev_get_drvdata(dev);
+
+	if (!dart)
+		return -ENODEV;
+	if (dart->locked)
+		return -EOPNOTSUPP;
+
+	guard(spinlock_irqsave)(&dart->lock);
+	if (dart->commands_gated)
+		return -EBUSY;
+	apple_dart_save_state(dart);
+	dart->island_saved = true;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_dart_save_island_state);
+
+/*
+ * The island is powered again: allow commands, then reset the DART and put
+ * the saved translations back, as a resume after lost power does. macOS
+ * makes the mapper active again before it resumes the SEP.
+ */
+int apple_dart_restore_island_state(struct device *dev)
+{
+	struct apple_dart *dart = dev_get_drvdata(dev);
+	int ret;
+
+	if (!dart)
+		return -ENODEV;
+	if (!dart->island_saved)
+		return -EINVAL;
+
+	scoped_guard(spinlock_irqsave, &dart->lock)
+		WRITE_ONCE(dart->commands_gated, false);
+	ret = apple_dart_resume(dev);
+	dev_dbg(dev, "island state restored (%d)\n", ret);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_dart_restore_island_state);
 
 /* The adopted MTP stays live: system s2idle must retain, never reset it. */
 static int apple_dart_system_suspend(struct device *dev)

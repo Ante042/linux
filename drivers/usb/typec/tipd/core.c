@@ -15,6 +15,7 @@
 #include <linux/of.h>
 #include <linux/power_supply.h>
 #include <linux/regmap.h>
+#include <linux/suspend.h>
 #include <linux/unaligned.h>
 #include <linux/usb/pd.h>
 #include <linux/usb/typec.h>
@@ -26,6 +27,7 @@
 #include <linux/workqueue.h>
 #include <linux/firmware.h>
 #include <drm/drm_connector.h>
+#include <linux/soc/apple/s2r.h>
 
 #include "cd321x-dp.h"
 #include "tps6598x.h"
@@ -3233,8 +3235,94 @@ void tipd_remove(struct tps6598x *tps)
 }
 EXPORT_SYMBOL_GPL(tipd_remove);
 
+/*
+ * In S3 a port goes on sourcing VBUS and VCONN to what is plugged into it, so
+ * a bus-powered device such as a USB-C to DisplayPort adapter draws from the
+ * battery all through deep sleep, about 13 mA each. In S5 the controller
+ * disables the port, which turns that power off; the device attaches again
+ * after the wake, like a replug. Only ports that source to a plugged device
+ * go to S5. Ports that sink (a charger, a dock with its own supply) and empty
+ * ports stay in S3. Off by default, since the replug at wake makes displays
+ * come back later and less reliably.
+ */
+static bool s2r_source_off;
+module_param(s2r_source_off, bool, 0644);
+MODULE_PARM_DESC(s2r_source_off,
+		 "Turn off USB-C ports that power a plugged-in device during deep sleep; it is unplugged and plugged in again at wake (default: N)");
+
+static u8 tipd_sleep_state(struct tps6598x *tps)
+{
+	u32 status;
+
+	if (!READ_ONCE(s2r_source_off) || !apple_s2r_deep_sleep())
+		return TPS_SYSTEM_POWER_STATE_S3;
+	if (tps6598x_read32(tps, TPS_REG_STATUS, &status) ||
+	    !(status & TPS_STATUS_PLUG_PRESENT) ||
+	    TPS_STATUS_TO_TYPEC_PORTROLE(status) != TYPEC_SOURCE)
+		return TPS_SYSTEM_POWER_STATE_S3;
+
+	return TPS_SYSTEM_POWER_STATE_S5;
+}
+
+/*
+ * Before sleep macOS moves the controller to S3 and turns its interrupt off.
+ * Left in S0 across suspend to RAM it keeps raising events after the i2c bus
+ * is down, and the SMC wakes the machine early with acdetach.
+ */
+static void tipd_sleep_enter(struct tps6598x *tps)
+{
+	u8 state;
+	int ret;
+
+	tps->sleep_entered = false;
+	if (!tps->data->switch_power_state || tps->wakeup ||
+	    pm_suspend_target_state != PM_SUSPEND_MEM)
+		return;
+
+	if (tps->irq)
+		disable_irq(tps->irq);
+	scoped_guard(mutex, &tps->lock) {
+		state = tipd_sleep_state(tps);
+		ret = tps->data->switch_power_state(tps, state);
+	}
+	if (ret) {
+		dev_warn(tps->dev, "failed to enter S%u for sleep: %d\n", state, ret);
+		if (tps->irq)
+			enable_irq(tps->irq);
+		return;
+	}
+	tps->sleep_entered = true;
+	dev_dbg(tps->dev, "s2r: controller in S%u\n", state);
+}
+
+static void tipd_wake_s0(struct tps6598x *tps)
+{
+	int ret, tries = 3;
+
+	if (!tps->sleep_entered)
+		return;
+	tps->sleep_entered = false;
+
+	do {
+		scoped_guard(mutex, &tps->lock)
+			ret = tps->data->switch_power_state(tps, TPS_SYSTEM_POWER_STATE_S0);
+		if (!ret)
+			break;
+		msleep(20);
+	} while (--tries);
+	if (ret)
+		dev_err(tps->dev, "failed to return to S0 after sleep: %d\n", ret);
+	else
+		dev_dbg(tps->dev, "s2r: controller back in S0\n");
+
+	if (tps->irq)
+		enable_irq(tps->irq);
+}
+
 int tipd_suspend(struct tps6598x *tps)
 {
+	tipd_sleep_enter(tps);
+
 	if (tps->wakeup) {
 		if (!tps->sleep_event) {
 			disable_irq(tps->irq);
@@ -3257,6 +3345,8 @@ int tipd_resume(struct tps6598x *tps)
 
 	tps->h17_display = of_machine_is_compatible("apple,t8140") ||
 			   of_machine_is_compatible("apple,t8142");
+
+	tipd_wake_s0(tps);
 
 	ret = tps6598x_check_mode(tps);
 	if (ret < 0)

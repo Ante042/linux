@@ -23,6 +23,7 @@
 #include <linux/platform_device.h>
 #include <linux/property.h>
 #include <linux/regmap.h>
+#include <linux/suspend.h>
 
 #include <linux/pinctrl/pinctrl.h>
 #include <linux/pinctrl/pinmux.h>
@@ -48,6 +49,15 @@ struct apple_gpio_pinctrl {
 
 	struct pinctrl_desc pinctrl_desc;
 	struct gpio_chip gpio_chip;
+	/* The parent IRQ of the first group, which every pin's IRQ goes to */
+	int grp0_irq;
+
+	const struct apple_gpio_hw *hw;
+	/* Pin configuration saved for suspend-to-RAM, NULL if the block keeps it */
+	u32 *s2r_cfg;
+	bool s2r_saved;
+	u32 s2r_input_enable;
+
 	u8 irq_group_base;
 	struct apple_gpio_irq_group irqgrps[];
 };
@@ -75,6 +85,12 @@ struct apple_gpio_pinctrl {
 #define REG_GPIOx_LOCK       BIT(21)
 #define REG_GPIOx_DRIVE_STRENGTH1 GENMASK(23, 22)
 #define REG_IRQ(g, x)        (0x800 + 0x40 * (g) + 4 * ((x) >> 5))
+/*
+ * Input receivers of the whole block. The boot firmware sets this, and it reads
+ * 0 once the block has lost power. While it is clear every input reads low, so
+ * a level-low IRQ fires forever although nothing drives the line.
+ */
+#define REG_INPUT_ENABLE     0xc48
 
 static const struct regmap_config regmap_config = {
 	.reg_bits = 32,
@@ -349,6 +365,17 @@ static int apple_gpio_irq_set_type(struct irq_data *data, unsigned int type)
 	return 0;
 }
 
+/*
+ * Pass wake requests on to the AIC, which only keeps wake-armed IRQs
+ * unmasked during system sleep.
+ */
+static int apple_gpio_irq_set_wake(struct irq_data *data, unsigned int on)
+{
+	struct apple_gpio_pinctrl *pctl = gpiochip_get_data(irq_data_get_irq_chip_data(data));
+
+	return irq_set_irq_wake(pctl->grp0_irq, on);
+}
+
 static void apple_gpio_irq_handler(struct irq_desc *desc)
 {
 	struct irq_chip *chip = irq_desc_get_chip(desc);
@@ -385,6 +412,25 @@ static const struct irq_chip apple_gpio_irqchip = {
 	GPIOCHIP_IRQ_RESOURCE_HELPERS,
 };
 
+/* Wake arming that reaches the AIC, so far only on the machine with suspend-to-RAM */
+static const struct irq_chip apple_gpio_irqchip_wake = {
+	.name			= "Apple-GPIO",
+	.irq_startup		= apple_gpio_irq_startup,
+	.irq_ack		= apple_gpio_irq_ack,
+	.irq_mask		= apple_gpio_irq_mask,
+	.irq_unmask		= apple_gpio_irq_unmask,
+	.irq_set_type		= apple_gpio_irq_set_type,
+	.irq_set_wake		= apple_gpio_irq_set_wake,
+	/*
+	 * Every pin shares the first group's IRQ, so pins that are not wake sources
+	 * have to be masked here while it stays open. Drivers such as
+	 * spi-hid-apple disable their IRQ before arming it for wake.
+	 */
+	.flags			= IRQCHIP_IMMUTABLE | IRQCHIP_MASK_ON_SUSPEND |
+				  IRQCHIP_ENABLE_WAKEUP_ON_SUSPEND,
+	GPIOCHIP_IRQ_RESOURCE_HELPERS,
+};
+
 /* Probe & register */
 
 struct apple_gpio_hw {
@@ -394,11 +440,29 @@ struct apple_gpio_hw {
 	 * only within the valid GPIO registers minus gpio-reserved-ranges.
 	 */
 	bool no_regcache;
+	/*
+	 * The instance in a power domain that can go down loses its pin
+	 * configuration in suspend-to-RAM. Save it and check it on resume,
+	 * except for the pins the ADT lists as no-restore-gpio-pins, which
+	 * macOS leaves alone too. Only SoCs whose list is known do this.
+	 */
+	bool s2r_save;
+	const u16 *s2r_skip_pins;
+	unsigned int num_s2r_skip_pins;
 };
 
 /* T8140 (A18 Pro) and T8132 (M4) both have faulting slots in this block. */
 static const struct apple_gpio_hw apple_gpio_uncached_hw = {
 	.no_regcache = true,
+};
+
+/* no-restore-gpio-pins of gpio0 in the J314s ADT */
+static const u16 apple_gpio_t6000_s2r_skip_pins[] = { 114, 115, 119 };
+
+static const struct apple_gpio_hw apple_gpio_t6000_hw = {
+	.s2r_save = true,
+	.s2r_skip_pins = apple_gpio_t6000_s2r_skip_pins,
+	.num_s2r_skip_pins = ARRAY_SIZE(apple_gpio_t6000_s2r_skip_pins),
 };
 
 static int apple_gpio_regmap_access(struct device *dev, unsigned int npins,
@@ -450,6 +514,27 @@ static int apple_gpio_regmap_access(struct device *dev, unsigned int npins,
 	return 0;
 }
 
+/*
+ * Only a block whose power domain can go down loses its pins in
+ * suspend-to-RAM: on t6000 that is the AP block. The NUB block sits in an
+ * always-on domain, and the SMC and AOP blocks have no domain at all; the
+ * ADT marks all three no-resume-restore.
+ */
+static bool apple_gpio_domain_can_power_down(struct device *dev)
+{
+	struct device_node *pd;
+	bool ret;
+
+	pd = of_parse_phandle(dev->of_node, "power-domains", 0);
+	if (!pd)
+		return false;
+
+	ret = !of_property_read_bool(pd, "apple,always-on");
+	of_node_put(pd);
+
+	return ret;
+}
+
 static int apple_gpio_register(struct apple_gpio_pinctrl *pctl)
 {
 	struct gpio_irq_chip *girq = &pctl->gpio_chip.irq;
@@ -471,7 +556,10 @@ static int apple_gpio_register(struct apple_gpio_pinctrl *pctl)
 	if (girq->num_parents) {
 		int i;
 
-		gpio_irq_chip_set_chip(girq, &apple_gpio_irqchip);
+		if (IS_ENABLED(CONFIG_APPLE_S2R) && of_machine_is_compatible("apple,t6000"))
+			gpio_irq_chip_set_chip(girq, &apple_gpio_irqchip_wake);
+		else
+			gpio_irq_chip_set_chip(girq, &apple_gpio_irqchip);
 		girq->parent_handler = apple_gpio_irq_handler;
 
 		girq->parents = kmalloc_array(girq->num_parents,
@@ -489,6 +577,8 @@ static int apple_gpio_register(struct apple_gpio_pinctrl *pctl)
 				goto out_free_irq_data;
 
 			girq->parents[i] = ret;
+			if (!i)
+				pctl->grp0_irq = ret;
 			pctl->irqgrps[i].pctl = pctl;
 			pctl->irqgrps[i].index = pctl->irq_group_base + i;
 			irq_data[i] = &pctl->irqgrps[i];
@@ -594,6 +684,14 @@ static int apple_gpio_pinctrl_probe(struct platform_device *pdev)
 		return dev_err_probe(&pdev->dev, PTR_ERR(pctl->map),
 				     "Failed to create regmap\n");
 
+	pctl->hw = hw;
+	if (hw && hw->s2r_save && apple_gpio_domain_can_power_down(&pdev->dev)) {
+		pctl->s2r_cfg = devm_kcalloc(&pdev->dev, npins, sizeof(*pctl->s2r_cfg),
+					     GFP_KERNEL);
+		if (!pctl->s2r_cfg)
+			return -ENOMEM;
+	}
+
 	for (i = 0; i < npins; i++) {
 		pins[i].number = i;
 		pins[i].name = devm_kasprintf(&pdev->dev, GFP_KERNEL, "PIN%u", i);
@@ -635,10 +733,127 @@ static int apple_gpio_pinctrl_probe(struct platform_device *pdev)
 	return apple_gpio_register(pctl);
 }
 
+/* Suspend-to-RAM */
+
+static bool apple_gpio_s2r_skip(struct apple_gpio_pinctrl *pctl, unsigned int pin)
+{
+	unsigned int i;
+
+	for (i = 0; i < pctl->hw->num_s2r_skip_pins; i++)
+		if (pctl->hw->s2r_skip_pins[i] == pin)
+			return true;
+
+	return false;
+}
+
+/*
+ * The bits that tell whether a pin kept its configuration. DATA only counts
+ * on a GPIO output; on any other pin it follows the pad.
+ */
+static u32 apple_gpio_s2r_mask(u32 cfg)
+{
+	if (!FIELD_GET(REG_GPIOx_PERIPH, cfg) &&
+	    FIELD_GET(REG_GPIOx_MODE, cfg) == REG_GPIOx_OUT)
+		return ~0U;
+
+	return ~(u32)REG_GPIOx_DATA;
+}
+
+/*
+ * Suspend-to-RAM takes the AP block's power domain down with the SoC. Save
+ * every pin after suspend_device_irqs() has masked the pins that are not
+ * wake sources, so the saved IRQ modes are the ones the IRQ core unmasks
+ * again on resume. s2idle stays as it was: only apple_s2r offers
+ * PM_SUSPEND_MEM.
+ */
+static int apple_gpio_suspend_noirq(struct device *dev)
+{
+	struct apple_gpio_pinctrl *pctl = dev_get_drvdata(dev);
+	unsigned int pin;
+
+	if (!pctl->s2r_cfg || pm_suspend_target_state != PM_SUSPEND_MEM)
+		return 0;
+
+	for (pin = 0; pin < pctl->pinctrl_desc.npins; pin++)
+		pctl->s2r_cfg[pin] = readl_relaxed(pctl->base + REG_GPIO(pin));
+	pctl->s2r_input_enable = readl_relaxed(pctl->base + REG_INPUT_ENABLE);
+	pctl->s2r_saved = true;
+
+	return 0;
+}
+
+/*
+ * By now genpd has the domain on again, or the power state driver (our
+ * supplier) has if a wake source such as the keyboard's spien pin kept
+ * genpd from turning it off. Only pins that changed are written, so this
+ * does nothing when the domain kept its state. The writes go through the
+ * regmap so its cache follows: regcache_sync() would skip every register
+ * that equals the value read at probe. The IRQ status registers are left
+ * alone, a bit latched there is for the IRQ handler to see.
+ */
+static int apple_gpio_resume_noirq(struct device *dev)
+{
+	struct apple_gpio_pinctrl *pctl = dev_get_drvdata(dev);
+	unsigned int pin, first = 0, lost = 0, stuck = 0;
+	u32 cfg, saved, first_cfg = 0;
+
+	if (!pctl->s2r_saved)
+		return 0;
+	pctl->s2r_saved = false;
+
+	/* First, so the pins below come back with their real input levels */
+	cfg = readl_relaxed(pctl->base + REG_INPUT_ENABLE);
+	if (cfg != pctl->s2r_input_enable) {
+		writel_relaxed(pctl->s2r_input_enable, pctl->base + REG_INPUT_ENABLE);
+		dev_dbg(dev, "restored the input enable after suspend-to-RAM (was 0x%x)\n", cfg);
+	}
+
+	for (pin = 0; pin < pctl->pinctrl_desc.npins; pin++) {
+		if (apple_gpio_s2r_skip(pctl, pin))
+			continue;
+
+		saved = pctl->s2r_cfg[pin];
+		cfg = readl_relaxed(pctl->base + REG_GPIO(pin));
+		if (!((cfg ^ saved) & apple_gpio_s2r_mask(saved)))
+			continue;
+
+		if (!lost++) {
+			first = pin;
+			first_cfg = cfg;
+		}
+
+		if (regmap_write(pctl->map, REG_GPIO(pin), saved)) {
+			stuck++;
+			continue;
+		}
+
+		cfg = readl_relaxed(pctl->base + REG_GPIO(pin));
+		if ((cfg ^ saved) & apple_gpio_s2r_mask(saved))
+			stuck++;
+	}
+
+	if (!lost)
+		dev_dbg(dev, "pins kept their configuration through suspend-to-RAM\n");
+	else
+		dev_dbg(dev, "restored %u pins after suspend-to-RAM (pin %u was 0x%08x, saved 0x%08x)\n",
+			lost, first, first_cfg, pctl->s2r_cfg[first]);
+
+	if (stuck)
+		dev_warn(dev, "%u pins did not take their saved configuration\n", stuck);
+
+	return 0;
+}
+
+static const struct dev_pm_ops apple_gpio_pinctrl_pm_ops = {
+	.suspend_noirq = pm_sleep_ptr(apple_gpio_suspend_noirq),
+	.resume_noirq = pm_sleep_ptr(apple_gpio_resume_noirq),
+};
+
 static const struct of_device_id apple_gpio_pinctrl_of_match[] = {
 	{ .compatible = "apple,t8140-pinctrl", .data = &apple_gpio_uncached_hw },
 	{ .compatible = "apple,t8132-pinctrl", .data = &apple_gpio_uncached_hw },
 	{ .compatible = "apple,t6050-pinctrl", .data = &apple_gpio_uncached_hw },
+	{ .compatible = "apple,t6000-pinctrl", .data = &apple_gpio_t6000_hw },
 	{ .compatible = "apple,t8103-pinctrl", },
 	{ .compatible = "apple,pinctrl", },
 	{ }
@@ -650,6 +865,7 @@ static struct platform_driver apple_gpio_pinctrl_driver = {
 		.name = "apple-gpio-pinctrl",
 		.of_match_table = apple_gpio_pinctrl_of_match,
 		.suppress_bind_attrs = true,
+		.pm = pm_sleep_ptr(&apple_gpio_pinctrl_pm_ops),
 	},
 	.probe = apple_gpio_pinctrl_probe,
 };

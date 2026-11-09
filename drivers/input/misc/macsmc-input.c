@@ -9,6 +9,7 @@
 
 #include <linux/device.h>
 #include <linux/input.h>
+#include <linux/interrupt.h>
 #include <linux/mfd/core.h>
 #include <linux/mfd/macsmc.h>
 #include <linux/ktime.h>
@@ -16,7 +17,9 @@
 #include <linux/moduleparam.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
+#include <linux/of_irq.h>
 #include <linux/reboot.h>
+#include <linux/suspend.h>
 
 #define LID_WAKE_SETTLE_MS_J716S	2000
 
@@ -36,6 +39,10 @@ MODULE_PARM_DESC(lid_wake_settle_ms,
  * @wakeup_mode: Set to true when system is suspended and power button events should wake it
  * @lid_held: A lid-open report was not passed on during this system sleep
  * @sleep_start: CLOCK_BOOTTIME at which this system sleep started
+ * @wake_irq: The SMC mailbox IRQ the events arrive on, 0 if not found
+ * @wake_irq_armed: wake_irq is enabled for wake during system sleep
+ * @have_lid: The SMC has the lid state key
+ * @have_power: The SMC has the power button state key
  */
 struct macsmc_input {
 	struct device *dev;
@@ -47,6 +54,10 @@ struct macsmc_input {
 	bool wakeup_mode;
 	bool lid_held;
 	ktime_t sleep_start;
+	int wake_irq;
+	bool wake_irq_armed;
+	bool have_lid;
+	bool have_power;
 };
 
 #define SMC_EV_BTN 0x7201
@@ -180,6 +191,27 @@ static void macsmc_input_unregister_notifier(void *data)
 	blocking_notifier_chain_unregister(&smcin->smc->event_handlers, &smcin->nb);
 }
 
+/*
+ * The events arrive on the SMC mailbox. Its driver takes the IRQ with
+ * IRQF_NO_SUSPEND, which keeps it running but does not make it a wake
+ * source: an interrupt controller that masks everything else for system
+ * sleep would mask it too.
+ */
+static int macsmc_input_get_wake_irq(struct device *dev)
+{
+	struct device_node *np;
+	int irq;
+
+	np = of_parse_phandle(dev->parent->of_node, "mboxes", 0);
+	if (!np)
+		return 0;
+
+	irq = of_irq_get_byname(np, "recv-not-empty");
+	of_node_put(np);
+
+	return irq > 0 ? irq : 0;
+}
+
 static int macsmc_input_probe(struct platform_device *pdev)
 {
 	struct apple_smc *smc = dev_get_drvdata(pdev->dev.parent);
@@ -199,6 +231,8 @@ static int macsmc_input_probe(struct platform_device *pdev)
 
 	smcin->dev = &pdev->dev;
 	smcin->smc = smc;
+	smcin->have_lid = have_lid;
+	smcin->have_power = have_power;
 	platform_set_drvdata(pdev, smcin);
 
 	error = devm_mutex_init(&pdev->dev, &smcin->lid_lock);
@@ -275,6 +309,8 @@ static int macsmc_input_probe(struct platform_device *pdev)
 	if (error)
 		return error;
 
+	smcin->wake_irq = macsmc_input_get_wake_irq(&pdev->dev);
+
 	return 0;
 }
 
@@ -289,6 +325,47 @@ static int macsmc_input_pm_prepare(struct device *dev)
 	return 0;
 }
 
+/*
+ * Lid events can be lost, or arrive before the input device is back, around
+ * a sleep that powers the SMC link down. Read the lid back and let the input
+ * core drop the report if nothing changed. The power button is only logged:
+ * reporting a button that is still held after a wake would make userspace
+ * power off, which is what the wakeup_mode suppression above prevents.
+ */
+static void macsmc_input_resync(struct macsmc_input *smcin)
+{
+	struct device *dev = smcin->dev;
+	bool changed;
+	u32 btn;
+	u8 lid;
+	int error;
+
+	if (smcin->have_lid) {
+		error = apple_smc_read_u8(smcin->smc, SMC_KEY(MSLD), &lid);
+		if (error < 0) {
+			/* Do not wait for a second timeout on an SMC that does not answer */
+			dev_warn(dev, "Failed to read lid state after resume: %d\n", error);
+			return;
+		}
+
+		changed = !!test_bit(SW_LID, smcin->input->sw) != !!lid;
+		input_report_switch(smcin->input, SW_LID, lid);
+		input_sync(smcin->input);
+		dev_dbg(dev, "Lid %s after resume%s\n", lid ? "closed" : "open",
+			changed ? ", changed while asleep" : "");
+	}
+
+	if (smcin->have_power) {
+		error = apple_smc_read_u32(smcin->smc, SMC_KEY(bHLD), &btn);
+		if (error < 0) {
+			dev_warn(dev, "Failed to read power button after resume: %d\n", error);
+			return;
+		}
+
+		dev_dbg(dev, "Power button %s after resume\n", (btn & 1) ? "held" : "released");
+	}
+}
+
 static void macsmc_input_pm_complete(struct device *dev)
 {
 	struct macsmc_input *smcin = dev_get_drvdata(dev);
@@ -297,6 +374,21 @@ static void macsmc_input_pm_complete(struct device *dev)
 
 	guard(mutex)(&smcin->lid_lock);
 	smcin->wakeup_mode = false;
+
+	/*
+	 * Not in .resume: the input device is a child of this one and only
+	 * resumes after it, while complete runs once every device including the
+	 * mailbox the read depends on is back, and still before userspace is
+	 * thawed. Only S2R needs it, s2idle keeps the mailbox irq live and
+	 * loses nothing. The read also settles a lid-open report held back
+	 * during the sleep.
+	 */
+	if (pm_suspend_target_state == PM_SUSPEND_MEM) {
+		smcin->lid_held = false;
+		macsmc_input_resync(smcin);
+		return;
+	}
+
 	if (!smcin->lid_held)
 		return;
 	smcin->lid_held = false;
@@ -312,9 +404,43 @@ static void macsmc_input_pm_complete(struct device *dev)
 	input_sync(smcin->input);
 }
 
+static int macsmc_input_suspend(struct device *dev)
+{
+	struct macsmc_input *smcin = dev_get_drvdata(dev);
+	int ret;
+
+	/* Only the AIC sleep mask of S2R reads it, s2idle keeps the irq live anyway */
+	if (pm_suspend_target_state != PM_SUSPEND_MEM || !smcin->wake_irq ||
+	    !device_may_wakeup(dev))
+		return 0;
+
+	ret = enable_irq_wake(smcin->wake_irq);
+	if (ret) {
+		dev_warn(dev, "Failed to enable SMC wake irq %d: %d\n", smcin->wake_irq, ret);
+		return 0;
+	}
+
+	smcin->wake_irq_armed = true;
+	dev_dbg(dev, "SMC wake irq %d armed\n", smcin->wake_irq);
+	return 0;
+}
+
+static int macsmc_input_resume(struct device *dev)
+{
+	struct macsmc_input *smcin = dev_get_drvdata(dev);
+
+	if (smcin->wake_irq_armed) {
+		disable_irq_wake(smcin->wake_irq);
+		smcin->wake_irq_armed = false;
+	}
+
+	return 0;
+}
+
 static const struct dev_pm_ops macsmc_input_pm_ops = {
 	.prepare = macsmc_input_pm_prepare,
 	.complete = macsmc_input_pm_complete,
+	SYSTEM_SLEEP_PM_OPS(macsmc_input_suspend, macsmc_input_resume)
 };
 
 static struct platform_driver macsmc_input_driver = {

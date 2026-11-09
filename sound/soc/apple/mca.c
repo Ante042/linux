@@ -36,6 +36,8 @@
 #include <linux/regmap.h>
 #include <linux/reset.h>
 #include <linux/slab.h>
+#include <linux/soc/apple/s2r.h>
+#include <linux/suspend.h>
 
 #include <sound/core.h>
 #include <sound/pcm.h>
@@ -123,6 +125,29 @@
 
 #define MAX_NCLUSTERS	6
 
+/*
+ * Cluster registers that a stream writes once, at hw_params or when its clocks
+ * start. A stream that stays open across suspend-to-RAM does not go through
+ * that again, so they are put back in this order, enable bits last.
+ */
+static const u16 mca_stream_regs[] = {
+	REG_MCLK_CONF,
+	REG_SYNCGEN_MCLK_SEL,
+	REG_SYNCGEN_HI_PERIOD,
+	REG_SYNCGEN_LO_PERIOD,
+	CLUSTER_TX_OFF + REG_TX_SERDES_CONF,
+	CLUSTER_TX_OFF + REG_TX_SERDES_SLOTMASK,
+	CLUSTER_TX_OFF + REG_TX_SERDES_SLOTMASK + 0x4,
+	CLUSTER_TX_OFF + REG_TX_SERDES_SLOTMASK + 0x8,
+	CLUSTER_TX_OFF + REG_TX_SERDES_SLOTMASK + 0xc,
+	CLUSTER_RX_OFF + REG_RX_SERDES_CONF,
+	CLUSTER_RX_OFF + REG_RX_SERDES_SLOTMASK,
+	CLUSTER_RX_OFF + REG_RX_SERDES_SLOTMASK + 0x4,
+	CLUSTER_RX_OFF + REG_RX_SERDES_PORT,
+	REG_SYNCGEN_STATUS,
+	REG_STATUS,
+};
+
 #define APPLE_MCA_FMTBITS (SNDRV_PCM_FMTBIT_S16_LE | \
 			   SNDRV_PCM_FMTBIT_S24_LE | \
 			   SNDRV_PCM_FMTBIT_S32_LE)
@@ -164,6 +189,15 @@ struct mca_cluster {
 	 */
 	size_t capture_synced;
 	ktime_t capture_synced_at;
+	/* What set_fmt programmed, which happens only when the card binds */
+	bool fmt_set;
+	u32 fmt_serdes_conf;
+	u32 fmt_bitstart;
+
+	/* Stream setup kept across suspend-to-RAM */
+	bool stream_saved;
+	u32 stream_regs[ARRAY_SIZE(mca_stream_regs)];
+	u32 dma_adapter[SNDRV_PCM_STREAM_LAST + 1];
 };
 
 struct mca_data {
@@ -540,6 +574,18 @@ static int mca_fe_set_tdm_slot(struct snd_soc_dai *dai, unsigned int tx_mask,
 	return 0;
 }
 
+static void mca_fe_apply_fmt(struct mca_cluster *cl)
+{
+	mca_modify(cl, CLUSTER_TX_OFF + REG_TX_SERDES_CONF,
+		   SERDES_CONF_BCLK_POL, cl->fmt_serdes_conf);
+	mca_modify(cl, CLUSTER_RX_OFF + REG_RX_SERDES_CONF,
+		   SERDES_CONF_BCLK_POL, cl->fmt_serdes_conf);
+	writel_relaxed(cl->fmt_bitstart,
+		       cl->base + CLUSTER_TX_OFF + REG_TX_SERDES_BITSTART);
+	writel_relaxed(cl->fmt_bitstart,
+		       cl->base + CLUSTER_RX_OFF + REG_RX_SERDES_BITSTART);
+}
+
 static int mca_fe_set_fmt(struct snd_soc_dai *dai, unsigned int fmt)
 {
 	struct mca_cluster *cl = mca_dai_to_cluster(dai);
@@ -591,14 +637,10 @@ static int mca_fe_set_fmt(struct snd_soc_dai *dai, unsigned int fmt)
 	if (!fpol_inv)
 		goto err;
 
-	mca_modify(cl, CLUSTER_TX_OFF + REG_TX_SERDES_CONF,
-		   SERDES_CONF_BCLK_POL, serdes_conf);
-	mca_modify(cl, CLUSTER_RX_OFF + REG_RX_SERDES_CONF,
-		   SERDES_CONF_BCLK_POL, serdes_conf);
-	writel_relaxed(bitstart,
-		       cl->base + CLUSTER_TX_OFF + REG_TX_SERDES_BITSTART);
-	writel_relaxed(bitstart,
-		       cl->base + CLUSTER_RX_OFF + REG_RX_SERDES_BITSTART);
+	cl->fmt_serdes_conf = serdes_conf;
+	cl->fmt_bitstart = bitstart;
+	cl->fmt_set = true;
+	mca_fe_apply_fmt(cl);
 
 	return 0;
 
@@ -614,6 +656,17 @@ static int mca_set_bclk_ratio(struct snd_soc_dai *dai, unsigned int ratio)
 	cl->bclk_ratio = ratio;
 
 	return 0;
+}
+
+static void __iomem *mca_dma_adapter(struct mca_cluster *cl, int stream)
+{
+	struct mca_data *mca = cl->host;
+
+#ifdef USE_RXB_FOR_CAPTURE
+	if (stream == SNDRV_PCM_STREAM_CAPTURE)
+		return mca->switch_base + REG_DMA_ADAPTER_B(cl->no);
+#endif
+	return mca->switch_base + REG_DMA_ADAPTER_A(cl->no);
 }
 
 static int mca_fe_hw_params(struct snd_pcm_substream *substream,
@@ -700,16 +753,8 @@ static int mca_fe_hw_params(struct snd_pcm_substream *substream,
 		 FIELD_PREP(DMA_ADAPTER_TX_LSB_PAD, pad) |
 		 FIELD_PREP(DMA_ADAPTER_RX_MSB_PAD, pad);
 
-#ifndef USE_RXB_FOR_CAPTURE
-	writel_relaxed(regval, mca->switch_base + REG_DMA_ADAPTER_A(cl->no));
-#else
-	if (is_tx)
-		writel_relaxed(regval,
-			       mca->switch_base + REG_DMA_ADAPTER_A(cl->no));
-	else
-		writel_relaxed(regval,
-			       mca->switch_base + REG_DMA_ADAPTER_B(cl->no));
-#endif
+	cl->dma_adapter[substream->stream] = regval;
+	writel_relaxed(regval, mca_dma_adapter(cl, substream->stream));
 
 	if (!mca_fe_clocks_in_use(cl)) {
 		/*
@@ -981,6 +1026,15 @@ static int mca_set_runtime_hwparams(struct snd_soc_component *component,
 
 	if (ret)
 		return ret;
+
+	/*
+	 * A paused ADMAC channel keeps its descriptors in hardware rings, and
+	 * those do not survive suspend-to-RAM. Without these two flags the
+	 * channel is terminated on suspend and the stream is prepared anew.
+	 * Only the machine with suspend-to-RAM support needs that.
+	 */
+	if (IS_ENABLED(CONFIG_APPLE_S2R) && of_machine_is_compatible("apple,t6000"))
+		hw.info &= ~(SNDRV_PCM_INFO_PAUSE | SNDRV_PCM_INFO_RESUME);
 
 	return snd_soc_set_runtime_hwparams(substream, &hw);
 }
@@ -1467,10 +1521,94 @@ static const struct of_device_id apple_mca_of_match[] = {
 };
 MODULE_DEVICE_TABLE(of, apple_mca_of_match);
 
+static int mca_suspend(struct device *dev)
+{
+	struct mca_data *mca = dev_get_drvdata(dev);
+	int i, j;
+
+	if (pm_suspend_target_state != PM_SUSPEND_MEM)
+		return 0;
+
+	for (i = 0; i < mca->nclusters; i++) {
+		struct mca_cluster *cl = &mca->clusters[i];
+
+		/* Only a cluster propped up by a stream is powered to read */
+		cl->stream_saved = !!cl->pd_link;
+		if (!cl->stream_saved)
+			continue;
+
+		for (j = 0; j < ARRAY_SIZE(mca_stream_regs); j++)
+			cl->stream_regs[j] = readl_relaxed(cl->base + mca_stream_regs[j]);
+	}
+
+	return 0;
+}
+
+static void mca_restore_port(struct mca_cluster *cl)
+{
+	u32 enables = PORT_ENABLES_CLOCKS;
+
+	if (!mca_be_clk_started(cl))
+		return;
+
+	writel_relaxed(FIELD_PREP(PORT_CLOCK_SEL, cl->port_clk_driver + 1),
+		       cl->base + REG_PORT_CLOCK_SEL);
+
+	if (cl->port_clk_started[SNDRV_PCM_STREAM_PLAYBACK]) {
+		writel_relaxed(PORT_DATA_SEL_TXA(cl->port_clk_driver),
+			       cl->base + REG_PORT_DATA_SEL);
+		enables |= PORT_ENABLES_TX_DATA;
+	}
+
+	writel_relaxed(enables, cl->base + REG_PORT_ENABLES);
+}
+
+/* Harmless when nothing was lost: every value is the one already there */
+static int mca_resume(struct device *dev)
+{
+	struct mca_data *mca = dev_get_drvdata(dev);
+	int i, j, stream;
+
+	if (pm_suspend_target_state != PM_SUSPEND_MEM)
+		return 0;
+
+	/*
+	 * A deep sleep given up on the way down: the clusters kept everything,
+	 * and writing a live stream's registers back hangs the bus.
+	 */
+	if (!apple_s2r_power_cut())
+		return 0;
+
+	for (i = 0; i < mca->nclusters; i++) {
+		struct mca_cluster *cl = &mca->clusters[i];
+
+		if (cl->fmt_set)
+			mca_fe_apply_fmt(cl);
+
+		if (cl->stream_saved) {
+			for_each_pcm_streams(stream)
+				if (cl->dma_adapter[stream])
+					writel_relaxed(cl->dma_adapter[stream],
+						       mca_dma_adapter(cl, stream));
+
+			for (j = 0; j < ARRAY_SIZE(mca_stream_regs); j++)
+				writel_relaxed(cl->stream_regs[j],
+					       cl->base + mca_stream_regs[j]);
+		}
+
+		mca_restore_port(cl);
+	}
+
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(mca_pm_ops, mca_suspend, mca_resume);
+
 static struct platform_driver apple_mca_driver = {
 	.driver = {
 		.name = "apple-mca",
 		.of_match_table = apple_mca_of_match,
+		.pm = pm_sleep_ptr(&mca_pm_ops),
 	},
 	.probe = apple_mca_probe,
 	.remove = apple_mca_remove,

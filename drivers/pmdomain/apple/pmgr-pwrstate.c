@@ -16,6 +16,7 @@
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
 #include <linux/regmap.h>
+#include <linux/suspend.h>
 #include <linux/mfd/syscon.h>
 #include <linux/reset-controller.h>
 #include <linux/module.h>
@@ -441,6 +442,55 @@ static int apple_pmgr_ps_suspend_late(struct device *dev)
 static int apple_pmgr_ps_resume_early(struct device *dev)
 {
 	apple_pmgr_ps_set_system_sleep(dev, false);
+
+	return 0;
+}
+
+/*
+ * Suspend-to-RAM powers the SoC down, and a domain genpd keeps on need not
+ * come back on with it. Turn such a domain back on before its consumers
+ * resume. After suspend-to-idle every domain is still where genpd left it.
+ */
+static int apple_pmgr_ps_resume_noirq(struct device *dev)
+{
+	struct apple_pmgr_ps *ps = dev_get_drvdata(dev);
+	unsigned long flags;
+	u32 reg = 0;
+
+	if (ps->firmware_owned || pm_suspend_target_state != PM_SUSPEND_MEM)
+		return 0;
+
+	spin_lock_irqsave(&ps->genpd.slock, flags);
+
+	regmap_read(ps->regmap, ps->offset, &reg);
+	if (ps->genpd.status != GENPD_STATE_OFF && !apple_pmgr_ps_is_active(ps) &&
+	    !(ps->externally_clocked &&
+	      FIELD_GET(APPLE_PMGR_PS_ACTUAL, reg) >= APPLE_PMGR_PS_CLKGATE)) {
+		dev_dbg(dev, "PS %s: off after system sleep (0x%x), turning it on\n",
+			ps->genpd.name, reg);
+		if (ps->min_state && ps->min_state <= APPLE_PMGR_PS_ACTIVE)
+			regmap_update_bits(ps->regmap, ps->offset,
+					   APPLE_PMGR_FLAGS | APPLE_PMGR_PS_MIN,
+					   FIELD_PREP(APPLE_PMGR_PS_MIN, ps->min_state));
+		apple_pmgr_ps_set(&ps->genpd, APPLE_PMGR_PS_ACTIVE, !ps->no_auto_pm);
+	}
+
+	/*
+	 * The minimum state goes with the power too. Without it auto-PM may
+	 * power an idle DCP CPU fully off, and its firmware cannot come back.
+	 */
+	if (ps->min_state && ps->min_state <= APPLE_PMGR_PS_ACTIVE) {
+		regmap_read(ps->regmap, ps->offset, &reg);
+		if (FIELD_GET(APPLE_PMGR_PS_MIN, reg) != ps->min_state) {
+			dev_dbg(dev, "PS %s: min state lost in system sleep (0x%x), restoring it\n",
+				ps->genpd.name, reg);
+			regmap_update_bits(ps->regmap, ps->offset,
+					   APPLE_PMGR_FLAGS | APPLE_PMGR_PS_MIN,
+					   FIELD_PREP(APPLE_PMGR_PS_MIN, ps->min_state));
+		}
+	}
+
+	spin_unlock_irqrestore(&ps->genpd.slock, flags);
 
 	return 0;
 }
@@ -1099,6 +1149,7 @@ MODULE_DEVICE_TABLE(of, apple_pmgr_ps_of_match);
 
 static const struct dev_pm_ops apple_pmgr_ps_pm_ops = {
 	LATE_SYSTEM_SLEEP_PM_OPS(apple_pmgr_ps_suspend_late, apple_pmgr_ps_resume_early)
+	NOIRQ_SYSTEM_SLEEP_PM_OPS(NULL, apple_pmgr_ps_resume_noirq)
 };
 
 static struct platform_driver apple_pmgr_ps_driver = {

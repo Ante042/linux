@@ -817,6 +817,10 @@ impl GpuManager::ver {
         let rtkit =
             rtkit::RtKit::<GpuManager::ver>::new(dev.as_ref().as_ref(), None, 0, mgr.clone())?;
 
+        // SAFETY: The GPU manager and its RTKit live until the device goes away, never unbound.
+        #[cfg(CONFIG_APPLE_S2R)]
+        unsafe { kernel::bindings::apple_s2r_set_gpu_rtkit(rtkit.as_raw()) };
+
         *mgr.rtkit.lock() = Some(rtkit);
 
         {

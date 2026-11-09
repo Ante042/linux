@@ -526,6 +526,8 @@ struct apple_pcie {
 	u32			msi_vector_base;
 };
 
+#define MAX_AUX_PERST 3
+
 struct apple_pcie_port {
 	raw_spinlock_t		lock;
 	raw_spinlock_t		irq_lock;
@@ -540,6 +542,11 @@ struct apple_pcie_port {
 	unsigned long		*sid_map;
 	u32			*saved_rid2sid;
 	struct apple_tunable	*tunable;
+	/* From apple_pcie_setup_link(), to set the link up again after S2R */
+	struct gpio_desc	*main_perst;
+	struct gpio_desc	*aux_perst[MAX_AUX_PERST];
+	struct gpio_desc	*link_pwren;
+	u32			num_aux_perst;
 	unsigned int		irq;
 	unsigned int		link_irqs[2];
 	u32			saved_intmask;
@@ -2689,7 +2696,6 @@ static int apple_pcie_setup_link(struct apple_pcie *pcie,
 				 struct apple_pcie_port *port,
 				 struct device_node *np)
 {
-#define MAX_AUX_PERST 3
 	struct gpio_desc *aux_reset[MAX_AUX_PERST] = { NULL };
 	u32 num_aux_resets = 0;
 	struct gpio_desc *reset, *pwren = NULL;
@@ -2754,6 +2760,11 @@ static int apple_pcie_setup_link(struct apple_pcie *pcie,
 	ret = gpiod_set_value_cansleep(pwren, 1);
 	if (ret)
 		return ret;
+
+	port->main_perst = reset;
+	port->link_pwren = pwren;
+	port->num_aux_perst = num_aux_resets;
+	memcpy(port->aux_perst, aux_reset, sizeof(aux_reset));
 
 	if (!pcie->hw->retain_clocks) {
 		ret = apple_pcie_setup_refclk(pcie, port);
@@ -5300,6 +5311,20 @@ static int apple_pcie_check_adopted_s2idle(struct apple_pcie *pcie)
 	return error;
 }
 
+/* What apple_pcie_internal_relink() puts back after suspend-to-RAM */
+static void apple_pcie_internal_save(struct apple_pcie *pcie)
+{
+	struct apple_pcie_port *port;
+	int i;
+
+	list_for_each_entry(port, &pcie->ports, entry) {
+		port->saved_intmask = apple_pcie_port_readl(port, PORT_INTMSK);
+		for_each_set_bit(i, port->sid_map, port->sid_map_sz)
+			port->saved_rid2sid[i] =
+				apple_pcie_port_readl(port, port_rid2sid_offset(port, i));
+	}
+}
+
 static int apple_pcie_suspend_noirq(struct device *dev)
 {
 	struct apple_pcie *pcie = apple_pcie_lookup(dev);
@@ -5317,6 +5342,8 @@ static int apple_pcie_suspend_noirq(struct device *dev)
 		return ret;
 	}
 	if (!pcie->hw->tunneled) {
+		if (pm_suspend_target_state == PM_SUSPEND_MEM)
+			apple_pcie_internal_save(pcie);
 		if (pm_suspend_no_platform() && pcie->num_pds)
 			return apple_pcie_hold_domains(pcie);
 		return 0;
@@ -5369,6 +5396,148 @@ static int apple_pcie_reset_for_resume(struct apple_pcie *pcie)
 	return 0;
 }
 
+/* Stop every DART the iommu-map of this controller points at from touching hardware. */
+static void apple_pcie_quiesce_mapped_darts(struct apple_pcie *pcie)
+{
+	struct device_node *np = pcie->dev->of_node;
+	int n, i;
+
+	n = of_property_count_u32_elems(np, "iommu-map");
+	for (i = 0; n > 0 && i + 3 < n;) {
+		struct platform_device *pdev;
+		struct device_node *dart;
+		u32 phandle, cells = 1;
+
+		if (of_property_read_u32_index(np, "iommu-map", i + 1, &phandle))
+			break;
+		dart = of_find_node_by_phandle(phandle);
+		if (!dart)
+			break;
+		of_property_read_u32(dart, "#iommu-cells", &cells);
+		pdev = of_find_device_by_node(dart);
+		if (pdev) {
+			apple_dart_quiesce_commands(&pdev->dev);
+			put_device(&pdev->dev);
+		}
+		of_node_put(dart);
+		i += 3 + cells;
+	}
+}
+
+/*
+ * m1n1 set the controller up again on the wake path, as it did at boot. Bring
+ * a port back the way probe did: apple_pcie_setup_link() with the GPIOs it
+ * got, the rest of apple_pcie_setup_port(), and the mappings suspend saved.
+ * Then train the link, before the PCI core restores the functions behind it.
+ */
+static int apple_pcie_internal_relink(struct apple_pcie *pcie,
+				      struct apple_pcie_port *port)
+{
+	const struct hw_info *hw = pcie->hw;
+	u32 stat;
+	int i, ret;
+
+	if (!port->main_perst)
+		return -ENODEV;
+
+	rmw_set(PORT_APPCLK_EN, port->base + PORT_APPCLK);
+	gpiod_set_value_cansleep(port->main_perst, 1);
+	for (i = 0; i < port->num_aux_perst; i++)
+		gpiod_set_value_cansleep(port->aux_perst[i], 1);
+	if (port->link_pwren) {
+		ret = gpiod_set_value_cansleep(port->link_pwren, 1);
+		if (ret)
+			return ret;
+	}
+	if (!hw->retain_clocks) {
+		ret = apple_pcie_setup_refclk(pcie, port);
+		if (ret < 0)
+			return ret;
+	}
+	if (port->link_pwren)
+		msleep(hw->pwren_on_ms ?: 100);
+	else
+		usleep_range(100, 200);
+
+	rmw_set(PORT_PERST_OFF, port->base + hw->port_perst);
+	gpiod_set_value_cansleep(port->main_perst, 0);
+	for (i = 0; i < port->num_aux_perst; i++)
+		gpiod_set_value_cansleep(port->aux_perst[i], 0);
+	msleep(100);
+
+	ret = readl_relaxed_poll_timeout(port->base + PORT_STATUS, stat,
+					 stat & PORT_STATUS_READY, 100, 250000);
+	if (ret)
+		return ret;
+
+	if (!hw->retain_clocks) {
+		if (hw->port_refclk)
+			rmw_clear(PORT_REFCLK_CGDIS, port->base + hw->port_refclk);
+		else if (port->phy)
+			rmw_set(PHY_LANE_CFG_REFCLKCGEN, port->phy + PHY_LANE_CFG);
+		rmw_clear(PORT_APPCLK_CGDIS, port->base + PORT_APPCLK);
+	}
+
+	apple_pcie_tunnel_restore_irq_hw(port);
+	for_each_set_bit(i, port->sid_map, port->sid_map_sz)
+		apple_pcie_rid2sid_write(port, i, port->saved_rid2sid[i]);
+	apple_pcie_port_writel(port, port->saved_intmask, PORT_INTMSK);
+
+	apple_pcie_port_writel(port, PORT_LTSSMCTL_START, PORT_LTSSMCTL);
+	ret = readl_relaxed_poll_timeout(port->base + PORT_LINKSTS, stat,
+					 stat & PORT_LINKSTS_UP, 1000,
+					 link_up_timeout * USEC_PER_MSEC);
+	if (ret)
+		dev_warn(pcie->dev, "%pOF link didn't come up after sleep\n", port->np);
+	else
+		dev_dbg(pcie->dev, "%pOF link up again after sleep\n", port->np);
+	return 0;
+}
+
+/*
+ * Suspend-to-RAM resets the internal apcie: APPCLK, REFCLK, PERST and the PHY
+ * come back cleared, and the port DARTs stop answering MMIO. When m1n1 set the
+ * controller up again on the wake path, bring the ports up again. Otherwise
+ * keep everything below them from touching the hardware, like a surprise
+ * removal, rather than hanging the resume.
+ */
+static int apple_pcie_internal_resume_noirq(struct device *dev,
+					    struct apple_pcie *pcie)
+{
+	struct apple_pcie_port *port;
+	bool lost = false, down = false;
+	int ret;
+
+	if (pm_suspend_target_state != PM_SUSPEND_MEM)
+		return 0;
+	list_for_each_entry(port, &pcie->ports, entry) {
+		if (!(apple_pcie_port_readl(port, PORT_APPCLK) & PORT_APPCLK_EN))
+			lost = true;
+		else if (!(apple_pcie_port_readl(port, PORT_LINKSTS) & PORT_LINKSTS_UP))
+			down = true;
+	}
+	if (!lost && down) {
+		list_for_each_entry(port, &pcie->ports, entry) {
+			if (apple_pcie_port_readl(port, PORT_LINKSTS) & PORT_LINKSTS_UP)
+				continue;
+			ret = apple_pcie_internal_relink(pcie, port);
+			if (ret) {
+				dev_err(dev, "%pOF failed to come back after sleep: %d\n",
+					port->np, ret);
+				lost = true;
+				break;
+			}
+		}
+	}
+	if (!lost)
+		return 0;
+
+	dev_warn(dev, "apcie lost its state in system sleep, its ports stay down\n");
+	apple_pcie_tunnel_hierarchy_gone(dev);
+	apple_pcie_quiesce_mapped_darts(pcie);
+	return 0;
+}
+
 static int apple_pcie_resume_noirq(struct device *dev)
 {
 	struct apple_pcie *pcie = apple_pcie_lookup(dev);
@@ -5391,7 +5560,7 @@ static int apple_pcie_resume_noirq(struct device *dev)
 		return ret;
 	}
 	if (!pcie->hw->tunneled)
-		return 0;
+		return apple_pcie_internal_resume_noirq(dev, pcie);
 	if (pcie->resume_failed)
 		return -EIO;
 	/*

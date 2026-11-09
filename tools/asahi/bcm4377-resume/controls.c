@@ -1,5 +1,19 @@
 // SPDX-License-Identifier: GPL-2.0-only
 static bool timeout_during_resume;
+static int pci_read_config_dword(struct pci_dev *p, int where, u32 *val)
+{
+	struct bcm4377_data *b = p->data;
+
+	if (cfg_read_error)
+		return cfg_read_error;
+	if (where == BCM4377_PCIECFG_BAR0_WINDOW1)
+		*val = cfg_window_lost ? 0 : b->hw->bar0_window1;
+	else if (where == BCM4377_PCIECFG_SUBSYSTEM_CTRL)
+		*val = cfg_ctrl_lost ? 0 : BIT(16);
+	else
+		abort();
+	return 0;
+}
 static int hci_resume_sync(struct hci_dev *h) { if(timeout_during_resume)hci_cmd_timeout(&h->cmd_timer.work);return resume_error; }
 static int hci_dev_close_sync(struct hci_dev *h) {assert(req_locked);h->flags&=~HCI_UP;return bcm4377_hci_close(h);}
 static int hci_dev_open_sync(struct hci_dev *h) {assert(req_locked);int e=bcm4377_hci_open(h);if(!e)e=bcm4377_hci_post_init(h);if(!e)h->flags|=HCI_UP;return e;}
@@ -108,11 +122,37 @@ int main(int argc,char **argv) {
 		recover(&b);
 		assert(rebind_count == 1);
 		break;
+	case 46:
+		/* Power lost in sleep: BAR0 window reset, rebind instead of resume. */
+		cfg_window_lost = true;
+		b.quiesced = true;
+		b.resume_powered = true;
+		assert(!bcm4377_resume(&dev));
+		assert(!b.quiesced && b.needs_reset && init_cfg_count == 1);
+		assert(lost_rebind_count == 1 && lost_rebind_wq == system_freezable_wq && !lost_rebind_why);
+		assert(b.resume_powered && !reset_count);
+		break;
+	case 47:
+		/* Window kept but subsystem control lost bit 16: also power loss. */
+		cfg_ctrl_lost = true;
+		resume_cycle(&dev);
+		assert(b.needs_reset && init_cfg_count == 1 && lost_rebind_count == 1);
+		assert(b.resume_powered && !reset_count);
+		break;
+	case 48:
+		/* Unreadable config space counts as lost; a failed restore still rebinds. */
+		cfg_read_error = -EIO;
+		init_cfg_error = -EIO;
+		resume_cycle(&dev);
+		assert(b.needs_reset && init_cfg_count == 1 && lost_rebind_count == 1);
+		break;
  default:abort();
  }
 	if (atoi(argv[1]) == 6 || atoi(argv[1]) == 44 || atoi(argv[1]) == 45)
 		assert(rebind_count == 1);
 	else
 		assert(!rebind_count);
+ if (atoi(argv[1]) < 46)
+		assert(!init_cfg_count && !lost_rebind_count);
  assert(!request.fn);printf("case %s passed\n",argv[1]);return 0;
 }

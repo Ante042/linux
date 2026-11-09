@@ -918,6 +918,12 @@ struct SepData {
     // The system is going to sleep: no capture may start. Changed under the
     // bio session lock; `sleep_over` is signalled when it clears.
     suspending: Atomic<bool>,
+    /// The enclave acknowledged SLEEP; it stays down until `enclave_wake`.
+    enclave_asleep: Atomic<bool>,
+    /// `enclave_sleep` held the receive interrupt.
+    rx_held: Atomic<bool>,
+    /// Where `enclave_wake` is in the SEPROM resume handshake.
+    wake_state: Atomic<u32>,
 
     #[pin]
     sleep_over: CondVar,
@@ -1208,6 +1214,9 @@ impl SepData {
                 shutting_down: Atomic::new(false),
                 capture_epoch: Atomic::new(0),
                 suspending: Atomic::new(false),
+                enclave_asleep: Atomic::new(false),
+                rx_held: Atomic::new(false),
+                wake_state: Atomic::new(0),
                 sleep_over <- new_condvar!("SepData::sleep_over"),
                 captures_running: Atomic::new(0),
                 worker_gone <- new_condvar!("SepData::worker_gone"),
@@ -1289,6 +1298,10 @@ impl SepData {
     /// Handle a message from the boot endpoint during the cold-boot handshake.
     fn on_boot(&self, msg: Message) {
         let ty = (msg.msg0 >> proto::MSG_TYPE_SHIFT) & 0xff;
+        if self.wake_state.load(Relaxed) != Self::WAKE_IDLE {
+            self.on_boot_wake(msg, ty);
+            return;
+        }
         match ty {
             proto::MSG_BOOT_TZ0_ACK1 => {
                 dev_info_ratelimited!(self.dev, "boot: first TZ0 acknowledgement\n");
@@ -1408,7 +1421,7 @@ impl SepData {
     }
 
     fn send(&self, msg: Message) -> Result<()> {
-        if self.shutting_down.load(Relaxed) {
+        if self.shutting_down.load(Relaxed) || self.enclave_asleep.load(Relaxed) {
             return Err(ENODEV);
         }
         Self::ring(self.mbox.lock().as_ref().ok_or(ENODEV)?, msg)
@@ -1575,7 +1588,7 @@ impl SepData {
     /// way to sleep waits for it. It must not then write its request into
     /// the suspend. Lock order: mailbox, then control.
     fn send_entropy_request(&self, msg: Message) -> Result<()> {
-        if self.shutting_down.load(Relaxed) {
+        if self.shutting_down.load(Relaxed) || self.enclave_asleep.load(Relaxed) {
             return Err(ENODEV);
         }
         let mbox = self.mbox.lock();
@@ -1591,6 +1604,216 @@ impl SepData {
     /// still answer it. On a T6000 a request sent while devices were
     /// suspended was never answered, and the enclave did not read its mailbox
     /// again after the resume.
+    /// AppleSEPManager's sleep for S2R: hold the other endpoints, send SLEEP
+    /// type 2 and wait for its reply, then what AppleA7IOP::stopCPU does on
+    /// the AP side, the outbox disabled and nothing received. The enclave
+    /// stays down until `enclave_wake` resumes it, or until reboot.
+    pub(crate) fn enclave_sleep(&self) -> Result<()> {
+        if self.enclave_asleep.load(Relaxed) {
+            return Err(EALREADY);
+        }
+        self.rng_sleep_prepare();
+        self.sleep_prepare();
+
+        if let Some(mbox) = self.mbox.lock().as_ref() {
+            let (a2i, i2a) = mbox.control();
+            dev_dbg!(self.dev, "SLEEP: mailbox control a2i {:#x} i2a {:#x}\n", a2i, i2a);
+        }
+        // The DART goes down with the island; keep what a wake puts back.
+        if let Err(e) = pm::save_dart(&self.dev) {
+            dev_warn!(self.dev, "SLEEP: could not save the DART ({:?}); no wake\n", e);
+        }
+
+        let reply = match self.control_request(&proto::op_sleep(proto::SLEEP_TYPE_S2R)) {
+            Ok(Some(reply)) => reply,
+            Ok(None) => {
+                dev_err!(self.dev, "SLEEP: no reply within 15 s\n");
+                return Err(ETIMEDOUT);
+            }
+            Err(e) => {
+                dev_err!(self.dev, "SLEEP: request failed ({:?})\n", e);
+                return Err(e);
+            }
+        };
+        dev_dbg!(
+            self.dev,
+            "SLEEP: reply tag {:#04x} type {:#04x} param {:#04x} data {:#010x}\n",
+            reply.tag,
+            reply.ty,
+            reply.param,
+            reply.data_lo
+        );
+        if reply.param != 0 {
+            return Err(EIO);
+        }
+
+        self.enclave_asleep.store(true, Relaxed);
+        self.rng_shutdown.store(true, Relaxed);
+        if let Some(mbox) = self.mbox.lock().as_ref() {
+            mbox.set_outbox(false);
+            if !self.rx_held.xchg(true, Relaxed) {
+                mbox.hold_rx();
+            }
+        }
+        if let Err(e) = pm::gate_dart(&self.dev) {
+            dev_err!(self.dev, "SLEEP: could not gate the DART ({:?})\n", e);
+        }
+        dev_dbg!(self.dev, "SLEEP: outbox off, receive held until the wake\n");
+        Ok(())
+    }
+
+    const WAKE_IDLE: u32 = 0;
+    const WAKE_TZ0: u32 = 1;
+    const WAKE_RESUME: u32 = 2;
+    const WAKE_DONE: u32 = 3;
+    const WAKE_FAILED: u32 = 4;
+
+    /// AppleSEPManager's wake from S2R. The island is powered on as
+    /// AppleT6000PMGR::restoreHW does it, the DART is made active again and
+    /// the outbox enabled as startCPU does, then the SEPROM resumes sepOS from
+    /// RAM: TZ0, and once the ROM reports status 2, op 8 in place of the
+    /// IMG4, answered by 0x6c. On failure the enclave is left as asleep.
+    pub(crate) fn enclave_wake(&self) -> Result<()> {
+        if !self.enclave_asleep.load(Relaxed) {
+            return Err(EALREADY);
+        }
+        if self.shutting_down.load(Relaxed) {
+            return Err(ENODEV);
+        }
+        pm::power_on(&self.dev)?;
+
+        let ret = self.wake_handshake();
+        self.wake_state.store(Self::WAKE_IDLE, Relaxed);
+        match ret {
+            Ok(()) => {
+                self.enclave_asleep.store(false, Relaxed);
+                self.rng_shutdown.store(false, Relaxed);
+                dev_info!(self.dev, "WAKE: the enclave is back\n");
+            }
+            Err(e) => {
+                dev_err!(self.dev, "WAKE: failed ({:?}); the enclave stays down\n", e);
+                if let Some(mbox) = self.mbox.lock().as_ref() {
+                    mbox.set_outbox(false);
+                    if !self.rx_held.xchg(true, Relaxed) {
+                        mbox.hold_rx();
+                    }
+                }
+                if let Err(e) = pm::gate_dart(&self.dev) {
+                    dev_err!(self.dev, "WAKE: could not gate the DART again ({:?})\n", e);
+                }
+            }
+        }
+        pm::power_release(&self.dev);
+        ret
+    }
+
+    fn wake_handshake(&self) -> Result<()> {
+        if let Err(e) = pm::restore_dart(&self.dev) {
+            dev_err!(self.dev, "WAKE: could not restore the DART ({:?})\n", e);
+            return Err(e);
+        }
+        self.wake_state.store(Self::WAKE_TZ0, Relaxed);
+        {
+            let guard = self.mbox.lock();
+            let mbox = guard.as_ref().ok_or(ENODEV)?;
+            let (a2i, i2a) = mbox.control();
+            dev_dbg!(self.dev, "WAKE: mailbox control a2i {:#x} i2a {:#x}\n", a2i, i2a);
+            if a2i & 1 == 0 {
+                mbox.set_inbox(true);
+                dev_dbg!(self.dev, "WAKE: inbox enabled: a2i {:#x}\n", mbox.control().0);
+            }
+            mbox.set_outbox(true);
+            if self.rx_held.xchg(false, Relaxed) {
+                mbox.release_rx();
+            }
+        }
+        // sepOS stays silent until the boot endpoint rings, and answers the
+        // TZ0 within milliseconds: ring it at once, as bootSEP does after
+        // startCPU. Waiting first only held the whole resume up.
+        if self.wake_state.load(Relaxed) == Self::WAKE_DONE {
+            return Ok(());
+        }
+        {
+            let guard = self.mbox.lock();
+            let mbox = guard.as_ref().ok_or(ENODEV)?;
+            let msg = Message {
+                msg0: u64::from(proto::EP_BOOT) | (proto::MSG_BOOT_TZ0 << proto::MSG_TYPE_SHIFT),
+                msg1: 0,
+            };
+            Self::ring(mbox, msg)?;
+        }
+        dev_dbg!(self.dev, "WAKE: op 5 sent\n");
+        for _ in 0..1000 {
+            match self.wake_state.load(Relaxed) {
+                Self::WAKE_DONE => return Ok(()),
+                Self::WAKE_FAILED => return Err(EIO),
+                _ => kernel::time::delay::fsleep(kernel::time::Delta::from_millis(10)),
+            }
+        }
+        let (a2i, i2a) = self.mbox.lock().as_ref().map_or((0, 0), |m| m.control());
+        dev_err!(
+            self.dev,
+            "WAKE: no answer from the SEPROM within 10 s (state {}, a2i {:#x} i2a {:#x}, rx {})\n",
+            self.wake_state.load(Relaxed),
+            a2i,
+            i2a,
+            self.rx_count.load(Relaxed)
+        );
+        Err(ETIMEDOUT)
+    }
+
+    /// A boot-endpoint message while `enclave_wake` runs, read as
+    /// AppleSEPBooter::_bootAction reads it: 0x69 accepts TZ0, 0xd2 carries
+    /// the ROM status in its data, 0x6c reports sepOS resumed from RAM.
+    fn on_boot_wake(&self, msg: Message, ty: u64) {
+        let data = (msg.msg0 >> proto::MSG_DATA_SHIFT) as u32;
+        match ty {
+            proto::MSG_BOOT_TZ0_ACK1 => {
+                dev_dbg!(self.dev, "WAKE: TZ0 accepted (msg0 {:#018x})\n", msg.msg0);
+            }
+            proto::MSG_BOOT_TZ0_ACK2 => {
+                dev_dbg!(self.dev, "WAKE: SEPROM status {} (msg0 {:#018x})\n", data, msg.msg0);
+                if self
+                    .wake_state
+                    .cmpxchg(Self::WAKE_TZ0, Self::WAKE_RESUME, Relaxed)
+                    .is_err()
+                {
+                    return;
+                }
+                let resume = Message {
+                    msg0: u64::from(proto::EP_BOOT)
+                        | (proto::MSG_BOOT_RESUME << proto::MSG_TYPE_SHIFT),
+                    msg1: 0,
+                };
+                let guard = self.mbox.lock();
+                let ret = match guard.as_ref() {
+                    Some(mbox) => Self::ring(mbox, resume),
+                    None => Err(ENODEV),
+                };
+                drop(guard);
+                match ret {
+                    Ok(()) => dev_dbg!(self.dev, "WAKE: resume sent\n"),
+                    Err(e) => {
+                        dev_err!(self.dev, "WAKE: could not send the resume ({:?})\n", e);
+                        self.wake_state.store(Self::WAKE_FAILED, Relaxed);
+                    }
+                }
+            }
+            proto::MSG_BOOT_RESUMED => {
+                dev_dbg!(self.dev, "WAKE: SEP resumed from RAM (msg0 {:#018x})\n", msg.msg0);
+                self.wake_state.store(Self::WAKE_DONE, Relaxed);
+            }
+            _ => {
+                dev_warn!(
+                    self.dev,
+                    "WAKE: boot message type {:#x} (msg0 {:#018x})\n",
+                    ty,
+                    msg.msg0
+                );
+            }
+        }
+    }
+
     pub(crate) fn rng_sleep_prepare(&self) {
         if !self.control.lock().entropy_sleep() {
             return;
@@ -2781,6 +3004,25 @@ impl SepData {
 
     fn dispatch(&self, msg: Message) {
         let f = proto::decode(&msg);
+        if self.wake_state.load(Relaxed) != Self::WAKE_IDLE {
+            dev_dbg!(self.dev, "WAKE: rx msg0 {:#018x} msg1 {:#x}\n", msg.msg0, msg.msg1);
+            // AppleSEPControl::_cmsgAction: EP0 tag 0 type 0x0d and 0x15 end in
+            // notifyOSActive, 0x10 in notifyWrappingActive.
+            if f.ep == proto::EP_CONTROL && f.tag == 0 {
+                match f.ty {
+                    0x0d | 0x15 => {
+                        dev_dbg!(self.dev, "WAKE: sepOS active (type {:#x})\n", f.ty);
+                        self.wake_state.store(Self::WAKE_DONE, Relaxed);
+                        return;
+                    }
+                    0x10 => {
+                        dev_dbg!(self.dev, "WAKE: sepOS wrapping active\n");
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
 
         match f.ep {
             proto::EP_DISCOVER => self.on_discovery(msg, f),
@@ -2811,7 +3053,19 @@ impl SepData {
 
     fn on_control(&self, msg: Message, f: proto::Fields) {
         if f.ty != proto::CONTROL_REPLY_TYPE {
-            return;
+            // macOS (_cmsgAction) matches control replies by tag alone. Take
+            // one with another type only when it answers a request in flight,
+            // which only deep sleep has been seen to need.
+            if !pm::s2r_deep_sleep() || !self.control.lock().tag_in_flight(f.tag) {
+                return;
+            }
+            dev_info!(
+                self.dev,
+                "control: reply of type {:#04x} to tag {:#04x} (msg0 {:#018x})\n",
+                f.ty,
+                f.tag,
+                msg.msg0
+            );
         }
 
         let reply = proto::ControlReply::from_message(&msg);

@@ -1605,7 +1605,10 @@ static bool dcpep_process_chunks(struct apple_dcp *dcp,
 				dcp->chunks.data = NULL;
 				dcp->chunks.length = 0;
 			}
-			dev_warn(dcp->dev, "failed to parse modes\n");
+			dev_warn(dcp->dev, "failed to parse modes: %d len %zu gen %llu/%llu\n",
+				 ret, dcp->chunks.length,
+				 (unsigned long long)dcp->chunks.modes_generation,
+				 (unsigned long long)dcp->modes_generation);
 			dcp_firmware_metadata_timing(dcp);
 			return false;
 		}
@@ -2387,6 +2390,41 @@ static void dcp_on_set_parameter(struct apple_dcp *dcp, void *out, void *cookie)
 }
 #endif
 
+static void dcp_s2r_link_sleep_done(struct apple_dcp *dcp, void *out, void *cookie)
+{
+	struct dcp_wait_cookie *wait = cookie;
+
+	complete(&wait->done);
+	kref_put(&wait->refcount, release_wait_cookie);
+}
+
+/*
+ * DCPPowerManager A500 (13.x firmware) drains the AP link and marks it
+ * inactive, so an AP power IDLE can be acked; the AP power ON at wake
+ * activates the link again. A true argument is a teardown: it also
+ * unregisters the AP power callbacks, after which the link stays inactive.
+ */
+int DCP_FW_NAME(iomfb_s2r_link_sleep)(struct apple_dcp *dcp, bool teardown)
+{
+	struct dcp_wait_cookie *cookie;
+	u32 in = teardown;
+	long t;
+
+	if (!dcp_methods[dcpep_s2r_link_sleep].tag[0])
+		return -EOPNOTSUPP;
+	cookie = kzalloc_obj(*cookie);
+	if (!cookie)
+		return -ENOMEM;
+	init_completion(&cookie->done);
+	kref_init(&cookie->refcount);
+	kref_get(&cookie->refcount);
+	dcp_push(dcp, false, &dcp_methods[dcpep_s2r_link_sleep], sizeof(in), 0, &in,
+		 dcp_s2r_link_sleep_done, cookie);
+	t = wait_for_completion_timeout(&cookie->done, msecs_to_jiffies(2000));
+	kref_put(&cookie->refcount, release_wait_cookie);
+	return t ? 0 : -ETIMEDOUT;
+}
+
 void DCP_FW_NAME(iomfb_poweron)(struct apple_dcp *dcp)
 {
 	struct dcp_wait_cookie *cookie;
@@ -2454,6 +2492,9 @@ void DCP_FW_NAME(iomfb_poweron)(struct apple_dcp *dcp)
 		dcp_backlight_desktop_power(dcp, true);
 #endif
 
+	/* Until a poweron completes again, deep sleep is refused (dcp_platform_prepare()) */
+	if (ret >= 0)
+		WRITE_ONCE(dcp->poweron_timed_out, ret == 0);
 	if (ret == 0) {
 		dev_warn(dcp->dev, "wait for power timed out, connector will be broken\n");
 	} else if (ret > 0) {

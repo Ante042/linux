@@ -29,4 +29,9 @@ int apple_pmp_register(struct device *dev, const void *data);
 void apple_pmp_unregister(const void *data);
 int apple_pmp_send_power_command(const void *data, u8 command,
 				u16 device_id, u32 enabled);
+/* RTKit steps of a PMP stop and restart; the C bridge drives the CPU in between */
+int apple_pmp_set_sleep(const void *data, int op);
+#define APPLE_PMP_IDLE		1
+#define APPLE_PMP_REINIT	2
+#define APPLE_PMP_BOOT		3
 #endif

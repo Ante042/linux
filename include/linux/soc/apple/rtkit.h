@@ -196,6 +196,12 @@ void apple_rtkit_free_retaining_buffers(struct apple_rtkit *rtk);
  * is held in reset.
  */
 int apple_rtkit_reinit(struct apple_rtkit *rtk);
+int apple_rtkit_reinit_keep(struct apple_rtkit *rtk);
+int apple_rtkit_idle_iop(struct apple_rtkit *rtk);
+int apple_rtkit_ap_power_timeout(struct apple_rtkit *rtk, bool on, unsigned int ms);
+int apple_rtkit_wake_keep_ap(struct apple_rtkit *rtk);
+int apple_rtkit_restart_started_eps(struct apple_rtkit *rtk);
+void apple_rtkit_detach_keep(struct apple_rtkit *rtk);
 
 /*
  * Set how long each handshake step (power state and endpoint map replies)
@@ -260,6 +266,11 @@ int apple_rtkit_poweroff(struct apple_rtkit *rtk);
 int apple_rtkit_idle(struct apple_rtkit *rtk);
 
 /*
+ * Set only the AP power state, idle (0x201) or on (0x20)
+ */
+int apple_rtkit_set_ap_power(struct apple_rtkit *rtk, bool on);
+
+/*
  * Checks if RTKit is running and ready to handle messages.
  */
 bool apple_rtkit_is_running(struct apple_rtkit *rtk);
@@ -300,6 +311,8 @@ int apple_rtkit_send_message(struct apple_rtkit *rtk, u8 ep, u64 message,
  * @rtk:            RTKit reference
  */
 int apple_rtkit_poll(struct apple_rtkit *rtk);
+
+u32 apple_rtkit_boot_progress(struct apple_rtkit *rtk);
 
 /*
  * Stop taking interrupts for messages from the co-processor, which then

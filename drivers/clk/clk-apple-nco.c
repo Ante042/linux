@@ -16,6 +16,7 @@
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/spinlock.h>
+#include <linux/suspend.h>
 
 #define NCO_CHANNEL_STRIDE	0x4000
 #define NCO_CHANNEL_REGSIZE	20
@@ -70,6 +71,11 @@ struct applnco_channel {
 	struct clk_hw hw;
 
 	spinlock_t lock;
+	u32 saved_ctrl;
+	u32 saved_div;
+	u32 saved_inc1;
+	u32 saved_inc2;
+	u32 saved_accinit;
 };
 
 #define to_applnco_channel(_hw) container_of(_hw, struct applnco_channel, hw)
@@ -245,6 +251,70 @@ static void applnco_disable(struct clk_hw *hw)
 	spin_unlock_irqrestore(&chan->lock, flags);
 }
 
+/*
+ * The boot firmware leaves every channel with its enable bit set. Once a
+ * channel that clocks an MCA cluster has been used and then disabled, the
+ * PMGR refuses to power-gate the SIO island during S2R. Put the enable bit
+ * back for the duration of suspend and restore the real state on resume.
+ *
+ * Suspend-to-RAM also clears the rate registers. The clock core still caches
+ * the rate, so it will not program them again: a channel left like that runs
+ * many times too fast, whatever rate the audio stack asks for.
+ */
+static int applnco_suspend_noirq(struct device *dev)
+{
+	struct clk_hw_onecell_data *cells = dev_get_drvdata(dev);
+	unsigned long flags;
+	int i;
+
+	if (pm_suspend_target_state != PM_SUSPEND_MEM)
+		return 0;
+
+	for (i = 0; i < cells->num; i++) {
+		struct applnco_channel *chan = to_applnco_channel(cells->hws[i]);
+
+		spin_lock_irqsave(&chan->lock, flags);
+		chan->saved_ctrl = readl_relaxed(chan->base + REG_CTRL);
+		chan->saved_div = readl_relaxed(chan->base + REG_DIV);
+		chan->saved_inc1 = readl_relaxed(chan->base + REG_INC1);
+		chan->saved_inc2 = readl_relaxed(chan->base + REG_INC2);
+		chan->saved_accinit = readl_relaxed(chan->base + REG_ACCINIT);
+		writel_relaxed(chan->saved_ctrl | CTRL_ENABLE, chan->base + REG_CTRL);
+		spin_unlock_irqrestore(&chan->lock, flags);
+	}
+
+	return 0;
+}
+
+static int applnco_resume_noirq(struct device *dev)
+{
+	struct clk_hw_onecell_data *cells = dev_get_drvdata(dev);
+	unsigned long flags;
+	int i;
+
+	if (pm_suspend_target_state != PM_SUSPEND_MEM)
+		return 0;
+
+	for (i = 0; i < cells->num; i++) {
+		struct applnco_channel *chan = to_applnco_channel(cells->hws[i]);
+
+		spin_lock_irqsave(&chan->lock, flags);
+		writel_relaxed(chan->saved_ctrl & ~CTRL_ENABLE, chan->base + REG_CTRL);
+		writel_relaxed(chan->saved_div, chan->base + REG_DIV);
+		writel_relaxed(chan->saved_inc1, chan->base + REG_INC1);
+		writel_relaxed(chan->saved_inc2, chan->base + REG_INC2);
+		writel_relaxed(chan->saved_accinit, chan->base + REG_ACCINIT);
+		writel_relaxed(chan->saved_ctrl, chan->base + REG_CTRL);
+		spin_unlock_irqrestore(&chan->lock, flags);
+	}
+
+	return 0;
+}
+
+static const struct dev_pm_ops applnco_pm_ops = {
+	NOIRQ_SYSTEM_SLEEP_PM_OPS(applnco_suspend_noirq, applnco_resume_noirq)
+};
+
 static const struct clk_ops applnco_ops = {
 	.set_rate = applnco_set_rate,
 	.recalc_rate = applnco_recalc_rate,
@@ -315,6 +385,8 @@ static int applnco_probe(struct platform_device *pdev)
 		onecell_data->hws[i] = &chan->hw;
 	}
 
+	platform_set_drvdata(pdev, onecell_data);
+
 	return devm_of_clk_add_hw_provider(&pdev->dev, of_clk_hw_onecell_get,
 							onecell_data);
 }
@@ -330,6 +402,7 @@ static struct platform_driver applnco_driver = {
 	.driver = {
 		.name = "apple-nco",
 		.of_match_table = applnco_ids,
+		.pm = pm_sleep_ptr(&applnco_pm_ops),
 	},
 	.probe = applnco_probe,
 };

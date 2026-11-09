@@ -56,6 +56,9 @@
 #include <linux/limits.h>
 #include <linux/of_address.h>
 #include <linux/slab.h>
+#include <linux/soc/apple/s2r.h>
+#include <linux/suspend.h>
+#include <linux/syscore_ops.h>
 #include <asm/apple_m1_pmu.h>
 #include <asm/cputype.h>
 #include <asm/exception.h>
@@ -1039,6 +1042,227 @@ static int aic_init_cpu(unsigned int cpu)
 	return 0;
 }
 
+#ifdef CONFIG_PM_SLEEP
+/*
+ * Suspend-to-RAM powers the AIC down with the rest of the SoC and the CPUs
+ * come back from reset. The controller then wakes up disabled with its
+ * configuration at reset values. Keep what was programmed before Linux took
+ * over and what Linux programmed since, and put it back when the controller
+ * comes back disabled. In suspend-to-idle it keeps its state and this does
+ * nothing.
+ */
+static u32 *aic_saved_irq_cfg;
+static u32 aic_saved_timeout, aic_saved_cluster_prio;
+
+/*
+ * The mailboxes take their IRQs with IRQF_NO_SUSPEND, so the IRQ core leaves
+ * them alone, and coprocessors such as the AOP keep sending messages. Mask
+ * everything but the wake IRQs last thing before deep sleep. A chained
+ * parent, such as the GPIO controller's, is never armed, so go by
+ * enable_irq_wake() instead.
+ */
+static u32 *aic_saved_mask;
+static bool aic_sleep_masked;
+
+static void aic_mask_for_sleep(struct aic_irq_chip *ic)
+{
+	u32 words = BITS_TO_U32(ic->nr_irq), off = 0;
+	int die, i;
+
+	if (!aic_saved_mask)
+		return;
+
+	for (die = 0; die < ic->nr_die; die++) {
+		for (i = 0; i < words; i++) {
+			aic_saved_mask[die * words + i] =
+				aic_ic_read(ic, ic->info.mask_set + off + i * 4);
+			aic_ic_write(ic, ic->info.mask_set + off + i * 4, U32_MAX);
+		}
+
+		for (i = 0; i < ic->nr_irq; i++) {
+			unsigned int virq = irq_find_mapping(ic->hw_domain, AIC_IRQ_HWIRQ(die, i));
+			struct irq_data *d = virq ? irq_get_irq_data(virq) : NULL;
+
+			if (d && irqd_is_wakeup_set(d) && !irqd_irq_masked(d)) {
+				aic_ic_write(ic, ic->info.mask_clr + off + MASK_REG(i),
+					     MASK_BIT(i));
+				pr_debug("AIC: left open for wake: die %d irq %d (virq %u)\n",
+					 die, i, virq);
+			}
+		}
+		off += ic->info.die_stride;
+	}
+
+	aic_sleep_masked = true;
+}
+
+static void aic_unmask_after_sleep(struct aic_irq_chip *ic)
+{
+	u32 words = BITS_TO_U32(ic->nr_irq), off = 0, mask;
+	int die, i;
+
+	for (die = 0; die < ic->nr_die; die++) {
+		for (i = 0; i < words; i++) {
+			mask = aic_saved_mask[die * words + i];
+			aic_ic_write(ic, ic->info.mask_set + off + i * 4, mask);
+			aic_ic_write(ic, ic->info.mask_clr + off + i * 4, ~mask);
+		}
+		off += ic->info.die_stride;
+	}
+}
+
+static int aic_suspend(void *data)
+{
+	struct aic_irq_chip *ic = aic_irqc;
+	int die, i;
+
+	if (ic->info.version < 2)
+		return 0;
+
+	aic_saved_timeout = aic_ic_read(ic, AIC2_TIMEOUT);
+	aic_saved_cluster_prio = aic_ic_read(ic, AIC2_CLUSTER_PRIO);
+
+	if (aic2_chip.flags & IRQCHIP_MASK_ON_SUSPEND)
+		aic_mask_for_sleep(ic);
+
+	if (!aic_saved_irq_cfg)
+		return 0;
+
+	for (die = 0; die < ic->nr_die; die++)
+		for (i = 0; i < ic->nr_irq; i++)
+			aic_saved_irq_cfg[die * ic->nr_irq + i] =
+				aic_ic_read(ic, ic->info.irq_cfg +
+					    die * ic->info.die_stride + i * 4);
+
+	return 0;
+}
+
+/* The boot CPU went through reset without a CPU hotplug cycle */
+static void aic_restore_boot_cpu(void)
+{
+	u32 unmasked = __this_cpu_read(aic_fiq_unmasked);
+
+	aic_init_cpu(smp_processor_id());
+	__this_cpu_write(aic_fiq_unmasked, unmasked);
+
+	if (is_kernel_in_hyp_mode()) {
+		aic_vm_timer_mask(VM_TMR_FIQ_ENABLE_P, !(unmasked & BIT(AIC_TMR_EL02_PHYS)));
+		aic_vm_timer_mask(VM_TMR_FIQ_ENABLE_V, !(unmasked & BIT(AIC_TMR_EL02_VIRT)));
+		isb();
+	}
+}
+
+static void aic_resume(void *data)
+{
+	struct aic_irq_chip *ic = aic_irqc;
+	u32 config, off;
+	int die, i;
+
+	if (ic->info.version < 2)
+		return;
+
+	config = aic_ic_read(ic, AIC2_CONFIG);
+	if (config & AIC2_CONFIG_ENABLE) {
+		if (aic_sleep_masked)
+			aic_unmask_after_sleep(ic);
+		aic_sleep_masked = false;
+		return;
+	}
+	/* Rebuilt from the IRQ core's state below */
+	aic_sleep_masked = false;
+
+	pr_debug("AIC: came back from reset, restoring its state\n");
+
+	aic_ic_write(ic, AIC2_TIMEOUT, aic_saved_timeout);
+	aic_ic_write(ic, AIC2_CLUSTER_PRIO, aic_saved_cluster_prio);
+
+	off = 0;
+	for (die = 0; die < ic->nr_die; die++) {
+		if (aic_saved_irq_cfg)
+			for (i = 0; i < ic->nr_irq; i++)
+				aic_ic_write(ic, ic->info.irq_cfg + off + i * 4,
+					     aic_saved_irq_cfg[die * ic->nr_irq + i]);
+		for (i = 0; i < BITS_TO_U32(ic->nr_irq); i++)
+			aic_ic_write(ic, ic->info.mask_set + off + i * 4, U32_MAX);
+		for (i = 0; i < BITS_TO_U32(ic->nr_irq); i++)
+			aic_ic_write(ic, ic->info.sw_clr + off + i * 4, U32_MAX);
+
+		/* Unmask what the IRQ core has unmasked */
+		for (i = 0; i < ic->nr_irq; i++) {
+			unsigned int virq = irq_find_mapping(ic->hw_domain, AIC_IRQ_HWIRQ(die, i));
+			struct irq_data *d = virq ? irq_get_irq_data(virq) : NULL;
+
+			if (d && !irqd_irq_masked(d))
+				aic_ic_write(ic, ic->info.mask_clr + off + MASK_REG(i),
+					     MASK_BIT(i));
+		}
+		off += ic->info.die_stride;
+	}
+
+	aic_ic_write(ic, AIC2_CONFIG, config | AIC2_CONFIG_ENABLE);
+
+	aic_restore_boot_cpu();
+}
+
+static const struct syscore_ops aic_syscore_ops = {
+	.suspend = aic_suspend,
+	.resume = aic_resume,
+};
+
+static struct syscore aic_syscore = {
+	.ops = &aic_syscore_ops,
+};
+
+/*
+ * Deep sleep (suspend-to-RAM): a CPU powered down for system sleep wakes for
+ * any IRQ that is still unmasked, and the IRQ core only disables the others
+ * lazily. For such a suspend only, have it mask everything that is not
+ * wake-armed instead, mailboxes included.
+ */
+static void aic_set_mask_on_suspend(bool on)
+{
+	if (on) {
+		aic_chip.flags |= IRQCHIP_MASK_ON_SUSPEND;
+		aic2_chip.flags |= IRQCHIP_MASK_ON_SUSPEND;
+	} else {
+		aic_chip.flags &= ~IRQCHIP_MASK_ON_SUSPEND;
+		aic2_chip.flags &= ~IRQCHIP_MASK_ON_SUSPEND;
+	}
+}
+
+static int aic_pm_notify(struct notifier_block *nb, unsigned long action, void *data)
+{
+	switch (action) {
+	case PM_SUSPEND_PREPARE:
+		aic_set_mask_on_suspend(apple_s2r_deep_sleep());
+		break;
+	case PM_POST_SUSPEND:
+		aic_set_mask_on_suspend(false);
+		break;
+	}
+
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block aic_pm_nb = {
+	.notifier_call = aic_pm_notify,
+};
+
+static void __init aic_init_pm(struct aic_irq_chip *ic)
+{
+	if (ic->info.version >= 2) {
+		aic_saved_irq_cfg = kcalloc(ic->nr_die * ic->nr_irq, sizeof(u32), GFP_KERNEL);
+		aic_saved_mask = kcalloc(ic->nr_die * BITS_TO_U32(ic->nr_irq), sizeof(u32),
+					 GFP_KERNEL);
+	}
+
+	register_syscore(&aic_syscore);
+	register_pm_notifier(&aic_pm_nb);
+}
+#else
+static void __init aic_init_pm(struct aic_irq_chip *ic) {}
+#endif
+
 static struct gic_kvm_info vgic_info __initdata = {
 	.type			= GIC_V3,
 	.no_maint_irq_mask	= true,
@@ -1218,6 +1442,8 @@ static int __init aic_of_ic_init(struct device_node *node, struct device_node *p
 	cpuhp_setup_state(CPUHP_AP_IRQ_APPLE_AIC_STARTING,
 			  "irqchip/apple-aic/ipi:starting",
 			  aic_init_cpu, NULL);
+
+	aic_init_pm(irqc);
 
 	if (is_kernel_in_hyp_mode()) {
 		struct irq_fwspec mi = {

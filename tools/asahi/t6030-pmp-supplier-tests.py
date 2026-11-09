@@ -143,6 +143,7 @@ def main():
             ("serialized-command", "\tguard(mutex)(&pmp_lock);", "\t(void)&pmp_lock;"),
             ("gfx-check-error", "ret = apple_pmp_report_check_t6030_gfx(pmp_device);",
              "ret = (apple_pmp_report_check_t6030_gfx(pmp_device), 0);"),
+            ("stopped-command", "\tif (pmp_pc.stopped)\n\t\treturn -EAGAIN;", "\t(void)pmp_pc;"),
         ]
         for name, old, new in mutations:
             assert code.count(old) == 1, (name, code.count(old))

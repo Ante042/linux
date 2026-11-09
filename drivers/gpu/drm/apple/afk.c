@@ -20,6 +20,7 @@
 #include <linux/ioport.h>
 #include <linux/soc/apple/dart.h>
 #include <linux/soc/apple/rtkit.h>
+#include <linux/soc/apple/s2r.h>
 
 #include <kunit/visibility.h>
 
@@ -65,6 +66,8 @@ enum rbep_msg_type {
 
 #define SEND_WPTR GENMASK(31, 0)
 
+#define AFK_KICK_WAIT_MS 250
+
 static void afk_service_worker(struct work_struct *work);
 static bool afk_compact_capable(struct apple_dcp_afkep *ep);
 static void afk_discard_pending_open(struct apple_epic_service *service);
@@ -85,6 +88,45 @@ EXPORT_SYMBOL_IF_KUNIT(afk_service_retry);
 static void afk_send(struct apple_dcp_afkep *ep, u64 message)
 {
 	dcp_send_message(ep->dcp, ep->endpoint, message);
+}
+
+/*
+ * Snapshot both shared rings and ring the doorbells again for an entry the
+ * other side has not taken: one lost in system sleep leaves it unread. Shared
+ * RAM only, no coprocessor MMIO. Returns true if either ring held an entry.
+ */
+bool afk_kick(struct apple_dcp_afkep *ep, const char *why)
+{
+	u32 tx_r, tx_w, rx_r, rx_w;
+	unsigned long flags;
+	bool tx_pending, rx_pending;
+
+	if (!ep || !ep->txbfr.ready || !ep->rxbfr.ready)
+		return false;
+
+	spin_lock_irqsave(&ep->lock, flags);
+	dma_rmb();
+	tx_r = le32_to_cpu(READ_ONCE(*ep->txbfr.rptr));
+	tx_w = le32_to_cpu(READ_ONCE(*ep->txbfr.wptr));
+	rx_r = le32_to_cpu(READ_ONCE(*ep->rxbfr.rptr));
+	rx_w = le32_to_cpu(READ_ONCE(*ep->rxbfr.wptr));
+	tx_pending = tx_r != tx_w;
+	rx_pending = rx_r != rx_w;
+	if (tx_pending && !ep->stopping)
+		afk_send(ep, FIELD_PREP(RBEP_TYPE, RBEP_SEND) |
+			     FIELD_PREP(SEND_WPTR, tx_w));
+	spin_unlock_irqrestore(&ep->lock, flags);
+	if (rx_pending)
+		afk_receive_message(ep, FIELD_PREP(RBEP_TYPE, RBEP_RECV));
+
+	dev_dbg(ep->dcp->dev,
+		"AFK[ep:%02x] %s: TX r/w=%#x/%#x RX r/w=%#x/%#x running=%d crashed=%d%s%s\n",
+		ep->endpoint, why, tx_r, tx_w, rx_r, rx_w,
+		apple_rtkit_is_running(ep->dcp->rtk),
+		apple_rtkit_is_crashed(ep->dcp->rtk),
+		tx_pending ? ", firmware doorbell rung again" : "",
+		rx_pending ? ", receive ring drained again" : "");
+	return tx_pending || rx_pending;
 }
 
 static void afk_release_context(void *data)
@@ -3056,6 +3098,19 @@ static int afk_send_command_common(struct apple_epic_service *service, u8 type,
 	ret = wait_for_completion_timeout(&completion,
 					  msecs_to_jiffies(timeout_ms));
 
+	/*
+	 * Give a doorbell lost on either side one more chance, see afk_kick().
+	 * Only deep sleep (suspend-to-RAM) is known to lose one.
+	 */
+	if (ret <= 0 && apple_s2r_deep_sleep() && afk_kick(ep, "command timed out") &&
+	    wait_for_completion_timeout(&completion,
+					msecs_to_jiffies(AFK_KICK_WAIT_MS)) > 0) {
+		dev_warn(ep->dcp->dev,
+			 "AFK[ep:%02x]: %s (chan:%u) command tag 0x%04x completed after ringing the doorbells again\n",
+			 ep->endpoint, service->ops->name, service->channel, tag);
+		ret = 1;
+	}
+
 	if (ret <= 0) {
 		spin_lock_irqsave(&service->lock, flags);
 		/*
@@ -3071,7 +3126,9 @@ static int afk_send_command_common(struct apple_epic_service *service, u8 type,
 				 "AFK[ep:%02x]: %s (chan:%u) command type 0x%x tag 0x%04x timed out after %u ms\n",
 				 ep->endpoint, service->ops->name, service->channel,
 				 type, tag, timeout_ms);
-			if (ep->dcp->external && ep->txbfr.ready && ep->rxbfr.ready) {
+			/* With deep sleep, afk_kick() logged the rings already. */
+			if (!apple_s2r_deep_sleep() && ep->dcp->external &&
+			    ep->txbfr.ready && ep->rxbfr.ready) {
 				/* Diagnostic snapshot of shared RAM, not coprocessor MMIO.
 				 * Unequal TX pointers mean firmware has not drained the queue.
 				 */

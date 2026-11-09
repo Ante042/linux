@@ -26,6 +26,7 @@
 #include <linux/mutex.h>
 #include <linux/printk.h>
 #include <linux/platform_device.h>
+#include <linux/soc/apple/s2r.h>
 #include <linux/spi/spi.h>
 #include <linux/spinlock.h>
 #include <linux/unaligned.h>
@@ -36,6 +37,7 @@
 
 #define SPIHID_DEF_WAIT msecs_to_jiffies(1000)
 #define SPIHID_GET_REPORT_ATTEMPTS 3
+#define SPIHID_TX_DRAIN_WAIT msecs_to_jiffies(100)
 
 #define SPIHID_MAX_INPUT_REPORT_SIZE 0x800
 
@@ -128,6 +130,9 @@ struct spihid_apple {
 	u32 version_number;
 
 	u8 msg_id;
+
+	/* writes the MCU has not answered yet */
+	atomic_t tx_pending;
 
 	/* fragmented HID report */
 	struct spihid_input_report report;
@@ -349,6 +354,8 @@ static int spihid_apple_request(struct spihid_apple *spihid, u8 target, u8 unk0,
 	}
 
 	err = spi_sync(spihid->spidev, &spihid->tx_msg);
+	if (!err)
+		atomic_inc(&spihid->tx_pending);
 
 	status_mismatch = !err && memcmp(spihid->status_buf, spi_hid_apple_status_ok,
 					 sizeof(spi_hid_apple_status_ok));
@@ -978,6 +985,11 @@ static void spihid_process_read(struct spihid_apple *spihid)
 
 	length = le16_to_cpu(pkt->length);
 
+	/* Last packet of an answer to one of our writes */
+	if (pkt->flags == SPIHID_WRITE_PACKET && pkt->remain == 0 &&
+	    atomic_dec_if_positive(&spihid->tx_pending) == 0)
+		wake_up(&spihid->wait);
+
 	if (length < sizeof(struct spihid_msg_hdr) + 2) {
 		if (length == sizeof(spi_hid_apple_booted) &&
 		    !memcmp(pkt->data, spi_hid_apple_booted, length)) {
@@ -1310,6 +1322,14 @@ static int spihid_apple_core_suspend(struct device *dev)
 {
 	int ret;
 	struct spihid_apple *spihid = spi_get_drvdata(to_spi_device(dev));
+	/*
+	 * Deep sleep cuts the SoC's power. Keys and the trackpad wake the
+	 * machine through the SMC there, and an armed interrupt would turn
+	 * every other wake into a full one. So the controller is powered
+	 * off and rebooted on resume, as for a device that is no wakeup
+	 * source.
+	 */
+	bool wake = device_may_wakeup(dev) && !apple_s2r_deep_sleep();
 
 	if (spihid->tp.hid) {
 		ret = hid_driver_suspend(spihid->tp.hid, PMSG_SUSPEND);
@@ -1334,6 +1354,17 @@ static int spihid_apple_core_suspend(struct device *dev)
 	 */
 	spihid_flush_led_reports(spihid);
 
+	/*
+	 * An answer the MCU sends after the IRQ is disabled holds the line
+	 * and aborts a wake-armed sleep.
+	 */
+	if (wake &&
+	    !wait_event_timeout(spihid->wait, !atomic_read(&spihid->tx_pending),
+				SPIHID_TX_DRAIN_WAIT))
+		dev_warn(dev, "%d writes still unanswered\n",
+			 atomic_read(&spihid->tx_pending));
+	atomic_set(&spihid->tx_pending, 0);
+
 	/* Save some power */
 	spihid->ops->disable_irq(spihid->ops);
 
@@ -1343,10 +1374,11 @@ static int spihid_apple_core_suspend(struct device *dev)
 	 * system. Its state is kept, so resume does not reboot it.
 	 */
 	spihid->irq_wake_enabled = false;
-	if (device_may_wakeup(dev)) {
+	if (wake) {
 		ret = spihid->ops->enable_irq_wake(spihid->ops);
 		if (!ret) {
 			spihid->irq_wake_enabled = true;
+			dev_dbg(dev, "irq wake armed\n");
 			return 0;
 		}
 		dev_warn(dev, "Failed to enable irq wake: %d\n", ret);

@@ -367,6 +367,21 @@ impl<T: Operations> RtKit<T> {
         to_result(unsafe { bindings::apple_rtkit_wake(self.rtk) })
     }
 
+    /// Puts the RTKit coprocessor into its idle power state; `wake` resumes it.
+    ///
+    /// The caller must not hold a lock needed by its receive callbacks: the
+    /// acknowledgment arrives through the same ordered RTKit workqueue.
+    pub fn idle(self: Pin<&mut Self>) -> Result {
+        // SAFETY: `rtk` is valid and the mutable borrow excludes other callers.
+        to_result(unsafe { bindings::apple_rtkit_idle(self.rtk) })
+    }
+
+    /// Resets the session state for a coprocessor restarted from its reset vector.
+    pub fn reinit(self: Pin<&mut Self>) -> Result {
+        // SAFETY: `rtk` is valid and the mutable borrow excludes other callers.
+        to_result(unsafe { bindings::apple_rtkit_reinit(self.rtk) })
+    }
+
     /// Waits for the RTKit coprocessor to finish booting.
     pub fn boot(self: Pin<&mut Self>) -> Result {
         // SAFETY: `rtk` is valid per the type invariant.

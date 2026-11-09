@@ -22,6 +22,8 @@
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/soc/apple/rtkit.h>
+#include <linux/soc/apple/s2r.h>
+#include <linux/suspend.h>
 #include <linux/wait.h>
 
 #include "dmaengine.h"
@@ -167,6 +169,13 @@ struct sio_hw_data {
 	int (*send_dt_params)(struct sio_data *sio);
 };
 
+/* The firmware across deep sleep, see sio_system_suspend_late() */
+enum sio_fw_state {
+	SIO_FW_RUNNING,		/* zero, as after probe */
+	SIO_FW_PARKED,		/* idle and stopped for deep sleep: nothing is sent */
+	SIO_FW_LOST,		/* did not go idle or start again: left alone until a reboot */
+};
+
 struct sio_data {
 	const struct sio_hw_data *hw;
 	void __iomem *base;
@@ -181,6 +190,7 @@ struct sio_data {
 	const struct sio_dma_arrays *arrays;	/* when the driver owns them */
 	struct sio_coproc_desc *shmem_desc_base;
 	unsigned long *desc_allocated;
+	enum sio_fw_state fw_state;
 
 	struct sio_tagdata {
 		DECLARE_BITMAP(allocated, SIO_NTAGS);
@@ -1047,11 +1057,11 @@ static bool sio_fill_in_old_locked(struct sio_chan *siochan)
 				     FIELD_PREP(SIOMSG_TYPE, MSG_ISSUE) |
 				     FIELD_PREP(SIOMSG_DATA, sio_coproc_desc_slot(sio, d)),
 				     sio_handle_issue_ack, (void *)(uintptr_t)tx->vd.tx.cookie);
-	if (ret < 0)
+	if (ret >= 0)
+		siochan->pending++;
+	else if (ret != -ESHUTDOWN)
 		dev_err_ratelimited(sio->dev, "can't issue on chan %d ninflight %d: %d\n",
 				    siochan->no, tx->ninflight, ret);
-	else
-		siochan->pending++;
 	return true;
 }
 
@@ -1073,8 +1083,9 @@ static bool sio_fill_in_ring_locked(struct sio_chan *siochan)
 				     FIELD_PREP(SIOMSG_DATA, sio_coproc_desc_slot(sio, d)),
 				     sio_handle_issue_ack, NULL);
 	if (ret < 0) {
-		dev_err_ratelimited(sio->dev, "can't issue on chan %d ninflight %d: %d\n",
-				    siochan->no, siochan->nissued, ret);
+		if (ret != -ESHUTDOWN)
+			dev_err_ratelimited(sio->dev, "can't issue on chan %d ninflight %d: %d\n",
+					    siochan->no, siochan->nissued, ret);
 		return false;
 	}
 	/* The ack takes the channel lock, held here. */
@@ -1544,6 +1555,10 @@ static int _sio_send_siomsg(struct sio_data *sio, u64 msg, bool atomic,
 			    sio_ack_callback ack_callback, void *cookie)
 {
 	int tag, ret;
+
+	/* Not to a firmware stopped for deep sleep, or one that did not start again */
+	if (READ_ONCE(sio->fw_state) != SIO_FW_RUNNING)
+		return -ESHUTDOWN;
 
 	tag = sio_alloc_tag(sio);
 	if (tag < 0)
@@ -2074,7 +2089,91 @@ static __maybe_unused int sio_resume(struct device *dev)
 	return 0;
 }
 
-static DEFINE_RUNTIME_DEV_PM_OPS(sio_pm_ops, sio_suspend, sio_resume, NULL);
+/* Suspend-to-RAM parks the SIO late; other system sleep forces it into runtime suspend. */
+static __maybe_unused int sio_system_suspend(struct device *dev)
+{
+	if (pm_suspend_target_state == PM_SUSPEND_MEM)
+		return 0;
+	return pm_runtime_force_suspend(dev);
+}
+
+/*
+ * Deep sleep cuts the SIO's power. As macOS does before it, tell the firmware
+ * that the AP goes idle, idle it and stop its CPU, with its buffers and its
+ * state left where they are: after the power cut it carries on from there.
+ * In the late phase, once every device has suspended, as a stopped firmware
+ * only starts again after a power cut.
+ */
+static __maybe_unused int sio_system_suspend_late(struct device *dev)
+{
+	struct sio_data *sio = dev_get_drvdata(dev);
+	int ret;
+
+	if (!apple_s2r_deep_sleep())
+		return 0;
+
+	/* Still stopped from a sleep that was given up, or left alone */
+	if (sio->fw_state != SIO_FW_RUNNING)
+		return 0;
+
+	ret = apple_rtkit_ap_power_timeout(sio->rtk, false, 2000);
+	if (!ret)
+		ret = apple_rtkit_idle_iop(sio->rtk);
+	if (ret) {
+		dev_err(dev, "the firmware did not go idle (%d), no DisplayPort sound until a reboot\n",
+			ret);
+		WRITE_ONCE(sio->fw_state, SIO_FW_LOST);
+		return 0;
+	}
+	apple_rtkit_detach_keep(sio->rtk);
+	writel(readl(sio->base + REG_CPU_CONTROL) & ~CPU_CONTROL_RUN, sio->base + REG_CPU_CONTROL);
+	WRITE_ONCE(sio->fw_state, SIO_FW_PARKED);
+
+	return 0;
+}
+
+static __maybe_unused int sio_system_resume(struct device *dev)
+{
+	struct sio_data *sio = dev_get_drvdata(dev);
+	int ret;
+
+	if (sio->fw_state != SIO_FW_PARKED) {
+		if (pm_suspend_target_state == PM_SUSPEND_MEM)
+			return 0;
+		return pm_runtime_force_resume(dev);
+	}
+
+	/* Given up on the way down: stopped it stays, until a sleep that cuts the power */
+	if (!apple_s2r_power_cut()) {
+		dev_warn(dev, "no DisplayPort sound until the next sleep: this one was given up\n");
+		return 0;
+	}
+
+	ret = apple_rtkit_reinit_keep(sio->rtk);
+	if (!ret) {
+		writel(CPU_CONTROL_RUN, sio->base + REG_CPU_CONTROL);
+		ret = apple_rtkit_wake_keep_ap(sio->rtk);
+	}
+	if (!ret)
+		ret = apple_rtkit_restart_started_eps(sio->rtk);
+	if (!ret)
+		ret = apple_rtkit_ap_power_timeout(sio->rtk, true, 2000);
+	if (ret) {
+		dev_err(dev, "the firmware did not start again (%d), no DisplayPort sound until a reboot\n",
+			ret);
+		WRITE_ONCE(sio->fw_state, SIO_FW_LOST);
+		return 0;
+	}
+	WRITE_ONCE(sio->fw_state, SIO_FW_RUNNING);
+
+	return 0;
+}
+
+static const struct dev_pm_ops sio_pm_ops = {
+	SET_SYSTEM_SLEEP_PM_OPS(sio_system_suspend, sio_system_resume)
+	.suspend_late = pm_sleep_ptr(sio_system_suspend_late),
+	SET_RUNTIME_PM_OPS(sio_suspend, sio_resume, NULL)
+};
 
 static struct platform_driver apple_sio_driver = {
 	.driver = {

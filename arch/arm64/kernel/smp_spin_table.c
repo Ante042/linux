@@ -17,6 +17,7 @@
 #include <asm/cputype.h>
 #include <asm/io.h>
 #include <asm/smp_plat.h>
+#include <asm/spin_table.h>
 
 extern void secondary_holding_pen(void);
 volatile unsigned long __section(".mmuoff.data.read")
@@ -104,6 +105,38 @@ static int smp_spin_table_cpu_prepare(unsigned int cpu)
 	return 0;
 }
 
+#ifdef CONFIG_HOTPLUG_CPU
+static const struct spin_table_hotplug_ops *hotplug_ops __ro_after_init;
+
+static bool smp_spin_table_cpu_can_disable(unsigned int cpu)
+{
+	if (!hotplug_ops)
+		return false;
+	return !hotplug_ops->cpu_can_disable || hotplug_ops->cpu_can_disable(cpu);
+}
+
+static int smp_spin_table_cpu_disable(unsigned int cpu)
+{
+	return smp_spin_table_cpu_can_disable(cpu) ? 0 : -EOPNOTSUPP;
+}
+
+static void smp_spin_table_cpu_die(unsigned int cpu)
+{
+	/* A reset that brings this CPU back to the pen must not let it out */
+	write_pen_release(INVALID_HWID);
+
+	if (hotplug_ops)
+		hotplug_ops->cpu_die(cpu);
+}
+
+static int smp_spin_table_cpu_kill(unsigned int cpu)
+{
+	if (hotplug_ops && hotplug_ops->cpu_kill)
+		return hotplug_ops->cpu_kill(cpu);
+	return 0;
+}
+#endif
+
 static int smp_spin_table_cpu_boot(unsigned int cpu)
 {
 	/*
@@ -116,12 +149,33 @@ static int smp_spin_table_cpu_boot(unsigned int cpu)
 	 */
 	sev();
 
+#ifdef CONFIG_HOTPLUG_CPU
+	if (hotplug_ops && hotplug_ops->cpu_boot)
+		return hotplug_ops->cpu_boot(cpu);
+#endif
 	return 0;
 }
 
-const struct cpu_operations smp_spin_table_ops = {
+/* The hotplug methods are only filled in by spin_table_set_hotplug_ops() */
+struct cpu_operations smp_spin_table_ops __ro_after_init = {
 	.name		= "spin-table",
 	.cpu_init	= smp_spin_table_cpu_init,
 	.cpu_prepare	= smp_spin_table_cpu_prepare,
 	.cpu_boot	= smp_spin_table_cpu_boot,
 };
+
+#ifdef CONFIG_HOTPLUG_CPU
+/*
+ * Only a platform that can power its CPUs down and up again gets the hotplug
+ * methods; elsewhere spin-table CPUs stay as they were. Called before the
+ * secondary CPUs boot.
+ */
+void __init spin_table_set_hotplug_ops(const struct spin_table_hotplug_ops *ops)
+{
+	hotplug_ops = ops;
+	smp_spin_table_ops.cpu_can_disable = smp_spin_table_cpu_can_disable;
+	smp_spin_table_ops.cpu_disable = smp_spin_table_cpu_disable;
+	smp_spin_table_ops.cpu_die = smp_spin_table_cpu_die;
+	smp_spin_table_ops.cpu_kill = smp_spin_table_cpu_kill;
+}
+#endif

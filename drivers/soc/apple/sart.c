@@ -23,6 +23,7 @@
 #include <linux/of.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
+#include <linux/suspend.h>
 #include <linux/types.h>
 
 #define APPLE_SART_MAX_ENTRIES 16
@@ -90,6 +91,12 @@ struct apple_sart {
 
 	unsigned long protected_entries;
 	unsigned long used_entries;
+
+	struct {
+		u8 flags;
+		phys_addr_t paddr;
+		size_t size;
+	} saved[APPLE_SART_MAX_ENTRIES];
 };
 
 static void sart0_get_entry(struct apple_sart *sart, int index, u8 *flags,
@@ -398,6 +405,60 @@ static void apple_sart_shutdown(struct platform_device *pdev)
 	}
 }
 
+/*
+ * Suspend-to-RAM can power the SART down with the rest of the SoC, and its
+ * consumers come back expecting the regions they and the boot loader allowed.
+ * Put back whatever did not survive. Other sleep states leave it alone.
+ */
+static int apple_sart_suspend_noirq(struct device *dev)
+{
+	struct apple_sart *sart = dev_get_drvdata(dev);
+	int i;
+
+	if (pm_suspend_target_state != PM_SUSPEND_MEM)
+		return 0;
+
+	for (i = 0; i < APPLE_SART_MAX_ENTRIES; ++i)
+		sart->ops->get_entry(sart, i, &sart->saved[i].flags, &sart->saved[i].paddr,
+				     &sart->saved[i].size);
+
+	return 0;
+}
+
+static int apple_sart_resume_noirq(struct device *dev)
+{
+	struct apple_sart *sart = dev_get_drvdata(dev);
+	int i, restored = 0;
+
+	if (pm_suspend_target_state != PM_SUSPEND_MEM)
+		return 0;
+
+	for (i = 0; i < APPLE_SART_MAX_ENTRIES; ++i) {
+		u8 flags;
+		size_t size;
+		phys_addr_t paddr;
+
+		sart->ops->get_entry(sart, i, &flags, &paddr, &size);
+		if (flags == sart->saved[i].flags && paddr == sart->saved[i].paddr &&
+		    size == sart->saved[i].size)
+			continue;
+
+		sart->ops->set_entry(sart, i, sart->saved[i].flags,
+				     sart->saved[i].paddr >> sart->ops->paddr_shift,
+				     sart->saved[i].size >> sart->ops->size_shift);
+		restored++;
+	}
+
+	if (restored)
+		dev_dbg(dev, "restored %d entries lost in system sleep\n", restored);
+
+	return 0;
+}
+
+static const struct dev_pm_ops apple_sart_pm_ops = {
+	NOIRQ_SYSTEM_SLEEP_PM_OPS(apple_sart_suspend_noirq, apple_sart_resume_noirq)
+};
+
 static const struct of_device_id apple_sart_of_match[] = {
 	{
 		.compatible = "apple,t6050-sart",
@@ -423,6 +484,7 @@ static struct platform_driver apple_sart_driver = {
 	.driver = {
 		.name = "apple-sart",
 		.of_match_table = apple_sart_of_match,
+		.pm = pm_sleep_ptr(&apple_sart_pm_ops),
 	},
 	.probe = apple_sart_probe,
 	.shutdown = apple_sart_shutdown,

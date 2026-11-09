@@ -31,7 +31,9 @@
 #include <linux/slab.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/soc/apple/pmp-report.h>
+#include <linux/soc/apple/s2r.h>
 #include <linux/string.h>
+#include <linux/suspend.h>
 #include <linux/usb/typec_altmode.h>
 #include <linux/usb/typec_dp.h>
 #include <linux/usb/typec_mux.h>
@@ -2918,6 +2920,9 @@ static void dcp_typec_reconnect_work(struct work_struct *work)
 	struct dcp_fabric_session session;
 	int ret;
 
+	/* From here on a mode set has a link to train, or reports its loss. */
+	WRITE_ONCE(dcp->typec_link_deferred, false);
+
 	/* A route following its CRTC hands the link over itself. */
 	if ((dcp->external && dcpext_scanout_terminal(dcp)) ||
 	    !READ_ONCE(dcp->typec_cable_connected) ||
@@ -4383,7 +4388,19 @@ void dcp_poweron(struct platform_device *pdev)
 		 * A Type-C CRTC disable releases its DPTX session. Re-establish it
 		 * synchronously before IOMFB is powered back on.
 		 */
-		if (READ_ONCE(dcp->typec_cable_connected)) {
+		WRITE_ONCE(dcp->typec_link_deferred, false);
+		if (READ_ONCE(dcp->typec_cable_connected) &&
+		    pm_suspend_target_state == PM_SUSPEND_MEM) {
+			/*
+			 * A display left plugged in through suspend-to-RAM. Its link
+			 * does not come up from the resume commit, so connect once
+			 * the system is running again, the way a new HPD does. The
+			 * mode is set on that link, see dcp_crtc_atomic_modeset().
+			 */
+			dcp->typec_reconnect_tries = 0;
+			WRITE_ONCE(dcp->typec_link_deferred, true);
+			dcp_queue_typec_reconnect(dcp, DPTX_RECONNECT_DELAY);
+		} else if (READ_ONCE(dcp->typec_cable_connected)) {
 			cancel_delayed_work(&dcp->typec_reconnect_wq);
 			dcp->typec_reconnect_tries = 0;
 			/* the modeset of this commit follows, see dcpep_cb_hotplug() */
@@ -4405,8 +4422,12 @@ void dcp_poweron(struct platform_device *pdev)
 		bool connected = gpiod_get_value_cansleep(dcp->hdmi_hpd);
 		dev_info(dcp->dev, "%s: DP2HDMI HPD connected:%d\n", __func__, connected);
 
-		/* A yielded hybrid is about to take a Type-C display. */
-		if (connected && !READ_ONCE(dcp->hdmi_yielded))
+		/*
+		 * A yielded hybrid is about to take a Type-C display. After
+		 * suspend-to-RAM, see dcp_fabric_hdmi_after_sleep().
+		 */
+		if (connected && !READ_ONCE(dcp->hdmi_yielded) &&
+		    pm_suspend_target_state != PM_SUSPEND_MEM)
 			dcp_dptx_connect(dcp, 0);
 	}
 
@@ -5230,6 +5251,7 @@ VISIBLE_IF_KUNIT void dcp_disable_typec_work(struct apple_dcp *dcp, bool release
 	cancel_delayed_work_sync(&dcp->external_stop_retry_wq);
 	disable_delayed_work_sync(&dcp->hdmi_settle_wq);
 	disable_delayed_work_sync(&dcp->hdmi_recheck_wq);
+	disable_delayed_work_sync(&dcp->hdmi_wake_wq);
 	disable_delayed_work_sync(&dcp->link_recovery_wq);
 	disable_work_sync(&dcp->tb_event_work);
 	scoped_guard(mutex, &dcp->tb_event_lock) {
@@ -5239,6 +5261,18 @@ VISIBLE_IF_KUNIT void dcp_disable_typec_work(struct apple_dcp *dcp, bool release
 	}
 	disable_delayed_work_sync(&dcp->hybrid_wq);
 	dcp_hdmi_disable(dcp);
+}
+
+/*
+ * Whether deep sleep is what "mem" selects, whatever the suspend under way
+ * is: a link left up after an s2idle resume is still there for the next
+ * deep sleep. apple_s2r_deep_sleep() alone is false while an s2idle
+ * resumes.
+ */
+static bool dcp_s2r_selected(void)
+{
+	return apple_s2r_deep_sleep() ||
+	       (IS_ENABLED(CONFIG_APPLE_S2R) && !pm_suspend_default_s2idle());
 }
 
 VISIBLE_IF_KUNIT void dcp_enable_typec_work(struct apple_dcp *dcp)
@@ -5251,14 +5285,21 @@ VISIBLE_IF_KUNIT void dcp_enable_typec_work(struct apple_dcp *dcp)
 	enable_delayed_work(&dcp->announce_wq);
 	enable_delayed_work(&dcp->hdmi_settle_wq);
 	enable_delayed_work(&dcp->hdmi_recheck_wq);
+	enable_delayed_work(&dcp->hdmi_wake_wq);
 	enable_delayed_work(&dcp->link_recovery_wq);
 	enable_work(&dcp->tb_event_work);
 	enable_delayed_work(&dcp->hybrid_wq);
 	dcp_hdmi_enable(dcp);
 	scoped_guard(mutex, &dcp->hpd_mutex)
 		dcp->typec_work_enabled = true;
-	/* A cable can be routed before the DRM component binds. */
-	if (READ_ONCE(dcp->typec_cable_connected))
+	/*
+	 * A cable can be routed before the DRM component binds. A CRTC that
+	 * is off gets its link from dcp_poweron(), after system sleep too: a
+	 * link brought up under it stops answering, and the next sleep can
+	 * then not release it. Only deep sleep needs this.
+	 */
+	if (READ_ONCE(dcp->typec_cable_connected) &&
+	    (!READ_ONCE(dcp->typec_crtc_off) || !dcp_s2r_selected()))
 		dcp_queue_typec_reconnect(dcp, 0);
 	if (dcp_is_external_h17p(dcp)) {
 		struct apple_connector *con = READ_ONCE(dcp->connector);
@@ -6100,6 +6141,9 @@ static void dcp_t8132_ext_routes(struct apple_dcp *dcp)
 		 dcp->nr_typec_routes);
 }
 
+static int dcp_sleep_notify(struct notifier_block *nb, unsigned long action, void *data);
+static void dcp_unregister_sleep_nb(void *data);
+
 static int dcp_platform_probe_pipe(struct platform_device *pdev)
 {
 	const struct apple_dcp_hw_data *hw = of_device_get_match_data(&pdev->dev);
@@ -6289,6 +6333,13 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	}
 
 	platform_set_drvdata(pdev, dcp);
+
+	dcp->sleep_nb.notifier_call = dcp_sleep_notify;
+	ret = register_pm_notifier(&dcp->sleep_nb);
+	if (!ret)
+		ret = devm_add_action_or_reset(dev, dcp_unregister_sleep_nb, dcp);
+	if (ret)
+		return ret;
 
 	if (iomfb_is_m4(dcp)) {
 		dcp->fixed_connector_type = DRM_MODE_CONNECTOR_eDP;
@@ -6970,6 +7021,66 @@ static const char *dcp_external_sleep_vetoed(struct apple_dcp *dcp)
 	return NULL;
 }
 
+/*
+ * A wake connects the link of a plugged-in display even with its CRTC off,
+ * and only a CRTC disable releases it again. Suspend-to-RAM with the
+ * firmware's link up resets the SoC, so release it the same way. Do it
+ * before the sleep starts: devices prepare too late, as the USB controllers
+ * have taken the Type-C PHY down by then and the firmware no longer answers.
+ */
+static void dcp_release_link_for_s2r(struct apple_dcp *dcp)
+{
+	int hpd, ret;
+
+	if (!dcp_is_typec_output(dcp) || dcp_is_external_h17p(dcp) || iomfb_is_m4(dcp) ||
+	    dcp_takeover_was_aborted(dcp) || READ_ONCE(dcp->ext_dead))
+		return;
+	/* Nothing links it up again before the suspend callback. */
+	dcp_disable_typec_work(dcp, false);
+	dcp->s2r_typec_off = true;
+	/* Only a link left up under a CRTC that is off. */
+	if (READ_ONCE(dcp->crashed) || !dptx_service_available(&dcp->dptxport[0]) ||
+	    !dcp->dptxport[0].connected || !READ_ONCE(dcp->typec_crtc_off))
+		return;
+	hpd = dptxport_set_hpd(dcp->dptxport[0].service, false);
+	if (hpd)
+		dev_warn(dcp->dev, "failed to deassert Type-C DPTX HPD: %d\n", hpd);
+	ret = dcp_dptx_disconnect(dcp, 0);
+	if (ret)
+		dev_warn(dcp->dev, "failed to release the display link: %d\n", ret);
+	/* dcp_platform_prepare() refuses the deep sleep */
+	dcp->s2r_link_stuck = hpd || ret;
+	dev_dbg(dcp->dev, "s2r: released the display link left up since the wake (%d, %d)\n",
+		hpd, ret);
+}
+
+static int dcp_sleep_notify(struct notifier_block *nb, unsigned long action, void *data)
+{
+	struct apple_dcp *dcp = container_of(nb, struct apple_dcp, sleep_nb);
+
+	/* No target state yet: whether "mem" is deep sleep, see apple_s2r_deep_sleep() */
+	if (action == PM_SUSPEND_PREPARE) {
+		if (!apple_s2r_deep_sleep())
+			return NOTIFY_DONE;
+		dcp->s2r_link_stuck = false;
+		/* A stuck firmware does not answer: dcp_platform_prepare() refuses the sleep */
+		if (!READ_ONCE(dcp->poweron_timed_out))
+			dcp_release_link_for_s2r(dcp);
+	} else if (action == PM_POST_SUSPEND && dcp->s2r_typec_off) {
+		/* The sleep failed before this device prepared. */
+		dcp->s2r_typec_off = false;
+		dcp_enable_typec_work(dcp);
+	}
+	return NOTIFY_DONE;
+}
+
+static void dcp_unregister_sleep_nb(void *data)
+{
+	struct apple_dcp *dcp = data;
+
+	unregister_pm_notifier(&dcp->sleep_nb);
+}
+
 /* dpm_prepare completes for every device before any dpm_suspend callback.
  * Veto early so Thunderbolt cannot tear down a working tunnel first. The
  * same HPD lock serializes this gate against explicit firmware startup.
@@ -6995,6 +7106,22 @@ static int dcp_platform_prepare(struct device *dev)
 		}
 		return 0;
 	}
+	/*
+	 * A firmware that did not power its display on is stuck, and one that
+	 * did not release its link still drives it: deep sleep then resets the
+	 * SoC. Refuse it here, where the target state is known, so that a
+	 * suspend-to-idle with deep sleep selected still goes ahead.
+	 */
+	if (apple_s2r_deep_sleep()) {
+		if (READ_ONCE(dcp->poweron_timed_out)) {
+			dev_err(dev, "display firmware did not power on, refusing deep sleep\n");
+			return -EBUSY;
+		}
+		if (dcp->s2r_link_stuck) {
+			dev_err(dev, "display link not released, refusing deep sleep\n");
+			return -EBUSY;
+		}
+	}
 	if (!dcp->external)
 		return 0;
 	mutex_lock(&dcp->hpd_mutex);
@@ -7016,6 +7143,11 @@ static void dcp_platform_complete(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 
+	/* The sleep failed before this device suspended. */
+	if (dcp->s2r_typec_off) {
+		dcp->s2r_typec_off = false;
+		dcp_enable_typec_work(dcp);
+	}
 	if (!dcp->external)
 		return;
 	mutex_lock(&dcp->hpd_mutex);
@@ -7023,10 +7155,99 @@ static void dcp_platform_complete(struct device *dev)
 	mutex_unlock(&dcp->hpd_mutex);
 }
 
+/*
+ * Suspend-to-RAM powers the coprocessor's CPU down. As macOS does: put the
+ * IOMFB link to sleep (A500) and the AP to IDLE where the firmware supports
+ * it, then IOP IDLE (0x201), stop the ASC and keep the RTKit buffers. On
+ * resume restart the ASC and send INIT (0x220) so the firmware resumes from
+ * what IDLE saved, start the app endpoints again and set AP ON if it was IDLE.
+ */
+static int dcp_s2r_link_sleep(struct apple_dcp *dcp)
+{
+	switch (dcp->fw_compat) {
+	case DCP_FIRMWARE_V_13_5:
+		return iomfb_s2r_link_sleep_v13_3(dcp, false);
+	default:
+		return -EOPNOTSUPP;
+	}
+}
+
+static void dcp_park_for_s2r(struct apple_dcp *dcp)
+{
+	u32 ctrl;
+	int ret;
+
+	if (pm_suspend_target_state != PM_SUSPEND_MEM || dcp->external ||
+	    dcp->hw.adopt_live_session || IS_ERR_OR_NULL(dcp->rtk) ||
+	    !dcp->coproc_reg || READ_ONCE(dcp->crashed) || !apple_rtkit_is_running(dcp->rtk))
+		return;
+
+	/* The IDLE ack comes through the mailbox that dcp_hold_for_sleep() held */
+	if (dcp->rx_held) {
+		apple_rtkit_resume_rx(dcp->rtk);
+		dcp->rx_held = false;
+		dcp->s2r_unheld = true;
+	}
+	ret = dcp_s2r_link_sleep(dcp);
+	dev_dbg(dcp->dev, "s2r: link sleep (A500): %d\n", ret);
+	if (!ret)
+		ret = apple_rtkit_ap_power_timeout(dcp->rtk, false, 2000);
+	dcp->s2r_ap_idle = !ret;
+	ret = apple_rtkit_idle_iop(dcp->rtk);
+	if (ret) {
+		dev_warn(dcp->dev, "s2r: IOP IDLE failed: %d, not parked\n", ret);
+		if (dcp->s2r_unheld) {
+			apple_rtkit_hold_rx(dcp->rtk);
+			dcp->rx_held = true;
+			dcp->s2r_unheld = false;
+		}
+		return;
+	}
+	apple_rtkit_detach_keep(dcp->rtk);
+	ctrl = readl_relaxed(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
+	writel_relaxed(ctrl & ~APPLE_DCP_COPROC_CPU_CONTROL_RUN,
+		       dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
+	dcp->s2r_parked = true;
+	apple_s2r_display_parked(dcp->dev->of_node);
+	dev_dbg(dcp->dev, "s2r: parked, cpu control %#x\n", ctrl);
+}
+
+static void dcp_unpark_after_s2r(struct apple_dcp *dcp)
+{
+	u32 ctrl;
+	int ret;
+
+	if (!dcp->s2r_parked)
+		return;
+	dcp->s2r_parked = false;
+
+	ctrl = readl_relaxed(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
+	ret = apple_rtkit_reinit_keep(dcp->rtk);
+	if (!ret) {
+		writel_relaxed(ctrl | APPLE_DCP_COPROC_CPU_CONTROL_RUN,
+			       dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
+		ret = apple_rtkit_wake_keep_ap(dcp->rtk);
+	}
+	if (!ret)
+		ret = apple_rtkit_restart_started_eps(dcp->rtk);
+	if (!ret && dcp->s2r_ap_idle)
+		ret = apple_rtkit_ap_power_timeout(dcp->rtk, true, 2000);
+	dcp->s2r_ap_idle = false;
+	if (ret)
+		dev_err(dcp->dev, "s2r: restart failed: %d (cpu control was %#x)\n", ret, ctrl);
+	else
+		dev_dbg(dcp->dev, "s2r: restarted (cpu control was %#x)\n", ctrl);
+	if (dcp->s2r_unheld) {
+		dcp->s2r_unheld = false;
+		iomfb_pause_presentation(dcp, false);
+	}
+}
+
 static int dcp_platform_suspend(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 
+	dcp->s2r_park_due = false;
 	/* Its power sequences may crash the DCP and blank the panel. */
 	if (dcp_takeover_was_aborted(dcp))
 		return -EBUSY;
@@ -7089,7 +7310,11 @@ static int dcp_platform_suspend(struct device *dev)
 	 * connected, and resume powers the CRTC back up through dcp_poweron()
 	 * as after DPMS off.
 	 */
-	dcp_disable_typec_work(dcp, false);
+	/* The sleep notifier disabled it already. */
+	if (dcp->s2r_typec_off)
+		dcp->s2r_typec_off = false;
+	else
+		dcp_disable_typec_work(dcp, false);
 	cancel_delayed_work_sync(&dcp->swap_watchdog_wq);
 	if (dcp->external_native)
 		disable_work_sync(&dcp->external_audio_work);
@@ -7105,6 +7330,13 @@ static int dcp_platform_suspend(struct device *dev)
 		}
 	}
 	/*
+	 * The DP-to-HDMI converter draws about 0.7 W, far more than the rest of
+	 * the machine in suspend-to-RAM. Nothing uses it in sleep and macOS
+	 * keeps it off, so power it down until resume.
+	 */
+	if (dcp->dp2hdmi_pwren && pm_suspend_target_state == PM_SUSPEND_MEM)
+		gpiod_set_value_cansleep(dcp->dp2hdmi_pwren, 0);
+	/*
 	 * Set the device as a wakeup device, which forces its power
 	 * domains to stay on. We need this as we do not support full
 	 * shutdown properly yet.
@@ -7112,6 +7344,23 @@ static int dcp_platform_suspend(struct device *dev)
 	device_set_wakeup_path(dev);
 	/* Last: the steps above still talk to the coprocessor. */
 	dcp_hold_for_sleep(dcp);
+	dcp->s2r_park_due = true;
+
+	return 0;
+}
+
+/*
+ * Deep sleep stops the coprocessor, and a stopped one only starts again once
+ * its block lost power. So stop it here, after every device's suspend: when
+ * one of those refuses the sleep, nothing takes the block down.
+ */
+static int dcp_platform_suspend_late(struct device *dev)
+{
+	struct apple_dcp *dcp = dev_get_drvdata(dev);
+
+	if (dcp->s2r_park_due)
+		dcp_park_for_s2r(dcp);
+	dcp->s2r_park_due = false;
 
 	return 0;
 }
@@ -7128,16 +7377,31 @@ static int dcp_platform_resume(struct device *dev)
 	if (READ_ONCE(dcp->ext_dead))
 		return 0;
 
+	/* Converter first, so it is up by the time HPD is sampled below. */
+	if (dcp->dp2hdmi_pwren && pm_suspend_target_state == PM_SUSPEND_MEM)
+		gpiod_set_value_cansleep(dcp->dp2hdmi_pwren, 1);
+	dcp_unpark_after_s2r(dcp);
 	dcp->link_recovery_tries = 0;
 	dcp_release_after_sleep(dcp);
 	iomfb_v14_7_backlight_resume(dcp);
 	dcp_enable_typec_work(dcp);
 	/* The HDMI output's PHY and crossbar may have lost their setup in sleep. */
-	if (dcp->external_native)
+	if (dcp->external_native ||
+	    (dcp->hdmi_hpd && pm_suspend_target_state == PM_SUSPEND_MEM))
 		dcp_fabric_hdmi_reinit(dcp, "after system sleep");
+	if (!dcp->external_native && dcp->hdmi_hpd && pm_suspend_target_state == PM_SUSPEND_MEM)
+		dcp_fabric_hdmi_after_sleep(dcp);
 	/* Observe future edges before sampling any edges lost in sleep. */
 	if (dcp->hdmi_hpd_irq)
 		dcp_fabric_run_resume(&dcp_resume_ops, dcp);
+	/*
+	 * A Type-C-only DCP has no HDMI path that talks to its DPTX endpoint
+	 * around sleep, and its next validate after sleep has been seen to
+	 * never complete. Log the endpoint's rings and ring a doorbell lost in
+	 * sleep again before the next cable.
+	 */
+	else if (dcp_is_typec_output(dcp) && pm_suspend_target_state == PM_SUSPEND_MEM)
+		afk_kick(dcp->dptxep, "after system sleep");
 	if (dcp->external_native)
 		enable_work(&dcp->external_audio_work);
 
@@ -7162,6 +7426,7 @@ static const struct dev_pm_ops dcp_platform_pm_ops = {
 	.prepare = pm_sleep_ptr(dcp_platform_prepare),
 	.complete = pm_sleep_ptr(dcp_platform_complete),
 	.suspend = pm_sleep_ptr(dcp_platform_suspend),
+	.suspend_late = pm_sleep_ptr(dcp_platform_suspend_late),
 	.resume = pm_sleep_ptr(dcp_platform_resume),
 	.freeze = pm_sleep_ptr(dcp_platform_freeze),
 	.thaw = pm_sleep_ptr(dcp_platform_resume),

@@ -4,7 +4,7 @@
 from pathlib import Path
 import re
 from common import (block, source_defines, atc_mux_without_pm, ATC_POST_TUNABLE,
-                    atc_function, ATC_SPLIT, ATC_T8103_LIVE, atc_restore_helpers,
+                    atc_function, ATC_SPLIT, ATC_T8103_LIVE, atc_restore_helpers, atc_pm_target,
                     atc_cio_helpers)
 
 def parking(root):
@@ -180,6 +180,7 @@ static int __attribute__((unused)) atcphy_configure_pipehandler_usb3_host_t8132(
     for name in ('core_read32', 'atcphy_get_mode_config', 'j700_field_update', 'j700_pma_idle'):
         parts.append(function(atc, name))
     parts.append(dp)
+    parts.append(atc_pm_target(atc))
     parts.append(atc_restore_helpers(atc))
     for name in ('atcphy_configure_lanes', 'j700_aux_enable', 'j700_aux_disable',
                  'atcphy_enable_dp_aux', 'atcphy_disable_dp_aux', 'atcphy_power_off',
@@ -214,7 +215,9 @@ typedef uint16_t u16;
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 #define hweight32(v) __builtin_popcount(v)
 #define dev_info_once(...) ((void)0)
-#define dev_dbg(...) ((void)0)
+/* As without DEBUG: never evaluated, but the arguments are used and format-checked. */
+static inline __attribute__((format(printf, 1, 2), unused)) int no_printk(const char *fmt, ...) { (void)fmt; return 0; }
+#define dev_dbg(dev, fmt, ...) do { if (0) { (void)(dev); no_printk(fmt, ##__VA_ARGS__); } } while (0)
 #define dev_warn(...) ((void)0)
 static void report(void *dev, const char *fmt, ...) { (void)dev; (void)fmt; }
 #define dev_err report
@@ -2448,7 +2451,9 @@ typedef uint16_t u16;
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 #define hweight32(v) __builtin_popcount(v)
 #define dev_info_once(...) ((void)0)
-#define dev_dbg(...) ((void)0)
+/* As without DEBUG: never evaluated, but the arguments are used and format-checked. */
+static inline __attribute__((format(printf, 1, 2), unused)) int no_printk(const char *fmt, ...) { (void)fmt; return 0; }
+#define dev_dbg(dev, fmt, ...) do { if (0) { (void)(dev); no_printk(fmt, ##__VA_ARGS__); } } while (0)
 #define dev_warn(...) ((void)0)
 static void report(void *dev, const char *fmt, ...) { (void)dev; (void)fmt; }
 #define dev_err report

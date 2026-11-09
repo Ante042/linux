@@ -46,6 +46,7 @@ struct apple_rtkit {
 	struct completion epmap_completion;
 	struct completion coreanalytics_completion;
 	struct completion iop_pwr_ack_completion;
+	u8 boot_progress;
 	struct completion ap_pwr_ack_completion;
 
 	int boot_result;
@@ -76,6 +77,8 @@ struct apple_rtkit {
 	 */
 	bool retained_wake;
 	bool retained_on_sent;
+	/* App endpoints the client started, to start again after an IDLE wake */
+	DECLARE_BITMAP(started_eps, APPLE_RTKIT_MAX_ENDPOINTS);
 
 	struct apple_rtkit_shmem ioreport_buffer;
 	struct apple_rtkit_shmem coreanalytics_buffer;

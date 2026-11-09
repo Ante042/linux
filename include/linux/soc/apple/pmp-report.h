@@ -42,6 +42,7 @@ void apple_pmp_agx_activity_begin(void);
 void apple_pmp_agx_activity_end(void);
 void apple_pmp_agx_activity_release(void);
 void apple_pmp_agx_activity_resume(void);
+void apple_pmp_report_gate(bool gate);
 #else
 static inline int apple_pmp_report_ane_available(const struct device_node *np)
 {
@@ -114,6 +115,8 @@ static inline int apple_pmp_report_set_request(const struct device_node *report_
 static inline void apple_pmp_j613_floor_gpu_activity(bool busy)
 {
 }
+
+static inline void apple_pmp_report_gate(bool gate) { }
 #endif
 
 #endif /* _LINUX_SOC_APPLE_PMP_REPORT_H_ */

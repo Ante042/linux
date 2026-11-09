@@ -191,6 +191,8 @@ static void apple_rtkit_management_rx_hello(struct apple_rtkit *rtk, u64 msg)
 {
 	u64 reply;
 
+	WRITE_ONCE(rtk->boot_progress, rtk->boot_progress | 2);
+
 	int min_ver = FIELD_GET(APPLE_RTKIT_MGMT_HELLO_MINVER, msg);
 	int max_ver = FIELD_GET(APPLE_RTKIT_MGMT_HELLO_MAXVER, msg);
 	int want_ver = min(APPLE_RTKIT_MAX_SUPPORTED_VERSION, max_ver);
@@ -1275,6 +1277,7 @@ static void apple_rtkit_rx(struct apple_mbox *mbox, struct apple_mbox_msg msg,
 	struct apple_rtkit_rx_work *work;
 	u8 ep = msg.msg1;
 
+	WRITE_ONCE(rtk->boot_progress, rtk->boot_progress | 1);
 	if (READ_ONCE(rtk->shutting_down))
 		return;
 
@@ -1365,6 +1368,18 @@ int apple_rtkit_poll(struct apple_rtkit *rtk)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_poll);
 
+/*
+ * How far the boot handshake got since the last reinit: b0 any message,
+ * b1 HELLO, b2 endpoint discovery done, b3 IOP power state acknowledged.
+ */
+u32 apple_rtkit_boot_progress(struct apple_rtkit *rtk)
+{
+	return READ_ONCE(rtk->boot_progress) |
+	       (completion_done(&rtk->epmap_completion) ? 4 : 0) |
+	       (completion_done(&rtk->iop_pwr_ack_completion) ? 8 : 0);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_boot_progress);
+
 void apple_rtkit_hold_rx(struct apple_rtkit *rtk)
 {
 	apple_mbox_hold_rx(rtk->mbox);
@@ -1419,6 +1434,8 @@ int apple_rtkit_start_ep(struct apple_rtkit *rtk, u8 endpoint)
 	}
 	if (!ret)
 		set_bit(endpoint, rtk->started);
+	if (!ret && endpoint >= APPLE_RTKIT_APP_ENDPOINT_START)
+		set_bit(endpoint, rtk->started_eps);
 	return ret;
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_start_ep);
@@ -1750,6 +1767,7 @@ int apple_rtkit_reinit(struct apple_rtkit *rtk)
 	apple_rtkit_detach_rx(rtk);
 	flush_workqueue(rtk->wq);
 	cancel_delayed_work_sync(&rtk->crashlog_late_work);
+	bitmap_zero(rtk->started_eps, APPLE_RTKIT_MAX_ENDPOINTS);
 
 	apple_rtkit_free_buffer(rtk, &rtk->coreanalytics_buffer);
 	apple_rtkit_free_buffer(rtk, &rtk->ioreport_buffer);
@@ -1776,6 +1794,7 @@ int apple_rtkit_reinit(struct apple_rtkit *rtk)
 
 	reinit_completion(&rtk->epmap_completion);
 	reinit_completion(&rtk->coreanalytics_completion);
+	WRITE_ONCE(rtk->boot_progress, 0);
 	reinit_completion(&rtk->iop_pwr_ack_completion);
 	reinit_completion(&rtk->ap_pwr_ack_completion);
 
@@ -1799,6 +1818,54 @@ int apple_rtkit_reinit(struct apple_rtkit *rtk)
 	return ret;
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_reinit);
+
+/*
+ * Like apple_rtkit_reinit(), but for a co-processor that was put to idle and
+ * resumes from its saved context: it keeps the shared buffers it was given,
+ * so they must stay mapped. Only the mailbox and the power handshake restart.
+ */
+int apple_rtkit_reinit_keep(struct apple_rtkit *rtk)
+{
+	unsigned long flags;
+	int ret;
+
+	apple_rtkit_detach_rx(rtk);
+	flush_workqueue(rtk->wq);
+
+	bitmap_zero(rtk->endpoints, APPLE_RTKIT_MAX_ENDPOINTS);
+	set_bit(APPLE_RTKIT_EP_MGMT, rtk->endpoints);
+
+	reinit_completion(&rtk->epmap_completion);
+	WRITE_ONCE(rtk->boot_progress, 0);
+	reinit_completion(&rtk->iop_pwr_ack_completion);
+	reinit_completion(&rtk->ap_pwr_ack_completion);
+
+	rtk->crashed = false;
+	rtk->iop_power_state = APPLE_RTKIT_PWR_STATE_OFF;
+	rtk->ap_power_state = APPLE_RTKIT_PWR_STATE_OFF;
+	kfifo_reset(&rtk->sync_ack_fifo);
+
+	spin_lock_irqsave(&rtk->mbox->rx_lock, flags);
+	WRITE_ONCE(rtk->shutting_down, false);
+	rtk->mbox->rx = apple_rtkit_rx;
+	spin_unlock_irqrestore(&rtk->mbox->rx_lock, flags);
+
+	ret = apple_mbox_start(rtk->mbox);
+	if (ret) {
+		apple_rtkit_detach_rx(rtk);
+		flush_workqueue(rtk->wq);
+	}
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_reinit_keep);
+
+/* Stop receiving before an idled co-processor sleeps, its buffers stay put */
+void apple_rtkit_detach_keep(struct apple_rtkit *rtk)
+{
+	apple_rtkit_detach_rx(rtk);
+	flush_workqueue(rtk->wq);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_detach_keep);
 
 static int apple_rtkit_set_ap_power_state(struct apple_rtkit *rtk,
 					  unsigned int state)
@@ -1948,6 +2015,47 @@ int apple_rtkit_poweroff(struct apple_rtkit *rtk)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_poweroff);
 
+/* AP power state ON or IDLE alone, with a caller-chosen wait for the ack. */
+int apple_rtkit_ap_power_timeout(struct apple_rtkit *rtk, bool on, unsigned int ms)
+{
+	unsigned int state = on ? APPLE_RTKIT_PWR_STATE_ON : APPLE_RTKIT_PWR_STATE_IDLE;
+	unsigned long t0 = jiffies;
+	long t;
+	int ret;
+
+	reinit_completion(&rtk->ap_pwr_ack_completion);
+	ret = apple_rtkit_management_send(rtk, APPLE_RTKIT_MGMT_SET_AP_PWR_STATE,
+					  FIELD_PREP(APPLE_RTKIT_MGMT_PWR_STATE, state));
+	if (ret)
+		return ret;
+	t = wait_for_completion_timeout(&rtk->ap_pwr_ack_completion, msecs_to_jiffies(ms));
+	if (t)
+		dev_dbg(rtk->dev, "RTKit: AP power %#x ack came after %u ms, state %#x\n", state,
+			jiffies_to_msecs(jiffies - t0), rtk->ap_power_state);
+	else
+		dev_warn(rtk->dev, "RTKit: AP power %#x ack missing after %u ms, state %#x\n",
+			 state, jiffies_to_msecs(jiffies - t0), rtk->ap_power_state);
+	return t ? 0 : -ETIME;
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_ap_power_timeout);
+
+/*
+ * IOP IDLE (0x201) alone, as macOS sends it to a display coprocessor before
+ * stopping its ASC; DCP firmware does not ack an AP power-state change.
+ */
+int apple_rtkit_idle_iop(struct apple_rtkit *rtk)
+{
+	int ret;
+
+	ret = apple_rtkit_set_iop_power_state(rtk, APPLE_RTKIT_PWR_STATE_IDLE);
+	if (ret)
+		return ret;
+
+	rtk->iop_power_state = APPLE_RTKIT_PWR_STATE_IDLE;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_idle_iop);
+
 int apple_rtkit_idle(struct apple_rtkit *rtk)
 {
 	int ret;
@@ -1967,6 +2075,14 @@ int apple_rtkit_idle(struct apple_rtkit *rtk)
 	return 0;
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_idle);
+
+/* AP power state only, as macOS RTBuddy sends it to user-power-managed IOPs (SMC) */
+int apple_rtkit_set_ap_power(struct apple_rtkit *rtk, bool on)
+{
+	return apple_rtkit_set_ap_power_state(rtk, on ? APPLE_RTKIT_PWR_STATE_ON :
+						      APPLE_RTKIT_PWR_STATE_IDLE);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_set_ap_power);
 
 int apple_rtkit_quiesce(struct apple_rtkit *rtk)
 {
@@ -2014,6 +2130,70 @@ static int apple_rtkit_wake_common(struct apple_rtkit *rtk, bool early_ap_power)
 
 	return apple_rtkit_boot_common(rtk, early_ap_power);
 }
+
+/*
+ * Wake after apple_rtkit_idle_iop(): INIT (0x220) and wait for the IOP ack,
+ * but leave the AP power state alone. The IOP-only IDLE never moved it, and
+ * DCP firmware crashes ("Invalid AP power") on an ON it already has.
+ */
+int apple_rtkit_wake_keep_ap(struct apple_rtkit *rtk)
+{
+	u64 msg;
+	int ret;
+
+	if (apple_rtkit_is_running(rtk))
+		return -EINVAL;
+
+	reinit_completion(&rtk->iop_pwr_ack_completion);
+	msg = FIELD_PREP(APPLE_RTKIT_MGMT_PWR_STATE, APPLE_RTKIT_PWR_STATE_INIT);
+	ret = apple_rtkit_management_send(rtk, APPLE_RTKIT_MGMT_SET_IOP_PWR_STATE,
+					  msg);
+	if (ret)
+		return ret;
+
+	ret = apple_rtkit_wait(rtk, &rtk->epmap_completion);
+	if (ret) {
+		dev_err(rtk->dev, "RTKit: endpoint discovery failed: %d\n", ret);
+		return ret;
+	}
+	if (rtk->boot_result)
+		return rtk->boot_result;
+
+	ret = apple_rtkit_wait(rtk, &rtk->iop_pwr_ack_completion);
+	if (ret) {
+		dev_err(rtk->dev, "RTKit: IOP power acknowledgment failed: %d\n", ret);
+		return ret;
+	}
+	if (rtk->crashed)
+		return -EIO;
+
+	rtk->ap_power_state = APPLE_RTKIT_PWR_STATE_ON;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_wake_keep_ap);
+
+/* Start again, in ascending order, every app endpoint started before the IDLE */
+int apple_rtkit_restart_started_eps(struct apple_rtkit *rtk)
+{
+	DECLARE_BITMAP(eps, APPLE_RTKIT_MAX_ENDPOINTS);
+	unsigned int ep, n = 0;
+	int ret;
+
+	bitmap_copy(eps, rtk->started_eps, APPLE_RTKIT_MAX_ENDPOINTS);
+	for_each_set_bit(ep, eps, APPLE_RTKIT_MAX_ENDPOINTS) {
+		ret = apple_rtkit_start_ep(rtk, ep);
+		if (ret) {
+			dev_err(rtk->dev, "RTKit: restarting endpoint 0x%02x failed: %d\n",
+				ep, ret);
+			return ret;
+		}
+		n++;
+	}
+	dev_dbg(rtk->dev, "RTKit: restarted %u app endpoints (%*pb)\n", n,
+		APPLE_RTKIT_MAX_ENDPOINTS, eps);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_restart_started_eps);
 
 int apple_rtkit_wake(struct apple_rtkit *rtk)
 {

@@ -23,6 +23,7 @@
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/soc/apple/dp-tunnel.h>
+#include <linux/suspend.h>
 
 /*
  * T602x register interface is cleary different so most of the names below are
@@ -114,6 +115,7 @@ struct apple_dpxbar_hw {
 
 struct apple_dpxbar {
 	struct device *dev;
+	struct mux_chip *chip;
 	const struct apple_dpxbar_hw *hw;
 	void __iomem *regs;
 	int selected_dispext[T8142_MUX_MAX];
@@ -1322,6 +1324,7 @@ static int apple_dpxbar_probe(struct platform_device *pdev)
 	spin_lock_init(&dpxbar->lock);
 
 	dpxbar->dev = dev;
+	dpxbar->chip = mux_chip;
 	dpxbar->t6030_dpin = hw->t6030_flow || of_machine_is_compatible("apple,t6030");
 	dpxbar->regs = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(dpxbar->regs))
@@ -1371,7 +1374,31 @@ static int apple_dpxbar_resume(struct device *dev)
 	unsigned long restored = 0, flags;
 	unsigned int i;
 
-	if (!xbar || !xbar->t6030_dpin)
+	if (!xbar)
+		return 0;
+
+	/* Suspend-to-RAM powers the block down without the PM domain knowing */
+	if (pm_suspend_target_state == PM_SUSPEND_MEM && !xbar->hw->no_tunable &&
+	    !of_device_is_compatible(dev->of_node, "apple,t6020-display-crossbar")) {
+		writel(xbar->hw->tunable, xbar->regs + UNK_TUNABLE);
+
+		/* The mux core skips a select of the state it already holds */
+		for (i = 0; xbar->hw->ops == &apple_dpxbar_ops && i < MUX_MAX; i++) {
+			int state = xbar->selected_dispext[i];
+			u32 mux, atc, dispext;
+
+			if (state < 0)
+				continue;
+			mux = readl(xbar->regs + CROSSBAR_MUX_CTRL);
+			atc = readl(xbar->regs + CROSSBAR_ATC_EN);
+			dispext = readl(xbar->regs + CROSSBAR_DISPEXT_EN);
+			dev_dbg(dev, "s2r: %s on %d: mux %08x atc %08x dispext %08x\n",
+				apple_dpxbar_names[i], state, mux, atc, dispext);
+			apple_dpxbar_set(&xbar->chip->mux[i], state);
+		}
+	}
+
+	if (!xbar->t6030_dpin)
 		return 0;
 
 	spin_lock_irqsave(&xbar->lock, flags);

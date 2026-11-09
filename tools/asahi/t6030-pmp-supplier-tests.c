@@ -125,6 +125,7 @@ static bool passive_present, passive_lockable, passive_data;
 
 static const char *machine;
 static const void *pmp_data;
+static struct { bool stopped; } pmp_pc;
 static struct device *pmp_device;
 static int pmp_lock, ready_calls, add_calls, add_result;
 static int poll_calls, device_locked, power_calls, power_result, link_calls;
@@ -480,6 +481,7 @@ static void reset(void)
 	machine = "apple,t6030";
 	gate_soc = &gate_t6030;
 	pmp_device = &supplier;
+	pmp_pc.stopped = false;
 	pmp_data = (void *)1;
 	ready_calls = add_calls = add_result = poll_calls = 0;
 	power_calls = power_result = link_calls = find_calls = 0;
@@ -602,6 +604,7 @@ int main(void)
 	    supplier_node.report = &report25;
 	    status_word = 0, -ETIMEDOUT, 0, 0);
 	RUN(pmp_data = NULL, -ENODEV, 0, 0);
+	RUN(pmp_pc.stopped = true, -EAGAIN, 0, 0);
 	/* GPU phandle changes are scoped, preserve existing good links, and fail closed. */
 	for (int soc = 0; soc < 3; soc++) {
 		struct of_changeset cs;

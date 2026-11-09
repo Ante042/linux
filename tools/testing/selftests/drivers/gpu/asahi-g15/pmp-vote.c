@@ -14,6 +14,7 @@ typedef uint32_t u32;
 #define guard(kind) ignore_lock
 #define dev_warn(...) ((void)0)
 static int pmp_lock;
+static struct { bool stopped; } pmp_pc;
 static void ignore_lock(void *p) { (void)p; }
 struct device { void *of_node; };
 static struct device owner;
@@ -50,7 +51,7 @@ static int apple_pmp_report_set_t6030_gfx(struct device *d, bool enabled)
 #include "pmp-vote-production.h"
 static void reset(void)
 {
-	pmp_data = &owner; t6030 = true; requested = false; ready = check = 0; powers = reports = used = 0;
+	pmp_pc.stopped = false; pmp_data = &owner; t6030 = true; requested = false; ready = check = 0; powers = reports = used = 0;
 	memset(calls, 0, sizeof(calls));
 	memset(power_result, 0, sizeof(power_result));
 	memset(report_result, 0, sizeof(report_result));
@@ -68,6 +69,8 @@ int main(void)
 	assert(apple_pmp_set_device_power(0x0f, 5, 2) == -EINVAL);
 	assert(!used);
 	pmp_data = NULL; result(-ENODEV, "", true);
+	reset(); pmp_pc.stopped = true; result(-EAGAIN, "", true);
+	assert(apple_pmp_t6030_gpu_ready() == -EAGAIN && !used);
 	reset(); ready = -EAGAIN; result(-EAGAIN, "W", true);
 	reset(); t6030 = false; result(0, "WP", true);
 	reset(); t6030 = false; result(0, "Wp", false);

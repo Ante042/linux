@@ -146,6 +146,19 @@ def atc_restore_helpers(source):
     return atc_function(source, 'atcphy_setup_pipehandler')
 
 
+def atc_pm_target(source):
+    """The suspend target that atcphy_restore_after_pd_off() checks, '' when unused.
+
+    The restore runs in a resume from suspend-to-RAM, which powers the PHY down.
+    """
+    if 'pm_suspend_target_state' not in atc_function(source, 'atcphy_restore_after_pd_off'):
+        return ''
+    return (
+        'typedef int suspend_state_t;\n'
+        'enum { PM_SUSPEND_ON, PM_SUSPEND_TO_IDLE, PM_SUSPEND_STANDBY, PM_SUSPEND_MEM };\n'
+        'static suspend_state_t pm_suspend_target_state = PM_SUSPEND_MEM;\n')
+
+
 def atc_mux_without_pm(source):
     """Lane/teardown fixtures omit USB PM, keeping mode mapping and lane work real.
 

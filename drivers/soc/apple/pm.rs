@@ -11,6 +11,7 @@
 
 use core::sync::atomic::{AtomicPtr, Ordering};
 
+use kernel::bindings;
 use kernel::prelude::*;
 use kernel::sync::Arc;
 use kernel::types::ForeignOwnable;
@@ -23,9 +24,32 @@ use crate::SepData;
 static SEP: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
 
 extern "C" {
-    fn sep_pm_register(event: unsafe extern "C" fn(bool)) -> c_int;
+    fn sep_pm_register(
+        event: unsafe extern "C" fn(bool),
+        sleep: unsafe extern "C" fn() -> c_int,
+        wake: unsafe extern "C" fn() -> c_int,
+    ) -> c_int;
+    fn sep_pm_power_on(dev: *mut c_void) -> c_int;
+    fn sep_pm_power_release(dev: *mut c_void);
+    fn sep_pm_save_dart(dev: *mut c_void) -> c_int;
+    fn sep_pm_restore_dart(dev: *mut c_void) -> c_int;
     fn sep_pm_unregister();
     fn sep_pm_keep_domains(dev: *mut c_void) -> c_int;
+    fn sep_pm_gate_dart(dev: *mut c_void) -> c_int;
+}
+
+/// Whether a system sleep is (or would be) suspend-to-RAM; see
+/// `apple_s2r_deep_sleep()`. Always false without `CONFIG_APPLE_S2R`.
+#[cfg(CONFIG_APPLE_S2R)]
+pub(crate) fn s2r_deep_sleep() -> bool {
+    // SAFETY: Only reads the suspend state, callable from any context.
+    unsafe { bindings::apple_s2r_deep_sleep() }
+}
+
+/// See above: there is no suspend-to-RAM without `CONFIG_APPLE_S2R`.
+#[cfg(not(CONFIG_APPLE_S2R))]
+pub(crate) fn s2r_deep_sleep() -> bool {
+    false
 }
 
 /// Attaches every power domain of a multi-domain SEP node and keeps them on
@@ -35,6 +59,54 @@ pub(crate) fn keep_domains(dev: &kernel::device::Device) -> Result<()> {
     // SAFETY: `dev` is the bound SEP device; the shim ties what it attaches to
     // that device's lifetime through devres.
     let rc = unsafe { sep_pm_keep_domains(dev.as_raw().cast()) };
+    if rc != 0 {
+        return Err(Error::from_errno(rc));
+    }
+    Ok(())
+}
+
+/// Stops the DART driver touching the enclave's DART, which loses power with
+/// the enclave once it has gone to sleep.
+pub(crate) fn gate_dart(dev: &kernel::device::Device) -> Result<()> {
+    // SAFETY: `dev` is the bound SEP device.
+    let rc = unsafe { sep_pm_gate_dart(dev.as_raw().cast()) };
+    if rc != 0 {
+        return Err(Error::from_errno(rc));
+    }
+    Ok(())
+}
+
+/// Powers the enclave's island back on, holding its minimum state up until
+/// [`power_release`]; see `pm_shim.c`.
+pub(crate) fn power_on(dev: &kernel::device::Device) -> Result<()> {
+    // SAFETY: `dev` is the bound SEP device.
+    let rc = unsafe { sep_pm_power_on(dev.as_raw().cast()) };
+    if rc != 0 {
+        return Err(Error::from_errno(rc));
+    }
+    Ok(())
+}
+
+/// Drops the minimum state [`power_on`] raised.
+pub(crate) fn power_release(dev: &kernel::device::Device) {
+    // SAFETY: `dev` is the bound SEP device.
+    unsafe { sep_pm_power_release(dev.as_raw().cast()) };
+}
+
+/// Saves the enclave's DART registers while its island is still powered.
+pub(crate) fn save_dart(dev: &kernel::device::Device) -> Result<()> {
+    // SAFETY: `dev` is the bound SEP device.
+    let rc = unsafe { sep_pm_save_dart(dev.as_raw().cast()) };
+    if rc != 0 {
+        return Err(Error::from_errno(rc));
+    }
+    Ok(())
+}
+
+/// Puts the saved DART registers back once the island is powered again.
+pub(crate) fn restore_dart(dev: &kernel::device::Device) -> Result<()> {
+    // SAFETY: `dev` is the bound SEP device.
+    let rc = unsafe { sep_pm_restore_dart(dev.as_raw().cast()) };
     if rc != 0 {
         return Err(Error::from_errno(rc));
     }
@@ -92,6 +164,38 @@ unsafe extern "C" fn pm_event(entering: bool) {
     sleep_event(&*sep, entering);
 }
 
+/// # Safety
+/// Called by `pm_shim.c` in process context, from the PM notifier when the
+/// system suspends to deep sleep.
+unsafe extern "C" fn enclave_sleep() -> c_int {
+    let ptr = SEP.load(Ordering::Acquire);
+    if ptr.is_null() {
+        return -(bindings::ENODEV as c_int);
+    }
+    // SAFETY: as in `pm_event`.
+    let sep = unsafe { <Arc<SepData> as ForeignOwnable>::borrow(ptr) };
+    match sep.enclave_sleep() {
+        Ok(()) => 0,
+        Err(e) => e.to_errno(),
+    }
+}
+
+/// # Safety
+/// Called by `pm_shim.c` in process context, from the PM notifier after every
+/// suspend; returns `EALREADY` unless the enclave is asleep.
+unsafe extern "C" fn enclave_wake() -> c_int {
+    let ptr = SEP.load(Ordering::Acquire);
+    if ptr.is_null() {
+        return -(bindings::ENODEV as c_int);
+    }
+    // SAFETY: as in `pm_event`.
+    let sep = unsafe { <Arc<SepData> as ForeignOwnable>::borrow(ptr) };
+    match sep.enclave_wake() {
+        Ok(()) => 0,
+        Err(e) => e.to_errno(),
+    }
+}
+
 pub(crate) fn register(sep: Arc<SepData>) -> Result<()> {
     let ptr = sep.into_foreign();
 
@@ -111,7 +215,7 @@ pub(crate) fn register(sep: Arc<SepData>) -> Result<()> {
 
     // SAFETY: the shim stores the callback and registers a notifier block
     // that lives for the module's lifetime.
-    let rc = unsafe { sep_pm_register(pm_event) };
+    let rc = unsafe { sep_pm_register(pm_event, enclave_sleep, enclave_wake) };
     if rc != 0 {
         let raw = SEP.swap(core::ptr::null_mut(), Ordering::AcqRel);
         if !raw.is_null() {

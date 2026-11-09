@@ -2,6 +2,7 @@
 #include <kunit/test.h>
 #include <linux/slab.h>
 #include <linux/platform_device.h>
+#include <linux/soc/apple/s2r.h>
 #include <drm/drm_kunit_helpers.h>
 #include <drm/drm_edid.h>
 #include <drm/drm_property.h>
@@ -872,6 +873,13 @@ static void parser_route_programming_guard(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, dcp_crtc_needs_route_start(dcp));
 	dcp->typec_follow_gen = 4;
 	KUNIT_EXPECT_FALSE(test, dcp_crtc_needs_route_start(dcp));
+	/* A catalog adopted across a move still gets its start after a deep sleep. */
+	dcp->modes_provisional = true;
+	dcp->typec_cable_connected = true;
+	KUNIT_EXPECT_EQ(test, dcp_crtc_needs_route_start(dcp), apple_s2r_deep_sleep());
+	dcp->typec_cable_connected = false;
+	KUNIT_EXPECT_FALSE(test, dcp_crtc_needs_route_start(dcp));
+	dcp->modes_provisional = false;
 	dcp->typec_follow_gen = 5;
 	/* A moved Thunderbolt tunnel starts its link as a direct route does. */
 	dcp->active_typec_route->tunnel = true;

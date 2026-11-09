@@ -2788,7 +2788,7 @@ static void bcm4377_reset_work(struct work_struct *work)
  * same way, by rebinding the driver.
  */
 static void bcm4377_queue_rebind(struct bcm4377_data *bcm4377,
-				 const char *why)
+				 struct workqueue_struct *wq, const char *why)
 {
 	struct hci_dev *hdev = bcm4377->hdev;
 	struct bcm4377_reset_work *rw;
@@ -2810,10 +2810,11 @@ static void bcm4377_queue_rebind(struct bcm4377_data *bcm4377,
 		return;
 	}
 
-	bt_dev_err(hdev, "%s, rebinding the driver", why);
+	if (why)
+		bt_dev_err(hdev, "%s, rebinding the driver", why);
 	rw->pdev = pci_dev_get(bcm4377->pdev);
 	INIT_WORK(&rw->work, bcm4377_reset_work);
-	queue_work(bcm4377_reset_wq, &rw->work);
+	queue_work(wq, &rw->work);
 }
 
 static void bcm4377_hci_reset(struct hci_dev *hdev)
@@ -2823,7 +2824,7 @@ static void bcm4377_hci_reset(struct hci_dev *hdev)
 	/* A timeout while still setting up would only loop probe failures. */
 	if (hci_dev_test_flag(hdev, HCI_SETUP))
 		return;
-	bcm4377_queue_rebind(bcm4377, "controller not responding");
+	bcm4377_queue_rebind(bcm4377, bcm4377_reset_wq, "controller not responding");
 }
 
 /*
@@ -2855,7 +2856,7 @@ static void bcm4377_reset_done(struct pci_dev *pdev)
 	irq = pci_irq_vector(pdev, 0);
 	if (irq > 0)
 		enable_irq(irq);
-	bcm4377_queue_rebind(bcm4377, "function reset");
+	bcm4377_queue_rebind(bcm4377, bcm4377_reset_wq, "function reset");
 }
 
 static const struct pci_error_handlers bcm4377_err_handler = {
@@ -3156,6 +3157,24 @@ static int bcm4377_suspend(struct device *dev)
 	return 0;
 }
 
+/*
+ * Suspend-to-RAM can cut the chip's power. The PCI core restores the standard
+ * header, but not the BAR0 windows in the vendor config space, and a BAR0
+ * access through the reset windows stalls the bus. Config reads are safe.
+ */
+static bool bcm4377_lost_power(struct bcm4377_data *bcm4377)
+{
+	u32 window, ctrl;
+
+	if (pci_read_config_dword(bcm4377->pdev, BCM4377_PCIECFG_BAR0_WINDOW1,
+				  &window) ||
+	    pci_read_config_dword(bcm4377->pdev, BCM4377_PCIECFG_SUBSYSTEM_CTRL,
+				  &ctrl))
+		return true;
+
+	return window != bcm4377->hw->bar0_window1 || !(ctrl & BIT(16));
+}
+
 static int bcm4377_resume(struct device *dev)
 {
 	struct pci_dev *pdev = to_pci_dev(dev);
@@ -3166,6 +3185,24 @@ static int bcm4377_resume(struct device *dev)
 	if (bcm4377->wake_armed) {
 		disable_irq_wake(pdev->irq);
 		bcm4377->wake_armed = false;
+	}
+
+	if (bcm4377_lost_power(bcm4377)) {
+		/*
+		 * Point the windows back at the right cores so nothing that still
+		 * touches BAR0 can stall, and rebind once the system is up: probe
+		 * boots the firmware from scratch. The rebind replaces the hci
+		 * device, so it is not resumed here.
+		 */
+		bcm4377->quiesced = false;
+		bcm4377->needs_reset = true;
+		ret = bcm4377_init_cfg(bcm4377);
+		if (ret)
+			dev_warn(dev, "failed to restore the BAR0 windows: %d\n", ret);
+		/* Expected after suspend-to-RAM, so not an error */
+		dev_dbg(dev, "lost power in system sleep, rebinding the driver\n");
+		bcm4377_queue_rebind(bcm4377, system_freezable_wq, NULL);
+		return 0;
 	}
 
 	if (bcm4377->quiesced) {

@@ -204,7 +204,7 @@ impl ControlState {
         true
     }
 
-    fn tag_in_flight(&self, tag: u8) -> bool {
+    pub(crate) fn tag_in_flight(&self, tag: u8) -> bool {
         self.slots.iter().any(|s| s.used && s.tag == tag)
     }
 
@@ -395,6 +395,8 @@ mod tests {
     fn entropy(value: u32) -> proto::ControlReply {
         proto::ControlReply {
             tag: proto::TAG_ENTROPY,
+            ty: proto::CONTROL_REPLY_TYPE,
+            param: 0,
             data_lo: value,
         }
     }

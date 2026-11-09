@@ -41,6 +41,7 @@
 #include <linux/soc/apple/rtkit.h>
 #include <linux/soc/apple/sart.h>
 #include <linux/reset.h>
+#include <linux/suspend.h>
 #include <linux/time64.h>
 
 #include "nvme.h"
@@ -311,6 +312,19 @@ unsigned int flush_interval = 1000;
 module_param(flush_interval, uint, 0644);
 MODULE_PARM_DESC(flush_interval,
 		 "Grace period in msecs between flushes (ignored on post-M4 ANS)");
+
+/*
+ * Deep sleep puts the ANS to IDLE (AP and IOP power state 0x201), like macOS,
+ * instead of QUIESCED/SLEEP, and keeps the RTKit buffers: the ANS resumes from
+ * its saved context and keeps using them.
+ */
+static bool ans_idle_kept;
+
+/* Only the M1 Pro (t6000) has deep sleep, see CONFIG_APPLE_S2R */
+static bool apple_nvme_s2r_machine(void)
+{
+	return IS_ENABLED(CONFIG_APPLE_S2R) && of_machine_is_compatible("apple,t6000");
+}
 
 static_assert(sizeof(struct nvme_command) == 64);
 static_assert(sizeof(struct apple_nvmmu_tcb) == 128);
@@ -1647,6 +1661,81 @@ static void apple_nvme_stop_crashed_session(struct apple_nvme *anv)
 	anv->ctrl.ctrl_config = 0;
 }
 
+/*
+ * The ANS SART is power managed: iBoot leaves 1 in its power register in the
+ * NVMe block (ADT sart-power-reg-offset). Suspend-to-RAM resets it, and nothing
+ * else in Linux writes it. Put iBoot's value back before the ANS starts.
+ */
+#define APPLE_ANS_SART_POWER	0x13e8
+static u32 ans_sart_power_boot;
+
+/*
+ * iBoot applies the ADT afc-aiu-ans-dual-tunables to the ANS AXI2AF block
+ * (ADT ans reg[4]) at cold boot, and macOS applies them again each time it
+ * powers the ANS up. Suspend-to-RAM resets the block, and the ANS firmware
+ * crashes right after its endpoint discovery without them. The t6000 values
+ * come from the runtime ADT and belong in the devicetree.
+ */
+#define T6000_ANS_AXI2AF	0x391000000ULL
+static const struct {
+	u32 off, mask, val;
+} t6000_ans_afc_aiu_tunables[] = {
+	{ 0x000, 0x00000003, 0x00000001 }, { 0x010, 0x0fff0000, 0x000d0000 },
+	{ 0x014, 0x0000003f, 0x00000001 }, { 0x018, 0x0000003f, 0x00000001 },
+	{ 0x01c, 0x0000003f, 0x00000003 }, { 0x020, 0x0000003f, 0x00000003 },
+	{ 0x024, 0x0000003f, 0x00000003 }, { 0x028, 0x0000003f, 0x00000003 },
+	{ 0x02c, 0x0000003f, 0x00000003 }, { 0x030, 0x0000003f, 0x00000003 },
+	{ 0x034, 0x0000003f, 0x00000003 }, { 0x400, 0x400103ff, 0x40010001 },
+	{ 0x600, 0x01ffffff, 0x01ffffff },
+};
+
+/* ADT storage-lane-common-tunables, ANS reg[5] (storage PCIe lanes) */
+#define T6000_ANS_SL_COMMON	0x393b94000ULL
+static const struct {
+	u32 off, mask, val;
+} t6000_ans_sl_common_tunables[] = {
+	{ 0x100, BIT(19), 0 }, { 0x104, BIT(12), 0 },
+};
+
+static void __iomem *ans_sl_common;
+static void __iomem *ans_axi2af;
+
+static void apple_nvme_apply_afc_tunables(void)
+{
+	int i;
+
+	if (!ans_axi2af)
+		return;
+
+	for (i = 0; i < ARRAY_SIZE(t6000_ans_afc_aiu_tunables); i++) {
+		void __iomem *reg = ans_axi2af + t6000_ans_afc_aiu_tunables[i].off;
+		u32 mask = t6000_ans_afc_aiu_tunables[i].mask;
+		u32 v = readl(reg);
+
+		if ((v & mask) == t6000_ans_afc_aiu_tunables[i].val)
+			continue;
+		writel((v & ~mask) | t6000_ans_afc_aiu_tunables[i].val, reg);
+	}
+
+	for (i = 0; ans_sl_common && i < ARRAY_SIZE(t6000_ans_sl_common_tunables); i++) {
+		void __iomem *reg = ans_sl_common + t6000_ans_sl_common_tunables[i].off;
+		u32 mask = t6000_ans_sl_common_tunables[i].mask;
+		u32 v = readl(reg);
+
+		if ((v & mask) == t6000_ans_sl_common_tunables[i].val)
+			continue;
+		writel((v & ~mask) | t6000_ans_sl_common_tunables[i].val, reg);
+	}
+}
+
+/*
+ * After suspend-to-RAM the ANS firmware comes up and maps its endpoints, but
+ * takes longer than RTKit's one second to acknowledge the power state change.
+ * Keep waiting, up to this many seconds, while it has at least said hello.
+ */
+#define APPLE_ANS_BOOT_WAIT_S	25
+static bool ans_boot_saved;
+
 static void apple_nvme_reset_work(struct work_struct *work)
 {
 	unsigned int nr_io_queues = 1;
@@ -1778,13 +1867,25 @@ static void apple_nvme_reset_work(struct work_struct *work)
 		if (ret)
 			goto out;
 
-		ret = apple_rtkit_reinit(anv->rtk);
+		if (ans_idle_kept) {
+			ans_idle_kept = false;
+			ret = apple_rtkit_reinit_keep(anv->rtk);
+		} else {
+			ret = apple_rtkit_reinit(anv->rtk);
+		}
 		if (ret)
 			goto out;
 
 		ret = reset_control_deassert(anv->reset);
 		if (ret)
 			goto out;
+
+		/* A deep sleep reset what the first good boot had: put it back */
+		if (ans_boot_saved) {
+			if (readl(anv->mmio_nvme + APPLE_ANS_SART_POWER) != ans_sart_power_boot)
+				writel(ans_sart_power_boot, anv->mmio_nvme + APPLE_ANS_SART_POWER);
+			apple_nvme_apply_afc_tunables();
+		}
 
 		writel(APPLE_ANS_COPROC_CPU_CONTROL_RUN,
 		       anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL);
@@ -1795,8 +1896,32 @@ static void apple_nvme_reset_work(struct work_struct *work)
 	}
 
 booted:
-	if (ret) {
+	if (ret && apple_nvme_s2r_machine() &&
+	    (apple_rtkit_boot_progress(anv->rtk) & 4)) {
+		unsigned long start = jiffies;
+		unsigned int i;
+
+		for (i = 0; ret && i < APPLE_ANS_BOOT_WAIT_S; i++) {
+			if (apple_rtkit_is_crashed(anv->rtk))
+				break;
+			ret = apple_rtkit_boot(anv->rtk);
+		}
+		if (!ret)
+			dev_info(anv->dev, "ANS powered on after %u ms more\n",
+				 jiffies_to_msecs(jiffies - start));
+	}
+	if (ret && !apple_nvme_s2r_machine()) {
 		dev_err(anv->dev, "ANS did not boot");
+		goto out;
+	}
+	if (ret) {
+		u32 p1 = apple_rtkit_boot_progress(anv->rtk), p2;
+
+		/* a message the IRQ never delivered? */
+		apple_rtkit_poll(anv->rtk);
+		p2 = apple_rtkit_boot_progress(anv->rtk);
+		dev_err(anv->dev, "ANS did not boot (rtkit progress %#x then %#x after poll)\n",
+			p1, p2);
 		goto out;
 	}
 
@@ -2030,6 +2155,19 @@ rtkit_ready:
 	nvme_start_ctrl(&anv->ctrl);
 
 	dev_dbg(anv->dev, "ANS boot and NVMe init completed.");
+	/* The ANS state of the first good boot is what a deep sleep loses */
+	if (!ans_boot_saved && !anv->hw->needs_ioq_registers &&
+	    apple_nvme_s2r_machine()) {
+		ans_sart_power_boot = readl(anv->mmio_nvme + APPLE_ANS_SART_POWER);
+		if (of_device_is_compatible(anv->dev->of_node, "apple,t6000-nvme-ans2")) {
+			ans_axi2af = ioremap_np(T6000_ANS_AXI2AF, SZ_4K);
+			if (ans_axi2af)
+				ans_sl_common = ioremap_np(T6000_ANS_SL_COMMON, SZ_4K);
+		}
+		ans_boot_saved = true;
+		dev_info(anv->dev, "saved ANS state: sart power %#x tunables %s\n",
+			 ans_sart_power_boot, ans_sl_common ? "mapped" : "not mapped");
+	}
 	return;
 
 out_remove_sq:
@@ -2767,7 +2905,15 @@ static int apple_nvme_suspend(struct device *dev)
 	}
 
 	if (apple_rtkit_is_running(anv->rtk)) {
-		ret = apple_rtkit_shutdown(anv->rtk);
+		if (pm_suspend_target_state == PM_SUSPEND_MEM) {
+			ret = apple_rtkit_idle(anv->rtk);
+			if (!ret) {
+				apple_rtkit_detach_keep(anv->rtk);
+				ans_idle_kept = true;
+			}
+		} else {
+			ret = apple_rtkit_shutdown(anv->rtk);
+		}
 
 		writel(0, anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL);
 	}

@@ -382,6 +382,7 @@ struct tps6598x {
 	enum power_supply_usb_type usb_type;
 
 	int wakeup;
+	bool sleep_entered; /* sent to S3 or S5 for suspend to RAM */
 	/* Handles events while the system sleeps, if the variant can filter them */
 	bool (*sleep_event)(struct tps6598x *tps);
 	u32 status; /* status reg */

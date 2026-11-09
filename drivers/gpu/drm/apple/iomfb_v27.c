@@ -116,6 +116,7 @@ static const struct dcp_method_entry dcp_methods[dcpep_num_methods] = {
 #define iomfb_modeset_h17p iomfb_modeset_v27
 #define iomfb_flush_h17p iomfb_flush_v27
 #define iomfb_poweron_h17p iomfb_poweron_v27
+#define iomfb_s2r_link_sleep_h17p iomfb_s2r_link_sleep_v27
 #define iomfb_poweroff_h17p iomfb_poweroff_v27
 #define iomfb_sleep_h17p iomfb_sleep_v27
 #define iomfb_shutdown_h17p iomfb_shutdown_v27

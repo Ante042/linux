@@ -25,6 +25,7 @@
 #include <linux/platform_device.h>
 #include <linux/property.h>
 #include <linux/regulator/consumer.h>
+#include <linux/suspend.h>
 #include <linux/gpio/consumer.h>
 #include <linux/of_device.h>
 #include <sound/core.h>
@@ -1143,6 +1144,41 @@ static void cs42l84_setup_plug_detect(struct cs42l84_private *cs42l84)
 
 }
 
+/*
+ * Suspend-to-RAM takes the chip back to its reset values, which leaves jack
+ * detection off. The interrupt mask shows whether that happened: every other
+ * state of this register has the plug interrupts unmasked.
+ */
+static int cs42l84_resume(struct device *dev)
+{
+	struct cs42l84_private *cs42l84 = dev_get_drvdata(dev);
+	unsigned int cached, hw;
+	int ret;
+
+	if (pm_suspend_target_state != PM_SUSPEND_MEM)
+		return 0;
+
+	ret = regmap_read(cs42l84->regmap, CS42L84_TSRS_PLUG_INT_MASK, &cached);
+	if (ret)
+		return ret;
+
+	regcache_cache_bypass(cs42l84->regmap, true);
+	ret = regmap_read(cs42l84->regmap, CS42L84_TSRS_PLUG_INT_MASK, &hw);
+	regcache_cache_bypass(cs42l84->regmap, false);
+	if (ret)
+		return ret;
+
+	if (hw == cached)
+		return 0;
+
+	dev_dbg(dev, "restoring the registers lost in suspend\n");
+	regcache_mark_dirty(cs42l84->regmap);
+
+	return regcache_sync(cs42l84->regmap);
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(cs42l84_pm_ops, NULL, cs42l84_resume);
+
 static int cs42l84_i2c_probe(struct i2c_client *i2c_client)
 {
 	struct cs42l84_private *cs42l84;
@@ -1284,6 +1320,7 @@ static struct i2c_driver cs42l84_i2c_driver = {
 	.driver = {
 		.name = "cs42l84",
 		.of_match_table = cs42l84_of_match,
+		.pm = pm_sleep_ptr(&cs42l84_pm_ops),
 	},
 	.id_table = cs42l84_id,
 	.probe = cs42l84_i2c_probe,

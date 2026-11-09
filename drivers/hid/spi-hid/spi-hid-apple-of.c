@@ -7,6 +7,8 @@
  */
 
 #include <linux/delay.h>
+#include <linux/gpio/consumer.h>
+#include <linux/gpio/driver.h>
 #include <linux/interrupt.h>
 #include <linux/of.h>
 #include <linux/of_irq.h>
@@ -68,8 +70,22 @@ static int spihid_apple_of_disable_irq(struct spihid_apple_ops *ops)
 static int spihid_apple_of_enable_irq_wake(struct spihid_apple_ops *ops)
 {
 	struct spihid_apple_of *sh_of = container_of(ops, struct spihid_apple_of, ops);
+	struct device *gpio_dev;
+	int ret;
 
-	return enable_irq_wake(sh_of->irq);
+	ret = enable_irq_wake(sh_of->irq);
+	if (ret)
+		return ret;
+
+	/*
+	 * spien has to stay driven while asleep: keep the power domain of its
+	 * GPIO controller up. The PM core clears this in every prepare.
+	 */
+	gpio_dev = gpio_device_to_device(gpiod_to_gpio_device(sh_of->enable_gpio));
+	if (gpio_dev->parent)
+		device_set_wakeup_path(gpio_dev->parent);
+
+	return 0;
 }
 
 static int spihid_apple_of_disable_irq_wake(struct spihid_apple_ops *ops)

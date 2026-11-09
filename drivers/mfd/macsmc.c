@@ -136,6 +136,13 @@ static int apple_smc_cmd_locked(struct apple_smc *smc, u64 cmd, u64 arg,
 		return -EIO;
 	if (smc->atomic_mode)
 		return -EIO;
+	/*
+	 * The SMC can still send notifications while the AP side is asleep, during a
+	 * dark wake in suspend to RAM. Handlers that read keys then would only be
+	 * refused by RTKit, with an error for every attempt.
+	 */
+	if (!apple_rtkit_is_running(smc->rtk))
+		return -EINVAL;
 
 	reinit_completion(&smc->cmd_done);
 
@@ -251,7 +258,7 @@ int apple_smc_read(struct apple_smc *smc, smc_key key, void *buf, size_t size)
 
 	return apple_smc_rw_locked(smc, key, NULL, 0, buf, size);
 }
-EXPORT_SYMBOL(apple_smc_read);
+EXPORT_SYMBOL_GPL(apple_smc_read);
 
 int apple_smc_write(struct apple_smc *smc, smc_key key, const void *buf, size_t size)
 {
@@ -262,7 +269,7 @@ int apple_smc_write(struct apple_smc *smc, smc_key key, const void *buf, size_t 
 
 	return apple_smc_rw_locked(smc, key, buf, size, NULL, 0);
 }
-EXPORT_SYMBOL(apple_smc_write);
+EXPORT_SYMBOL_GPL(apple_smc_write);
 
 int apple_smc_rw(struct apple_smc *smc, smc_key key, const void *wbuf, size_t wsize,
 		 void *rbuf, size_t rsize)

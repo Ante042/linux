@@ -108,6 +108,9 @@ int apple_mbox_poll(struct apple_mbox *mbox);
  */
 void apple_mbox_hold_rx(struct apple_mbox *mbox);
 void apple_mbox_release_rx(struct apple_mbox *mbox);
+void apple_mbox_set_outbox(struct apple_mbox *mbox, bool on);
+void apple_mbox_read_control(struct apple_mbox *mbox, u32 *a2i, u32 *i2a);
+void apple_mbox_set_inbox(struct apple_mbox *mbox, bool on);
 /*
  * Set the minimum utilization (0..1024) the threaded receive handler runs with,
  * or -1 to restore the scheduler's default; the handler applies it to itself

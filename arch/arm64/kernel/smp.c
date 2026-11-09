@@ -44,6 +44,7 @@
 #include <asm/cpu.h>
 #include <asm/cputype.h>
 #include <asm/cpu_ops.h>
+#include <asm/spin_table.h>
 #include <asm/ctxr_execmem.h>
 #include <asm/daifflags.h>
 #include <asm/kexec.h>
@@ -1366,9 +1367,19 @@ static bool have_cpu_die(void)
 	return false;
 }
 
+/*
+ * A CPU that hotplug takes down through the spin table goes back to the boot
+ * loader, and only this kernel knows how to start it from there.
+ */
+static bool have_spin_table(void)
+{
+	return get_cpu_ops(raw_smp_processor_id()) == &smp_spin_table_ops;
+}
+
 bool cpus_are_stuck_in_kernel(void)
 {
-	bool smp_spin_tables = (num_possible_cpus() > 1 && !have_cpu_die());
+	bool smp_spin_tables = (num_possible_cpus() > 1 &&
+				(!have_cpu_die() || have_spin_table()));
 
 	return !!cpus_stuck_in_kernel || smp_spin_tables ||
 		is_protected_kvm_enabled();

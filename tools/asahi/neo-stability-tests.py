@@ -80,7 +80,10 @@ static int devm_request_threaded_irq(struct device*d,int irq,int(*h)(int,void*),
 enum dwc3_apple_state {DWC3_APPLE_PROBE_PENDING,DWC3_APPLE_NO_CABLE,DWC3_APPLE_HOST,DWC3_APPLE_DEVICE,DWC3_APPLE_SUSPENDED};
 #define DWC3_GCTL_PRTCAP_HOST 1
 struct dwc3 {int num_usb3_ports,num_usb2_ports;int usb3_generic_phy[2],usb2_generic_phy[2],usb3_phy,usb2_phy;int current_dr_role;bool dis_u3_susphy_quirk;};
-struct dwc3_apple {struct device*dev;struct dwc3 dwc;int lock,reset;enum dwc3_apple_state state;bool fixed_hub,host_only,rpm_held,core_active,core_exit_pending,reset_pending,dt_dis_u3_susphy;unsigned usb3_power_off_pending,usb2_power_off_pending;int usb2_phy;};
+struct dwc3_apple {struct device*dev;struct dwc3 dwc;int lock,reset;enum dwc3_apple_state state;bool fixed_hub,host_only,rpm_held,core_active,core_exit_pending,reset_pending,dt_dis_u3_susphy;unsigned usb3_power_off_pending,usb2_power_off_pending;int usb2_phy;
+ int sleep_lock;bool sleeping,syscore;};
+/* Scoped lock guard; the host run is single-threaded. */
+#define guard(type) (void)
 static int core_error,host_error,gadget_error,reset_error,role_error,start_role;
 static unsigned rpm_puts;
 /* A started core holds the glue runtime PM reference until core_stop drops it. */
@@ -178,6 +181,9 @@ int main(int argc,char**argv){
    reset_error=0;n=core_exits;exits=role_exits;
    assert(!dwc3_apple_exit(&a)&&!d.syscore&&!a.reset_pending&&!a.rpm_held&&rpm_puts==puts+4);
    assert(core_exits==n&&role_exits==exits);
+   /* While the system goes to sleep the core's syscore request is kept, not applied. */
+   a.sleeping=true;assert(!dwc3_apple_init(&a,role)&&a.syscore&&!d.syscore);
+   assert(!dwc3_apple_exit(&a)&&!a.syscore&&!d.syscore);a.sleeping=false;
   }
  }else if(!strcmp(argv[1],"regulatory")){
   enum {N25=MT7932_CHANNELS_2G+MT7932_CHANNELS_5G,SIX13=N25+3,VLP=N25+5};
@@ -269,7 +275,7 @@ def main():
     files = {
         'drivers/soc/apple/dockchannel.c': ['dockchannel_init_wakeup'],
         'drivers/soc/apple/pm_shim.c': ['sep_pm_release_domains', 'sep_pm_keep_domains'],
-        'drivers/usb/dwc3/dwc3-apple.c': ['dwc3_apple_core_stop', 'dwc3_apple_init', 'dwc3_apple_exit'],
+        'drivers/usb/dwc3/dwc3-apple.c': ['dwc3_apple_set_syscore', 'dwc3_apple_core_stop', 'dwc3_apple_init', 'dwc3_apple_exit'],
         'drivers/net/wireless/mediatek/mt7932/six.h': ['mt7932_6g_class'],
         'drivers/net/wireless/mediatek/mt7932/startup.c': ['mt_channel', 'mt_policy_disable', 'mt_regulatory_notify'],
     }
@@ -278,7 +284,7 @@ def main():
         source = (ROOT/path).read_text()
         for name in names:
             text = source
-            if args.old_usb and path.endswith('dwc3-apple.c') and name != 'dwc3_apple_core_stop' or args.old_regulatory and name == 'mt_regulatory_notify':
+            if args.old_usb and path.endswith('dwc3-apple.c') and name not in ('dwc3_apple_set_syscore', 'dwc3_apple_core_stop') or args.old_regulatory and name == 'mt_regulatory_notify':
                 text = subprocess.check_output(['git', 'show', '990a45b609dd:'+path], cwd=ROOT, text=True)
             bodies[name] = function(text, name)
     headers = [ROOT/'drivers/net/wireless/mediatek/mt7932/channels.h',

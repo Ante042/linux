@@ -15,6 +15,7 @@
 #include <linux/usb/typec_altmode.h>
 #include <linux/usb/typec_dp.h>
 #include <linux/workqueue.h>
+#include <linux/suspend.h>
 
 #include <drm/drm_file.h>
 
@@ -1188,6 +1189,37 @@ static void dcp_hdmi_recheck_work(struct work_struct *work)
 	mod_delayed_work(system_freezable_wq, &dcp->hdmi_recheck_wq, 0);
 }
 
+/*
+ * A display left plugged in through suspend-to-RAM. Its link does not come up
+ * from the resume commit, so connect once the system is running again, the
+ * way a new HPD does.
+ */
+static void dcp_hdmi_wake_work(struct work_struct *work)
+{
+	struct apple_dcp *dcp = container_of(to_delayed_work(work),
+					     struct apple_dcp, hdmi_wake_wq);
+	int ret;
+
+	guard(mutex)(&dcp_typec_fabric_lock);
+	if (dcp->active_typec_route || dcp->dptxport[0].connected ||
+	    gpiod_get_value_cansleep(dcp->hdmi_hpd) <= 0)
+		return;
+	ret = dcp_fixed_output_select(dcp);
+	if (!ret)
+		ret = dcp_dptx_connect(dcp, 0);
+	dev_dbg(dcp->dev, "HDMI: connect after sleep: %d\n", ret);
+	if (ret && ret != -ESTALE && ret != -ESHUTDOWN && --dcp->hdmi_wake_tries)
+		mod_delayed_work(system_freezable_wq, &dcp->hdmi_wake_wq,
+				 msecs_to_jiffies(2000));
+}
+
+void dcp_fabric_hdmi_after_sleep(struct apple_dcp *dcp)
+{
+	dcp->hdmi_wake_tries = 3;
+	mod_delayed_work(system_freezable_wq, &dcp->hdmi_wake_wq,
+			 msecs_to_jiffies(1000));
+}
+
 static void dcp_hybrid_work(struct work_struct *work);
 
 void dcp_fabric_init(struct apple_dcp *dcp)
@@ -1197,9 +1229,11 @@ void dcp_fabric_init(struct apple_dcp *dcp)
 	dcp->hdmi_presence_prev = DCP_FABRIC_ABSENT;
 	INIT_DELAYED_WORK(&dcp->hdmi_settle_wq, dcp_hdmi_settle_work);
 	INIT_DELAYED_WORK(&dcp->hdmi_recheck_wq, dcp_hdmi_recheck_work);
+	INIT_DELAYED_WORK(&dcp->hdmi_wake_wq, dcp_hdmi_wake_work);
 	INIT_DELAYED_WORK(&dcp->hybrid_wq, dcp_hybrid_work);
 	disable_delayed_work(&dcp->hdmi_settle_wq);
 	disable_delayed_work(&dcp->hdmi_recheck_wq);
+	disable_delayed_work(&dcp->hdmi_wake_wq);
 	disable_delayed_work(&dcp->hybrid_wq);
 }
 
@@ -1241,7 +1275,12 @@ static void dcp_fixed_hdmi_reinit_locked(struct apple_dcp *dcp, const char *why)
 	int ret = 0;
 
 	lockdep_assert_held(&dcp_typec_fabric_lock);
-	if (!dcp->external_native || !dcp->fixed_phy || !dcp->hdmi_hpd)
+	dev_dbg(dcp->dev, "HDMI reinit: native %d fixed_phy %d hpd %d xbar %d selected %d route %d typec_mux %d managed %d\n",
+		dcp->external_native, !!dcp->fixed_phy, !!dcp->hdmi_hpd, !!dcp->xbar,
+		dcp->fixed_route_selected, !!dcp->active_typec_route, !!dcp->typec_mux,
+		dcp->phy_managed_by_typec);
+	if ((!dcp->external_native && pm_suspend_target_state != PM_SUSPEND_MEM) ||
+	    !dcp->fixed_phy || !dcp->hdmi_hpd)
 		return;
 	dev_info(dcp->dev, "HDMI: setting up the output again (%s)\n", why);
 	if (dcp->hdmi_pwren)

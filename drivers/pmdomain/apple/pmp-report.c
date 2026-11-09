@@ -121,6 +121,11 @@ struct apple_pmp_report {
 	struct delayed_work ready_work;
 	/* J613 floor owner, absent on all other report instances. */
 	struct j613_floor *j613;
+	/* Powered down with the PMP: requests only update @gated_tgt (under @lock) */
+	bool gated;
+	u64 gated_tgt;
+	/* Requests of the always-on entries (re-asserted when ungated) */
+	u64 always_on;
 };
 
 static bool apple_pmp_report_running(const struct apple_pmp_report *rep)
@@ -166,6 +171,22 @@ static const struct attribute_group apple_pmp_dram_group = {
 	.name = "dram",
 	.attrs = apple_pmp_dram_attrs,
 };
+
+/*
+ * The restarted PMP reports ready before it acts on the target: the word
+ * written at ungate is left alone until the next write (otherwise the end of
+ * resume), and the panel's DCP waits for it from its hotplug on. Writes made
+ * during the PMP start itself are ignored as well, so check from a work,
+ * every 50 ms, and write the target word again from this long after an
+ * ungate while the PMP has not acted on it.
+ */
+#define PMP_WATCH_KICK_MS	50
+
+static struct apple_pmp_report *pmp_watch_rep;
+static unsigned int pmp_watch_n;
+static unsigned int pmp_watch_kicked;
+static void apple_pmp_report_watch_fn(struct work_struct *work);
+static DECLARE_DELAYED_WORK(pmp_watch_work, apple_pmp_report_watch_fn);
 
 static const struct apple_pmp_report_offsets apple_pmp_offsets_t6030;
 static const struct apple_pmp_report_offsets apple_pmp_offsets_t600x;
@@ -357,7 +378,7 @@ int apple_pmp_report_fast_die_effort(const struct device_node *np,
 			ret = -EOPNOTSUPP;
 		} else if (lane >= offs->fast_die_lanes) {
 			ret = -EINVAL;
-		} else if (!apple_pmp_report_running(rep)) {
+		} else if (READ_ONCE(rep->gated) || !apple_pmp_report_running(rep)) {
 			ret = -EAGAIN;
 		} else {
 			*effort = readl(rep->base + offs->fast_die) >>
@@ -372,6 +393,103 @@ int apple_pmp_report_fast_die_effort(const struct device_node *np,
 }
 EXPORT_SYMBOL_GPL(apple_pmp_report_fast_die_effort);
 
+/**
+ * apple_pmp_report_gate() - hold power requests while the PMP is powered down
+ * @gate: true before the PMP and PMS_SRAM go down, false once the PMP runs
+ *
+ * The report region is in the PMS_SRAM domain, which macOS powers down with
+ * the PMP for system sleep. While gated, requests only update a shadow of
+ * the target word, and ungating writes it back for the restarted PMP.
+ *
+ * Context: Process context; sleeps.
+ */
+void apple_pmp_report_gate(bool gate)
+{
+	struct apple_pmp_report *rep;
+	unsigned long flags;
+	u64 status, actual;
+	int ret;
+
+	guard(mutex)(&apple_pmp_reports_lock);
+	list_for_each_entry(rep, &apple_pmp_reports, list) {
+		spin_lock_irqsave(&rep->lock, flags);
+		if (gate && !rep->gated) {
+			rep->gated_tgt = readq(rep->base + rep->offsets->tgt_read);
+			actual = readq(rep->base + rep->offsets->actual);
+			dev_dbg(rep->dev, "gated: target %#llx, actual %#llx, always-on %#llx\n",
+				rep->gated_tgt, actual, rep->always_on);
+		} else if (!gate && rep->gated) {
+			/* Request the always-on entries again */
+			if ((rep->gated_tgt & rep->always_on) != rep->always_on) {
+				dev_dbg(rep->dev, "ungate: always-on %#llx missing from target %#llx\n",
+					rep->always_on & ~rep->gated_tgt, rep->gated_tgt);
+				rep->gated_tgt |= rep->always_on;
+			}
+			writeq(rep->gated_tgt, rep->base + rep->offsets->tgt_write);
+		}
+		WRITE_ONCE(rep->gated, gate);
+		spin_unlock_irqrestore(&rep->lock, flags);
+	}
+	/* Requests and readers already past the check run under RCU */
+	if (gate) {
+		synchronize_rcu();
+		return;
+	}
+	list_for_each_entry(rep, &apple_pmp_reports, list) {
+		ret = readq_poll_timeout(rep->base + rep->offsets->status, status,
+					 rep->offsets->running_any ? status :
+					 status & PMP_REPORT_READY, 1000, 1000000);
+		actual = readq(rep->base + rep->offsets->actual);
+		if (ret)
+			dev_warn(rep->dev, "ungated: target %#llx, actual %#llx, status %#llx (PMP not ready)\n",
+				 rep->gated_tgt, actual, status);
+		else
+			dev_dbg(rep->dev, "ungated: target %#llx, actual %#llx, status %#llx\n",
+				rep->gated_tgt, actual, status);
+		if (!pmp_watch_rep) {
+			pmp_watch_rep = rep;
+			pmp_watch_n = 0;
+			pmp_watch_kicked = 0;
+			schedule_delayed_work(&pmp_watch_work, 0);
+		}
+	}
+}
+EXPORT_SYMBOL_GPL(apple_pmp_report_gate);
+
+static void apple_pmp_report_watch_fn(struct work_struct *work)
+{
+	struct apple_pmp_report *rep = pmp_watch_rep;
+	u64 tgt, act, now;
+
+	if (!rep)
+		return;
+	if (READ_ONCE(rep->gated)) {
+		pmp_watch_rep = NULL;
+		return;
+	}
+	tgt = readq(rep->base + rep->offsets->tgt_read);
+	act = readq(rep->base + rep->offsets->actual);
+	if (pmp_watch_n * 50 >= PMP_WATCH_KICK_MS && (act & tgt) != tgt &&
+	    pmp_watch_kicked < 40) {
+		unsigned long flags;
+
+		pmp_watch_kicked++;
+		spin_lock_irqsave(&rep->lock, flags);
+		if (!rep->gated) {
+			tgt = readq(rep->base + rep->offsets->tgt_read);
+			writeq(tgt, rep->base + rep->offsets->tgt_write);
+		}
+		spin_unlock_irqrestore(&rep->lock, flags);
+		now = readq(rep->base + rep->offsets->actual);
+		dev_dbg(rep->dev, "watch %u: target %#llx written again, actual now %#llx\n",
+			pmp_watch_n, tgt, now);
+	}
+	if (++pmp_watch_n < 200)
+		schedule_delayed_work(&pmp_watch_work, msecs_to_jiffies(50));
+	else
+		pmp_watch_rep = NULL;
+}
+
 static void apple_pmp_start_show(struct seq_file *s, struct apple_pmp_start *st);
 
 /* Read only the documented status and fast-die entries, never the aperture. */
@@ -379,17 +497,25 @@ static int apple_pmp_report_status_show(struct seq_file *s, void *unused)
 {
 	struct apple_pmp_report *rep = s->private;
 	const struct apple_pmp_report_offsets *offs = rep->offsets;
-	bool running = apple_pmp_report_running(rep);
+	bool running = false, gated;
 	unsigned int lane;
-	u32 effort;
+	u32 effort = 0;
 
-	seq_printf(s, "running: %u\n", running);
+	/* apple_pmp_report_gate() waits out RCU readers before the power cut */
+	scoped_guard(rcu) {
+		gated = READ_ONCE(rep->gated);
+		if (!gated) {
+			running = apple_pmp_report_running(rep);
+			if (running && offs->fast_die)
+				effort = readl(rep->base + offs->fast_die);
+		}
+	}
+	seq_printf(s, "running: %u%s\n", running, gated ? " (powered down)" : "");
 	if (rep->start)
 		apple_pmp_start_show(s, rep->start);
 	if (!running || !offs->fast_die)
 		return 0;
 
-	effort = readl(rep->base + offs->fast_die);
 	for (lane = 0; lane < offs->fast_die_lanes; lane++)
 		seq_printf(s, "lane%u: %u\n", lane,
 			   (effort >> (lane * BITS_PER_BYTE)) & 0xff);
@@ -2445,9 +2571,22 @@ static int apple_pmp_report_set_state(struct apple_pmp_report *rep, u32 id,
 		rep->shadow |= bit_val;
 	else
 		rep->shadow &= ~bit_val;
+	if (rep->gated) {
+		if (enable)
+			rep->gated_tgt |= bit_val;
+		else
+			rep->gated_tgt &= ~bit_val;
+		spin_unlock_irqrestore(&rep->lock, flags);
+		dev_dbg_ratelimited(rep->dev, "gated request %u %s, target %#llx\n", id,
+				    enable ? "on" : "off", rep->gated_tgt);
+		return 0;
+	}
 	ready = !rep->defer;
 	if (ready) {
 		val = readq(rep->base + rep->offsets->tgt_read);
+		if (!!(val & bit_val) != enable || (rep->always_on & bit_val))
+			dev_dbg_ratelimited(rep->dev, "request %u %s, target %#llx\n", id,
+					    enable ? "on" : "off", val);
 		val &= ~bit_val;
 		if (enable)
 			val |= bit_val;
@@ -3036,8 +3175,15 @@ static int apple_pmp_report_entry_probe(struct platform_device *pdev)
 	}
 
 	if (of_property_read_bool(node, "apple,always-on")) {
+		struct apple_pmp_report *report;
+
 		ent->genpd.flags |= GENPD_FLAG_ACTIVE_WAKEUP;
 		apple_pmp_report_entry_set_state(&ent->genpd, true);
+		rcu_read_lock();
+		list_for_each_entry_rcu(report, &apple_pmp_reports, list)
+			if (report->dev->of_node == ent->report_node)
+				report->always_on |= BIT_ULL(ent->id);
+		rcu_read_unlock();
 	}
 
 	ent->genpd.power_on = apple_pmp_report_entry_power_on;

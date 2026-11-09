@@ -197,6 +197,7 @@ enum dcpep_method {
 	dcpep_pipe_query_474,
 	dcpep_pipe_set_476,
 	iomfbep_set_brightness_correction,
+	dcpep_s2r_link_sleep,
 	dcpep_num_methods
 };
 

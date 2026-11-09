@@ -5,6 +5,7 @@
 #define __APPLE_DCP_INTERNAL_H__
 
 #include <drm/drm_mode.h>
+#include <linux/notifier.h>
 #include <linux/atomic.h>
 #include <linux/backlight.h>
 #include <linux/device.h>
@@ -664,6 +665,13 @@ struct apple_dcp {
 	bool pipe_enabled_h17p;
 	/* Messages from the coprocessor are held in the mailbox for sleep. */
 	bool rx_held;
+	/* Suspend-to-RAM: IDLE, CPU stopped, RTKit buffers kept for the restart */
+	bool s2r_parked;
+	/* Suspend got as far as the park, which waits for the late phase */
+	bool s2r_park_due;
+	/* The park released the mailbox hold; resume unpauses presentation */
+	bool s2r_unheld;
+	bool s2r_ap_idle;
 
 	/* eDP display without DP-HDMI conversion */
 	bool main_display;
@@ -815,6 +823,8 @@ struct apple_dcp {
 	u64 typec_follow_gen;
 	/* dcp_poweron() reconnects DPTX; its own modeset follows the HPD */
 	bool typec_poweron_hpd;
+	/* The resume commit after deep sleep has no link, see dcp_poweron() */
+	bool typec_link_deferred;
 	/* IOMFB reports its video interface ready after DPTX link training. */
 	struct completion typec_iomfb_hpd_ready;
 	struct delayed_work typec_reconnect_wq;
@@ -824,6 +834,11 @@ struct apple_dcp {
 	struct dcp_announce announce;
 	struct delayed_work announce_wq;
 	bool typec_work_enabled; /* hpd_mutex; IRQ recovery admission */
+	bool s2r_typec_off; /* PM: Type-C work disabled for the sleep */
+	bool s2r_link_stuck; /* PM: the link was not released for deep sleep */
+	/* The last poweron timed out ("connector will be broken"): no deep sleep */
+	bool poweron_timed_out;
+	struct notifier_block sleep_nb;
 #if IS_ENABLED(CONFIG_DRM_APPLE_KUNIT_TEST)
 	/* Lets a test stop work where it races, see dcp_test_point(). */
 	void (*test_point)(struct apple_dcp *dcp, enum dcp_test_point point);
@@ -914,6 +929,8 @@ struct apple_dcp {
 	bool hdmi_edge_seen;
 	struct delayed_work hdmi_settle_wq;
 	struct delayed_work hdmi_recheck_wq;
+	struct delayed_work hdmi_wake_wq;
+	unsigned int hdmi_wake_tries;
 	/* T6030 HDMI converter service requests, see dcp-hdmi.c */
 	struct dcp_hdmi *hdmi;
 

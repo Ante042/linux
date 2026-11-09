@@ -19,6 +19,7 @@
 #include <linux/sched.h>
 #include <linux/soc/apple/dp-tunnel.h>
 #include <linux/soc/apple/rtkit.h>
+#include <linux/soc/apple/s2r.h>
 #include <linux/unaligned.h>
 
 #include <drm/drm_atomic.h>
@@ -3051,6 +3052,19 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 	if (crtc_state->mode.hdisplay == 0 && crtc_state->mode.vdisplay == 0)
 		return 0;
 
+	/*
+	 * The resume commit after deep sleep runs before the link of a Type-C
+	 * display is back.  The firmware fails the mode set then and drops the
+	 * swaps after it, and each one holds the commit, and with it the
+	 * resume, until the swap watchdog.  Leave the mode unset: the flips of
+	 * the CRTC complete at once, and the HPD of the deferred reconnect has
+	 * the hotplug worker set the mode on the new link.
+	 */
+	if (READ_ONCE(dcp->typec_link_deferred)) {
+		dcp_mode_invalidate(&dcp->mode_state);
+		return 0;
+	}
+
 	dcp->pq_requested = dcp_crtc_eotf(dcp, crtc, commit) == HDMI_EOTF_SMPTE_ST2084;
 	dcp->output_edr = dcp->pq_requested && dcp_panel_edr_supported(dcp) &&
 			  dcp_crtc_bt2020(dcp, crtc, commit);
@@ -3109,8 +3123,18 @@ bool dcp_crtc_needs_route_start(struct apple_dcp *dcp)
 {
 	struct apple_dcp_typec_route *route = READ_ONCE(dcp->active_typec_route);
 
-	return dcp_typec_follows_crtc(dcp) && route &&
-	       READ_ONCE(dcp->typec_crtc_off) && READ_ONCE(dcp->typec_follow_start) &&
+	if (!dcp_typec_follows_crtc(dcp) || !route || !READ_ONCE(dcp->typec_crtc_off))
+		return false;
+	/*
+	 * A catalog adopted across a route move is only replaced once the link
+	 * is up, and a system sleep keeps the link of a CRTC that is off down
+	 * while it moves the generation on. Start the route for it all the same.
+	 * Only deep sleep has been seen to do that.
+	 */
+	if (apple_s2r_deep_sleep() && READ_ONCE(dcp->modes_provisional) &&
+	    READ_ONCE(dcp->typec_cable_connected))
+		return true;
+	return READ_ONCE(dcp->typec_follow_start) &&
 	       READ_ONCE(dcp->typec_follow_gen) == READ_ONCE(dcp->typec_generation);
 }
 
@@ -3743,6 +3767,7 @@ static void iomfb_recv_message(struct apple_dcp *dcp, u64 message)
 				 "IOMFB: init complete %#llx (version %llu)\n",
 				 message,
 				 FIELD_GET(GENMASK_ULL(63, 48), message));
+		dev_dbg(dcp->dev, "IOMFB: initialized\n");
 		iomfb_start(dcp);
 	} else if (type == IOMFB_MESSAGE_TYPE_MSG)
 		dcpep_got_msg(dcp, message);

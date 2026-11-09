@@ -107,6 +107,7 @@ const AFK_OPC_INIT_TX: u64 = 0x8a;
 const AFK_OPC_INIT_UNK: u64 = 0x8c;
 const AFK_OPC_SEND: u64 = 0xa2;
 const AFK_OPC_START_ACK: u64 = 0x86;
+const AFK_OPC_STOP_ACK: u64 = 0x87;
 const AFK_OPC_SHUTDOWN_ACK: u64 = 0xc1;
 const AFK_OPC_RECV: u64 = 0x85;
 const AFK_MSG_GET_BUF_ACK: u64 = 0xa1 << 48;
@@ -472,7 +473,7 @@ impl AFKEndpoint {
                 self.recv_get_buf(client.dev.clone(), rtkit, msg)?;
             }
             AFK_OPC_INIT_UNK => {} // no-op
-            AFK_OPC_START_ACK => {}
+            AFK_OPC_START_ACK | AFK_OPC_STOP_ACK => {}
             AFK_OPC_INIT_RX => {
                 if self.rxbuf.is_some() {
                     dev_err!(
@@ -530,6 +531,16 @@ impl AFKEndpoint {
         let end = offset.checked_add(size).ok_or(EIO)?;
         if end > iomem_size || buf_size == 0 || block_size == 0 || !block_size.is_power_of_two() {
             return Err(EIO);
+        }
+        if let Some(iomem) = self.iomem.as_ref() {
+            pr_debug!(
+                "aop: AFK endpoint {:#04x} ring at iova {:#x} + {:#x}: {:#x} bytes, block {:#x}\n",
+                self.index,
+                iomem.dma_address(),
+                offset,
+                buf_size,
+                block_size
+            );
         }
         Ok(AFKRingBuffer {
             offset,
@@ -2094,6 +2105,9 @@ impl AOP for AopData {
                 return;
             }
         }
+        // SAFETY: s2r takes its own lock, and the handle is withdrawn before the RTKit goes away.
+        #[cfg(CONFIG_APPLE_S2R)]
+        unsafe { bindings::apple_s2r_set_aop_rtkit(ptr::null_mut()) };
         // No registration is queued after this point, so once the queue is
         // empty the list of children is complete.
         self.registration_queue.drain();
@@ -2885,6 +2899,8 @@ impl platform::Driver for AopDriver {
         } else {
             rtkit::RtKit::<AopData>::new(pdev.as_ref(), None, 0, data.clone())?
         };
+        #[cfg(CONFIG_APPLE_S2R)]
+        let raw_rtkit = rtkit.as_raw();
         data.rtkit.lock().as_mut().set(Some(rtkit));
         if cfg.setup_port {
             AopData::setup_open(&data, pdev.as_ref())?;
@@ -2923,6 +2939,9 @@ impl platform::Driver for AopDriver {
             }
             return Err(e);
         }
+        // SAFETY: The handle stays valid until remove() withdraws it before the RTKit is dropped.
+        #[cfg(CONFIG_APPLE_S2R)]
+        unsafe { bindings::apple_s2r_set_aop_rtkit(raw_rtkit) };
         probe_guard.dismiss();
         let data = data as Arc<dyn AOP>;
         Ok(Self(data))

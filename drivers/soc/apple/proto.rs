@@ -29,6 +29,11 @@ pub(crate) const MSG_SET_SHMEM: u64 = 0x18;
 pub(crate) const MSG_BOOT_TZ0_ACK1: u64 = 0x69;
 pub(crate) const MSG_BOOT_TZ0_ACK2: u64 = 0xd2;
 pub(crate) const MSG_BOOT_IMG4_ACK: u64 = 0x6a;
+// AppleSEPBooter::bootSEP without firmware: op 8 in place of the IMG4 tells
+// the SEPROM to resume the sepOS still in RAM; it answers 0x6c ("SEP resumed
+// from RAM" in _bootAction).
+pub(crate) const MSG_BOOT_RESUME: u64 = 0x8;
+pub(crate) const MSG_BOOT_RESUMED: u64 = 0x6c;
 
 // 4 KiB units even though CPU pages are 16 KiB
 pub(crate) const IOVA_SHIFT: u32 = 12;
@@ -147,6 +152,22 @@ pub(crate) fn op_security_mode() -> ControlOp {
     }
 }
 
+/// AppleSEPManager's cmsgSLEEP: param is the sleep type, 2 for S2R and 3 for
+/// hibernate. macOS waits 15 s for the reply and matches it by tag alone.
+pub(crate) const SLEEP_TYPE_S2R: u8 = 2;
+
+pub(crate) fn op_sleep(sleep_type: u8) -> ControlOp {
+    ControlOp {
+        ty: 0x0c,
+        param: sleep_type,
+        data: 0,
+        expect_reply: true,
+        timeout_ms: 15000,
+        reserved_tag: false,
+        name: c"SLEEP",
+    }
+}
+
 // no op for control 0x18: it wedges the control endpoint
 
 pub(crate) fn op_get_entropy() -> ControlOp {
@@ -251,6 +272,8 @@ impl<'a> FieldCursor<'a> {
 #[derive(Clone, Copy)]
 pub(crate) struct ControlReply {
     pub(crate) tag: u8,
+    pub(crate) ty: u8,
+    pub(crate) param: u8,
     pub(crate) data_lo: u32,
 }
 
@@ -259,6 +282,8 @@ impl ControlReply {
         let f = decode(msg);
         ControlReply {
             tag: f.tag,
+            ty: f.ty,
+            param: f.param,
             data_lo: f.data_lo,
         }
     }

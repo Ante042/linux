@@ -97,6 +97,20 @@ config APPLE_PMGR_DCS_KUNIT_TEST
 	  Also verify that boot constraints and concurrent endpoints retain
 	  their votes, and that suspend restores the last confirmed request.
 
+config APPLE_S2R
+	bool "Apple SoC suspend-to-RAM through m1n1"
+	depends on ARM64 && SMP && HOTPLUG_CPU && SUSPEND && ARM_ARCH_TIMER
+	depends on ARCH_APPLE || COMPILE_TEST
+	help
+	  CPU hotplug and suspend-to-RAM on the Apple M1 Pro (t6000) booted
+	  by an m1n1 that publishes a warm resume mailbox. Waking from
+	  suspend-to-RAM resets the CPUs into m1n1, which returns to Linux
+	  through the mailbox. The SoC power-down steps follow macOS on t6000.
+	  On any other machine, the M1 Max (t6001) included, the driver does
+	  nothing. Suspend-to-RAM stays off until apple_s2r.enable is set.
+
+	  If unsure, say N.
+
 config APPLE_RTKIT
 	tristate "Apple RTKit co-processor IPC protocol"
 	depends on APPLE_MAILBOX

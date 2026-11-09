@@ -54,7 +54,9 @@ prefix = r'''
 #define DECLARE_COMPLETION_ONSTACK(n) int n=0
 #define init_completion(p) (*(p)=0)
 #define msecs_to_jiffies(x) (x)
-#define wait_for_completion_timeout(p,t) ((void)(t),*(p))
+static unsigned long wait_for_completion_timeout(int *p,unsigned long t) { (void)t; return *p; }
+/* The doorbell retry is for deep sleep; take that path. */
+static bool apple_s2r_deep_sleep(void) { return true; }
 typedef u64 dma_addr_t;
 struct epic_cmd { u32 retcode; u64 rxbuf,txbuf; u32 rxlen,txlen; u8 rxcookie,txcookie; };
 struct cmd_info {
@@ -80,6 +82,19 @@ static size_t owned_reply_size=32888;
 static bool real_reply;
 static u32 legacy_rxlen;
 static void afk_recv_handle_reply(struct apple_dcp_afkep *ep,u32 channel,u16 tag,void *payload,size_t payload_size);
+/* A timed-out command rings the doorbells again; this mock stands for the rings. */
+static unsigned int kicks;
+static bool kick_delivers;
+static bool afk_kick(struct apple_dcp_afkep *ep,const char *why)
+{
+ struct cmd_info *c=&active->cmds[0];
+ assert(ep==active->ep && why);
+ kicks++;
+ if(!kick_delivers)return false;
+ c->reply_length=owned_reply_size;c->retcode=reply_status;
+ memset(c->rxbuf,0x77,c->reply_length);c->done=true;*c->completion=1;
+ return true;
+}
 /* Compact EPIC goes inline through the ring; this mock stands for that transport. */
 static bool compact_echo;
 static u32 compact_reply,compact_request;
@@ -209,7 +224,7 @@ int main(void)
  dcp.external=true;ep.txbfr.ready=ep.rxbfr.ready=true;
  ep.wire_v2=true;owned_reply_size=32888;timeout=1;
  assert(afk_send_command_timeout_len(&s,0xc0,request,112,output,32888,&status,1000,&received)==-ETIMEDOUT);
- assert(s.cmd_map[0] && s.cmds[0].free_on_ack && !s.cmds[0].completion);
+ assert(s.cmd_map[0] && s.cmds[0].free_on_ack && !s.cmds[0].completion && kicks==1);
  /* Execute the real late-ACK completer: mismatch/duplicate cannot free DMA. */
  unsigned int before_late=frees;u16 retained_tag=s.cmds[0].tag;
  struct epic_cmd reply={.retcode=0};
@@ -222,8 +237,13 @@ int main(void)
  assert(frees==before_late+2);
  s.enabled=true;s.torndown=false;timeout=0;
  assert(!afk_send_command_timeout_len(&s,0xc0,request,112,output,32888,&status,1000,&received));
- assert(!s.cmd_map[0] && s.users==1);free(output);
- puts("PASS: extracted production sender, 128-byte command envelope / 32888-byte reply, short OOB, strict/legacy callers, legacy reply lengths, compact status and actual late-ACK ownership");
+ assert(!s.cmd_map[0] && s.users==1 && kicks==1);
+ /* A reply that only arrives after the doorbells are rung again completes. */
+ timeout=1;kick_delivers=true;received=0;
+ assert(!afk_send_command_timeout_len(&s,0xc0,request,112,output,32888,&status,1000,&received));
+ assert(kicks==2 && received==32888 && status==0 && !s.cmd_map[0] && s.users==1);
+ timeout=0;kick_delivers=false;free(output);
+ puts("PASS: extracted production sender, 128-byte command envelope / 32888-byte reply, short OOB, strict/legacy callers, legacy reply lengths, compact status, doorbell kick on timeout and actual late-ACK ownership");
 }
 '''
 bodies = [function(r"static u32 afk_compact_next_status", "compact status allocator"),
@@ -232,4 +252,8 @@ bodies = [function(r"static u32 afk_compact_next_status", "compact status alloca
           function(r"static int afk_send_command_timeout_len", "length-aware sender"),
           function(r"int afk_send_command_with_reply_len", "legacy reply-length sender"),
           function(r"static void afk_recv_handle_reply", "reply completer")]
-pathlib.Path(sys.argv[2]).write_text(prefix + "".join(bodies) + suffix)
+# The kick retry waits for the driver's own grace period.
+kick_wait = re.search(r"^#define AFK_KICK_WAIT_MS\b.*$", source, re.M)
+if not kick_wait:
+    raise RuntimeError("production AFK_KICK_WAIT_MS not found")
+pathlib.Path(sys.argv[2]).write_text(prefix + kick_wait.group() + "\n" + "".join(bodies) + suffix)

@@ -95,7 +95,9 @@ static struct xhci_hcd xhci_context;
 struct dwc3 { bool sys_wakeup, dis_u3_susphy_quirk; struct platform_device *xhci; };
 enum { DWC3_APPLE_PROBE_PENDING, DWC3_APPLE_NO_CABLE, DWC3_APPLE_HOST, DWC3_APPLE_DEVICE };
 /* pre_core_rpm is T8132 only: runtime PM before the first core probe; never set here. */
-struct dwc3_apple { struct dwc3 dwc; struct device *dev; int lock,state; void *role_sw; bool pre_core_rpm, dt_dis_u3_susphy; };
+struct notifier_block { int (*notifier_call)(struct notifier_block *,unsigned long,void *); };
+struct dwc3_apple { struct dwc3 dwc; struct device *dev; int lock,state; void *role_sw; bool fixed_hub, pre_core_rpm, dt_dis_u3_susphy;
+ struct notifier_block pm_nb; struct work_struct restore_work; };
 static struct dwc3_apple apple_context;
 #define to_dwc3_apple(d) container_of(d,struct dwc3_apple,dwc)
 static bool inside_host_remove;
@@ -106,6 +108,10 @@ static void platform_device_unregister(struct platform_device *d);
 static void dwc3_gadget_exit(struct dwc3 *d) { (void)d;assert(0); }
 static int dwc3_apple_core_stop(struct dwc3_apple *d) { (void)d;return 0; }
 static void usb_role_switch_unregister(void *s) { (void)s; }
+/* Removal retires the sleep notifier and its restore work before taking the glue lock. */
+static int pm_nb_unregisters, restore_cancels;
+static int unregister_pm_notifier(struct notifier_block *nb) { assert(nb==&apple_context.pm_nb&&!apple_context.lock);pm_nb_unregisters++;return 0; }
+static bool cancel_work_sync(struct work_struct *w) { assert(w==&apple_context.restore_work&&!apple_context.lock);restore_cancels++;return false; }
 static void dwc3_core_remove_no_shutdown(struct dwc3 *d) { (void)d; }
 static void usb_remove_hcd(struct usb_hcd *h) { host_remove_calls++;h->state=HC_STATE_QUIESCING;usb_set_device_state(h->self.root_hub,USB_STATE_NOTATTACHED); }
 static void usb_phy_shutdown(void *p) { (void)p; }
@@ -162,7 +168,7 @@ int main(void) {
   xhci_context=(struct xhci_hcd){0};
   inject_remove=true;removal_started=blocked_attempt=release_remove=false;
   atomic_store(&early_write,false);atomic_store(&handoff_active,true);
-  susphy_calls=host_remove_calls=0;
+  susphy_calls=host_remove_calls=pm_nb_unregisters=restore_cancels=0;
   int ret=safe(&p);
   atomic_store(&handoff_active,false);
   pthread_mutex_lock(&schedule_mutex);release_remove=true;pthread_cond_broadcast(&schedule_cond);pthread_mutex_unlock(&schedule_mutex);
@@ -170,6 +176,7 @@ int main(void) {
   fprintf(stderr,"connected teardown target=%d ret=%d early_write=%d susphy=%d host_remove=%d\n",remove_target,ret,atomic_load(&early_write),susphy_calls,host_remove_calls);
   assert(ret==0&&!atomic_load(&early_write)&&host_remove_calls==1);
   assert(susphy_calls==(remove_target?0:1));balanced(&p);
+  assert(pm_nb_unregisters==(remove_target?0:1)&&restore_cancels==pm_nb_unregisters);
  }
  puts("PASS actual PM wrapper connected to driver-core/DWC3/xHCI removal; synchronous teardown waits until owned transaction ends");
  return 0;

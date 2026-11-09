@@ -13,8 +13,8 @@
 #include <asm/acpi.h>
 #include <asm/cpu_ops.h>
 #include <asm/smp_plat.h>
+#include <asm/spin_table.h>
 
-extern const struct cpu_operations smp_spin_table_ops;
 #ifdef CONFIG_ARM64_ACPI_PARKING_PROTOCOL
 extern const struct cpu_operations acpi_parking_protocol_ops;
 #endif

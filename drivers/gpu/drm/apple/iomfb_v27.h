@@ -88,6 +88,7 @@ void iomfb_flush_v27(struct apple_dcp *dcp, struct drm_crtc *crtc,
 void iomfb_start_v27(struct apple_dcp *dcp);
 void iomfb_shutdown_v27(struct apple_dcp *dcp);
 void iomfb_poweron_v27(struct apple_dcp *dcp);
+int iomfb_s2r_link_sleep_v27(struct apple_dcp *dcp, bool teardown);
 void iomfb_poweroff_v27(struct apple_dcp *dcp);
 void iomfb_sleep_v27(struct apple_dcp *dcp);
 void iomfb_present_backlight_v27(struct apple_dcp *dcp);

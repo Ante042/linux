@@ -1079,6 +1079,39 @@ void apple_mbox_release_rx(struct apple_mbox *mbox)
 }
 EXPORT_SYMBOL(apple_mbox_release_rx);
 
+/* Bit 0 of I2A_CONTROL: what AppleA7IOP::_enableOutbox flips around stopCPU */
+void apple_mbox_set_outbox(struct apple_mbox *mbox, bool on)
+{
+	u32 control = readl(mbox->regs + mbox->hw->i2a_control);
+
+	if (on)
+		control |= BIT(0);
+	else
+		control &= ~BIT(0);
+	writel(control, mbox->regs + mbox->hw->i2a_control);
+}
+EXPORT_SYMBOL(apple_mbox_set_outbox);
+
+void apple_mbox_read_control(struct apple_mbox *mbox, u32 *a2i, u32 *i2a)
+{
+	*a2i = readl(mbox->regs + mbox->hw->a2i_control);
+	*i2a = readl(mbox->regs + mbox->hw->i2a_control);
+}
+EXPORT_SYMBOL(apple_mbox_read_control);
+
+/* Bit 0 of A2I_CONTROL: the inbox enable (ADT inbox-ctrl-enable-mask) */
+void apple_mbox_set_inbox(struct apple_mbox *mbox, bool on)
+{
+	u32 control = readl(mbox->regs + mbox->hw->a2i_control);
+
+	if (on)
+		control |= BIT(0);
+	else
+		control &= ~BIT(0);
+	writel(control, mbox->regs + mbox->hw->a2i_control);
+}
+EXPORT_SYMBOL(apple_mbox_set_inbox);
+
 /*
  * Stop the provider-owned CPU, then quiesce every transport edge before
  * devres releases IRQs or MMIO mappings. Device links order consumer removal
