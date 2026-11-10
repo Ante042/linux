@@ -535,10 +535,19 @@ static int typec_probe(struct device *dev)
 	}
 
 	ret = drv->probe(adev);
-	if (ret)
+	if (ret) {
 		typec_altmode_remove_links(altmode);
+		return ret;
+	}
 
-	return ret;
+	/*
+	 * A mode entered before its driver bound took no reference on the
+	 * driver's module, but leaving it drops one. Take it now.
+	 */
+	if (adev->active && !is_typec_port(adev->dev.parent))
+		WARN_ON(!try_module_get(drv->driver.owner));
+
+	return 0;
 }
 
 static void typec_remove(struct device *dev)
