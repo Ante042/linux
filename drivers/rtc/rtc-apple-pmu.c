@@ -11,6 +11,7 @@
 #include <linux/regmap.h>
 #include <linux/rtc.h>
 #include <linux/slab.h>
+#include <linux/soc/apple/s2r.h>
 #include <linux/suspend.h>
 #include <linux/unaligned.h>
 
@@ -386,7 +387,9 @@ static int apple_pmu_rtc_prepare(struct device *dev)
 {
 	struct apple_pmu_rtc *rtc = dev_get_drvdata(dev);
 
-	if (pm_suspend_target_state != PM_SUSPEND_TO_IDLE || rtc->io_failed)
+	/* Deep sleep on the M1 Pro keeps the alarm's SPMI vector as a wake source */
+	if ((pm_suspend_target_state != PM_SUSPEND_TO_IDLE && !apple_s2r_deep_sleep()) ||
+	    rtc->io_failed)
 		return -EBUSY;
 	return 0;
 }

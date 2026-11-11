@@ -198,6 +198,8 @@ enum { ACCR_PERF, ACCR_ENERGY, ACCR_AMX, ACCR_LLC, ACCR_PPT, ACCR_DVFS, ACCR_N }
 #define T6000_S2R_TIMER			0x2925c4000ULL
 /* NUB SPMI controller vector enables (word n at +4n), the clear words sit 0x40 above */
 #define T6000_NUB_SPMI_IRQ_EN		0x2920a1320ULL
+/* The enable words spmi-apple programs on t6000: 192 vectors and its RX FIFO notification */
+#define S2R_SPMI_WORDS			7
 /* Vector 2 (word 0), on before GO as macOS has it, so the PMU RTC alarm can wake the SoC */
 #define S2R_SPMI_VEC			BIT(2)
 #define T6000_NUB_PS			0x292280000ULL
@@ -3330,6 +3332,59 @@ static int apple_s2r_prepare_late(void)
 	return 0;
 }
 
+/*
+ * The NUB SPMI vector enables belong to spmi-apple's irqchip, which has no
+ * suspend hooks. Keep them as it left them for the PMU RTC alarm, put them
+ * back after the wake and note the words that read back different.
+ */
+static u32 s2r_spmi_saved[S2R_SPMI_WORDS];
+static unsigned long s2r_spmi_changed;
+static bool s2r_spmi_written;
+
+/* Right before GO: the alarm vector on, unless its driver has it on already */
+static void apple_s2r_spmi_arm(void)
+{
+	int i;
+
+	if (!s2r.spmi_irq)
+		return;
+
+	for (i = 0; i < S2R_SPMI_WORDS; i++)
+		s2r_spmi_saved[i] = readl(s2r.spmi_irq + 4 * i);
+	s2r_spmi_written = true;
+	if (s2r_spmi_saved[0] & S2R_SPMI_VEC)
+		return;
+	writel(S2R_SPMI_VEC, s2r.spmi_irq + 0x40);
+	writel(s2r_spmi_saved[0] | S2R_SPMI_VEC, s2r.spmi_irq);
+	dsb(sy);
+}
+
+/*
+ * Right after wake, with IRQs still off: the enables back as the irqchip
+ * has them. A latched alarm stays for the irqchip to deliver if it has the
+ * vector on, and is cleared if only apple_s2r_spmi_arm() turned it on.
+ */
+static void apple_s2r_spmi_restore(void)
+{
+	u32 left;
+	int i;
+
+	s2r_spmi_changed = 0;
+	if (!s2r_spmi_written)
+		return;
+	s2r_spmi_written = false;
+
+	for (i = 0; i < S2R_SPMI_WORDS; i++) {
+		left = s2r_spmi_saved[i] | (i ? 0 : S2R_SPMI_VEC);
+		if (readl(s2r.spmi_irq + 4 * i) != left)
+			__set_bit(i, &s2r_spmi_changed);
+		writel(s2r_spmi_saved[i], s2r.spmi_irq + 4 * i);
+	}
+	if (!(s2r_spmi_saved[0] & S2R_SPMI_VEC))
+		writel(S2R_SPMI_VEC, s2r.spmi_irq + 0x40);
+	dsb(sy);
+}
+
 /* Runs through cpu_suspend(), whose argument it does not use */
 static int apple_s2r_finisher(unsigned long arg)
 {
@@ -3385,12 +3440,8 @@ static int apple_s2r_finisher(unsigned long arg)
 		dsb(sy);
 	}
 	apple_s2r_ps_late();
-	/* Linux never enables SPMI vectors, macOS has the PMU one on for the RTC alarm */
-	if (s2r.spmi_irq) {
-		writel(S2R_SPMI_VEC, s2r.spmi_irq + 0x40);
-		writel(readl(s2r.spmi_irq) | S2R_SPMI_VEC, s2r.spmi_irq);
-		dsb(sy);
-	}
+	/* macOS has the PMU vector on for the RTC alarm */
+	apple_s2r_spmi_arm();
 	/* Dead-man from here on: it keeps counting in S2R and m1n1 restarts it on a wake */
 	if (s2r.wdt) {
 		writel(0, s2r.wdt + WDT_WD1_CTL);
@@ -3476,6 +3527,7 @@ static int apple_s2r_enter(suspend_state_t state)
 	apple_s2r_wdt_mark();
 	apple_s2r_quiesce_restore();
 	apple_s2r_sep_pg_restore();
+	apple_s2r_spmi_restore();
 	s2r.counter_after = __arch_counter_get_cntpct();
 	/* What woke us, if it was not an IRQ through the AIC */
 	s2r.wake_isr = read_sysreg(isr_el1);
@@ -3697,6 +3749,9 @@ static void apple_s2r_finish(void)
 		 div_u64(s2r.counter_after - s2r.counter_before, arch_timer_get_cntfrq() / 1000));
 
 	apple_s2r_pmgr_report();
+	if (s2r_spmi_changed)
+		pr_info("NUB SPMI vector enables changed in sleep (words %#lx), put back\n",
+			s2r_spmi_changed);
 	apple_s2r_sep_pg_report();
 	apple_s2r_dcs_report();
 	apple_s2r_quiesce_report();
