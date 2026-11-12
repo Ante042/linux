@@ -42,6 +42,13 @@ no sink taking a display pipeline, and 120 Hz).
 - `CONFIG_APPLE_S2R=y` (bool, default n; needs `HOTPLUG_CPU`, `SUSPEND`, `ARM_ARCH_TIMER`).
 - Boot through the m1n1 from the m1n1 branch. I ran it as the second stage with the device trees
   from this kernel branch appended; with them, `rtc-apple-pmu` shows up as `rtc1`.
+- Stage 1 on my machine is not the stock one, and I should have said so from the start. While
+  bisecting on 1 Nov I installed a thin stage 1 (m1n1 built with `-DTHIN_STAGE1`: MMU, primary
+  watchdog off, PMGR tables, then chainload) and never went back, so every sleep in these notes
+  ran with it. It is the branch `t600x-s2r-thin-stage1` on my m1n1 fork: the first three commits
+  of the reference branch plus two. The wake path itself runs in stage 2 only, because the
+  chainloaded stage 2 lands at the same base and RVBAR then points into it. But I never retested
+  with a full stage 1, so I can't say whether its extra init matters for the sleep.
 - At boot the driver looks for the mailbox and checks for `apple,t6000`. On anything else, or
   without the mailbox, it does nothing at all (no CPU hotplug, no deep sleep). With it you get
   `apple-s2r: m1n1 mailbox at ..., N CPUs, CPU hotplug through m1n1`.
