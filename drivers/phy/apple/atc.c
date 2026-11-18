@@ -20,6 +20,7 @@
 #include <dt-bindings/phy/phy.h>
 #include <kunit/static_stub.h>
 #include <linux/bitfield.h>
+#include <linux/capability.h>
 #include <linux/cleanup.h>
 #include <linux/delay.h>
 #include <linux/devm-helpers.h>
@@ -58,6 +59,11 @@
 
 /* Runtime-suspend delay, which covers the mux, orientation and reset calls of a plug */
 #define ATCPHY_AUTOSUSPEND_MS 2000
+
+static bool release_on_unplug;
+module_param(release_on_unplug, bool, 0444);
+MODULE_PARM_DESC(release_on_unplug,
+		 "M1 Pro/Max: set up runtime PM on the Type-C PHYs, forbidden until user space writes \"auto\" to power/control; an idle PHY then runtime-suspends, so that its power domain can switch off (default: N)");
 
 #define AUSPLL_FSM_CTRL 0x1014
 
@@ -787,6 +793,13 @@ enum atcphy_t8132_cio_tunable {
  * @idle_rpm: An idle PHY runtime-suspends, see atcphy_rpm_get()
  * @rpm_held: A runtime PM reference is held while busy, see atcphy_rpm_busy();
  *            under @lock
+ * @user_rpm: release_on_unplug: runtime PM is set up but forbidden at probe,
+ *            user space allows it through power/control
+ * @rpm_suspended: The PHY is runtime-suspended (@user_rpm only); read by the
+ *                 power domain notifier
+ * @pd_off_idle: The domain went off under a suspended PHY (@user_rpm only):
+ *               the restore also enables the dummy PHY and, with the PHY off,
+ *               the AXI2AF bridge tunables
  * @regs: Memory-mapped registers
  * @regs.core: Core registers
  * @regs.axi2af: AXI to Apple Fabric interface registers
@@ -873,6 +886,9 @@ struct apple_atcphy {
 	bool pd_was_off;
 	bool idle_rpm;
 	bool rpm_held;
+	bool user_rpm;
+	bool rpm_suspended;
+	bool pd_off_idle;
 
 	bool tunnel_dual_stream;
 	bool tunnel_routes_present;
@@ -4137,9 +4153,17 @@ static int atcphy_rpm_get(struct apple_atcphy *atcphy)
  */
 static bool atcphy_rpm_busy(const struct apple_atcphy *atcphy)
 {
-	return atcphy->mode != APPLE_ATCPHY_MODE_OFF || atcphy->host_active ||
-	       atcphy->pipe_pending || atcphy->pipe_state != ATCPHY_PIPEHANDLER_STATE_DUMMY ||
-	       atcphy->t8132_common_owned;
+	if (atcphy->mode != APPLE_ATCPHY_MODE_OFF || atcphy->host_active ||
+	    atcphy->pipe_pending || atcphy->pipe_state != ATCPHY_PIPEHANDLER_STATE_DUMMY ||
+	    atcphy->t8132_common_owned)
+		return true;
+	/*
+	 * With release_on_unplug, also a running tunnel pixel clock or an
+	 * unfinished PIPE or USB handoff (none outlives a mode change to off).
+	 */
+	return atcphy->user_rpm &&
+	       (atcphy->tunnel_clock_on || atcphy->tunnel_saved ||
+		atcphy->t8103_dummy_pending || atcphy->usb_off_pending);
 }
 
 /* Take or drop the reference held while busy; the device must be on. */
@@ -4207,6 +4231,7 @@ static void atcphy_rpm_release(void *data)
 static void atcphy_restore_after_pd_off(struct apple_atcphy *atcphy)
 {
 	enum atcphy_mode mode = atcphy->mode;
+	bool idle_off;
 	int ret;
 
 	lockdep_assert_held(&atcphy->lock);
@@ -4214,6 +4239,9 @@ static void atcphy_restore_after_pd_off(struct apple_atcphy *atcphy)
 	if (!READ_ONCE(atcphy->pd_was_off))
 		return;
 	WRITE_ONCE(atcphy->pd_was_off, false);
+	/* Only set with release_on_unplug, see atcphy_pd_notify() */
+	idle_off = READ_ONCE(atcphy->pd_off_idle);
+	WRITE_ONCE(atcphy->pd_off_idle, false);
 
 	atcphy->dp_t8122.aux = false;
 	atcphy->dp_t8122.pll = false;
@@ -4250,13 +4278,23 @@ static void atcphy_restore_after_pd_off(struct apple_atcphy *atcphy)
 					 "Failed to park the PIPE after its domain was off: %d\n",
 					 ret);
 			atcphy->pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY;
-			/* Clear after the power loss, and USB3 needs it for the PIPE lock */
-			if (pm_suspend_target_state == PM_SUSPEND_MEM)
+			/*
+			 * Clear after the power loss, and USB3 needs it for the PIPE lock;
+			 * with release_on_unplug also after a runtime power-down.
+			 */
+			if (pm_suspend_target_state == PM_SUSPEND_MEM || idle_off)
 				atcphy_enable_dummy_phy(atcphy);
 		}
+		/*
+		 * The fabric bridge in front of the block only reports idle with its
+		 * tunables, which otherwise come with the next mode.
+		 */
+		if (idle_off && mode == APPLE_ATCPHY_MODE_OFF)
+			apple_tunable_apply(atcphy->regs.axi2af, atcphy->tunables.axi2af);
 		dev_dbg(atcphy->dev,
-			"power domain was off, restoring mode %d: PIPE mux=%08x lock=%08x/%08x aon=%08x nonsel=%08x\n",
-			mode, readl(atcphy->regs.pipehandler + PIPEHANDLER_MUX_CTRL),
+			"power domain was off%s, restoring mode %d: PIPE mux=%08x lock=%08x/%08x aon=%08x nonsel=%08x\n",
+			idle_off ? " at runtime" : "", mode,
+			readl(atcphy->regs.pipehandler + PIPEHANDLER_MUX_CTRL),
 			readl(atcphy->regs.pipehandler + PIPEHANDLER_LOCK_REQ),
 			readl(atcphy->regs.pipehandler + PIPEHANDLER_LOCK_ACK),
 			readl(atcphy->regs.pipehandler + PIPEHANDLER_AON_GEN),
@@ -4646,6 +4684,7 @@ static int atcphy_dpphy_configure(struct phy *phy, union phy_configure_opts *opt
 	struct phy_configure_opts_dp *opts = &opts_->dp;
 	struct apple_atcphy *atcphy = phy_get_drvdata(phy);
 	enum atcphy_dp_link_rate link_rate;
+	int ret;
 
 	/* No DP alternate mode: a tunnel sets its rate through its own call. */
 	if (atcphy->hw->gen == ATCPHY_GENERATION_T8132)
@@ -4682,7 +4721,18 @@ static int atcphy_dpphy_configure(struct phy *phy, union phy_configure_opts *opt
 			return -EINVAL;
 		}
 
-		return atcphy_dp_configure(atcphy, link_rate);
+		/*
+		 * An idle DCP pipeline points at its first Type-C PHY, which may be
+		 * suspended with its domain off: power it for the rate change.
+		 */
+		ret = atcphy_rpm_get(atcphy);
+		if (ret)
+			return ret;
+		scoped_guard(mutex, &atcphy->lock)
+			atcphy_restore_after_pd_off(atcphy);
+		ret = atcphy_dp_configure(atcphy, link_rate);
+		atcphy_rpm_put(atcphy);
+		return ret;
 	}
 
 	return 0;
@@ -4807,30 +4857,13 @@ int apple_atc_dp_tunnel_rate_source(struct phy *phy, unsigned int source,
 }
 EXPORT_SYMBOL_GPL(apple_atc_dp_tunnel_rate_source);
 
-int apple_atc_dp_tunnel_rate(struct phy *phy, unsigned int dpin, u8 rate)
+static int atcphy_dp_tunnel_rate(struct apple_atcphy *atcphy, unsigned int dpin, u8 rate)
 {
-	struct apple_atcphy *atcphy;
 	int ret;
 
-	if (!phy || phy->ops != &apple_atc_dp_phy_ops || dpin > 1)
-		return -EINVAL;
-	atcphy = phy_get_drvdata(phy);
-	/*
-	 * Keep each supported SoC on its qualified clock sequence. Source 0
-	 * is no T8132 source, so this refuses there: T8132 callers name theirs.
-	 */
-	if (apple_atc_tunnel_t8122_clock(atcphy))
-		return apple_atc_dp_tunnel_rate_source(phy, 0, dpin, rate);
-	if (!apple_atc_tunnel_is_t8103_style()) {
-		bool valid_core = apple_atc_t602x_core_valid(atcphy->np, atcphy->res.core->start,
-							     resource_size(atcphy->res.core));
-
-		ret = apple_atc_t602x_gate(atcphy->tunnel_dual_stream,
-					   atcphy->tunnel_routes_present, valid_core);
-		if (ret)
-			return ret;
-	}
 	guard(mutex)(&atcphy->lock);
+	if (atcphy->user_rpm)
+		atcphy_restore_after_pd_off(atcphy);
 	if (!rate) {
 		if (apple_atc_tunnel_is_t8103_style()) {
 			/*
@@ -4858,6 +4891,51 @@ int apple_atc_dp_tunnel_rate(struct phy *phy, unsigned int dpin, u8 rate)
 		rate, ret, readl(atcphy->regs.core + ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0),
 		readl(atcphy->regs.core + (atcphy->hw->gen == ATCPHY_GENERATION_T8122 ?
 					 T8122_DP_PCLK_STATUS : ACIOPHY_DP_PCLK_STAT)));
+	return ret;
+}
+
+int apple_atc_dp_tunnel_rate(struct phy *phy, unsigned int dpin, u8 rate)
+{
+	struct apple_atcphy *atcphy;
+	int ret;
+
+	if (!phy || phy->ops != &apple_atc_dp_phy_ops || dpin > 1)
+		return -EINVAL;
+	atcphy = phy_get_drvdata(phy);
+	/*
+	 * Keep each supported SoC on its qualified clock sequence. Source 0
+	 * is no T8132 source, so this refuses there: T8132 callers name theirs.
+	 */
+	if (apple_atc_tunnel_t8122_clock(atcphy))
+		return apple_atc_dp_tunnel_rate_source(phy, 0, dpin, rate);
+	if (!apple_atc_tunnel_is_t8103_style()) {
+		bool valid_core = apple_atc_t602x_core_valid(atcphy->np, atcphy->res.core->start,
+							     resource_size(atcphy->res.core));
+
+		ret = apple_atc_t602x_gate(atcphy->tunnel_dual_stream,
+					   atcphy->tunnel_routes_present, valid_core);
+		if (ret)
+			return ret;
+	}
+	/*
+	 * DCP also stops the clock of a tunnel route that never came up, on a
+	 * PHY that may be suspended with its domain off: power it for the call.
+	 * A suspended PHY runs no tunnel clock (see atcphy_rpm_busy()), so a stop
+	 * that cannot power it, late in system sleep, has nothing to stop.
+	 */
+	if (!atcphy->user_rpm)
+		return atcphy_dp_tunnel_rate(atcphy, dpin, rate);
+	ret = atcphy_rpm_get(atcphy);
+	if (ret) {
+		if (rate)
+			return ret;
+		scoped_guard(mutex, &atcphy->lock)
+			atcphy->tunnel_users &= ~BIT(dpin);
+		dev_dbg(atcphy->dev, "DP tunnel stop on a suspended PHY: %d\n", ret);
+		return 0;
+	}
+	ret = atcphy_dp_tunnel_rate(atcphy, dpin, rate);
+	atcphy_rpm_put(atcphy);
 	return ret;
 }
 EXPORT_SYMBOL_GPL(apple_atc_dp_tunnel_rate);
@@ -6334,8 +6412,19 @@ static int atcphy_pd_notify(struct notifier_block *nb, unsigned long action, voi
 {
 	struct apple_atcphy *atcphy = container_of(nb, struct apple_atcphy, pd_nb);
 
-	if (action == GENPD_NOTIFY_OFF)
-		WRITE_ONCE(atcphy->pd_was_off, true);
+	if (action != GENPD_NOTIFY_OFF)
+		return NOTIFY_OK;
+	/*
+	 * With release_on_unplug only a power-down under a suspended PHY counts:
+	 * one under an active PHY, which only system sleep can bring, is left to
+	 * atcphy_resume() as without the parameter.
+	 */
+	if (atcphy->user_rpm) {
+		if (!READ_ONCE(atcphy->rpm_suspended))
+			return NOTIFY_OK;
+		WRITE_ONCE(atcphy->pd_off_idle, true);
+	}
+	WRITE_ONCE(atcphy->pd_was_off, true);
 	return NOTIFY_OK;
 }
 
@@ -6354,7 +6443,7 @@ static bool atcphy_probe_pd_notifier(struct apple_atcphy *atcphy)
 {
 	int ret;
 
-	if (!atcphy->hw->restore_after_pd_off)
+	if (!atcphy->hw->restore_after_pd_off && !atcphy->user_rpm)
 		return false;
 
 	atcphy->pd_nb.notifier_call = atcphy_pd_notify;
@@ -6370,6 +6459,25 @@ static bool atcphy_probe_pd_notifier(struct apple_atcphy *atcphy)
 			 "Cannot follow the PM domain (%d), PHY state is not restored after it was off\n",
 			 ret);
 	return !ret;
+}
+
+/*
+ * With release_on_unplug an M1 Pro/Max Type-C PHY sets up runtime PM, forbidden
+ * until user space allows it, and the T8103 generation restore, which otherwise
+ * only runs after suspend to RAM, also runs after a runtime power-down. Not a
+ * PHY behind a fixed hub, which runs from probe on, nor one without a Type-C
+ * connector (the HDMI port's), whose DP output nothing selects through the
+ * Type-C mux.
+ */
+static bool atcphy_release_on_unplug(struct apple_atcphy *atcphy)
+{
+	struct device_node *connector __free(device_node) = NULL;
+
+	if (!release_on_unplug || atcphy->dp_only || atcphy->fixed_usb2 ||
+	    !of_device_is_compatible(atcphy->np, "apple,t6000-atcphy"))
+		return false;
+	connector = of_graph_get_remote_node(atcphy->np, 0, -1);
+	return connector;
 }
 
 /* The T8103 PHY compatible is also a fallback on unqualified M1/M2 variants. */
@@ -6430,13 +6538,16 @@ static int atcphy_probe(struct platform_device *pdev)
 	atcphy->pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY;
 	atcphy->fixed_usb2 = atcphy_usb2_behind_fixed_hub(atcphy);
 	atcphy->typec_mode = APPLE_ATCPHY_MODE_USB2;
+	atcphy->user_rpm = atcphy_release_on_unplug(atcphy);
 	followed = atcphy_probe_pd_notifier(atcphy);
+	/* Without the notifier nothing would restore the PHY: keep it as before */
+	atcphy->user_rpm &= followed;
 
 	/*
 	 * Only a PHY that follows its domain may let it drop. Before the PHYs are
 	 * created, so that they follow runtime PM too.
 	 */
-	if (atcphy->hw->idle_power_off && followed) {
+	if ((atcphy->hw->idle_power_off || atcphy->user_rpm) && followed) {
 		pm_runtime_set_autosuspend_delay(dev, ATCPHY_AUTOSUSPEND_MS);
 		pm_runtime_use_autosuspend(dev);
 		ret = devm_pm_runtime_set_active_enabled(dev);
@@ -6446,6 +6557,13 @@ static int atcphy_probe(struct platform_device *pdev)
 		if (ret)
 			return ret;
 		atcphy->idle_rpm = true;
+		/*
+		 * Forbidden runtime PM keeps the device active with a reference
+		 * of its own, as without the parameter, until user space writes
+		 * "auto" to power/control.
+		 */
+		if (atcphy->user_rpm)
+			pm_runtime_forbid(dev);
 	}
 
 	ret = atcphy_probe_finalize(atcphy);
@@ -6499,6 +6617,15 @@ static int atcphy_resume(struct device *dev)
 		dev_dbg(dev, "power domain went off across sleep under DP tunnel clocks (users %#x)\n",
 			atcphy->tunnel_users);
 	/*
+	 * Another device may have kept the domain of a suspended release_on_unplug
+	 * PHY on; suspend to RAM powered the block down all the same.
+	 */
+	if (atcphy->user_rpm && pm_runtime_status_suspended(dev) &&
+	    pm_suspend_target_state == PM_SUSPEND_MEM) {
+		WRITE_ONCE(atcphy->pd_off_idle, true);
+		WRITE_ONCE(atcphy->pd_was_off, true);
+	}
+	/*
 	 * A suspended PHY holds nothing, and its domain may drop again once system
 	 * resume completes: leave the restore to its next operation.
 	 */
@@ -6534,7 +6661,234 @@ static void atcphy_shutdown(struct platform_device *pdev)
 		dev_err(atcphy->dev, "USB3 common shutdown failed: %d\n", ret);
 }
 
-static DEFINE_SIMPLE_DEV_PM_OPS(atcphy_pm_ops, atcphy_suspend, atcphy_resume);
+/* release_on_unplug: only bookkeeping, the restore follows with the next operation */
+static int atcphy_runtime_suspend(struct device *dev)
+{
+	struct apple_atcphy *atcphy = dev_get_drvdata(dev);
+
+	if (atcphy->user_rpm) {
+		WRITE_ONCE(atcphy->rpm_suspended, true);
+		dev_dbg(dev, "runtime suspend\n");
+	}
+	return 0;
+}
+
+static int atcphy_runtime_resume(struct device *dev)
+{
+	struct apple_atcphy *atcphy = dev_get_drvdata(dev);
+
+	if (atcphy->user_rpm) {
+		WRITE_ONCE(atcphy->rpm_suspended, false);
+		dev_dbg(dev, "runtime resume, power domain %s\n",
+			READ_ONCE(atcphy->pd_was_off) ? "was off" : "stayed on");
+	}
+	return 0;
+}
+
+static const struct dev_pm_ops atcphy_pm_ops = {
+	SYSTEM_SLEEP_PM_OPS(atcphy_suspend, atcphy_resume)
+	RUNTIME_PM_OPS(atcphy_runtime_suspend, atcphy_runtime_resume, NULL)
+};
+
+/*
+ * Experimental, release_on_unplug only: the domain of a Type-C PHY (atcN_usb on
+ * M1 Pro/Max) has the port's common domain as a parent, which the power state
+ * table marks always-on, and so is the PCIe domain below it, whose consumers are
+ * the USB4 controller and, once a tunnel was set up, its PCIe host. Writing 1 to
+ * idle_parents clears the always-on flag of both, found by name through the
+ * domain links, and asks genpd to power them off: the PCIe domain right away if
+ * all its devices are suspended, the common domain once the port's USB domain is
+ * off too. There is no way back but a reboot.
+ */
+static bool atcphy_genpd_name_ends(const struct generic_pm_domain *genpd, const char *suffix)
+{
+	size_t n = strlen(genpd->name), s = strlen(suffix);
+
+	return n >= s && !strcmp(genpd->name + n - s, suffix);
+}
+
+/* The PMGR domains have IRQ-safe (spinlock) locks, the only kind handled here */
+static bool atcphy_genpd_spinlocked(const struct generic_pm_domain *genpd)
+{
+	return (genpd->flags & GENPD_FLAG_IRQ_SAFE) && !(genpd->flags & GENPD_FLAG_CPU_DOMAIN);
+}
+
+/* The one parent (@up) or child of @genpd whose name ends in @suffix */
+static struct generic_pm_domain *atcphy_genpd_relative(struct generic_pm_domain *genpd,
+						       bool up, const char *suffix)
+{
+	struct generic_pm_domain *found = NULL, *other;
+	struct gpd_link *link;
+	unsigned long flags;
+	unsigned int n = 0;
+
+	spin_lock_irqsave(&genpd->slock, flags);
+	if (up) {
+		list_for_each_entry(link, &genpd->child_links, child_node) {
+			other = link->parent;
+			if (atcphy_genpd_name_ends(other, suffix) && !n++)
+				found = other;
+		}
+	} else {
+		list_for_each_entry(link, &genpd->parent_links, parent_node) {
+			other = link->child;
+			if (atcphy_genpd_name_ends(other, suffix) && !n++)
+				found = other;
+		}
+	}
+	spin_unlock_irqrestore(&genpd->slock, flags);
+
+	if (n != 1 || !atcphy_genpd_spinlocked(found))
+		return NULL;
+	return found;
+}
+
+/*
+ * The PHY's own domain: the notifier registration (user_rpm requires it)
+ * proved that dev->pm_domain is a genpd.
+ */
+static int atcphy_idle_parents_find(struct apple_atcphy *atcphy,
+				    struct generic_pm_domain **common,
+				    struct generic_pm_domain **pcie)
+{
+	struct generic_pm_domain *usb;
+
+	if (!atcphy->user_rpm || !atcphy->dev->pm_domain)
+		return -ENODEV;
+	usb = pd_to_genpd(atcphy->dev->pm_domain);
+	if (!atcphy_genpd_spinlocked(usb))
+		return -EOPNOTSUPP;
+	*common = atcphy_genpd_relative(usb, true, "_common");
+	*pcie = *common ? atcphy_genpd_relative(*common, false, "_pcie") : NULL;
+	if (!*common || !*pcie)
+		return -ENODEV;
+	return 0;
+}
+
+static int atcphy_idle_parent_show(char *buf, int len, struct generic_pm_domain *genpd)
+{
+	bool always_on, stay_on, on;
+	unsigned long flags;
+
+	spin_lock_irqsave(&genpd->slock, flags);
+	always_on = genpd->flags & GENPD_FLAG_ALWAYS_ON;
+	stay_on = genpd->stay_on;
+	on = genpd->status == GENPD_STATE_ON;
+	spin_unlock_irqrestore(&genpd->slock, flags);
+
+	return sysfs_emit_at(buf, len, "%s %s always_on=%d stay_on=%d\n", genpd->name,
+			     on ? "on" : "off", always_on, stay_on);
+}
+
+static ssize_t idle_parents_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct apple_atcphy *atcphy = dev_get_drvdata(dev);
+	struct generic_pm_domain *common, *pcie;
+	int ret, len = 0;
+
+	ret = atcphy_idle_parents_find(atcphy, &common, &pcie);
+	if (ret)
+		return ret;
+	len += atcphy_idle_parent_show(buf, len, common);
+	len += atcphy_idle_parent_show(buf, len, pcie);
+	return len;
+}
+
+/* Whether every device of @genpd is runtime-suspended (a bound PCIe host is not) */
+static bool atcphy_genpd_devices_idle(struct generic_pm_domain *genpd, const char **busy)
+{
+	struct pm_domain_data *pdd;
+	unsigned long flags;
+	bool idle = true;
+
+	spin_lock_irqsave(&genpd->slock, flags);
+	list_for_each_entry(pdd, &genpd->dev_list, list_node) {
+		if (!pm_runtime_suspended(pdd->dev)) {
+			*busy = dev_name(pdd->dev);
+			idle = false;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&genpd->slock, flags);
+	return idle;
+}
+
+static void atcphy_genpd_clear_always_on(struct apple_atcphy *atcphy,
+					 struct generic_pm_domain *genpd)
+{
+	unsigned long flags;
+	bool stay_on;
+
+	spin_lock_irqsave(&genpd->slock, flags);
+	genpd->flags &= ~GENPD_FLAG_ALWAYS_ON;
+	stay_on = genpd->stay_on;
+	spin_unlock_irqrestore(&genpd->slock, flags);
+	dev_dbg(atcphy->dev, "idle_parents: %s is no longer always-on (stay_on %d)\n",
+		genpd->name, stay_on);
+}
+
+static ssize_t idle_parents_store(struct device *dev, struct device_attribute *attr,
+				  const char *buf, size_t count)
+{
+	struct apple_atcphy *atcphy = dev_get_drvdata(dev);
+	struct generic_pm_domain *common, *pcie;
+	const char *busy = NULL;
+	bool val;
+	int ret;
+
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+	ret = kstrtobool(buf, &val);
+	if (ret)
+		return ret;
+	if (!val)
+		return -EINVAL;
+	ret = atcphy_idle_parents_find(atcphy, &common, &pcie);
+	if (ret)
+		return ret;
+	if (!common->has_provider || !pcie->has_provider ||
+	    !is_of_node(common->provider) || !is_of_node(pcie->provider))
+		return -EOPNOTSUPP;
+	/* A PCIe host bound after a USB4 tunnel, or a running tunnel, needs it */
+	if (!atcphy_genpd_devices_idle(pcie, &busy)) {
+		dev_info(dev, "idle_parents: %s is in use by %s, left as it is\n",
+			 pcie->name, busy);
+		return -EBUSY;
+	}
+
+	atcphy_genpd_clear_always_on(atcphy, common);
+	atcphy_genpd_clear_always_on(atcphy, pcie);
+	/*
+	 * Also ends the boot-time stay-on of each, and tries the power-off now;
+	 * the common domain then follows whenever its last child goes off.
+	 */
+	of_genpd_sync_state(to_of_node(pcie->provider));
+	of_genpd_sync_state(to_of_node(common->provider));
+	dev_info(dev, "idle_parents: %s now %s, %s now %s\n", pcie->name,
+		 pcie->status == GENPD_STATE_ON ? "on" : "off", common->name,
+		 common->status == GENPD_STATE_ON ? "on" : "off");
+	return count;
+}
+
+static DEVICE_ATTR_ADMIN_RW(idle_parents);
+
+static struct attribute *atcphy_attrs[] = {
+	&dev_attr_idle_parents.attr,
+	NULL,
+};
+
+static umode_t atcphy_attr_visible(struct kobject *kobj, struct attribute *attr, int n)
+{
+	struct apple_atcphy *atcphy = dev_get_drvdata(kobj_to_dev(kobj));
+
+	return atcphy && atcphy->user_rpm ? attr->mode : 0;
+}
+
+static const struct attribute_group atcphy_group = {
+	.attrs = atcphy_attrs,
+	.is_visible = atcphy_attr_visible,
+};
+__ATTRIBUTE_GROUPS(atcphy);
 
 static const struct atcphy_hw atcphy_hw_t8103 = {
 	.gen = ATCPHY_GENERATION_T8103,
@@ -6607,7 +6961,8 @@ static struct platform_driver atcphy_driver = {
 	.driver = {
 		.name = "phy-apple-atc",
 		.of_match_table = atcphy_match,
-		.pm = pm_sleep_ptr(&atcphy_pm_ops),
+		.pm = pm_ptr(&atcphy_pm_ops),
+		.dev_groups = atcphy_groups,
 	},
 	.probe = atcphy_probe,
 	.shutdown = atcphy_shutdown,
