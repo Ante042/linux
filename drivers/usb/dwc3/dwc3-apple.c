@@ -146,6 +146,8 @@ MODULE_PARM_DESC(release_on_unplug,
  * @pre_core_rpm: Runtime PM is the glue's own until the first core bring-up
  * @user_rpm: release_on_unplug: runtime PM is forbidden at probe and stays as user space sets
  *	      it in power/control, also across the first core probe
+ * @user_armed: release_on_unplug: user space had allowed runtime PM (power/control "auto") when
+ *		the last core probe attempt started; the glue restores that choice afterwards
  * @dt_dis_u3_susphy: The device tree keeps USB3 PHY suspend off itself
  * @drd_regs: The controller's optional blocks outside dwc3-core (drd-cfg, drd-bulk, drd-ausbc),
  *	      mapped for their tunables
@@ -192,6 +194,7 @@ struct dwc3_apple {
 	bool rpm_held;
 	bool pre_core_rpm;
 	bool user_rpm;
+	bool user_armed;
 	bool dt_dis_u3_susphy;
 
 	void __iomem *drd_regs[DWC3_APPLE_NR_DRD_REGS];
@@ -440,15 +443,17 @@ static int dwc3_apple_core_probe(struct dwc3_apple *appledwc, enum dwc3_apple_st
 		return -ENOMEM;
 
 	/*
-	 * dwc3_core_probe() forbids runtime PM; with release_on_unplug, allow it
-	 * again afterwards only if user space had allowed it.
+	 * dwc3_core_probe() forbids runtime PM, and a failed one allows it on its
+	 * way out. Outside of it, power/control is user space's alone: forbidden
+	 * at glue probe and put back below after a failed attempt. So with
+	 * release_on_unplug, take the user's choice here, before the attempt.
 	 */
-	allow = appledwc->idle_rpm;
 	if (appledwc->user_rpm) {
 		spin_lock_irq(&appledwc->dev->power.lock);
-		allow = appledwc->dev->power.runtime_auto;
+		appledwc->user_armed = appledwc->dev->power.runtime_auto;
 		spin_unlock_irq(&appledwc->dev->power.lock);
 	}
+	allow = appledwc->user_rpm ? appledwc->user_armed : appledwc->idle_rpm;
 
 	ret = dwc3_core_probe(&probe_data);
 	/* The glue remains bound even when a first core attempt unwinds. */
@@ -461,6 +466,12 @@ static int dwc3_apple_core_probe(struct dwc3_apple *appledwc, enum dwc3_apple_st
 		 * on the first attempt.
 		 */
 		memset(&appledwc->dwc, 0, sizeof(appledwc->dwc));
+		/*
+		 * Undo the core's pm_runtime_allow() unless user space had armed
+		 * the controller, so that the retry finds its choice in place.
+		 */
+		if (appledwc->user_rpm && !appledwc->user_armed)
+			pm_runtime_forbid(appledwc->dev);
 		return ret;
 	}
 	devres_remove_group(appledwc->dev, group);
