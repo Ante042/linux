@@ -6743,6 +6743,26 @@ static struct generic_pm_domain *atcphy_genpd_relative(struct generic_pm_domain 
 	return found;
 }
 
+/* Whether the power-domains of @child's provider node list @parent's */
+static bool atcphy_genpd_dt_parent(const struct generic_pm_domain *child,
+				   const struct generic_pm_domain *parent)
+{
+	struct of_phandle_iterator it;
+	int err;
+
+	if (!child->has_provider || !parent->has_provider ||
+	    !is_of_node(child->provider) || !is_of_node(parent->provider))
+		return false;
+	of_for_each_phandle(&it, err, to_of_node(child->provider), "power-domains",
+			    "#power-domain-cells", 0) {
+		if (it.node == to_of_node(parent->provider)) {
+			of_node_put(it.node);
+			return true;
+		}
+	}
+	return false;
+}
+
 /*
  * The PHY's own domain: the notifier registration (user_rpm requires it)
  * proved that dev->pm_domain is a genpd.
@@ -6761,6 +6781,9 @@ static int atcphy_idle_parents_find(struct apple_atcphy *atcphy,
 	*common = atcphy_genpd_relative(usb, true, "_common");
 	*pcie = *common ? atcphy_genpd_relative(*common, false, "_pcie") : NULL;
 	if (!*common || !*pcie)
+		return -ENODEV;
+	/* The names only pick the domains: the device tree must link them the same way */
+	if (!atcphy_genpd_dt_parent(usb, *common) || !atcphy_genpd_dt_parent(*pcie, *common))
 		return -ENODEV;
 	return 0;
 }
@@ -6794,8 +6817,11 @@ static ssize_t idle_parents_show(struct device *dev, struct device_attribute *at
 	return len;
 }
 
-/* Whether every device of @genpd is runtime-suspended (a bound PCIe host is not) */
-static bool atcphy_genpd_devices_idle(struct generic_pm_domain *genpd, const char **busy)
+/*
+ * Whether every device of @genpd is runtime-suspended (a bound PCIe host is not);
+ * otherwise the name of the first busy one goes into @busy.
+ */
+static bool atcphy_genpd_devices_idle(struct generic_pm_domain *genpd, char *busy, size_t len)
 {
 	struct pm_domain_data *pdd;
 	unsigned long flags;
@@ -6804,7 +6830,7 @@ static bool atcphy_genpd_devices_idle(struct generic_pm_domain *genpd, const cha
 	spin_lock_irqsave(&genpd->slock, flags);
 	list_for_each_entry(pdd, &genpd->dev_list, list_node) {
 		if (!pm_runtime_suspended(pdd->dev)) {
-			*busy = dev_name(pdd->dev);
+			strscpy(busy, dev_name(pdd->dev), len);
 			idle = false;
 			break;
 		}
@@ -6832,7 +6858,7 @@ static ssize_t idle_parents_store(struct device *dev, struct device_attribute *a
 {
 	struct apple_atcphy *atcphy = dev_get_drvdata(dev);
 	struct generic_pm_domain *common, *pcie;
-	const char *busy = NULL;
+	char busy[64];
 	bool val;
 	int ret;
 
@@ -6850,7 +6876,7 @@ static ssize_t idle_parents_store(struct device *dev, struct device_attribute *a
 	    !is_of_node(common->provider) || !is_of_node(pcie->provider))
 		return -EOPNOTSUPP;
 	/* A PCIe host bound after a USB4 tunnel, or a running tunnel, needs it */
-	if (!atcphy_genpd_devices_idle(pcie, &busy)) {
+	if (!atcphy_genpd_devices_idle(pcie, busy, sizeof(busy))) {
 		dev_info(dev, "idle_parents: %s is in use by %s, left as it is\n",
 			 pcie->name, busy);
 		return -EBUSY;
