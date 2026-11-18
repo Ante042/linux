@@ -28,6 +28,11 @@
 #include "glue.h"
 #include "io.h"
 
+static bool release_on_unplug;
+module_param(release_on_unplug, bool, 0444);
+MODULE_PARM_DESC(release_on_unplug,
+		 "M1 Pro/Max: set up runtime PM on the Type-C USB controllers, forbidden until user space writes \"auto\" to power/control; a controller without a running core then runtime-suspends with its DARTs, so that its power domain can switch off (default: N)");
+
 /*
  * This platform requires a very specific sequence of operations to bring up dwc3 and its USB3 PHY:
  *
@@ -139,6 +144,8 @@
  * @idle_rpm: Let the controller runtime-suspend while the core is down
  * @rpm_held: The glue holds a runtime PM reference for the running core
  * @pre_core_rpm: Runtime PM is the glue's own until the first core bring-up
+ * @user_rpm: release_on_unplug: runtime PM is forbidden at probe and stays as user space sets
+ *	      it in power/control, also across the first core probe
  * @dt_dis_u3_susphy: The device tree keeps USB3 PHY suspend off itself
  * @drd_regs: The controller's optional blocks outside dwc3-core (drd-cfg, drd-bulk, drd-ausbc),
  *	      mapped for their tunables
@@ -184,6 +191,7 @@ struct dwc3_apple {
 	bool idle_rpm;
 	bool rpm_held;
 	bool pre_core_rpm;
+	bool user_rpm;
 	bool dt_dis_u3_susphy;
 
 	void __iomem *drd_regs[DWC3_APPLE_NR_DRD_REGS];
@@ -398,6 +406,7 @@ static int dwc3_apple_core_probe(struct dwc3_apple *appledwc, enum dwc3_apple_st
 {
 	struct dwc3_probe_data probe_data = {};
 	void *group;
+	bool allow;
 	int ret;
 
 	lockdep_assert_held(&appledwc->lock);
@@ -430,6 +439,17 @@ static int dwc3_apple_core_probe(struct dwc3_apple *appledwc, enum dwc3_apple_st
 	if (!group)
 		return -ENOMEM;
 
+	/*
+	 * dwc3_core_probe() forbids runtime PM; with release_on_unplug, allow it
+	 * again afterwards only if user space had allowed it.
+	 */
+	allow = appledwc->idle_rpm;
+	if (appledwc->user_rpm) {
+		spin_lock_irq(&appledwc->dev->power.lock);
+		allow = appledwc->dev->power.runtime_auto;
+		spin_unlock_irq(&appledwc->dev->power.lock);
+	}
+
 	ret = dwc3_core_probe(&probe_data);
 	/* The glue remains bound even when a first core attempt unwinds. */
 	dev_set_drvdata(appledwc->dev, &appledwc->dwc);
@@ -453,7 +473,7 @@ static int dwc3_apple_core_probe(struct dwc3_apple *appledwc, enum dwc3_apple_st
 	 */
 	pm_runtime_get_noresume(appledwc->dev);
 	appledwc->rpm_held = true;
-	if (appledwc->idle_rpm)
+	if (allow)
 		pm_runtime_allow(appledwc->dev);
 
 	appledwc->state = DWC3_APPLE_NO_CABLE;
@@ -1077,8 +1097,28 @@ static int dwc3_apple_prepare(struct device *dev)
 	return dwc3_apple_exit(appledwc);
 }
 
+/* release_on_unplug: the core and glue state come back with the next core start */
+static int dwc3_apple_runtime_suspend(struct device *dev)
+{
+	struct dwc3 *dwc = dev_get_drvdata(dev);
+
+	if (dwc && to_dwc3_apple(dwc)->user_rpm)
+		dev_dbg(dev, "runtime suspend\n");
+	return 0;
+}
+
+static int dwc3_apple_runtime_resume(struct device *dev)
+{
+	struct dwc3 *dwc = dev_get_drvdata(dev);
+
+	if (dwc && to_dwc3_apple(dwc)->user_rpm)
+		dev_dbg(dev, "runtime resume\n");
+	return 0;
+}
+
 static const struct dev_pm_ops dwc3_apple_pm_ops = {
 	.prepare = pm_sleep_ptr(dwc3_apple_prepare),
+	RUNTIME_PM_OPS(dwc3_apple_runtime_suspend, dwc3_apple_runtime_resume, NULL)
 };
 
 static int dwc3_apple_setup_role_switch(struct dwc3_apple *appledwc)
@@ -1195,10 +1235,23 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 	 */
 	if (appledwc->idle_rpm && !appledwc->fixed_hub &&
 	    (of_device_is_compatible(dev->of_node, "apple,t8132-dwc3") ||
-	     of_machine_is_compatible("apple,t6041"))) {
+	     of_machine_is_compatible("apple,t6041")))
+		appledwc->pre_core_rpm = true;
+	/*
+	 * With release_on_unplug an M1 Pro/Max Type-C controller does the same, but
+	 * forbidden, with a reference of its own as without the parameter, until
+	 * user space writes "auto" to power/control. It then also runtime-suspends
+	 * each time the core goes down, after the core's autosuspend delay.
+	 */
+	appledwc->user_rpm = release_on_unplug && !appledwc->fixed_hub &&
+			     of_device_is_compatible(dev->of_node, "apple,t6000-dwc3");
+	if (appledwc->user_rpm)
+		appledwc->pre_core_rpm = true;
+	if (appledwc->pre_core_rpm) {
 		pm_runtime_set_active(dev);
 		pm_runtime_enable(dev);
-		appledwc->pre_core_rpm = true;
+		if (appledwc->user_rpm)
+			pm_runtime_forbid(dev);
 	}
 	ret = dwc3_apple_setup_role_switch(appledwc);
 	if (ret) {
