@@ -20,10 +20,16 @@
 #include <linux/mux/driver.h>
 #include <linux/of.h>
 #include <linux/of_device.h>
+#include <linux/of_graph.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/soc/apple/dp-tunnel.h>
 #include <linux/suspend.h>
+
+static bool release_on_unplug;
+module_param(release_on_unplug, bool, 0444);
+MODULE_PARM_DESC(release_on_unplug,
+		 "M1 Pro/Max: set up runtime PM on the crossbars of the Type-C ports, forbidden until user space writes \"auto\" to power/control; a crossbar without a selected output then runtime-suspends, so that its ATC power domain can switch off (default: N)");
 
 /*
  * T602x register interface is cleary different so most of the names below are
@@ -121,8 +127,10 @@ struct apple_dpxbar {
 	int selected_dispext[T8142_MUX_MAX];
 	/* T6030 programs all its outputs itself, see apple_dpxbar_t6030_link() */
 	bool t6030_dpin;
-	/* outputs holding a runtime PM reference (runtime_pm crossbars) */
+	/* outputs holding a runtime PM reference (runtime_pm crossbars, user_rpm) */
 	unsigned long rpm_held;
+	/* release_on_unplug: runtime PM as for runtime_pm, forbidden at probe */
+	bool user_rpm;
 	bool tunnel_link_up[MUX_MAX];
 	u8 pclk[T8142_MUX_MAX];
 	bool uhbr[T8142_MUX_MAX];
@@ -551,7 +559,7 @@ static bool apple_dpxbar_cycle_slip(struct apple_dpxbar *dpxbar, unsigned int in
 	return index == MUX_DPPHY || !dpxbar->hw->dpin_no_cycle_slip;
 }
 
-static int apple_dpxbar_set(struct mux_control *mux, int state)
+static int apple_dpxbar_route(struct mux_control *mux, int state, bool quiet)
 {
 	struct apple_dpxbar *dpxbar = mux_chip_priv(mux->chip);
 	unsigned int index = mux_control_get_index(mux);
@@ -680,7 +688,9 @@ static int apple_dpxbar_set(struct mux_control *mux, int state)
 
 	spin_unlock_irqrestore(&dpxbar->lock, flags);
 
-	if (enable)
+	if (quiet)
+		dev_dbg(dpxbar->dev, "%s: route %d restored\n", apple_dpxbar_names[index], state);
+	else if (enable)
 		dev_info(dpxbar->dev, "Switched %s to dispext%u,%u\n",
 			 apple_dpxbar_names[index], mux_state >> 1,
 			 mux_state & 1);
@@ -688,6 +698,71 @@ static int apple_dpxbar_set(struct mux_control *mux, int state)
 		dev_info(dpxbar->dev, "Switched %s to disconnected state\n",
 			 apple_dpxbar_names[index]);
 
+	return ret;
+}
+
+/*
+ * Power a release_on_unplug crossbar for an access outside a selection, which
+ * holds its own reference. A disconnect needs nothing from a suspended crossbar,
+ * which has nothing routed, also when runtime PM cannot power it late in system
+ * sleep: then 1, and the caller skips the access.
+ */
+static int apple_dpxbar_get(struct apple_dpxbar *dpxbar, int state)
+{
+	int ret;
+
+	if (!dpxbar->user_rpm)
+		return 0;
+	ret = pm_runtime_resume_and_get(dpxbar->dev);
+	if (ret && state < 0 && pm_runtime_status_suspended(dpxbar->dev)) {
+		dev_dbg(dpxbar->dev, "disconnect while suspended: %d\n", ret);
+		return 1;
+	}
+	return ret;
+}
+
+static void apple_dpxbar_put(struct apple_dpxbar *dpxbar)
+{
+	if (dpxbar->user_rpm)
+		pm_runtime_put(dpxbar->dev);
+}
+
+/*
+ * A release_on_unplug (T6000) crossbar shares its Type-C port's ATC domain: as
+ * on a runtime_pm crossbar, an output holds a runtime PM reference while it is
+ * selected. The mux core serialises the calls for one output.
+ */
+static int apple_dpxbar_set(struct mux_control *mux, int state)
+{
+	struct apple_dpxbar *dpxbar = mux_chip_priv(mux->chip);
+	unsigned int index = mux_control_get_index(mux);
+	int ret;
+
+	if (!dpxbar->user_rpm)
+		return apple_dpxbar_route(mux, state, false);
+	if (index >= MUX_MAX)
+		return -EINVAL;
+
+	if (test_bit(index, &dpxbar->rpm_held)) {
+		ret = 0;
+	} else if (state >= 0) {
+		ret = pm_runtime_resume_and_get(dpxbar->dev);
+		if (ret)
+			return ret;
+		set_bit(index, &dpxbar->rpm_held);
+	} else {
+		/* A disconnect of an output that holds nothing */
+		ret = apple_dpxbar_get(dpxbar, state);
+		if (ret)
+			return ret < 0 ? ret : 0;
+		ret = apple_dpxbar_route(mux, state, false);
+		apple_dpxbar_put(dpxbar);
+		return ret;
+	}
+	ret = apple_dpxbar_route(mux, state, false);
+	if (dpxbar->selected_dispext[index] < 0 &&
+	    test_and_clear_bit(index, &dpxbar->rpm_held))
+		pm_runtime_put(dpxbar->dev);
 	return ret;
 }
 
@@ -831,6 +906,11 @@ int apple_dpxbar_preselect(struct mux_control *mux, int state)
 		return -EOPNOTSUPP;
 	}
 
+	/* DCP also preselects on a crossbar that no selection holds */
+	ret = apple_dpxbar_get(dpxbar, state);
+	if (ret)
+		return ret < 0 ? ret : 0;
+
 	spin_lock_irqsave(&dpxbar->lock, flags);
 	/* a selected output already points at its source */
 	if (dpxbar->selected_dispext[index] >= 0)
@@ -838,12 +918,11 @@ int apple_dpxbar_preselect(struct mux_control *mux, int state)
 	else
 		dpxbar_mask32(dpxbar, CROSSBAR_MUX_CTRL, mask, set);
 	spin_unlock_irqrestore(&dpxbar->lock, flags);
-	if (ret)
-		return ret;
-
-	dev_dbg(dpxbar->dev, "%s: source preselected, MUX_CTRL=%08x\n",
-		apple_dpxbar_names[index], readl(dpxbar->regs + CROSSBAR_MUX_CTRL));
-	return 0;
+	if (!ret)
+		dev_dbg(dpxbar->dev, "%s: source preselected, MUX_CTRL=%08x\n",
+			apple_dpxbar_names[index], readl(dpxbar->regs + CROSSBAR_MUX_CTRL));
+	apple_dpxbar_put(dpxbar);
+	return ret;
 }
 EXPORT_SYMBOL_GPL(apple_dpxbar_preselect);
 
@@ -1296,6 +1375,33 @@ static int apple_dpxbar_domains(struct device *dev)
 	return 0;
 }
 
+/*
+ * The crossbar of a Type-C port shares its power domain with that port's PHY, a
+ * mode switch with a connector on its graph port 0. The HDMI port's PHY has none.
+ */
+static bool apple_dpxbar_typec_port(struct device_node *np)
+{
+	struct device_node *pd __free(device_node) = of_parse_phandle(np, "power-domains", 0);
+	struct device_node *phy;
+
+	if (!pd)
+		return false;
+	for_each_node_with_property(phy, "mode-switch") {
+		struct device_node *phy_pd __free(device_node) =
+			of_parse_phandle(phy, "power-domains", 0);
+		struct device_node *connector __free(device_node) = NULL;
+
+		if (phy_pd != pd)
+			continue;
+		connector = of_graph_get_remote_node(phy, 0, -1);
+		if (connector) {
+			of_node_put(phy);
+			return true;
+		}
+	}
+	return false;
+}
+
 static int apple_dpxbar_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -1334,6 +1440,21 @@ static int apple_dpxbar_probe(struct platform_device *pdev)
 		ret = devm_pm_runtime_enable(dev);
 		if (ret)
 			return ret;
+	}
+	dpxbar->user_rpm = release_on_unplug &&
+			   of_device_is_compatible(dev->of_node, "apple,t6000-display-crossbar") &&
+			   apple_dpxbar_typec_port(dev->of_node);
+	if (dpxbar->user_rpm) {
+		/*
+		 * Active for probe and the mux registration, which write registers,
+		 * and forbidden, as without the parameter, until user space writes
+		 * "auto" to power/control.
+		 */
+		pm_runtime_set_active(dev);
+		ret = devm_pm_runtime_enable(dev);
+		if (ret)
+			return ret;
+		pm_runtime_forbid(dev);
 	}
 
 	if (hw->ops == &apple_dpxbar_ops && !hw->no_tunable &&
@@ -1376,6 +1497,9 @@ static int apple_dpxbar_resume(struct device *dev)
 
 	if (!xbar)
 		return 0;
+	/* A suspended one is restored when it is powered again */
+	if (xbar->user_rpm && pm_runtime_status_suspended(dev))
+		return 0;
 
 	/* Suspend-to-RAM powers the block down without the PM domain knowing */
 	if (pm_suspend_target_state == PM_SUSPEND_MEM && !xbar->hw->no_tunable &&
@@ -1394,7 +1518,7 @@ static int apple_dpxbar_resume(struct device *dev)
 			dispext = readl(xbar->regs + CROSSBAR_DISPEXT_EN);
 			dev_dbg(dev, "s2r: %s on %d: mux %08x atc %08x dispext %08x\n",
 				apple_dpxbar_names[i], state, mux, atc, dispext);
-			apple_dpxbar_set(&xbar->chip->mux[i], state);
+			apple_dpxbar_route(&xbar->chip->mux[i], state, false);
 		}
 	}
 
@@ -1429,7 +1553,49 @@ static int apple_dpxbar_resume(struct device *dev)
 	return 0;
 }
 
-static DEFINE_SIMPLE_DEV_PM_OPS(apple_dpxbar_pm_ops, NULL, apple_dpxbar_resume);
+/*
+ * release_on_unplug: the ATC domain resets the crossbar when it goes off, which
+ * shows in UNK_TUNABLE. Then write it again and put every output back in the
+ * state the mux core holds for it, as the probe and mux registration left them.
+ */
+static int apple_dpxbar_runtime_resume(struct device *dev)
+{
+	struct apple_dpxbar *xbar = dev_get_drvdata(dev);
+	unsigned int i;
+	u32 tunable;
+
+	if (!xbar || !xbar->user_rpm)
+		return 0;
+	tunable = readl(xbar->regs + UNK_TUNABLE);
+	if (tunable == xbar->hw->tunable) {
+		dev_dbg(dev, "runtime resume, state kept\n");
+		return 0;
+	}
+	writel(xbar->hw->tunable, xbar->regs + UNK_TUNABLE);
+	for (i = 0; i < MUX_MAX; i++) {
+		int state = xbar->selected_dispext[i];
+
+		apple_dpxbar_route(&xbar->chip->mux[i], state < 0 ? MUX_IDLE_DISCONNECT : state,
+				   true);
+	}
+	dev_dbg(dev, "runtime resume after power loss: UNK_TUNABLE %08x -> %08x\n", tunable,
+		readl(xbar->regs + UNK_TUNABLE));
+	return 0;
+}
+
+static int apple_dpxbar_runtime_suspend(struct device *dev)
+{
+	struct apple_dpxbar *xbar = dev_get_drvdata(dev);
+
+	if (xbar && xbar->user_rpm)
+		dev_dbg(dev, "runtime suspend\n");
+	return 0;
+}
+
+static const struct dev_pm_ops apple_dpxbar_pm_ops = {
+	SYSTEM_SLEEP_PM_OPS(NULL, apple_dpxbar_resume)
+	RUNTIME_PM_OPS(apple_dpxbar_runtime_suspend, apple_dpxbar_runtime_resume, NULL)
+};
 
 static const struct apple_dpxbar_hw apple_dpxbar_hw_t8103 = {
 	.n_mux = MUX_MAX,
@@ -1540,7 +1706,7 @@ static struct platform_driver apple_dpxbar_driver = {
 	.driver = {
 		.name = "apple-display-crossbar",
 		.of_match_table	= apple_dpxbar_ids,
-		.pm = pm_sleep_ptr(&apple_dpxbar_pm_ops),
+		.pm = pm_ptr(&apple_dpxbar_pm_ops),
 	},
 	.probe = apple_dpxbar_probe,
 };
