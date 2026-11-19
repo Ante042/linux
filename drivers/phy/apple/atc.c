@@ -810,6 +810,9 @@ enum atcphy_t8132_cio_tunable {
  * @pd_off_work: Retries the power-off of a domain left on under a suspended
  *               PHY (@user_rpm only), see atcphy_pd_off_work()
  * @pd_off_tries: Retries done since the last runtime suspend of the PHY
+ * @idle_common_cleared: idle_parents cleared an always-on flag of the common
+ *                       domain that was set; 0 sets it again
+ * @idle_pcie_cleared: The same for the PCIe domain
  * @regs: Memory-mapped registers
  * @regs.core: Core registers
  * @regs.axi2af: AXI to Apple Fabric interface registers
@@ -901,6 +904,8 @@ struct apple_atcphy {
 	bool pd_off_idle;
 	struct delayed_work pd_off_work;
 	unsigned int pd_off_tries;
+	bool idle_common_cleared;
+	bool idle_pcie_cleared;
 
 	bool tunnel_dual_stream;
 	bool tunnel_routes_present;
@@ -6772,8 +6777,11 @@ static const struct dev_pm_ops atcphy_pm_ops = {
  * idle_parents clears the always-on flag of both, found by name through the
  * domain links, and asks genpd to power them off: the PCIe domain right away if
  * all its devices are suspended, the common domain once the port's USB domain is
- * off too. There is no way back but a reboot.
+ * off too. Writing 0 sets the flag again where a 1 of this PHY cleared it and
+ * powers both domains on again, as they are at boot.
  */
+static DEFINE_MUTEX(atcphy_idle_parents_lock);
+
 static bool atcphy_genpd_name_ends(const struct generic_pm_domain *genpd, const char *suffix)
 {
 	size_t n = strlen(genpd->name), s = strlen(suffix);
@@ -6913,18 +6921,135 @@ static bool atcphy_genpd_devices_idle(struct generic_pm_domain *genpd, char *bus
 	return idle;
 }
 
-static void atcphy_genpd_clear_always_on(struct apple_atcphy *atcphy,
+/* Returns whether the flag was set */
+static bool atcphy_genpd_clear_always_on(struct apple_atcphy *atcphy,
 					 struct generic_pm_domain *genpd)
 {
 	unsigned long flags;
-	bool stay_on;
+	bool stay_on, was;
 
 	spin_lock_irqsave(&genpd->slock, flags);
+	was = genpd->flags & GENPD_FLAG_ALWAYS_ON;
 	genpd->flags &= ~GENPD_FLAG_ALWAYS_ON;
 	stay_on = genpd->stay_on;
 	spin_unlock_irqrestore(&genpd->slock, flags);
 	dev_dbg(atcphy->dev, "idle_parents: %s is no longer always-on (stay_on %d)\n",
 		genpd->name, stay_on);
+	return was;
+}
+
+static void atcphy_genpd_set_always_on(struct apple_atcphy *atcphy,
+				       struct generic_pm_domain *genpd)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&genpd->slock, flags);
+	genpd->flags |= GENPD_FLAG_ALWAYS_ON;
+	spin_unlock_irqrestore(&genpd->slock, flags);
+	dev_dbg(atcphy->dev, "idle_parents: %s is always-on again\n", genpd->name);
+}
+
+static bool atcphy_genpd_is_on(struct generic_pm_domain *genpd)
+{
+	unsigned long flags;
+	bool on;
+
+	spin_lock_irqsave(&genpd->slock, flags);
+	on = genpd->status == GENPD_STATE_ON;
+	spin_unlock_irqrestore(&genpd->slock, flags);
+	return on;
+}
+
+/*
+ * A device of @genpd (with a reference) to power it through runtime PM: one
+ * without a driver if there is one, such as the virtual device genpd creates
+ * for a consumer with several domains, whose runtime PM genpd enabled itself.
+ */
+static struct device *atcphy_genpd_get_device(struct generic_pm_domain *genpd)
+{
+	struct device *found = NULL;
+	struct pm_domain_data *pdd;
+	unsigned long flags;
+
+	spin_lock_irqsave(&genpd->slock, flags);
+	list_for_each_entry(pdd, &genpd->dev_list, list_node) {
+		if (!found || !pdd->dev->driver)
+			found = pdd->dev;
+		if (!found->driver)
+			break;
+	}
+	if (found)
+		get_device(found);
+	spin_unlock_irqrestore(&genpd->slock, flags);
+	return found;
+}
+
+/*
+ * idle_parents 0: the flags first, so that no suspend after the power-on can
+ * switch the domains off again. An off PCIe domain comes back through a device
+ * of its own, which also powers the common domain, its parent. The PHY's domain
+ * is the other way to the common domain: only a resume, the PHY's state is
+ * restored by its next operation as after any power-down.
+ */
+static int atcphy_idle_parents_restore(struct apple_atcphy *atcphy,
+				       struct generic_pm_domain *common,
+				       struct generic_pm_domain *pcie)
+{
+	bool want_common = atcphy->idle_common_cleared, want_pcie = atcphy->idle_pcie_cleared;
+	struct device *dev = atcphy->dev, *pcie_dev = NULL;
+	int ret;
+
+	lockdep_assert_held(&atcphy_idle_parents_lock);
+	if (!want_common && !want_pcie) {
+		dev_dbg(dev, "idle_parents: no always-on flag to restore\n");
+		return 0;
+	}
+	if (want_pcie) {
+		pcie_dev = atcphy_genpd_get_device(pcie);
+		if (!pcie_dev && !atcphy_genpd_is_on(pcie)) {
+			dev_warn(dev, "idle_parents: %s is off and has no device to power it\n",
+				 pcie->name);
+			return -ENODEV;
+		}
+	}
+
+	if (want_common)
+		atcphy_genpd_set_always_on(atcphy, common);
+	if (want_pcie)
+		atcphy_genpd_set_always_on(atcphy, pcie);
+	atcphy->idle_common_cleared = false;
+	atcphy->idle_pcie_cleared = false;
+
+	if (pcie_dev) {
+		if (!atcphy_genpd_is_on(pcie)) {
+			ret = pm_runtime_resume_and_get(pcie_dev);
+			if (ret)
+				dev_dbg(dev, "idle_parents: resuming %s failed: %d\n",
+					dev_name(pcie_dev), ret);
+			else if (pm_runtime_put_sync_suspend(pcie_dev) < 0)
+				dev_dbg(dev, "idle_parents: %s stays active\n", dev_name(pcie_dev));
+		}
+		put_device(pcie_dev);
+	}
+	if (want_common && !atcphy_genpd_is_on(common)) {
+		ret = atcphy_rpm_get(atcphy);
+		if (ret)
+			dev_dbg(dev, "idle_parents: resuming the PHY failed: %d\n", ret);
+		else
+			atcphy_rpm_put(atcphy);
+	}
+
+	if ((want_pcie && !atcphy_genpd_is_on(pcie)) ||
+	    (want_common && !atcphy_genpd_is_on(common))) {
+		dev_warn(dev, "idle_parents: always-on again, but %s is %s, %s is %s\n",
+			 pcie->name, atcphy_genpd_is_on(pcie) ? "on" : "off",
+			 common->name, atcphy_genpd_is_on(common) ? "on" : "off");
+		return -EIO;
+	}
+	dev_info(dev, "idle_parents: always-on again, %s now %s, %s now %s\n", pcie->name,
+		 atcphy_genpd_is_on(pcie) ? "on" : "off", common->name,
+		 atcphy_genpd_is_on(common) ? "on" : "off");
+	return 0;
 }
 
 static ssize_t idle_parents_store(struct device *dev, struct device_attribute *attr,
@@ -6941,14 +7066,18 @@ static ssize_t idle_parents_store(struct device *dev, struct device_attribute *a
 	ret = kstrtobool(buf, &val);
 	if (ret)
 		return ret;
-	if (!val)
-		return -EINVAL;
 	ret = atcphy_idle_parents_find(atcphy, &common, &pcie);
 	if (ret)
 		return ret;
 	if (!common->has_provider || !pcie->has_provider ||
 	    !is_of_node(common->provider) || !is_of_node(pcie->provider))
 		return -EOPNOTSUPP;
+
+	guard(mutex)(&atcphy_idle_parents_lock);
+	if (!val) {
+		ret = atcphy_idle_parents_restore(atcphy, common, pcie);
+		return ret ? ret : count;
+	}
 	/* A PCIe host bound after a USB4 tunnel, or a running tunnel, needs it */
 	if (!atcphy_genpd_devices_idle(pcie, busy, sizeof(busy))) {
 		dev_info(dev, "idle_parents: %s is in use by %s, left as it is\n",
@@ -6956,8 +7085,11 @@ static ssize_t idle_parents_store(struct device *dev, struct device_attribute *a
 		return -EBUSY;
 	}
 
-	atcphy_genpd_clear_always_on(atcphy, common);
-	atcphy_genpd_clear_always_on(atcphy, pcie);
+	/* Only what was set: a second 1 keeps the record of the first */
+	if (atcphy_genpd_clear_always_on(atcphy, common))
+		atcphy->idle_common_cleared = true;
+	if (atcphy_genpd_clear_always_on(atcphy, pcie))
+		atcphy->idle_pcie_cleared = true;
 	/*
 	 * Also ends the boot-time stay-on of each, and tries the power-off now;
 	 * the common domain then follows whenever its last child goes off.
