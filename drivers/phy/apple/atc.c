@@ -59,6 +59,13 @@
 
 /* Runtime-suspend delay, which covers the mux, orientation and reset calls of a plug */
 #define ATCPHY_AUTOSUSPEND_MS 2000
+/*
+ * release_on_unplug: power-off retries after a runtime suspend, the first once
+ * the USB controller's 5 s autosuspend has passed, see atcphy_pd_off_work()
+ */
+#define ATCPHY_PD_OFF_FIRST_MS 5000
+#define ATCPHY_PD_OFF_RETRY_MS 3000
+#define ATCPHY_PD_OFF_TRIES 4
 
 static bool release_on_unplug;
 module_param(release_on_unplug, bool, 0444);
@@ -800,6 +807,9 @@ enum atcphy_t8132_cio_tunable {
  * @pd_off_idle: The domain went off under a suspended PHY (@user_rpm only):
  *               the restore also enables the dummy PHY and, with the PHY off,
  *               the AXI2AF bridge tunables
+ * @pd_off_work: Retries the power-off of a domain left on under a suspended
+ *               PHY (@user_rpm only), see atcphy_pd_off_work()
+ * @pd_off_tries: Retries done since the last runtime suspend of the PHY
  * @regs: Memory-mapped registers
  * @regs.core: Core registers
  * @regs.axi2af: AXI to Apple Fabric interface registers
@@ -889,6 +899,8 @@ struct apple_atcphy {
 	bool user_rpm;
 	bool rpm_suspended;
 	bool pd_off_idle;
+	struct delayed_work pd_off_work;
+	unsigned int pd_off_tries;
 
 	bool tunnel_dual_stream;
 	bool tunnel_routes_present;
@@ -6405,6 +6417,55 @@ static void apple_atc_tunnel_wiring(struct apple_atcphy *atcphy)
 }
 
 /*
+ * release_on_unplug: genpd tries to power the domain off only from the runtime
+ * suspend of one of its devices, and only when all the others have suspended.
+ * Two of them suspending at the same time on two CPUs, such as the USB
+ * controller's DARTs, which it releases asynchronously, each still count the
+ * other as active, and nothing tries again: the domain stays on with all its
+ * devices suspended. So after a suspend of the PHY, once the USB controller's
+ * autosuspend has passed, check a few times whether the domain is still on and
+ * if so resume and at once suspend the PHY, whose own suspend retries the
+ * power-off. While another device still holds the domain that does nothing.
+ *
+ * The runtime callbacks touch no registers: if the domain went off before the
+ * kick, the flags the notifier set stay until the next operation restores the
+ * PHY, and the kick's suspend lets the notifier set them again. Runs from a
+ * freezable workqueue, so never during system sleep.
+ */
+static void atcphy_pd_off_work(struct work_struct *work)
+{
+	struct apple_atcphy *atcphy = container_of(to_delayed_work(work), struct apple_atcphy,
+						   pd_off_work);
+	struct device *dev = atcphy->dev;
+	unsigned int tries;
+	int ret;
+
+	/* Resumed since, or runtime PM disabled by an unbind */
+	if (!atcphy->user_rpm || !pm_runtime_suspended(dev) || !dev_pm_genpd_is_on(dev))
+		return;
+	tries = READ_ONCE(atcphy->pd_off_tries);
+	if (tries >= ATCPHY_PD_OFF_TRIES) {
+		dev_dbg(dev, "power domain still on after %u tries, giving up\n", tries);
+		return;
+	}
+	WRITE_ONCE(atcphy->pd_off_tries, ++tries);
+	dev_dbg(dev, "power domain still on, retrying the power-off (try %u)\n", tries);
+
+	ret = pm_runtime_resume_and_get(dev);
+	if (ret) {
+		dev_dbg(dev, "power-off retry: resume failed: %d\n", ret);
+		return;
+	}
+	/* Immediate, not after the autosuspend delay; fails if the PHY is in use again */
+	ret = pm_runtime_put_sync_suspend(dev);
+	if (ret < 0)
+		dev_dbg(dev, "power-off retry: suspend failed: %d\n", ret);
+	/* A real suspend in the meantime has armed its own first check */
+	queue_delayed_work(system_freezable_wq, &atcphy->pd_off_work,
+			   msecs_to_jiffies(ATCPHY_PD_OFF_RETRY_MS));
+}
+
+/*
  * Called by the PM domain with its lock held, which is a spinlock for these
  * domains: only record the power-down, atcphy_restore_after_pd_off() acts on it.
  */
@@ -6550,6 +6611,13 @@ static int atcphy_probe(struct platform_device *pdev)
 	if ((atcphy->hw->idle_power_off || atcphy->user_rpm) && followed) {
 		pm_runtime_set_autosuspend_delay(dev, ATCPHY_AUTOSUSPEND_MS);
 		pm_runtime_use_autosuspend(dev);
+		/* Before runtime PM, which an unbind then disables before the cancel */
+		if (atcphy->user_rpm) {
+			ret = devm_delayed_work_autocancel(dev, &atcphy->pd_off_work,
+							   atcphy_pd_off_work);
+			if (ret)
+				return ret;
+		}
 		ret = devm_pm_runtime_set_active_enabled(dev);
 		if (ret)
 			return ret;
@@ -6669,6 +6737,12 @@ static int atcphy_runtime_suspend(struct device *dev)
 	if (atcphy->user_rpm) {
 		WRITE_ONCE(atcphy->rpm_suspended, true);
 		dev_dbg(dev, "runtime suspend\n");
+		/* Not the power-off retry's own suspend, which runs in its work */
+		if (current_work() != &atcphy->pd_off_work.work) {
+			WRITE_ONCE(atcphy->pd_off_tries, 0);
+			mod_delayed_work(system_freezable_wq, &atcphy->pd_off_work,
+					 msecs_to_jiffies(ATCPHY_PD_OFF_FIRST_MS));
+		}
 	}
 	return 0;
 }
