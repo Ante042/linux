@@ -2011,6 +2011,11 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 		/* T6030 external: out_withdraw drops the request as out_disconnect did. */
 		if (ret && (dcp->external || late_hpd))
 			goto out_withdraw;
+	} else if (dcp_fabric_hdmi_hpd_notified(dcp)) {
+		/* Told when this display drops HPD, the firmware is told that it is there, too. */
+		err = dptxport_set_hpd(dcp->dptxport[port].service, true);
+		if (err)
+			dev_warn(dcp->dev, "HDMI: HPD high not passed to the firmware: %d\n", err);
 	}
 	if (!dcp_connect_session_valid(dcp, session, cable, recovery))
 		return -ESTALE;

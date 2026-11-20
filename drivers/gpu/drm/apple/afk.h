@@ -603,6 +603,12 @@ int afk_service_call_len(struct apple_epic_service *service, u16 group,
  * against what arrived and against @output_len + @output_pad, and @received
  * is set to the number of bytes of @output that the reply filled.
  */
+/*
+ * Or'ed into a timeout by a caller that expects the firmware may not answer in
+ * time and copes with it: the call then times out without a word in the log.
+ */
+#define AFK_TIMEOUT_QUIET BIT(31)
+
 int afk_service_call_timeout_len(struct apple_epic_service *service, u16 group,
 				 u32 command, const void *data, size_t data_len,
 				 size_t data_pad, void *output, size_t output_len,

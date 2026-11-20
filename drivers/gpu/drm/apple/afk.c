@@ -2959,11 +2959,13 @@ static int afk_send_command_common(struct apple_epic_service *service, u8 type,
 	void *rxbuf, *txbuf;
 	dma_addr_t rxbuf_dma, txbuf_dma;
 	unsigned long flags;
+	bool quiet = timeout_ms & AFK_TIMEOUT_QUIET;
 	int ret, idx;
 	u16 tag;
 	struct apple_dcp_afkep *ep;
 	DECLARE_COMPLETION_ONSTACK(completion);
 
+	timeout_ms &= ~AFK_TIMEOUT_QUIET;
 	if (received)
 		*received = 0;
 	if (reply_len) {
@@ -3102,7 +3104,7 @@ static int afk_send_command_common(struct apple_epic_service *service, u8 type,
 	 * Give a doorbell lost on either side one more chance, see afk_kick().
 	 * Only deep sleep (suspend-to-RAM) is known to lose one.
 	 */
-	if (ret <= 0 && apple_s2r_deep_sleep() && afk_kick(ep, "command timed out") &&
+	if (ret <= 0 && !quiet && apple_s2r_deep_sleep() && afk_kick(ep, "command timed out") &&
 	    wait_for_completion_timeout(&completion,
 					msecs_to_jiffies(AFK_KICK_WAIT_MS)) > 0) {
 		dev_warn(ep->dcp->dev,
@@ -3122,6 +3124,10 @@ static int afk_send_command_common(struct apple_epic_service *service, u8 type,
 			service->cmds[idx].completion = NULL;
 			service->cmds[idx].free_on_ack = true;
 			spin_unlock_irqrestore(&service->lock, flags);
+			if (quiet) {
+				afk_service_put(service);
+				return -ETIMEDOUT;
+			}
 			dev_warn(ep->dcp->dev,
 				 "AFK[ep:%02x]: %s (chan:%u) command type 0x%x tag 0x%04x timed out after %u ms\n",
 				 ep->endpoint, service->ops->name, service->channel,
@@ -3263,6 +3269,8 @@ int afk_service_call_timeout_len(struct apple_epic_service *service, u16 group,
 					   service->ep->inline_v2 ? sizeof(*call) + data_len :
 					   bfr_len, bfr, bfr_len, &retcode, timeout_ms,
 					   received ? &wire_received : NULL);
+	if (ret == -ETIMEDOUT && (timeout_ms & AFK_TIMEOUT_QUIET))
+		goto out;
 	if (ret) {
 		dev_warn(service->ep->dcp->dev,
 			 "AFK[ep:%02x]: %s (chan:%u) service call group %u cmd %u failed to complete: %d\n",

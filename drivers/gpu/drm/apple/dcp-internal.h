@@ -935,6 +935,8 @@ struct apple_dcp {
 	struct mutex hdmi_converter_lock;
 	struct delayed_work hdmi_converter_off_wq;
 	bool hdmi_converter_on;
+	/* HPD fell while the HDMI display's link was up. */
+	bool hdmi_hpd_dropped;
 	/* T6030 HDMI converter service requests, see dcp-hdmi.c */
 	struct dcp_hdmi *hdmi;
 

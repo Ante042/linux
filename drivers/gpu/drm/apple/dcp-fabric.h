@@ -128,6 +128,7 @@ void dcp_fabric_hdmi_after_sleep(struct apple_dcp *dcp);
 void dcp_fabric_hdmi_converter_power(struct apple_dcp *dcp, bool on);
 bool dcp_fabric_hdmi_converter_wake(struct apple_dcp *dcp);
 void dcp_fabric_hdmi_converter_idle(struct apple_dcp *dcp);
+bool dcp_fabric_hdmi_hpd_notified(struct apple_dcp *dcp);
 irqreturn_t dcp_dp2hdmi_hpd_edge(int irq, void *data);
 irqreturn_t dcp_dp2hdmi_hpd(int irq, void *data);
 void dcp_fabric_shutdown_dptx(struct apple_dcp *dcp);

@@ -44,6 +44,11 @@ module_param(hdmi_converter_idle_off, bool, 0644);
 MODULE_PARM_DESC(hdmi_converter_idle_off,
 		 "Power the DP-to-HDMI converter only while an HDMI display is attached (default: on)");
 
+static bool hdmi_hpd_notify = true;
+module_param(hdmi_hpd_notify, bool, 0644);
+MODULE_PARM_DESC(hdmi_hpd_notify,
+		 "Tell the display firmware at once when an HDMI display drops HPD, so that a display that pulses HPD on waking is connected again without a five second wait (default: on)");
+
 static bool typec_follow_crtc = true;
 module_param(typec_follow_crtc, bool, 0444);
 
@@ -1192,6 +1197,50 @@ static void dcp_hdmi_recheck_work(struct work_struct *work)
 	dcp_hdmi_update_locked(dcp);
 	/* Catch a level change during this update's firmware/debounce waits. */
 	mod_delayed_work(system_freezable_wq, &dcp->hdmi_recheck_wq, 0);
+}
+
+/*
+ * The firmware finds out by itself that an HDMI display dropped HPD, but acts
+ * on it five seconds later, and for a pulse as for an unplug. A display that
+ * pulses HPD when it wakes from standby, a second or two after its first
+ * signal, so loses its link just as it shows the first picture, and stays dark
+ * for five more seconds. Told at once, the firmware drops the link at the
+ * pulse and has a new one up while the display is still waking.
+ *
+ * The firmware takes the low only once the display's pipe is off, which is up
+ * to whoever shows a picture: a compositor does that within some ten
+ * milliseconds of the hotplug event. Where none does, before one runs or with
+ * one that hangs, the firmware is left to itself and goes on five seconds
+ * later, as it does when it is not told at all.
+ *
+ * Only where it was tried: the HDMI port of the MacBook Pros, behind its
+ * converter.
+ */
+#define DCP_HDMI_HPD_NOTIFY_MS 300
+
+bool dcp_fabric_hdmi_hpd_notified(struct apple_dcp *dcp)
+{
+	return hdmi_hpd_notify && dcp->hdmi_hpd && dcp->dp2hdmi_pwren &&
+	       !dcp->external_native && dcp->fw_compat != DCP_FIRMWARE_V_26_6_DESKTOP &&
+	       !READ_ONCE(dcp->active_typec_route) && !dcp_is_typec_output(dcp);
+}
+
+static void dcp_hdmi_hpd_notify(struct apple_dcp *dcp, bool hpd)
+{
+	struct apple_epic_service *service = READ_ONCE(dcp->dptxport[0].service);
+	int ret;
+
+	if (!dcp_fabric_hdmi_hpd_notified(dcp) || !service ||
+	    !dptx_service_available(&dcp->dptxport[0]))
+		return;
+	ret = dptxport_set_hpd_timeout(service, hpd,
+				       DCP_HDMI_HPD_NOTIFY_MS | AFK_TIMEOUT_QUIET);
+	if (ret == -ETIMEDOUT)
+		dev_info(dcp->dev, "HDMI: display pipe still on, HPD %s left to the firmware\n",
+			 hpd ? "high" : "low");
+	else if (ret)
+		dev_warn(dcp->dev, "HDMI: HPD %s not passed to the firmware: %d\n",
+			 hpd ? "high" : "low", ret);
 }
 
 /*
@@ -4846,6 +4895,12 @@ static void dcp_hdmi_observed(void *ctx, bool high, bool debounced)
 {
 	struct apple_dcp *dcp = ctx;
 
+	/* The display is gone, or it wakes up and wants a new connection. */
+	if (!high && READ_ONCE(dcp->dptxport[0].connected) &&
+	    !READ_ONCE(dcp->hdmi_hpd_dropped)) {
+		WRITE_ONCE(dcp->hdmi_hpd_dropped, true);
+		dcp_hdmi_hpd_notify(dcp, false);
+	}
 	if (debounced)
 		dev_info(dcp->dev, "DP2HDMI HPD irq, 500ms debounce: connected:%d\n", high);
 	else
@@ -4874,10 +4929,19 @@ static void dcp_hdmi_connect_fixed(void *ctx)
 		atomic_set(&dcp->external_retries, 0);
 		cancel_delayed_work(&dcp->external_retry_wq);
 	}
-	if (ret)
+	if (ret) {
 		dev_err(dcp->dev, "could not select the HDMI output: %d\n", ret);
-	else
+	} else {
+		/*
+		 * HPD is back and the port still holds its connection: the CRTC
+		 * was off, or slow, so nothing released it when the firmware
+		 * dropped the link. The firmware makes a new one on HPD.
+		 */
+		if (READ_ONCE(dcp->hdmi_hpd_dropped) && READ_ONCE(dcp->dptxport[0].connected))
+			dcp_hdmi_hpd_notify(dcp, true);
 		ret = dcp_dptx_connect(dcp, 0);
+	}
+	WRITE_ONCE(dcp->hdmi_hpd_dropped, false);
 	dcp_hdmi_connect_failed(dcp, ret);
 }
 
