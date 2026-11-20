@@ -931,6 +931,10 @@ struct apple_dcp {
 	struct delayed_work hdmi_recheck_wq;
 	struct delayed_work hdmi_wake_wq;
 	unsigned int hdmi_wake_tries;
+	/* The DP-to-HDMI converter is powered down while no display is attached. */
+	struct mutex hdmi_converter_lock;
+	struct delayed_work hdmi_converter_off_wq;
+	bool hdmi_converter_on;
 	/* T6030 HDMI converter service requests, see dcp-hdmi.c */
 	struct dcp_hdmi *hdmi;
 

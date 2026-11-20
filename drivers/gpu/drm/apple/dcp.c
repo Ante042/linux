@@ -2595,6 +2595,10 @@ int dcp_dptx_connect(struct apple_dcp *dcp, u32 port)
 	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP && !dcp_is_typec_output(dcp))
 		return dcp_desktop_dptx_connect(dcp, port);
 
+	/* A converter that was powered down connects the display once it has booted. */
+	if (!dcp_is_typec_output(dcp) && dcp_fabric_hdmi_converter_wake(dcp))
+		return -EAGAIN;
+
 	if (!dcp_is_external_h17p(dcp)) {
 		if (dcp_typec_sessionless(dcp)) {
 			ret = dcp_dptx_connect_raw(dcp, port, NULL, NULL, false, false);
@@ -4185,6 +4189,7 @@ static int dcp_enable_dp2hdmi_hpd(struct apple_dcp *dcp)
 
 	if (dcp->hdmi_hpd_irq)
 		dcp_fabric_run_resume(&dcp_resume_ops, dcp);
+	dcp_fabric_hdmi_converter_idle(dcp);
 
 	return 0;
 }
@@ -5252,6 +5257,7 @@ VISIBLE_IF_KUNIT void dcp_disable_typec_work(struct apple_dcp *dcp, bool release
 	disable_delayed_work_sync(&dcp->hdmi_settle_wq);
 	disable_delayed_work_sync(&dcp->hdmi_recheck_wq);
 	disable_delayed_work_sync(&dcp->hdmi_wake_wq);
+	disable_delayed_work_sync(&dcp->hdmi_converter_off_wq);
 	disable_delayed_work_sync(&dcp->link_recovery_wq);
 	disable_work_sync(&dcp->tb_event_work);
 	scoped_guard(mutex, &dcp->tb_event_lock) {
@@ -5286,6 +5292,7 @@ VISIBLE_IF_KUNIT void dcp_enable_typec_work(struct apple_dcp *dcp)
 	enable_delayed_work(&dcp->hdmi_settle_wq);
 	enable_delayed_work(&dcp->hdmi_recheck_wq);
 	enable_delayed_work(&dcp->hdmi_wake_wq);
+	enable_delayed_work(&dcp->hdmi_converter_off_wq);
 	enable_delayed_work(&dcp->link_recovery_wq);
 	enable_work(&dcp->tb_event_work);
 	enable_delayed_work(&dcp->hybrid_wq);
@@ -6504,6 +6511,7 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 		}
 		if (IS_ERR(dcp->dp2hdmi_pwren))
 			return PTR_ERR(dcp->dp2hdmi_pwren);
+		dcp->hdmi_converter_on = !!dcp->dp2hdmi_pwren;
 		/* The converter rails must be stable before DCP requests the link. */
 		if (fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
 		    (dcp->hdmi_pwren || dcp->dp2hdmi_pwren))
@@ -7334,8 +7342,8 @@ static int dcp_platform_suspend(struct device *dev)
 	 * the machine in suspend-to-RAM. Nothing uses it in sleep and macOS
 	 * keeps it off, so power it down until resume.
 	 */
-	if (dcp->dp2hdmi_pwren && pm_suspend_target_state == PM_SUSPEND_MEM)
-		gpiod_set_value_cansleep(dcp->dp2hdmi_pwren, 0);
+	if (pm_suspend_target_state == PM_SUSPEND_MEM)
+		dcp_fabric_hdmi_converter_power(dcp, false);
 	/*
 	 * Set the device as a wakeup device, which forces its power
 	 * domains to stay on. We need this as we do not support full
@@ -7378,8 +7386,8 @@ static int dcp_platform_resume(struct device *dev)
 		return 0;
 
 	/* Converter first, so it is up by the time HPD is sampled below. */
-	if (dcp->dp2hdmi_pwren && pm_suspend_target_state == PM_SUSPEND_MEM)
-		gpiod_set_value_cansleep(dcp->dp2hdmi_pwren, 1);
+	if (pm_suspend_target_state == PM_SUSPEND_MEM)
+		dcp_fabric_hdmi_converter_power(dcp, true);
 	dcp_unpark_after_s2r(dcp);
 	dcp->link_recovery_tries = 0;
 	dcp_release_after_sleep(dcp);
@@ -7402,6 +7410,7 @@ static int dcp_platform_resume(struct device *dev)
 	 */
 	else if (dcp_is_typec_output(dcp) && pm_suspend_target_state == PM_SUSPEND_MEM)
 		afk_kick(dcp->dptxep, "after system sleep");
+	dcp_fabric_hdmi_converter_idle(dcp);
 	if (dcp->external_native)
 		enable_work(&dcp->external_audio_work);
 
