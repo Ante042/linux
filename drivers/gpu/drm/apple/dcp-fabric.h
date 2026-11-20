@@ -129,6 +129,15 @@ void dcp_fabric_hdmi_converter_power(struct apple_dcp *dcp, bool on);
 bool dcp_fabric_hdmi_converter_wake(struct apple_dcp *dcp);
 void dcp_fabric_hdmi_converter_idle(struct apple_dcp *dcp);
 bool dcp_fabric_hdmi_hpd_notified(struct apple_dcp *dcp);
+int dcp_fabric_ext_pmp_probe(struct apple_dcp *dcp);
+void dcp_fabric_ext_pmp_assert(struct apple_dcp *dcp, const char *why);
+/* Type-C HPD answer time allowed where the PMP request may have been withdrawn */
+#define DCP_EXT_PMP_HPD_MS	4000
+void dcp_fabric_ext_pmp_idle(struct apple_dcp *dcp);
+void dcp_fabric_ext_pmp_crtc(struct apple_dcp *dcp, bool on);
+void dcp_fabric_ext_pmp_resume(struct apple_dcp *dcp);
+void dcp_fabric_ext_pmp_stop(struct apple_dcp *dcp, const char *why);
+void dcp_fabric_ext_pmp_start(struct apple_dcp *dcp);
 irqreturn_t dcp_dp2hdmi_hpd_edge(int irq, void *data);
 irqreturn_t dcp_dp2hdmi_hpd(int irq, void *data);
 void dcp_fabric_shutdown_dptx(struct apple_dcp *dcp);

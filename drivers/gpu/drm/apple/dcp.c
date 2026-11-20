@@ -1891,6 +1891,12 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 
 	if (dcp->dptxport[port].connected)
 		goto out_unlock;
+	/*
+	 * Every link connect comes here: the PMP request before the firmware's
+	 * link work, under hpd_mutex so that it cannot be withdrawn before the
+	 * link counts as connected.
+	 */
+	dcp_fabric_ext_pmp_assert(dcp, "display connect");
 	if (dcp->external)
 		smp_store_release(&dcp->external_link_ready, false);
 
@@ -1951,6 +1957,15 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 		if (dcp_uses_t6020_tunnel_flow(dcp))
 			ret = dptxport_set_hpd_timeout(dcp->dptxport[port].service,
 						       true, 8000);
+		else if (READ_ONCE(dcp->ext_pmp_report))
+			/*
+			 * With its PMP request withdrawn while idle, the
+			 * firmware answered the first HPD after boot only
+			 * after more than 1 s (it powers the DPTX nub then),
+			 * and the connect had to be retried.
+			 */
+			ret = dptxport_set_hpd_timeout(dcp->dptxport[port].service,
+						       true, DCP_EXT_PMP_HPD_MS);
 		else
 			ret = dptxport_set_hpd(dcp->dptxport[port].service, true);
 		if (ret) {
@@ -3296,6 +3311,7 @@ int dcp_dptx_disconnect(struct apple_dcp *dcp, u32 port)
 	mutex_unlock(&dcp->hpd_mutex);
 	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP && !port)
 		dcp_peer_release_26_6(dcp);
+	dcp_fabric_ext_pmp_idle(dcp);
 
 	return ret;
 }
@@ -4312,6 +4328,7 @@ void dcp_poweron(struct platform_device *pdev)
 	unsigned long remaining;
 	int ret;
 
+	dcp_fabric_ext_pmp_crtc(dcp, true);
 	/* The takeover trial powered it on before the eviction. */
 	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
 	    dcp->desktop->trial_powered) {
@@ -4483,7 +4500,7 @@ void dcp_external_recover(struct platform_device *pdev)
 		dcp_poweron(pdev);
 }
 
-void dcp_poweroff(struct platform_device *pdev)
+static void dcp_poweroff_pipe(struct platform_device *pdev)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 	bool display_gone = false;
@@ -4606,6 +4623,13 @@ void dcp_poweroff(struct platform_device *pdev)
 			dcp_dptx_disconnect(dcp, 0);
 		}
 	}
+}
+
+void dcp_poweroff(struct platform_device *pdev)
+{
+	dcp_poweroff_pipe(pdev);
+	/* Once the pipe is off, whichever way it went. */
+	dcp_fabric_ext_pmp_crtc(platform_get_drvdata(pdev), false);
 }
 
 /* Desktop 26.x: the DRM device exists now, register the panel backlight. */
@@ -5272,6 +5296,7 @@ VISIBLE_IF_KUNIT void dcp_disable_typec_work(struct apple_dcp *dcp, bool release
 	}
 	disable_delayed_work_sync(&dcp->hybrid_wq);
 	dcp_hdmi_disable(dcp);
+	dcp_fabric_ext_pmp_stop(dcp, release_cable ? "unbind" : "system sleep");
 }
 
 /*
@@ -5302,6 +5327,7 @@ VISIBLE_IF_KUNIT void dcp_enable_typec_work(struct apple_dcp *dcp)
 	enable_work(&dcp->tb_event_work);
 	enable_delayed_work(&dcp->hybrid_wq);
 	dcp_hdmi_enable(dcp);
+	dcp_fabric_ext_pmp_start(dcp);
 	scoped_guard(mutex, &dcp->hpd_mutex)
 		dcp->typec_work_enabled = true;
 	/*
@@ -6264,6 +6290,9 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	INIT_DELAYED_WORK(&dcp->external_stop_retry_wq, dcp_external_stop_retry);
 	mutex_init(&dcp->tb_lock);
 	dcp_fabric_init(dcp);
+	ret = dcp_fabric_ext_pmp_probe(dcp);
+	if (ret)
+		return ret;
 	spin_lock_init(&dcp->mode_state.lock);
 	spin_lock_init(&dcp->metadata.lock);
 	mutex_init(&dcp->dcpavserv.lock);
@@ -7397,6 +7426,7 @@ static int dcp_platform_resume(struct device *dev)
 	dcp->link_recovery_tries = 0;
 	dcp_release_after_sleep(dcp);
 	iomfb_v14_7_backlight_resume(dcp);
+	dcp_fabric_ext_pmp_resume(dcp);
 	dcp_enable_typec_work(dcp);
 	/* The HDMI output's PHY and crossbar may have lost their setup in sleep. */
 	if (dcp->external_native ||

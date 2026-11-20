@@ -12,6 +12,7 @@
 #include <linux/phy/phy.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/dp-tunnel.h>
+#include <linux/soc/apple/pmp-report.h>
 #include <linux/usb/typec_altmode.h>
 #include <linux/usb/typec_dp.h>
 #include <linux/workqueue.h>
@@ -172,6 +173,304 @@ static enum dcp_fabric_presence_state dcp_hdmi_presence(struct apple_dcp *dcp);
 static void dcp_hdmi_update_locked(struct apple_dcp *dcp);
 static int dcp_hdmi_read_hpd(void *ctx);
 static bool dcp_hdmi_borrowed(void *ctx);
+
+/*
+ * Each external display processor has its own PMP power request (PS-REQ bit
+ * of its report entry, pmp-dispextN), set from boot on whether it drives a
+ * display or not. Set, it keeps the DCS memory state a step higher than the
+ * internal display alone needs: about 0.08 W at idle on a T6000. So withdraw
+ * the request of a processor that has driven nothing for a while, and set it
+ * again, acknowledged, before the processor is used: when a Type-C route is
+ * taken, a DPTX link connected, its CRTC powered on or HDMI HPD seen high.
+ *
+ * Only the request: the processor keeps running and keeps its power domains
+ * (a stopped one does not start again on this kernel, and its DART must not
+ * go down under live firmware). System sleep and unbind give the request back
+ * as the stock driver has it; after resume its state is not known (genpd and
+ * the PMP's restart write the word) until the processor is idle again.
+ *
+ * Only where measured: T600x external processors whose power domain is their
+ * own PMP report entry. The internal display's processor is never touched.
+ */
+#define DCP_EXT_PMP_IDLE_MS	10000
+
+enum {
+	DCP_EXT_PMP_ASSERTED,	/* set and acknowledged, as from boot */
+	DCP_EXT_PMP_RELEASED,	/* withdrawn here */
+	DCP_EXT_PMP_UNKNOWN,	/* after system sleep or a failed write */
+};
+
+static bool ext_pmp_release = true;
+static LIST_HEAD(dcp_ext_pmp_list);
+/* Guards dcp_ext_pmp_list; taken before a processor's ext_pmp_lock. */
+static DEFINE_MUTEX(dcp_ext_pmp_list_lock);
+
+/* Switched off, every request is asserted again at once. */
+static int dcp_ext_pmp_param_set(const char *val, const struct kernel_param *kp)
+{
+	struct apple_dcp *dcp;
+	int ret = param_set_bool(val, kp);
+
+	if (ret)
+		return ret;
+	guard(mutex)(&dcp_ext_pmp_list_lock);
+	list_for_each_entry(dcp, &dcp_ext_pmp_list, ext_pmp_link) {
+		if (READ_ONCE(ext_pmp_release))
+			dcp_fabric_ext_pmp_idle(dcp);
+		else
+			dcp_fabric_ext_pmp_assert(dcp, "ext_pmp_release off");
+	}
+	return 0;
+}
+
+static const struct kernel_param_ops dcp_ext_pmp_param_ops = {
+	.set = dcp_ext_pmp_param_set,
+	.get = param_get_bool,
+};
+module_param_cb(ext_pmp_release, &dcp_ext_pmp_param_ops, &ext_pmp_release, 0644);
+MODULE_PARM_DESC(ext_pmp_release,
+		 "Withdraw an external display processor's PMP request while it drives no display, about 0.08 W on T6000 (default: on)");
+
+/*
+ * Writes the request and waits for its acknowledgment (at most 50 ms, see
+ * apple_pmp_report_set_request()). A request set but not acknowledged stays
+ * written: write it again, as the report entry does after sleep. A withdrawal
+ * that is not acknowledged is taken back.
+ */
+static int dcp_ext_pmp_write(struct apple_dcp *dcp, bool on)
+{
+	typeof(&apple_pmp_report_set_request) set;
+	int ret, tries = 0;
+
+	lockdep_assert_held(&dcp->ext_pmp_lock);
+	set = symbol_get(apple_pmp_report_set_request);
+	if (!set)
+		return -ENODEV;
+	do {
+		ret = set(dcp->ext_pmp_report, dcp->ext_pmp_id, on, false);
+	} while (on && ret == -ETIMEDOUT && ++tries < 3);
+	if (!on && ret == -ETIMEDOUT)
+		set(dcp->ext_pmp_report, dcp->ext_pmp_id, true, false);
+	symbol_put(apple_pmp_report_set_request);
+	return ret;
+}
+
+static void dcp_ext_pmp_assert_locked(struct apple_dcp *dcp, const char *why)
+{
+	u8 was = dcp->ext_pmp_state;
+	int ret;
+
+	lockdep_assert_held(&dcp->ext_pmp_lock);
+	/* The work leaves the request alone for a while after this. */
+	dcp->ext_pmp_asserted = jiffies;
+	dcp->ext_pmp_retries = 0;
+	if (!dcp->ext_pmp_report || was == DCP_EXT_PMP_ASSERTED)
+		return;
+	ret = dcp_ext_pmp_write(dcp, true);
+	if (ret && ret != -ETIMEDOUT) {
+		dev_err(dcp->dev, "PMP request %u not asserted (%s): %d\n",
+			dcp->ext_pmp_id, why, ret);
+		return;
+	}
+	dcp->ext_pmp_state = DCP_EXT_PMP_ASSERTED;
+	if (ret)
+		dev_err(dcp->dev, "PMP request %u asserted (%s) but not acknowledged: %d\n",
+			dcp->ext_pmp_id, why, ret);
+	else if (was == DCP_EXT_PMP_RELEASED)
+		dev_info(dcp->dev, "PMP request %u asserted again (%s)\n",
+			 dcp->ext_pmp_id, why);
+	else
+		dev_dbg(dcp->dev, "PMP request %u asserted (%s)\n", dcp->ext_pmp_id, why);
+}
+
+/* A use is coming: the request must be set, and acknowledged, before it. */
+void dcp_fabric_ext_pmp_assert(struct apple_dcp *dcp, const char *why)
+{
+	if (!READ_ONCE(dcp->ext_pmp_report))
+		return;
+	scoped_guard(mutex, &dcp->ext_pmp_lock)
+		dcp_ext_pmp_assert_locked(dcp, why);
+	/* Should the use not come, the request goes again. */
+	dcp_fabric_ext_pmp_idle(dcp);
+}
+
+/* Something stopped using the processor: check again once it has been idle a while. */
+void dcp_fabric_ext_pmp_idle(struct apple_dcp *dcp)
+{
+	if (READ_ONCE(dcp->ext_pmp_report) && READ_ONCE(ext_pmp_release))
+		mod_delayed_work(system_freezable_wq, &dcp->ext_pmp_wq,
+				 msecs_to_jiffies(DCP_EXT_PMP_IDLE_MS));
+}
+
+/* dcp_poweron() and dcp_poweroff(): a CRTC on keeps the request. */
+void dcp_fabric_ext_pmp_crtc(struct apple_dcp *dcp, bool on)
+{
+	if (!READ_ONCE(dcp->ext_pmp_report))
+		return;
+	scoped_guard(mutex, &dcp->ext_pmp_lock) {
+		dcp->ext_pmp_crtc_on = on;
+		if (on)
+			dcp_ext_pmp_assert_locked(dcp, "display pipe on");
+	}
+	dcp_fabric_ext_pmp_idle(dcp);
+}
+
+/*
+ * dcp_disable_typec_work(), before the firmware is told of sleep or unbind:
+ * nothing withdraws the request until dcp_fabric_ext_pmp_start(), and it
+ * goes into either as the stock driver has it. Neither the fabric lock nor
+ * hpd_mutex is held here.
+ */
+void dcp_fabric_ext_pmp_stop(struct apple_dcp *dcp, const char *why)
+{
+	if (!READ_ONCE(dcp->ext_pmp_report))
+		return;
+	disable_delayed_work_sync(&dcp->ext_pmp_wq);
+	scoped_guard(mutex, &dcp->ext_pmp_lock)
+		dcp_ext_pmp_assert_locked(dcp, why);
+}
+
+/* dcp_enable_typec_work(): balances dcp_fabric_ext_pmp_stop() and dcp_fabric_init(). */
+void dcp_fabric_ext_pmp_start(struct apple_dcp *dcp)
+{
+	if (!READ_ONCE(dcp->ext_pmp_report))
+		return;
+	enable_delayed_work(&dcp->ext_pmp_wq);
+	dcp_fabric_ext_pmp_idle(dcp);
+}
+
+/* Before the work is enabled again; genpd and the PMP's restart wrote the word in sleep. */
+void dcp_fabric_ext_pmp_resume(struct apple_dcp *dcp)
+{
+	if (!READ_ONCE(dcp->ext_pmp_report))
+		return;
+	guard(mutex)(&dcp->ext_pmp_lock);
+	dcp->ext_pmp_state = DCP_EXT_PMP_UNKNOWN;
+}
+
+/* HDMI HPD was sampled: a display there wants the request, none lets it go. */
+static void dcp_ext_pmp_hdmi_sampled(struct apple_dcp *dcp)
+{
+	if (!READ_ONCE(dcp->ext_pmp_report))
+		return;
+	/* A failed read cannot establish absence. */
+	if (dcp->hdmi_hpd && gpiod_get_value_cansleep(dcp->hdmi_hpd) != 0)
+		dcp_fabric_ext_pmp_assert(dcp, "HDMI HPD");
+	else
+		dcp_fabric_ext_pmp_idle(dcp);
+}
+
+/* Under the fabric lock, hpd_mutex and ext_pmp_lock. */
+static bool dcp_ext_pmp_in_use(struct apple_dcp *dcp)
+{
+	return dcp->ext_pmp_crtc_on || dcp->active_typec_route ||
+	       READ_ONCE(dcp->dptx_tunnel) || READ_ONCE(dcp->split.active) ||
+	       READ_ONCE(dcp->typec_cable_connected) ||
+	       dcp->dptxport[0].connected || dcp->dptxport[1].connected ||
+	       (dcp->hdmi_hpd && gpiod_get_value_cansleep(dcp->hdmi_hpd) != 0);
+}
+
+static void dcp_ext_pmp_work(struct work_struct *work)
+{
+	struct apple_dcp *dcp = container_of(to_delayed_work(work), struct apple_dcp,
+					     ext_pmp_wq);
+	unsigned long due;
+	int ret;
+
+	/*
+	 * The routes are taken and released under the fabric lock and the
+	 * links under hpd_mutex, so neither changes under this check, and a
+	 * link connect asserts the request under hpd_mutex. A CRTC on is
+	 * marked under ext_pmp_lock. HDMI HPD is read here as it is now; an
+	 * edge after the read asserts again from its sample. An assert with
+	 * no use after it keeps the request a while: the time of the last
+	 * assert.
+	 */
+	guard(mutex)(&dcp_typec_fabric_lock);
+	guard(mutex)(&dcp->hpd_mutex);
+	guard(mutex)(&dcp->ext_pmp_lock);
+	if (!READ_ONCE(ext_pmp_release) || !dcp->ext_pmp_report ||
+	    dcp->ext_pmp_state == DCP_EXT_PMP_RELEASED || !READ_ONCE(dcp->active) ||
+	    READ_ONCE(dcp->crashed) || dcp_ext_pmp_in_use(dcp))
+		return;
+	due = dcp->ext_pmp_asserted + msecs_to_jiffies(DCP_EXT_PMP_IDLE_MS);
+	if (time_before(jiffies, due)) {
+		mod_delayed_work(system_freezable_wq, &dcp->ext_pmp_wq, due - jiffies);
+		return;
+	}
+	ret = dcp_ext_pmp_write(dcp, false);
+	if (!ret) {
+		dcp->ext_pmp_state = DCP_EXT_PMP_RELEASED;
+		dcp->ext_pmp_retries = 0;
+		dev_info(dcp->dev, "PMP request %u released: no display\n", dcp->ext_pmp_id);
+		return;
+	}
+	/*
+	 * Taken back after a timeout (see dcp_ext_pmp_write()). Try once more a
+	 * while later; after that only the next idle or assert tries again.
+	 */
+	if (ret == -ETIMEDOUT) {
+		dcp->ext_pmp_state = DCP_EXT_PMP_UNKNOWN;
+		if (!dcp->ext_pmp_retries++)
+			mod_delayed_work(system_freezable_wq, &dcp->ext_pmp_wq,
+					 msecs_to_jiffies(DCP_EXT_PMP_IDLE_MS));
+	}
+	dev_warn(dcp->dev, "PMP request %u not released: %d\n", dcp->ext_pmp_id, ret);
+}
+
+/* Unbind: the request is left set, as the stock driver has it. */
+static void dcp_ext_pmp_remove(void *data)
+{
+	struct apple_dcp *dcp = data;
+	struct device_node *report;
+
+	scoped_guard(mutex, &dcp_ext_pmp_list_lock)
+		list_del_init(&dcp->ext_pmp_link);
+	disable_delayed_work_sync(&dcp->ext_pmp_wq);
+	scoped_guard(mutex, &dcp->ext_pmp_lock) {
+		dcp_ext_pmp_assert_locked(dcp, "driver unbound");
+		report = dcp->ext_pmp_report;
+		WRITE_ONCE(dcp->ext_pmp_report, NULL);
+	}
+	of_node_put(report);
+}
+
+/*
+ * Probe: an external processor (apple,dcpext, never the internal apple,dcp)
+ * whose only power domain is its own request's entry in a T600x PMP report
+ * (pmp-dispextN, APPLE_USE_PMP device trees). The request bit is the entry's.
+ */
+int dcp_fabric_ext_pmp_probe(struct apple_dcp *dcp)
+{
+	struct device_node *np = dcp->dev->of_node, *entry, *report = NULL;
+	const char *label = NULL;
+	u32 id = 0;
+
+	if (!of_device_is_compatible(np, "apple,dcpext") || dcp->external ||
+	    dcp->desktop_external ||
+	    of_count_phandle_with_args(np, "power-domains", "#power-domain-cells") != 1)
+		return 0;
+	entry = of_parse_phandle(np, "power-domains", 0);
+	if (entry && of_device_is_compatible(entry, "apple,t6000-pmp-v2-report-entry") &&
+	    of_device_is_available(entry) && !of_property_read_bool(entry, "apple,no-ack") &&
+	    !of_property_read_string(entry, "label", &label) &&
+	    strstarts(label, "pmp-dispext") &&
+	    !of_property_read_u32(entry, "reg", &id) && id < 64)
+		report = of_get_parent(entry);
+	if (!report || !of_device_is_compatible(report, "apple,t6000-pmp-v2-report")) {
+		of_node_put(report);
+		of_node_put(entry);
+		return 0;
+	}
+	dcp->ext_pmp_id = id;
+	dcp->ext_pmp_report = report;
+	dev_info(dcp->dev, "PMP request %u (%s) withdrawn while no display is attached%s\n",
+		 id, label, READ_ONCE(ext_pmp_release) ? "" : " (ext_pmp_release off)");
+	of_node_put(entry);
+	scoped_guard(mutex, &dcp_ext_pmp_list_lock)
+		list_add_tail(&dcp->ext_pmp_link, &dcp_ext_pmp_list);
+	return devm_add_action_or_reset(dcp->dev, dcp_ext_pmp_remove, dcp);
+}
 
 bool dcp_is_typec_output(struct apple_dcp *dcp)
 {
@@ -541,6 +840,8 @@ static int dcp_typec_route_activate(struct apple_dcp_typec_route *route,
 		dcp_typec_route_connector(route, xbar != route->xbar);
 	int ret;
 
+	/* A display is coming: the processor's PMP request first. */
+	dcp_fabric_ext_pmp_assert(dcp, "Type-C route");
 	dcp_tb_events_retire(dcp);
 
 	/* Never select a DP PHY output that has no DP PHY behind it. */
@@ -768,6 +1069,7 @@ static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route)
 	ended_attachment = dcp_modes_end_typec(dcp, route);
 	if (dcp->active_typec_route == route)
 		dcp->active_typec_route = NULL;
+	dcp_fabric_ext_pmp_idle(dcp);
 
 	if (connector && connector->dcp == to_platform_device(dcp->dev)) {
 		/*
@@ -1305,6 +1607,8 @@ bool dcp_fabric_hdmi_converter_wake(struct apple_dcp *dcp)
 /* HPD was sampled: no display starts the power-down delay, a display ends it. */
 void dcp_fabric_hdmi_converter_idle(struct apple_dcp *dcp)
 {
+	/* The external processor's PMP request follows the same samples. */
+	dcp_ext_pmp_hdmi_sampled(dcp);
 	if (!dcp_hdmi_converter_managed(dcp))
 		return;
 	/* A failed GPIO read cannot establish absence. */
@@ -1384,11 +1688,16 @@ void dcp_fabric_init(struct apple_dcp *dcp)
 	mutex_init(&dcp->hdmi_converter_lock);
 	INIT_DELAYED_WORK(&dcp->hdmi_converter_off_wq, dcp_hdmi_converter_off_work);
 	INIT_DELAYED_WORK(&dcp->hybrid_wq, dcp_hybrid_work);
+	mutex_init(&dcp->ext_pmp_lock);
+	INIT_LIST_HEAD(&dcp->ext_pmp_link);
+	INIT_DELAYED_WORK(&dcp->ext_pmp_wq, dcp_ext_pmp_work);
+	dcp->ext_pmp_asserted = jiffies;
 	disable_delayed_work(&dcp->hdmi_settle_wq);
 	disable_delayed_work(&dcp->hdmi_recheck_wq);
 	disable_delayed_work(&dcp->hdmi_wake_wq);
 	disable_delayed_work(&dcp->hdmi_converter_off_wq);
 	disable_delayed_work(&dcp->hybrid_wq);
+	disable_delayed_work(&dcp->ext_pmp_wq);
 }
 
 /* Caller enables the HPD IRQ first; a later edge invalidates this sample. */

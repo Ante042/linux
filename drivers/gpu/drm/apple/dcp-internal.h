@@ -937,6 +937,21 @@ struct apple_dcp {
 	bool hdmi_converter_on;
 	/* HPD fell while the HDMI display's link was up. */
 	bool hdmi_hpd_dropped;
+	/*
+	 * External processor's own PMP request, withdrawn while it drives
+	 * nothing (see dcp-fabric.c). @ext_pmp_report is NULL where this does
+	 * not apply. @ext_pmp_lock is innermost, below the fabric lock and
+	 * @hpd_mutex, and guards the fields after it.
+	 */
+	struct device_node *ext_pmp_report;
+	u32 ext_pmp_id;
+	struct list_head ext_pmp_link;
+	struct delayed_work ext_pmp_wq;
+	struct mutex ext_pmp_lock;	/* innermost, see above */
+	u8 ext_pmp_state;
+	bool ext_pmp_crtc_on;
+	unsigned long ext_pmp_asserted;
+	u8 ext_pmp_retries;
 	/* T6030 HDMI converter service requests, see dcp-hdmi.c */
 	struct dcp_hdmi *hdmi;
 
