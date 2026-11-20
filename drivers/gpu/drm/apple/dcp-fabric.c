@@ -2045,12 +2045,13 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 	}
 
 	/*
-	 * Desktop 26.x has one Type-C pipeline: only a port with a sink (HPD)
-	 * takes it. A dock or cable in DP alt mode without a display behind it
-	 * would otherwise hold it against the port that has one.
+	 * There are fewer pipelines than ports (one on desktop 26.x, two for
+	 * three ports on a T600x laptop): only a port with a sink (HPD) takes
+	 * one. A dock or cable in DP alt mode without a display behind it
+	 * would otherwise hold it against the port that has one. Its HPD
+	 * coming up is a new state, routed then.
 	 */
-	if (!port->owner && !hpd &&
-	    route->dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP) {
+	if (!port->owner && !hpd) {
 		port->applied_valid = true;
 		return 0;
 	}
