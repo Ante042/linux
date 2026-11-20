@@ -2063,7 +2063,12 @@ int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *ctx,
 			return ret;
 		ctx->metadata_timing = dcp_firmware_metadata_enabled(dcp);
 	}
-	ctx->zero_vrr_range_fallback = dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP;
+	/*
+	 * Desktop 26.6 and 13.5 (J314s) publish both range fields as zero for
+	 * an internal ProMotion panel that runs adaptive at up to 120 Hz.
+	 */
+	ctx->zero_vrr_range_fallback = dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
+				      dcp->fw_compat == DCP_FIRMWARE_V_13_5;
 	modes = enumerate_modes(ctx, &nr_modes, dcp->width_mm, dcp->height_mm,
 				dcp->notch_height,
 				dcp->fixed_connector_type == DRM_MODE_CONNECTOR_eDP,

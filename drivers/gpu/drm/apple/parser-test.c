@@ -479,15 +479,15 @@ static void parser_vrr_empty_range(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, modes[0].min_vrr, 0U);
 	KUNIT_EXPECT_EQ(test, modes[0].max_vrr, 0U);
 	kfree(modes);
-	/* The catalog owner enables this convention only for desktop firmware. */
-	for (desktop = 0; desktop < 2; desktop++) {
+	/* The catalog owner enables this convention for desktop and 13.5 firmware. */
+	for (desktop = 0; desktop < 3; desktop++) {
 		struct apple_dcp *dcp = kunit_kzalloc(test, sizeof(*dcp), GFP_KERNEL);
 		u64 generation;
 
 		KUNIT_ASSERT_NOT_NULL(test, dcp);
 		parser_modes_init(dcp);
-		dcp->fw_compat = desktop ? DCP_FIRMWARE_V_26_6_DESKTOP :
-			DCP_FIRMWARE_V_13_5;
+		dcp->fw_compat = desktop == 2 ? DCP_FIRMWARE_V_26_6_DESKTOP :
+			desktop ? DCP_FIRMWARE_V_13_5 : DCP_FIRMWARE_V_12_3;
 		dcp->fixed_connector_type = DRM_MODE_CONNECTOR_eDP;
 		KUNIT_ASSERT_EQ(test, parse(blob->data, blob->size, &ctx), 0);
 		ctx.dcp = &parser_dcp;
