@@ -36,6 +36,7 @@ static const struct dcp_method_entry dcp_methods[dcpep_num_methods] = {
 	IOMFB_METHOD("A500", dcpep_s2r_link_sleep),
 };
 
+#define DCP_PACE 1
 #define DCP_FW v13_3
 #define DCP_FW_VER DCP_FW_VERSION(13, 3, 0)
 
