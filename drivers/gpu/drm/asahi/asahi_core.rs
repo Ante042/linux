@@ -182,6 +182,10 @@ module! {
             default: 512,
             description: "G13/G14: GPU event-drain utilization minimum (0..1024)",
         },
+        legacy_perf_base_pstate: u32 {
+            default: 0,
+            description: "G13/G14: lowest performance state of a working GPU (0: the device tree's apple,perf-base-pstate, 1 on laptops and 3 on Apple's desktops)",
+        },
         g15_deadline_ms: u32 {
             default: 5000,
             description: "G15: host deadline of a published prefix without progress, ms (min 100)",
