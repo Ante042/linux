@@ -27,6 +27,7 @@
 
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
+#include <drm/drm_atomic_uapi.h>
 #include <drm/drm_blend.h>
 #include <drm/clients/drm_client_setup.h>
 #include <drm/drm_color_mgmt.h>
@@ -47,6 +48,7 @@
 #include <drm/drm_vblank.h>
 #include <drm/drm_fixed.h>
 #include <linux/pm.h>
+#include <linux/suspend.h>
 
 #include "apple_boot_display.h"
 #include "apple_resume.h"
@@ -67,7 +69,11 @@ struct apple_drm_private {
 	 * the screen, the DRM device stays unregistered and its DCPs running.
 	 */
 	bool aborted;
+	/* The panel's pipe once up and down after a wake with the panel off. */
+	struct delayed_work dark_cycle_work;
 };
+
+static void apple_drm_dark_cycle_work(struct work_struct *work);
 
 /* Component readiness is later than platform probe/bind. */
 static DEFINE_MUTEX(apple_g15_display_lock);
@@ -1649,6 +1655,7 @@ static int apple_drm_init(struct device *dev)
 		return PTR_ERR(apple);
 
 	dev_set_drvdata(dev, apple);
+	INIT_DELAYED_WORK(&apple->dark_cycle_work, apple_drm_dark_cycle_work);
 
 	ret = drmm_mode_config_init(&apple->drm);
 	if (ret)
@@ -1806,6 +1813,7 @@ static void apple_drm_uninit(struct device *dev)
 	if (apple->aborted)
 		return;
 
+	cancel_delayed_work_sync(&apple->dark_cycle_work);
 	/* Before anything of the DRM device is torn down. */
 	t8132_ext_drm_fini(&apple->drm);
 	apple_drm_quiesce_connectors(&apple->drm);
@@ -1923,13 +1931,240 @@ static const struct of_device_id of_match[] = {
 };
 MODULE_DEVICE_TABLE(of, of_match);
 
+
+/*
+ * A deep sleep restarts the panel's display coprocessor.  If the panel was off
+ * across the sleep, nothing runs its pipe afterwards, and the firmware leaves
+ * part of the display chain powered until the pipe has been up and down once
+ * (0.01 to 0.02 W on a MacBook Pro 14-inch, 2021).  Do that once after such a
+ * wake, without showing anything: the frame is black, the backlight is held
+ * off, the firmware's "display is back" is not passed on as a hotplug event
+ * and the state it left is put back.  A
+ * compositor that commits to the CRTC meanwhile keeps it.
+ */
+
+static bool wake_dark_cycle = true;
+module_param(wake_dark_cycle, bool, 0644);
+MODULE_PARM_DESC(wake_dark_cycle, "After a deep sleep that the panel was off across, run its pipe once in the dark so that the display chain powers down fully");
+
+/* After the wake: time for a compositor to light the panel itself. Then how long the pipe stays up. */
+#define wake_dark_cycle_delay_ms	10000U
+#define wake_dark_cycle_hold_ms		1000U
+
+enum apple_dark_phase { APPLE_DARK_ON, APPLE_DARK_SWAP, APPLE_DARK_OFF };
+
+static struct drm_crtc *apple_drm_panel_crtc(struct drm_device *dev, struct apple_dcp **dcpp)
+{
+	struct drm_crtc *crtc;
+
+	drm_for_each_crtc(crtc, dev) {
+		struct platform_device *pdev;
+		struct apple_dcp *dcp;
+
+		if (t8132_ext_crtc(crtc))
+			continue;
+		pdev = to_apple_crtc(crtc)->dcp;
+		dcp = pdev ? platform_get_drvdata(pdev) : NULL;
+		if (dcp && dcp->connector && dcp->connector_type == DRM_MODE_CONNECTOR_eDP) {
+			*dcpp = dcp;
+			return crtc;
+		}
+	}
+	return NULL;
+}
+
+/*
+ * One commit of the dark cycle.  @mine is the CRTC commit the cycle made
+ * last, held by reference: a different one in place means that someone else
+ * has committed to the CRTC, and the cycle leaves it alone (-ECANCELED).
+ * @mode is the one to set for APPLE_DARK_ON if the CRTC has none.
+ */
+static int apple_drm_dark_commit(struct drm_device *dev, struct drm_crtc *crtc,
+				 struct drm_connector *conn, struct apple_dcp *dcp,
+				 enum apple_dark_phase phase,
+				 const struct drm_display_mode *mode,
+				 bool *was_enabled, struct drm_crtc_commit **mine)
+{
+	struct drm_connector_state *conn_state;
+	struct drm_modeset_acquire_ctx ctx;
+	struct drm_atomic_commit *state;
+	struct drm_crtc_state *cs;
+	int ret;
+
+	drm_modeset_acquire_init(&ctx, 0);
+	state = drm_atomic_commit_alloc(dev);
+	if (!state) {
+		ret = -ENOMEM;
+		goto out_ctx;
+	}
+	state->acquire_ctx = &ctx;
+retry:
+	cs = drm_atomic_get_crtc_state(state, crtc);
+	if (IS_ERR(cs)) {
+		ret = PTR_ERR(cs);
+		goto out;
+	}
+	if (phase != APPLE_DARK_ON && crtc->state->commit != *mine) {
+		ret = -ECANCELED;
+		goto out;
+	}
+	switch (phase) {
+	case APPLE_DARK_ON:
+		if (cs->active) {
+			ret = -EBUSY;
+			goto out;
+		}
+		*was_enabled = cs->enable;
+		if (!cs->enable) {
+			conn_state = drm_atomic_get_connector_state(state, conn);
+			if (IS_ERR(conn_state)) {
+				ret = PTR_ERR(conn_state);
+				goto out;
+			}
+			if (conn_state->crtc || !mode) {
+				ret = conn_state->crtc ? -EBUSY : -ENODATA;
+				goto out;
+			}
+			ret = drm_atomic_set_mode_for_crtc(cs, mode);
+			if (!ret)
+				ret = drm_atomic_set_crtc_for_connector(conn_state, crtc);
+			if (ret)
+				goto out;
+		}
+		cs->active = true;
+		break;
+	case APPLE_DARK_SWAP:
+		ret = drm_atomic_add_affected_planes(state, crtc);
+		if (ret)
+			goto out;
+		cs->color_mgmt_changed = true;
+		break;
+	case APPLE_DARK_OFF:
+		cs->active = false;
+		if (!*was_enabled) {
+			conn_state = drm_atomic_get_connector_state(state, conn);
+			if (IS_ERR(conn_state)) {
+				ret = PTR_ERR(conn_state);
+				goto out;
+			}
+			ret = drm_atomic_set_mode_for_crtc(cs, NULL);
+			if (!ret)
+				ret = drm_atomic_set_crtc_for_connector(conn_state, NULL);
+			if (ret)
+				goto out;
+		}
+		break;
+	}
+	to_apple_atomic_state(state)->dark = phase != APPLE_DARK_OFF;
+	if (phase == APPLE_DARK_ON)
+		WRITE_ONCE(dcp->dark_cycle, true);
+	ret = drm_atomic_commit(state);
+	if (ret && ret != -EDEADLK && phase == APPLE_DARK_ON)
+		WRITE_ONCE(dcp->dark_cycle, false);
+	if (!ret && phase != APPLE_DARK_OFF) {
+		if (*mine)
+			drm_crtc_commit_put(*mine);
+		*mine = crtc->state->commit;
+		drm_crtc_commit_get(*mine);
+	}
+out:
+	if (ret == -EDEADLK) {
+		drm_atomic_commit_clear(state);
+		drm_modeset_backoff(&ctx);
+		goto retry;
+	}
+	drm_atomic_commit_put(state);
+out_ctx:
+	drm_modeset_drop_locks(&ctx);
+	drm_modeset_acquire_fini(&ctx);
+	return ret;
+}
+
+static int apple_drm_dark_cycle(struct apple_drm_private *apple, unsigned int hold_ms)
+{
+	struct drm_display_mode mode, *m, *pick = NULL;
+	struct drm_device *dev = &apple->drm;
+	struct drm_crtc_commit *mine = NULL;
+	int idx, i = 0, ret, swap = 0, off = 0;
+	struct apple_dcp *dcp = NULL;
+	struct drm_connector *conn;
+	ktime_t t0 = ktime_get();
+	bool was_enabled = false;
+	struct drm_crtc *crtc;
+
+	if (apple->aborted || !drm_dev_enter(dev, &idx))
+		return -ENODEV;
+	crtc = apple_drm_panel_crtc(dev, &dcp);
+	if (!crtc) {
+		ret = -ENODEV;
+		goto out;
+	}
+	conn = &dcp->connector->base;
+	if (READ_ONCE(dcp->crashed) || conn->status != connector_status_connected) {
+		ret = -ENOTCONN;
+		goto out;
+	}
+	/* The panel's own mode, for a CRTC that user space has disabled. */
+	mutex_lock(&dev->mode_config.mutex);
+	list_for_each_entry(m, &conn->modes, head) {
+		if (!pick || (m->type & DRM_MODE_TYPE_PREFERRED))
+			pick = m;
+		if (m->type & DRM_MODE_TYPE_PREFERRED)
+			break;
+	}
+	if (pick)
+		drm_mode_init(&mode, pick);
+	mutex_unlock(&dev->mode_config.mutex);
+	ret = apple_drm_dark_commit(dev, crtc, conn, dcp, APPLE_DARK_ON, pick ? &mode : NULL,
+				    &was_enabled, &mine);
+	if (ret)
+		goto out;
+	/*
+	 * The first flush goes without a swap while the firmware has not
+	 * reported the panel back.  Wait for that, then present once more.
+	 */
+	for (; i < 150 && !READ_ONCE(dcp->connector->connected); i++)
+		msleep(20);
+	swap = apple_drm_dark_commit(dev, crtc, conn, dcp, APPLE_DARK_SWAP, NULL, &was_enabled, &mine);
+	if (swap != -ECANCELED) {
+		msleep(hold_ms);
+		off = apple_drm_dark_commit(dev, crtc, conn, dcp, APPLE_DARK_OFF, NULL, &was_enabled, &mine);
+	}
+	WRITE_ONCE(dcp->dark_cycle, false);
+	drm_crtc_commit_put(mine);
+	/* Someone lit the panel meanwhile: a level set since then is theirs to see. */
+	if (swap == -ECANCELED || off == -ECANCELED)
+		dcp_backlight_update(dcp);
+out:
+	if ((ret && ret != -EBUSY) || (swap && swap != -ECANCELED) || (off && off != -ECANCELED))
+		dev_warn(dev->dev, "dark cycle failed: on %d, swap %d, off %d%s\n", ret, swap, off,
+			 off && off != -ECANCELED ? " (the panel's pipe was left up)" : "");
+	else if (ret != -EBUSY)
+		dev_dbg(dev->dev, "dark cycle: on %d (waited %d ms for the panel), swap %d, off %d, %lld ms%s\n",
+			ret, i * 20, swap, off, ktime_ms_delta(ktime_get(), t0),
+			was_enabled ? "" : ", CRTC was disabled");
+	drm_dev_exit(idx);
+	return ret ?: off;
+}
+
+static void apple_drm_dark_cycle_work(struct work_struct *work)
+{
+	struct apple_drm_private *apple = container_of(to_delayed_work(work),
+						       struct apple_drm_private,
+						       dark_cycle_work);
+
+	apple_drm_dark_cycle(apple, wake_dark_cycle_hold_ms);
+}
+
 #ifdef CONFIG_PM_SLEEP
 static int apple_platform_suspend(struct device *dev)
 {
 	struct apple_drm_private *apple = dev_get_drvdata(dev);
 
-	if (apple && !apple->aborted)
+	if (apple && !apple->aborted) {
+		cancel_delayed_work_sync(&apple->dark_cycle_work);
 		return drm_mode_config_helper_suspend(&apple->drm);
+	}
 
 	return 0;
 }
@@ -1965,6 +2200,9 @@ static int apple_platform_resume(struct device *dev)
 		drm_mode_config_helper_resume(&apple->drm);
 		if (dropped)
 			drm_kms_helper_hotplug_event(&apple->drm);
+		if (wake_dark_cycle && pm_suspend_target_state == PM_SUSPEND_MEM)
+			schedule_delayed_work(&apple->dark_cycle_work,
+					      msecs_to_jiffies(wake_dark_cycle_delay_ms));
 	}
 
 	return 0;

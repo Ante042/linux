@@ -4290,7 +4290,8 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		l = apl_plane->iomfb_surf;
 		req->swap.swap_enabled |= BIT(l);
 
-		if (!new_state->fb || !new_state->visible) {
+		if (!new_state->fb || !new_state->visible ||
+		    to_apple_atomic_state(commit)->dark) {
 			continue;
 		}
 		req->surf_null[l] = false;
@@ -4403,7 +4404,8 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 	dcp->brightness.update = false;
 #else
 	/* update brightness if changed */
-	update_brightness = dcp_has_panel(dcp) && dcp->brightness.update;
+	update_brightness = dcp_has_panel(dcp) &&
+			    (dcp->brightness.update || to_apple_atomic_state(commit)->dark);
 #if DCP_FW_H17(DCP_FW_VER)
 	update_brightness = update_brightness &&
 			    dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G;
@@ -4430,9 +4432,11 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		req->swap.bl_unk = 1;
 #endif
 		req->swap.bl_value = dcp->brightness.dac;
-		req->swap.bl_power = dcp->brightness.off ? 0 : 0x40;
+		req->swap.bl_power = dcp->brightness.off ||
+				     to_apple_atomic_state(commit)->dark ? 0 : 0x40;
 #endif
-		dcp->brightness.update = false;
+		/* A dark swap leaves the level owed to the next swap that shows something. */
+		dcp->brightness.update = to_apple_atomic_state(commit)->dark;
 	}
 #endif
 

@@ -20,6 +20,8 @@ struct apple_atomic_state {
 	struct drm_atomic_commit base;
 	/* Failed route transactions suppress both CRTC enables in this commit. */
 	u32 failed_routes;
+	/* A commit of the dark cycle: black frame, backlight off (apple_drm_dark_cycle()). */
+	bool dark;
 };
 
 #define to_apple_atomic_state(s) container_of(s, struct apple_atomic_state, base)

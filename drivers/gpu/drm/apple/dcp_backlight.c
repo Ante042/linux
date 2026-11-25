@@ -667,6 +667,9 @@ retry:
 	if (dcp_backlight_desktop(dcp) ? !dcp_backlight_pending(dcp) :
 	    !dcp->brightness.update)
 		goto out;
+	/* The level stays owed (brightness.update) and goes out with the next real swap. */
+	if (READ_ONCE(dcp->dark_cycle))
+		goto out;
 
 	crtc_state = drm_atomic_get_crtc_state(commit, crtc);
 	if (IS_ERR(crtc_state)) {

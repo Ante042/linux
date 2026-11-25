@@ -1662,7 +1662,7 @@ void dcp_hotplug(struct work_struct *work)
 	/* The announcement already decided what an H17P external reports. */
 	if (gated)
 		drm_kms_helper_connector_hotplug_event(&connector->base);
-	else
+	else if (!READ_ONCE(dcp->dark_cycle))	/* the panel only ran for the dark cycle */
 		dcp_notify_hotplug(connector);
 	/* after the event, so registering a backlight cannot delay it */
 	apple_connector_backlight_sync(connector);

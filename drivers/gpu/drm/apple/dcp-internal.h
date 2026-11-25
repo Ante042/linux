@@ -687,6 +687,8 @@ struct apple_dcp {
 	bool rx_held;
 	/* Suspend-to-RAM: IDLE, CPU stopped, RTKit buffers kept for the restart */
 	bool s2r_parked;
+	/* The dark cycle has this pipe up: no brightness commit of our own until it is down. */
+	bool dark_cycle;
 	/* Suspend got as far as the park, which waits for the late phase */
 	bool s2r_park_due;
 	/* The park released the mailbox hold; resume unpauses presentation */
