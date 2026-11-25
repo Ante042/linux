@@ -190,7 +190,12 @@ static bool dcp_hdmi_borrowed(void *ctx);
  * the PMP's restart write the word) until the processor is idle again.
  *
  * Only where measured: T600x external processors whose power domain is their
- * own PMP report entry. The internal display's processor is never touched.
+ * own PMP report entry.
+ *
+ * The internal display's processor (pmp-disp0, int_pmp_release) gets the same
+ * treatment, but only while its CRTC is really powered off: it starts as on
+ * (the boot framebuffer scans out), and a DPMS off that only blanks the
+ * backlight (soft DPMS, H17G blank) keeps it on. About 0.04 W screen off.
  */
 #define DCP_EXT_PMP_IDLE_MS	10000
 
@@ -201,6 +206,12 @@ enum {
 };
 
 static bool ext_pmp_release = true;
+static bool int_pmp_release = true;
+
+static bool dcp_ext_pmp_enabled(struct apple_dcp *dcp)
+{
+	return dcp->ext_pmp_internal ? READ_ONCE(int_pmp_release) : READ_ONCE(ext_pmp_release);
+}
 static LIST_HEAD(dcp_ext_pmp_list);
 /* Guards dcp_ext_pmp_list; taken before a processor's ext_pmp_lock. */
 static DEFINE_MUTEX(dcp_ext_pmp_list_lock);
@@ -215,10 +226,10 @@ static int dcp_ext_pmp_param_set(const char *val, const struct kernel_param *kp)
 		return ret;
 	guard(mutex)(&dcp_ext_pmp_list_lock);
 	list_for_each_entry(dcp, &dcp_ext_pmp_list, ext_pmp_link) {
-		if (READ_ONCE(ext_pmp_release))
+		if (dcp_ext_pmp_enabled(dcp))
 			dcp_fabric_ext_pmp_idle(dcp);
 		else
-			dcp_fabric_ext_pmp_assert(dcp, "ext_pmp_release off");
+			dcp_fabric_ext_pmp_assert(dcp, "pmp release off");
 	}
 	return 0;
 }
@@ -230,6 +241,9 @@ static const struct kernel_param_ops dcp_ext_pmp_param_ops = {
 module_param_cb(ext_pmp_release, &dcp_ext_pmp_param_ops, &ext_pmp_release, 0644);
 MODULE_PARM_DESC(ext_pmp_release,
 		 "Withdraw an external display processor's PMP request while it drives no display, about 0.08 W on T6000 (default: on)");
+module_param_cb(int_pmp_release, &dcp_ext_pmp_param_ops, &int_pmp_release, 0644);
+MODULE_PARM_DESC(int_pmp_release,
+		 "Withdraw the internal display processor's PMP request while its CRTC is powered off, about 0.04 W on T6000 (default: on)");
 
 /*
  * Writes the request and waits for its acknowledgment (at most 50 ms, see
@@ -297,7 +311,7 @@ void dcp_fabric_ext_pmp_assert(struct apple_dcp *dcp, const char *why)
 /* Something stopped using the processor: check again once it has been idle a while. */
 void dcp_fabric_ext_pmp_idle(struct apple_dcp *dcp)
 {
-	if (READ_ONCE(dcp->ext_pmp_report) && READ_ONCE(ext_pmp_release))
+	if (READ_ONCE(dcp->ext_pmp_report) && dcp_ext_pmp_enabled(dcp))
 		mod_delayed_work(system_freezable_wq, &dcp->ext_pmp_wq,
 				 msecs_to_jiffies(DCP_EXT_PMP_IDLE_MS));
 }
@@ -389,7 +403,7 @@ static void dcp_ext_pmp_work(struct work_struct *work)
 	guard(mutex)(&dcp_typec_fabric_lock);
 	guard(mutex)(&dcp->hpd_mutex);
 	guard(mutex)(&dcp->ext_pmp_lock);
-	if (!READ_ONCE(ext_pmp_release) || !dcp->ext_pmp_report ||
+	if (!dcp_ext_pmp_enabled(dcp) || !dcp->ext_pmp_report ||
 	    dcp->ext_pmp_state == DCP_EXT_PMP_RELEASED || !READ_ONCE(dcp->active) ||
 	    READ_ONCE(dcp->crashed) || dcp_ext_pmp_in_use(dcp))
 		return;
@@ -402,7 +416,8 @@ static void dcp_ext_pmp_work(struct work_struct *work)
 	if (!ret) {
 		dcp->ext_pmp_state = DCP_EXT_PMP_RELEASED;
 		dcp->ext_pmp_retries = 0;
-		dev_info(dcp->dev, "PMP request %u released: no display\n", dcp->ext_pmp_id);
+		dev_info(dcp->dev, "PMP request %u released: %s\n", dcp->ext_pmp_id,
+			 dcp->ext_pmp_internal ? "display pipe off" : "no display");
 		return;
 	}
 	/*
@@ -436,9 +451,10 @@ static void dcp_ext_pmp_remove(void *data)
 }
 
 /*
- * Probe: an external processor (apple,dcpext, never the internal apple,dcp)
- * whose only power domain is its own request's entry in a T600x PMP report
- * (pmp-dispextN, APPLE_USE_PMP device trees). The request bit is the entry's.
+ * Probe: an external processor (apple,dcpext, pmp-dispextN) or the internal
+ * one (apple,dcp, pmp-disp0) whose only power domain is its own request's
+ * entry in a T600x PMP report (APPLE_USE_PMP device trees). The request bit
+ * is the entry's.
  */
 int dcp_fabric_ext_pmp_probe(struct apple_dcp *dcp)
 {
@@ -446,7 +462,10 @@ int dcp_fabric_ext_pmp_probe(struct apple_dcp *dcp)
 	const char *label = NULL;
 	u32 id = 0;
 
-	if (!of_device_is_compatible(np, "apple,dcpext") || dcp->external ||
+	bool internal = of_device_is_compatible(np, "apple,dcp") &&
+			!of_device_is_compatible(np, "apple,dcpext");
+
+	if ((!internal && !of_device_is_compatible(np, "apple,dcpext")) || dcp->external ||
 	    dcp->desktop_external ||
 	    of_count_phandle_with_args(np, "power-domains", "#power-domain-cells") != 1)
 		return 0;
@@ -454,7 +473,7 @@ int dcp_fabric_ext_pmp_probe(struct apple_dcp *dcp)
 	if (entry && of_device_is_compatible(entry, "apple,t6000-pmp-v2-report-entry") &&
 	    of_device_is_available(entry) && !of_property_read_bool(entry, "apple,no-ack") &&
 	    !of_property_read_string(entry, "label", &label) &&
-	    strstarts(label, "pmp-dispext") &&
+	    (internal ? !strcmp(label, "pmp-disp0") : strstarts(label, "pmp-dispext")) &&
 	    !of_property_read_u32(entry, "reg", &id) && id < 64)
 		report = of_get_parent(entry);
 	if (!report || !of_device_is_compatible(report, "apple,t6000-pmp-v2-report")) {
@@ -463,9 +482,13 @@ int dcp_fabric_ext_pmp_probe(struct apple_dcp *dcp)
 		return 0;
 	}
 	dcp->ext_pmp_id = id;
+	dcp->ext_pmp_internal = internal;
+	/* The internal pipe scans out the boot framebuffer until a CRTC off says otherwise. */
+	dcp->ext_pmp_crtc_on = internal;
 	dcp->ext_pmp_report = report;
-	dev_info(dcp->dev, "PMP request %u (%s) withdrawn while no display is attached%s\n",
-		 id, label, READ_ONCE(ext_pmp_release) ? "" : " (ext_pmp_release off)");
+	dev_info(dcp->dev, "PMP request %u (%s) withdrawn while %s%s\n", id, label,
+		 internal ? "the display pipe is off" : "no display is attached",
+		 dcp_ext_pmp_enabled(dcp) ? "" : " (release off)");
 	of_node_put(entry);
 	scoped_guard(mutex, &dcp_ext_pmp_list_lock)
 		list_add_tail(&dcp->ext_pmp_link, &dcp_ext_pmp_list);

@@ -1975,7 +1975,7 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 		if (dcp_uses_t6020_tunnel_flow(dcp))
 			ret = dptxport_set_hpd_timeout(dcp->dptxport[port].service,
 						       true, 8000);
-		else if (READ_ONCE(dcp->ext_pmp_report))
+		else if (READ_ONCE(dcp->ext_pmp_report) && !dcp->ext_pmp_internal)
 			/*
 			 * With its PMP request withdrawn while idle, the
 			 * firmware answered the first HPD after boot only
@@ -4645,9 +4645,15 @@ static void dcp_poweroff_pipe(struct platform_device *pdev)
 
 void dcp_poweroff(struct platform_device *pdev)
 {
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+	/* An internal DPMS off that only blanks leaves the pipe scanning out. */
+	bool scans_on = dcp->ext_pmp_internal &&
+			(iomfb_is_m4(dcp) || dcp_uses_soft_dpms(dcp) || dcp_h17g_panel(dcp));
+
 	dcp_poweroff_pipe(pdev);
 	/* Once the pipe is off, whichever way it went. */
-	dcp_fabric_ext_pmp_crtc(platform_get_drvdata(pdev), false);
+	if (!scans_on)
+		dcp_fabric_ext_pmp_crtc(dcp, false);
 }
 
 /* Desktop 26.x: the DRM device exists now, register the panel backlight. */

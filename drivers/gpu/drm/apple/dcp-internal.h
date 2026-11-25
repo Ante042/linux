@@ -965,6 +965,8 @@ struct apple_dcp {
 	 */
 	struct device_node *ext_pmp_report;
 	u32 ext_pmp_id;
+	/* pmp-disp0: released only while the CRTC is really off */
+	bool ext_pmp_internal;
 	struct list_head ext_pmp_link;
 	struct delayed_work ext_pmp_wq;
 	struct mutex ext_pmp_lock;	/* innermost, see above */
