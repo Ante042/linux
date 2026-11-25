@@ -24,6 +24,14 @@
 #define MAX_BRIGHTNESS_PART2	510U
 
 /*
+ * Where a swap carries a DAC value, the backlight device counts in millinits.
+ * The DAC tables below are far finer than whole nits, and at the dim end of
+ * the range a whole nit is a step of 10 to 25 %: a slow change of level, such
+ * as one following the ambient light, was a visible staircase there.
+ */
+#define DCP_BL_DAC_UNITS	1000U
+
+/*
  * lookup for display brightness 2 to 99 nits
  * */
 static u32 brightness_part1[] = {
@@ -238,6 +246,16 @@ int dcp_backlight_takeover(struct apple_dcp *dcp, u32 millinits)
 	return iomfb_configure_backlight_h17p(dcp, maximum, true, nits, false, 0);
 }
 
+/*
+ * The H17G panel shares the registration below but takes whole nits in its
+ * swaps; every other panel that gets here takes a DAC value.
+ */
+static u32 dcp_bl_dac_units(struct apple_dcp *dcp)
+{
+	return dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G ?
+		1 : DCP_BL_DAC_UNITS;
+}
+
 static int dcp_get_brightness(struct backlight_device *bd)
 {
 	struct apple_dcp *dcp = bl_get_data(bd);
@@ -263,6 +281,9 @@ static int dcp_get_brightness(struct backlight_device *bd)
 		return actual;
 	}
 
+	/* The firmware's own report of the level it shows. */
+	if (dcp_bl_dac_units(dcp) == DCP_BL_DAC_UNITS)
+		return dcp->brightness.mnits;
 	return dcp->brightness.nits;
 }
 
@@ -573,16 +594,22 @@ void dcp_backlight_desktop_finish(struct apple_dcp *dcp, u32 id,
 
 #define SCALE_FACTOR (1 << 10)
 
-static u32 interpolate(int val, int min, int max, u32 *tbl, size_t tbl_size)
+/*
+ * @val, @min and @max are millinits.  At a whole nit the result is the one
+ * the whole-nit arithmetic gave: both divide the same ratio.
+ */
+static u32 interpolate(u32 val, u32 min, u32 max, u32 *tbl, size_t tbl_size)
 {
 	u32 frac;
 	u64 low, high;
-	u32 interpolated = (tbl_size - 1) * ((val - min) * SCALE_FACTOR) / (max - min);
+	u64 interpolated = div_u64((u64)(tbl_size - 1) * (val - min) * SCALE_FACTOR,
+				   max - min);
 
 	size_t index = interpolated / SCALE_FACTOR;
 
-	if (WARN(index + 1 >= tbl_size, "invalid index %zu for brightness %u\n", index, val))
-		return tbl[tbl_size / 2];
+	/* The end of the table is its last entry. */
+	if (index + 1 >= tbl_size)
+		return tbl[tbl_size - 1];
 
 	frac = interpolated & (SCALE_FACTOR - 1);
 	low = tbl[index];
@@ -591,27 +618,27 @@ static u32 interpolate(int val, int min, int max, u32 *tbl, size_t tbl_size)
 	return ((frac * high) + ((SCALE_FACTOR - frac) * low)) / SCALE_FACTOR;
 }
 
-static u32 calculate_dac(struct apple_dcp *dcp, int val)
+/* @level is in the backlight device's units. */
+static u32 calculate_dac(struct apple_dcp *dcp, u32 level)
 {
+	const u32 min1 = MIN_BRIGHTNESS_PART1 * 1000, max1 = MAX_BRIGHTNESS_PART1 * 1000;
+	const u32 min2 = MIN_BRIGHTNESS_PART2 * 1000, max2 = MAX_BRIGHTNESS_PART2 * 1000;
+	u32 val = level * (1000 / dcp_bl_dac_units(dcp));
 	u32 dac;
 
-	if (val <= MIN_BRIGHTNESS_PART1)
+	if (val <= min1)
 		return 16 * brightness_part1[0];
-	else if (val == MAX_BRIGHTNESS_PART1)
-		return 16 * brightness_part1[ARRAY_SIZE(brightness_part1) - 1];
-	else if (val == MIN_BRIGHTNESS_PART2)
-		return 16 * brightness_part2[0];
-	else if (val >= MAX_BRIGHTNESS_PART2)
+	else if (val >= max2)
 		return brightness_part2[ARRAY_SIZE(brightness_part2) - 1];
 
-	if (val < MAX_BRIGHTNESS_PART1) {
-		dac = interpolate(val, MIN_BRIGHTNESS_PART1, MAX_BRIGHTNESS_PART1,
+	if (val <= max1) {
+		dac = interpolate(val, min1, max1,
 				  brightness_part1, ARRAY_SIZE(brightness_part1));
-	} else if (val > MIN_BRIGHTNESS_PART2) {
-		dac = interpolate(val, MIN_BRIGHTNESS_PART2, MAX_BRIGHTNESS_PART2,
+	} else if (val >= min2) {
+		dac = interpolate(val, min2, max2,
 				  brightness_part2, ARRAY_SIZE(brightness_part2));
 	} else {
-		dac = interpolate(val, MAX_BRIGHTNESS_PART1, MIN_BRIGHTNESS_PART2,
+		dac = interpolate(val, max1, min2,
 				  brightness_part12, ARRAY_SIZE(brightness_part12));
 	}
 
@@ -755,12 +782,12 @@ static void dcp_dac_fade_work(struct work_struct *work)
 }
 
 /* A lit panel with a mode fades to a new lit level; anything else jumps. */
-static bool dcp_dac_fade_starts(struct apple_dcp *dcp, u32 nits)
+static bool dcp_dac_fade_starts(struct apple_dcp *dcp, u32 level)
 {
 	struct dcp_brightness *b = &dcp->brightness;
 
 	return dcp_has_panel(dcp) && READ_ONCE(dcp->mode_state.valid) &&
-	       b->level && nits && b->level != nits;
+	       b->level && level && b->level != level;
 }
 
 static int dcp_set_brightness(struct backlight_device *bd)
@@ -866,12 +893,13 @@ int dcp_backlight_register(struct apple_dcp *dcp)
 	struct backlight_device *bl_dev;
 	int ret;
 	unsigned long flags;
+	u32 units = dcp_bl_dac_units(dcp);
 	struct backlight_properties props = {
 		.type = BACKLIGHT_PLATFORM,
-		.brightness = dcp->brightness.nits,
+		.brightness = dcp->brightness.nits * units,
 		.scale = BACKLIGHT_SCALE_LINEAR,
 	};
-	props.max_brightness = min(dcp->brightness.maximum, MAX_BRIGHTNESS_PART2 - 1);
+	props.max_brightness = min(dcp->brightness.maximum, MAX_BRIGHTNESS_PART2 - 1) * units;
 	if ((dcp_backlight_presents_nits(dcp) || iomfb_is_m4(dcp)) &&
 	    !dcp_backlight_active(dcp))
 		return -ENODATA;
@@ -936,8 +964,8 @@ int dcp_backlight_register(struct apple_dcp *dcp)
 		dcp_backlight_sync_hint(dcp);
 	if (!dcp_backlight_active(dcp) &&
 	    dcp->fw_compat != DCP_FIRMWARE_V_26_6_DESKTOP) {
-		dcp->brightness.level = dcp->brightness.nits;
-		dcp->brightness.dac = calculate_dac(dcp, dcp->brightness.nits);
+		dcp->brightness.level = dcp->brightness.nits * units;
+		dcp->brightness.dac = calculate_dac(dcp, dcp->brightness.level);
 	}
 
 	return 0;

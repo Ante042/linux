@@ -1143,6 +1143,8 @@ static void iomfb_cb_pr_publish(struct apple_dcp *dcp, struct iomfb_property *pr
 #endif
 		if (dcp_has_panel(dcp)) {
 			dcp->brightness.nits = prop->value / dcp->brightness.scale;
+			dcp->brightness.mnits = div_u64((u64)prop->value * 1000,
+							dcp->brightness.scale);
 			/* notify backlight device of the initial brightness */
 			if (!dcp->brightness.bl_dev && dcp->brightness.maximum > 0)
 				schedule_work(&dcp->bl_register_wq);

@@ -180,13 +180,16 @@ struct dcp_brightness {
 	u32 maximum;
 	u32 dac;
 	int nits;
+	/* The level the firmware reported last, in millinits. */
+	u32 mnits;
 	int scale;
 	bool update;
 	/* A level was written through the backlight device (desktop 26.x). */
 	bool requested;
 	/*
 	 * Fade between levels where the firmware takes a DAC value in each
-	 * swap.  level is the one set last, in nits; crtc mutex.
+	 * swap.  level is the one set last, in the backlight device's units
+	 * (see dcp_bl_dac_units()); crtc mutex.
 	 */
 	struct delayed_work fade_work;
 	unsigned long fade_start;

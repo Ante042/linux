@@ -125,6 +125,7 @@ have_mnits:
 	}
 
 	dcp->brightness.nits = mnits.millinits / 1000;
+	dcp->brightness.mnits = mnits.millinits;
 	/* H17G publishes no NITS property; its first report registers the device. */
 	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G &&
 	    dcp_has_panel(dcp) && !dcp->brightness.bl_dev && dcp->brightness.maximum > 0)
