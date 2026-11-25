@@ -15,6 +15,7 @@ obj-$(CONFIG_APPLE_PMGR_MISC)	+= apple-pmgr-misc.o
 
 obj-$(CONFIG_APPLE_S2R) += apple-s2r.o
 apple-s2r-y = s2r.o s2r-sleep.o
+obj-$(CONFIG_APPLE_S2R) += s2rwakefix.o
 
 obj-$(CONFIG_APPLE_RTKIT) += apple-rtkit.o
 apple-rtkit-y = rtkit.o rtkit-crashlog.o
